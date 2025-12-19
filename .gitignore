@@ -54,6 +54,7 @@ checkpoints/
 *.log
 logs/
 *.out
+*.json
 
 # Mosquitto
 mosquitto.log
