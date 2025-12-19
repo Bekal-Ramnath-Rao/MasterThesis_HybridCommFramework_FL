@@ -1,0 +1,61 @@
+// IDL definitions for Federated Learning with DDS
+module FederatedLearning {
+    
+    // Client registration message
+    struct ClientRegistration {
+        long client_id;
+        string message;
+    };
+    
+    // Training configuration
+    struct TrainingConfig {
+        long batch_size;
+        long local_epochs;
+    };
+    
+    // Training command from server
+    struct TrainingCommand {
+        long round;
+        boolean start_training;
+        boolean start_evaluation;
+        boolean training_complete;
+    };
+    
+    // Global model weights
+    struct GlobalModel {
+        long round;
+        sequence<octet> weights;  // Serialized model weights
+    };
+    
+    // Model update from client
+    struct ModelUpdate {
+        long client_id;
+        long round;
+        sequence<octet> weights;  // Serialized model weights
+        long num_samples;
+        double loss;
+        double mse;
+        double mae;
+        double mape;
+    };
+    
+    // Evaluation metrics from client
+    struct EvaluationMetrics {
+        long client_id;
+        long round;
+        long num_samples;
+        double loss;
+        double mse;
+        double mae;
+        double mape;
+    };
+    
+    // Server status for clients to query
+    struct ServerStatus {
+        long current_round;
+        long total_rounds;
+        boolean training_started;
+        boolean training_complete;
+        long registered_clients;
+    };
+};

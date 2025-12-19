@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package federated_learning;
+
+// Service definition for Federated Learning
+service FederatedLearning {
+    // Client registration
+    rpc RegisterClient(ClientRegistration) returns (RegistrationResponse);
+    
+    // Server sends global model to client
+    rpc GetGlobalModel(ModelRequest) returns (GlobalModel);
+    
+    // Client sends local model update to server
+    rpc SendModelUpdate(ModelUpdate) returns (UpdateResponse);
+    
+    // Client sends evaluation metrics to server
+    rpc SendMetrics(EvaluationMetrics) returns (MetricsResponse);
+    
+    // Get training configuration
+    rpc GetTrainingConfig(ConfigRequest) returns (TrainingConfig);
+    
+    // Check if training should start for a round
+    rpc CheckTrainingStatus(StatusRequest) returns (TrainingStatus);
+}
+
+// Messages
+message ClientRegistration {
+    int32 client_id = 1;
+}
+
+message RegistrationResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message ModelRequest {
+    int32 client_id = 1;
+    int32 round = 2;
+}
+
+message GlobalModel {
+    int32 round = 1;
+    bytes weights = 2;  // Serialized model weights
+    bool available = 3;
+}
+
+message ModelUpdate {
+    int32 client_id = 1;
+    int32 round = 2;
+    bytes weights = 3;  // Serialized model weights
+    int32 num_samples = 4;
+    map<string, double> metrics = 5;
+}
+
+message UpdateResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message EvaluationMetrics {
+    int32 client_id = 1;
+    int32 round = 2;
+    int32 num_samples = 3;
+    map<string, double> metrics = 4;
+}
+
+message MetricsResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message ConfigRequest {
+    int32 client_id = 1;
+}
+
+message TrainingConfig {
+    int32 batch_size = 1;
+    int32 local_epochs = 2;
+}
+
+message StatusRequest {
+    int32 client_id = 1;
+    int32 current_round = 2;
+}
+
+message TrainingStatus {
+    bool should_train = 1;
+    int32 round = 2;
+    bool should_evaluate = 3;
+    bool training_complete = 4;
+}
