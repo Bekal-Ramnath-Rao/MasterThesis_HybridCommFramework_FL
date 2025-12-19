@@ -1,0 +1,114 @@
+# Python
+*.py[cod]
+*$py.class
+*.so
+__pycache__/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+
+#virtual environment
+.venv/
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Data Files
+Dataset/
+*.csv
+*.xlsx
+*.xls
+
+# Model Files
+*.h5
+*.pkl
+*.pth
+*.pb
+*.ckpt
+saved_models/
+checkpoints/
+
+# Logs
+*.log
+logs/
+*.out
+
+# Mosquitto
+mosquitto.log
+mosquitto/data/
+*.conf.backup
+
+# Generated Results
+*.png
+*.jpg
+*.jpeg
+*.pdf
+fl_mqtt_results.json
+fl_mqtt_results.png
+
+# OS Files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Temporary Files
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+
+# Environment Variables
+.env
+.env.local
+
+# Documentation
+*.docx
+~$*.doc*
+
+# Compiled files
+*.pyc
+*.pyo
+*.pyd
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# Plots directory
+plots/
+Supervised/plots/
+
+# Keep specific files
+!requirements.txt
+!README*.md
+!COMMUNICATION_FLOW.md
+!DISTRIBUTED_SETUP.md
+!TROUBLESHOOT_MQTT.md
+!mosquitto_custom.conf
