@@ -16,7 +16,12 @@ AMQP_PORT = int(os.getenv("AMQP_PORT", "5672"))
 AMQP_USER = os.getenv("AMQP_USER", "guest")
 AMQP_PASSWORD = os.getenv("AMQP_PASSWORD", "guest")
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
-NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "5"))
+NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
+
+# Convergence Settings (primary stopping criterion)
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 # AMQP Exchanges and Queues
 EXCHANGE_BROADCAST = "fl_broadcast"
@@ -43,6 +48,16 @@ class FederatedLearningServer:
         self.LOSS = []
         self.ROUNDS = []
         
+        # Convergence tracking
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
+        self.converged = False
+        self.start_time = None
+        self.convergence_time = None
+        
+        # Initialize global model
+        self.initialize_global_model()
+        
         # Training configuration
         self.training_config = {
             "batch_size": 32,
@@ -53,6 +68,27 @@ class FederatedLearningServer:
         self.connection = None
         self.channel = None
         self.consuming = False
+    
+    def initialize_global_model(self):
+        """Initialize the global model structure (LSTM for FL)"""
+        import tensorflow as tf
+        from tensorflow.keras.models import Sequential
+        from tensorflow.keras.layers import Dense, LSTM
+        
+        # Create the same LSTM model structure as clients
+        # Input shape: (1, 4) - 1 time step, 4 features
+        model = Sequential()
+        model.add(LSTM(50, activation='relu', input_shape=(1, 4)))
+        model.add(Dense(1))
+        model.compile(loss='mean_squared_error', optimizer='adam', 
+                     metrics=['mse', 'mae', 'mape'])
+        
+        # Get initial weights
+        self.global_weights = model.get_weights()
+        
+        print("\nGlobal model initialized with random weights")
+        print(f"Model architecture: LSTM(50) -> Dense(1)")
+        print(f"Number of weight layers: {len(self.global_weights)}")
     
     def serialize_weights(self, weights):
         """Serialize model weights for AMQP transmission"""
@@ -128,11 +164,14 @@ class FederatedLearningServer:
             self.registered_clients.add(client_id)
             print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
             
-            # If all clients registered, start federated learning
+            # If all clients registered, distribute initial global model and start federated learning
             if len(self.registered_clients) == self.num_clients:
-                print("\nAll clients registered. Starting federated learning...\n")
+                print("\nAll clients registered. Distributing initial global model...\n")
                 time.sleep(2)
-                self.start_federated_learning()
+                self.distribute_initial_model()
+                # Record training start time
+                self.start_time = time.time()
+                print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         except Exception as e:
             print(f"Server error handling registration: {e}")
     
@@ -182,8 +221,8 @@ class FederatedLearningServer:
         except Exception as e:
             print(f"Server error handling client metrics: {e}")
     
-    def start_federated_learning(self):
-        """Initialize federated learning process"""
+    def distribute_initial_model(self):
+        """Distribute initial global model to all clients"""
         # Send training configuration to all clients
         self.channel.basic_publish(
             exchange=EXCHANGE_BROADCAST,
@@ -198,16 +237,31 @@ class FederatedLearningServer:
         self.current_round = 1
         
         print(f"\n{'='*70}")
-        print(f"Initializing Global Model")
+        print(f"Distributing Initial Global Model")
         print(f"{'='*70}\n")
         
-        print("Waiting for initial model from clients...")
+        # Send initial global model to all clients
+        self.channel.basic_publish(
+            exchange=EXCHANGE_BROADCAST,
+            routing_key='',
+            body=json.dumps({
+                "message_type": "global_model",
+                "round": 0,
+                "weights": self.serialize_weights(self.global_weights)
+            }),
+            properties=pika.BasicProperties(delivery_mode=2)
+        )
+        
+        print("Initial global model sent to all clients")
+        
+        # Wait for clients to receive and set the initial model
+        time.sleep(2)
         
         print(f"\n{'='*70}")
         print(f"Starting Round {self.current_round}/{self.num_rounds}")
         print(f"{'='*70}\n")
         
-        # Signal clients to start training
+        # Signal clients to start training with the global model
         self.channel.basic_publish(
             exchange=EXCHANGE_BROADCAST,
             routing_key='',
@@ -259,7 +313,7 @@ class FederatedLearningServer:
             properties=pika.BasicProperties(delivery_mode=2)
         )
         
-        print(f"Global model for round {self.current_round} sent to all clients")
+        print(f"Aggregated global model from round {self.current_round} sent to all clients")
         
         # Request evaluation from clients
         time.sleep(1)
@@ -315,6 +369,31 @@ class FederatedLearningServer:
         self.client_updates.clear()
         self.client_metrics.clear()
         
+        # Check for convergence (early stopping)
+        if self.current_round >= MIN_ROUNDS and self.check_convergence():
+            self.convergence_time = time.time() - self.start_time if self.start_time else 0
+            print("\n" + "="*70)
+            print("CONVERGENCE ACHIEVED!")
+            print(f"Training stopped early at round {self.current_round}/{self.num_rounds}")
+            print(f"Loss improvement below threshold for {CONVERGENCE_PATIENCE} consecutive rounds")
+            print(f"Time to Convergence: {self.convergence_time:.2f} seconds ({self.convergence_time/60:.2f} minutes)")
+            print("="*70 + "\n")
+            self.converged = True
+            
+            # Send training complete signal to all clients
+            self.channel.basic_publish(
+                exchange=EXCHANGE_BROADCAST,
+                routing_key='',
+                body=json.dumps({"message_type": "training_complete"}),
+                properties=pika.BasicProperties(delivery_mode=2)
+            )
+            time.sleep(1)  # Give clients time to receive the message
+            
+            self.plot_results()
+            self.save_results()
+            self.stop()
+            return
+        
         # Check if more rounds needed
         if self.current_round < self.num_rounds:
             self.current_round += 1
@@ -336,12 +415,51 @@ class FederatedLearningServer:
                 properties=pika.BasicProperties(delivery_mode=2)
             )
         else:
+            self.convergence_time = time.time() - self.start_time if self.start_time else 0
             print("\n" + "="*70)
             print("Federated Learning Completed!")
+            print(f"Maximum rounds ({self.num_rounds}) reached")
+            print(f"Total Training Time: {self.convergence_time:.2f} seconds ({self.convergence_time/60:.2f} minutes)")
             print("="*70 + "\n")
+            
+            # Send training complete signal to all clients
+            self.channel.basic_publish(
+                exchange=EXCHANGE_BROADCAST,
+                routing_key='',
+                body=json.dumps({"message_type": "training_complete"}),
+                properties=pika.BasicProperties(delivery_mode=2)
+            )
+            time.sleep(1)  # Give clients time to receive the message
+            
             self.plot_results()
             self.save_results()
             self.stop()
+    
+    def check_convergence(self):
+        """Check if model has converged based on loss improvement"""
+        if len(self.LOSS) == 0:
+            return False
+        
+        current_loss = self.LOSS[-1]
+        
+        # Check if loss improved by at least the threshold
+        improvement = self.best_loss - current_loss
+        
+        if improvement > CONVERGENCE_THRESHOLD:
+            # Significant improvement
+            self.best_loss = current_loss
+            self.rounds_without_improvement = 0
+            print(f"  → Loss improved by {improvement:.6f} (threshold: {CONVERGENCE_THRESHOLD})")
+            return False
+        else:
+            # No significant improvement
+            self.rounds_without_improvement += 1
+            print(f"  → No significant improvement (improvement: {improvement:.6f}, threshold: {CONVERGENCE_THRESHOLD})")
+            print(f"  → Rounds without improvement: {self.rounds_without_improvement}/{CONVERGENCE_PATIENCE}")
+            
+            if self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
+                return True
+            return False
     
     def plot_results(self):
         """Plot training metrics"""
@@ -372,24 +490,40 @@ class FederatedLearningServer:
         plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig('fl_amqp_results.png', dpi=300, bbox_inches='tight')
-        print("Results plot saved as 'fl_amqp_results.png'")
+        
+        # Save to results folder
+        results_dir = Path(__file__).parent / 'results'
+        results_dir.mkdir(exist_ok=True)
+        plt.savefig(results_dir / 'amqp_training_metrics.png', dpi=300, bbox_inches='tight')
+        print(f"Results plot saved to {results_dir / 'amqp_training_metrics.png'}")
         plt.show()
+        
+        # Disconnect and exit after plot is closed
+        print("\nTraining complete. Disconnecting...")
+        self.stop()
     
     def save_results(self):
         """Save results to file"""
+        results_dir = Path(__file__).parent / 'results'
+        results_dir.mkdir(exist_ok=True)
+        
         results = {
             "rounds": self.ROUNDS,
             "mse": self.MSE,
             "mae": self.MAE,
             "mape": self.MAPE,
-            "loss": self.LOSS
+            "loss": self.LOSS,
+            "convergence_time_seconds": self.convergence_time,
+            "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
+            "total_rounds": len(self.ROUNDS),
+            "num_clients": self.num_clients
         }
         
-        with open('fl_amqp_results.json', 'w') as f:
+        results_file = results_dir / 'amqp_training_results.json'
+        with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
         
-        print("Results saved to 'fl_amqp_results.json'")
+        print(f"Results saved to {results_file}")
     
     def start(self):
         """Start consuming messages"""

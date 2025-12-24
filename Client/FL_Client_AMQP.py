@@ -195,8 +195,21 @@ class FederatedLearningClient:
                 self.on_start_training(ch, method, properties, body)
             elif message_type == 'start_evaluation':
                 self.on_start_evaluation(ch, method, properties, body)
+            elif message_type == 'training_complete':
+                self.on_training_complete()
         except Exception as e:
-            print(f"Client {self.client_id} error handling broadcast message: {e}")
+            print(f"Client {self.client_id} error handling broadcast: {e}")
+    
+    def on_training_complete(self):
+        """Handle training complete signal from server"""
+        print("\n" + "="*70)
+        print(f"Client {self.client_id} - Training completed!")
+        print("="*70)
+        print("\nDisconnecting from server...")
+        self.channel.stop_consuming()
+        self.connection.close()
+        import sys
+        sys.exit(0)
     
     def on_global_model(self, ch, method, properties, body):
         """Callback for receiving global model"""
@@ -212,9 +225,15 @@ class FederatedLearningClient:
             
             weights = self.deserialize_weights(encoded_weights)
             self.model.set_weights(weights)
-            self.current_round = round_num
             
-            print(f"Client {self.client_id} received global model for round {round_num}")
+            if round_num == 0:
+                # Initial model from server
+                print(f"Client {self.client_id} received initial global model from server")
+                self.current_round = 0
+            else:
+                # Updated model after aggregation
+                self.current_round = round_num
+                print(f"Client {self.client_id} received global model for round {round_num}")
         except Exception as e:
             print(f"Client {self.client_id} error handling global model: {e}")
     
@@ -243,8 +262,14 @@ class FederatedLearningClient:
             
             round_num = data['round']
             
-            if self.current_round == 0 or round_num == self.current_round:
+            # Check if we're ready for this round (should have received global model first)
+            if self.current_round == 0 and round_num == 1:
+                # First training round with initial global model
                 self.current_round = round_num
+                print(f"\nClient {self.client_id} starting training for round {round_num} with initial global model...")
+                self.train_local_model()
+            elif round_num == self.current_round:
+                # Subsequent rounds
                 print(f"\nClient {self.client_id} starting training for round {round_num}...")
                 self.train_local_model()
             else:

@@ -130,6 +130,9 @@ class FederatedLearningClient:
             result4, mid4 = self.mqtt_client.subscribe(TOPIC_START_EVALUATION)
             print(f"  Subscribed to {TOPIC_START_EVALUATION} - Result: {result4}")
             
+            result5, mid5 = self.mqtt_client.subscribe('fl/training_complete')
+            print(f"  Subscribed to fl/training_complete - Result: {result5}")
+            
             # Send registration message
             self.mqtt_client.publish("fl/client_register", 
                                     json.dumps({"client_id": self.client_id}))
@@ -148,8 +151,21 @@ class FederatedLearningClient:
                 self.handle_start_training(msg.payload)
             elif msg.topic == TOPIC_START_EVALUATION:
                 self.handle_start_evaluation(msg.payload)
+            elif msg.topic == 'fl/training_complete':
+                self.handle_training_complete()
         except Exception as e:
             print(f"Client {self.client_id} error handling message: {e}")
+    
+    def handle_training_complete(self):
+        """Handle training completion signal from server"""
+        print("\n" + "="*70)
+        print(f"Client {self.client_id} - Training completed!")
+        print("="*70)
+        print("\nDisconnecting from server...")
+        self.mqtt_client.disconnect()
+        self.mqtt_client.loop_stop()
+        import sys
+        sys.exit(0)
     
     def handle_global_model(self, payload):
         """Receive and set global model weights"""
@@ -159,10 +175,15 @@ class FederatedLearningClient:
         
         weights = self.deserialize_weights(encoded_weights)
         self.model.set_weights(weights)
-        # Stay at current round for evaluation, will increment after evaluation
-        self.current_round = round_num
         
-        print(f"Client {self.client_id} received global model for round {round_num}")
+        if round_num == 0:
+            # Initial model from server
+            print(f"Client {self.client_id} received initial global model from server")
+            self.current_round = 0
+        else:
+            # Updated model after aggregation
+            self.current_round = round_num
+            print(f"Client {self.client_id} received global model for round {round_num}")
     
     def handle_training_config(self, payload):
         """Update training configuration"""
@@ -174,9 +195,14 @@ class FederatedLearningClient:
         data = json.loads(payload.decode())
         round_num = data['round']
         
-        # For first round or matching round, start training
-        if self.current_round == 0 or round_num == self.current_round:
-            self.current_round = round_num  # Update to current round
+        # Check if we're ready for this round (should have received global model first)
+        if self.current_round == 0 and round_num == 1:
+            # First training round with initial global model
+            self.current_round = round_num
+            print(f"\nClient {self.client_id} starting training for round {round_num} with initial global model...")
+            self.train_local_model()
+        elif round_num == self.current_round:
+            # Subsequent rounds
             print(f"\nClient {self.client_id} starting training for round {round_num}...")
             self.train_local_model()
         else:

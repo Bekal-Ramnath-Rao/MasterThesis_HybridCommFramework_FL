@@ -145,27 +145,93 @@ class FederatedLearningClient:
     
     def run(self):
         """Main client loop - poll server for instructions"""
-        print(f"\nClient {self.client_id} waiting for training to start...\n")
+        print(f"\nClient {self.client_id} waiting for server to start...\n")
+        
+        # First, get initial global model from server
+        initial_model_received = False
+        retry_count = 0
+        max_connection_retries = 30
+        
+        while not initial_model_received and retry_count < max_connection_retries:
+            try:
+                global_model = self.stub.GetGlobalModel(
+                    federated_learning_pb2.ModelRequest(
+                        client_id=self.client_id,
+                        round=0  # Request initial model
+                    )
+                )
+                
+                if global_model.available:
+                    # Update local model with initial global weights
+                    weights = pickle.loads(global_model.weights)
+                    self.model.set_weights(weights)
+                    if global_model.round == 0:
+                        print(f"Client {self.client_id} received initial global model from server")
+                        self.current_round = 0
+                        initial_model_received = True
+                    else:
+                        print(f"Client {self.client_id} received global model for round {global_model.round}")
+                        self.current_round = global_model.round
+                        initial_model_received = True
+                else:
+                    time.sleep(0.5)  # Wait for server to initialize
+            except grpc.RpcError as e:
+                retry_count += 1
+                if retry_count == 1:
+                    print(f"Client {self.client_id} waiting for server to start...")
+                if retry_count % 10 == 0:
+                    print(f"  Still waiting... (attempt {retry_count}/{max_connection_retries})")
+                time.sleep(2)
+            except Exception as e:
+                retry_count += 1
+                print(f"Client {self.client_id} unexpected error: {e}")
+                time.sleep(2)
+        
+        if not initial_model_received:
+            print(f"\nClient {self.client_id} failed to connect to server after {max_connection_retries} attempts.")
+            print("Please ensure the gRPC server is running.")
+            self.running = False
+            return
+        
+        print(f"\nClient {self.client_id} ready for training...\n")
         
         while self.running:
             try:
                 # Check training status
-                status = self.stub.CheckTrainingStatus(
-                    federated_learning_pb2.StatusRequest(
-                        client_id=self.client_id,
-                        current_round=self.current_round
+                try:
+                    status = self.stub.CheckTrainingStatus(
+                        federated_learning_pb2.StatusRequest(
+                            client_id=self.client_id,
+                            current_round=self.current_round
+                        )
                     )
-                )
+                except grpc.RpcError as e:
+                    if e.code() == grpc.StatusCode.UNAVAILABLE:
+                        # Server has shut down, exit gracefully
+                        print(f"\nClient {self.client_id} - Server has shut down.")
+                        print("Training completed. Disconnecting...")
+                        self.running = False
+                        break
+                    else:
+                        raise  # Re-raise other RPC errors
                 
                 if status.training_complete:
                     print(f"\nClient {self.client_id} - Training completed!")
+                    print("Disconnecting from server...")
                     self.running = False
                     break
                 
                 if status.should_train:
-                    print(f"\nClient {self.client_id} starting training for round {status.round}...")
-                    self.current_round = status.round
-                    self.train_local_model()
+                    if self.current_round == 0 and status.round == 1:
+                        # First training round with initial global model
+                        self.current_round = status.round
+                        print(f"\nClient {self.client_id} starting training for round {status.round} with initial global model...")
+                        self.train_local_model()
+                    elif status.round > self.current_round:
+                        # Subsequent rounds
+                        self.current_round = status.round
+                        print(f"\nClient {self.client_id} starting training for round {status.round}...")
+                        self.train_local_model()
                     time.sleep(1)  # Brief pause before checking for evaluation
                 
                 elif status.should_evaluate:
@@ -181,7 +247,7 @@ class FederatedLearningClient:
                         # Update local model with global weights
                         weights = pickle.loads(global_model.weights)
                         self.model.set_weights(weights)
-                        print(f"Client {self.client_id} received global model for round {self.current_round}")
+                        print(f"Client {self.client_id} received aggregated global model for round {self.current_round}")
                         
                         # Evaluate
                         print(f"Client {self.client_id} starting evaluation for round {self.current_round}...")
@@ -195,9 +261,18 @@ class FederatedLearningClient:
                 print(f"\nClient {self.client_id} shutting down...")
                 self.running = False
                 break
+            except grpc.RpcError as e:
+                if e.code() == grpc.StatusCode.UNAVAILABLE:
+                    # Server has shut down, exit gracefully
+                    print(f"\nClient {self.client_id} - Server unavailable, disconnecting...")
+                    self.running = False
+                    break
+                else:
+                    print(f"Client {self.client_id} RPC error: {e.code()}")
+                    time.sleep(2)
             except Exception as e:
-                print(f"Client {self.client_id} error in main loop: {e}")
-                time.sleep(1)
+                print(f"Client {self.client_id} error: {type(e).__name__}")
+                time.sleep(2)
         
         self.disconnect()
     

@@ -286,28 +286,44 @@ class FederatedLearningClient:
             if sample:
                 if sample.training_complete:
                     print(f"\nClient {self.client_id} - Training completed!")
+                    print("Disconnecting from server...")
                     self.running = False
                     return
                 
-                if sample.start_training and sample.round > self.current_round:
-                    self.current_round = sample.round
-                    print(f"\nClient {self.client_id} starting training for round {self.current_round}...")
-                    self.train_local_model()
+                # Check if we're ready for this round (should have received global model first)
+                if sample.start_training:
+                    if self.current_round == 0 and sample.round == 1:
+                        # First training round with initial global model
+                        self.current_round = sample.round
+                        print(f"\nClient {self.client_id} starting training for round {self.current_round} with initial global model...")
+                        self.train_local_model()
+                    elif sample.round > self.current_round:
+                        # Subsequent rounds
+                        self.current_round = sample.round
+                        print(f"\nClient {self.client_id} starting training for round {self.current_round}...")
+                        self.train_local_model()
     
     def check_global_model(self):
         """Check for global model updates from server"""
         samples = self.readers['global_model'].take()
         
         for sample in samples:
-            if sample and sample.round == self.current_round:
+            if sample:
                 # Update local model with global weights
                 weights = self.deserialize_weights(sample.weights)
                 self.model.set_weights(weights)
-                print(f"Client {self.client_id} received global model for round {self.current_round}")
                 
-                # Evaluate immediately after receiving global model
-                print(f"Client {self.client_id} starting evaluation for round {self.current_round}...")
-                self.evaluate_model()
+                if sample.round == 0:
+                    # Initial model from server
+                    print(f"Client {self.client_id} received initial global model from server")
+                    self.current_round = 0
+                elif sample.round == self.current_round:
+                    # Updated model after aggregation
+                    print(f"Client {self.client_id} received global model for round {self.current_round}")
+                    
+                    # Evaluate immediately after receiving global model
+                    print(f"Client {self.client_id} starting evaluation for round {self.current_round}...")
+                    self.evaluate_model()
     
     def train_local_model(self):
         """Train model on local data and send updates to server"""
