@@ -27,6 +27,7 @@ TOPIC_CLIENT_REGISTER = "fl/client_register"
 TOPIC_TRAINING_CONFIG = "fl/training_config"
 TOPIC_START_TRAINING = "fl/start_training"
 TOPIC_START_EVALUATION = "fl/start_evaluation"
+TOPIC_TRAINING_COMPLETE = "fl/training_complete"
 
 
 class FederatedLearningServer:
@@ -314,12 +315,19 @@ class FederatedLearningServer:
             print("="*70 + "\n")
             self.converged = True
             
-            # Send training complete signal to all clients
-            self.mqtt_client.publish('fl/training_complete', json.dumps({"message": "Training completed"}))
-            time.sleep(1)  # Give clients time to receive the message
+            # Send training complete signal to all clients with QoS 1 (at least once delivery)
+            print("Sending training completion signal to all clients...")
+            print(f"Publishing to topic: {TOPIC_TRAINING_COMPLETE}")
+            result = self.mqtt_client.publish(TOPIC_TRAINING_COMPLETE, json.dumps({"message": "Training completed"}), qos=1)
+            print(f"Publish result: rc={result.rc}, mid={result.mid}")
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                print(f"ERROR: Failed to publish training completion message, rc={result.rc}")
+            else:
+                print(f"Training completion signal sent successfully (QoS 1)")
+            time.sleep(2)  # Give clients time to receive and process the message
             
-            self.plot_results()
             self.save_results()
+            self.plot_results()  # This will handle disconnection and exit
             return
         
         # Check if more rounds needed
@@ -343,12 +351,19 @@ class FederatedLearningServer:
             print(f"Total Training Time: {self.convergence_time:.2f} seconds ({self.convergence_time/60:.2f} minutes)")
             print("="*70 + "\n")
             
-            # Send training complete signal to all clients
-            self.mqtt_client.publish('fl/training_complete', json.dumps({"message": "Training completed"}))
-            time.sleep(1)  # Give clients time to receive the message
+            # Send training complete signal to all clients with QoS 1 (at least once delivery)
+            print("Sending training completion signal to all clients...")
+            print(f"Publishing to topic: {TOPIC_TRAINING_COMPLETE}")
+            result = self.mqtt_client.publish(TOPIC_TRAINING_COMPLETE, json.dumps({"message": "Training completed"}), qos=1)
+            print(f"Publish result: rc={result.rc}, mid={result.mid}")
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                print(f"ERROR: Failed to publish training completion message, rc={result.rc}")
+            else:
+                print(f"Training completion signal sent successfully (QoS 1)")
+            time.sleep(2)  # Give clients time to receive and process the message
             
-            self.plot_results()
             self.save_results()
+            self.plot_results()  # This will handle disconnection and exit
     
     def check_convergence(self):
         """Check if model has converged based on loss improvement"""
@@ -411,12 +426,16 @@ class FederatedLearningServer:
         results_dir.mkdir(exist_ok=True)
         plt.savefig(results_dir / 'mqtt_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'mqtt_training_metrics.png'}")
-        plt.show()
+        plt.show(block=False)  # Non-blocking show
         
-        # Disconnect and exit after plot is closed
+        # Disconnect and exit
         print("\nTraining complete. Disconnecting...")
+        time.sleep(2)  # Give time for message delivery
         self.mqtt_client.disconnect()
         self.mqtt_client.loop_stop()
+        print("Server disconnected successfully.")
+        import sys
+        sys.exit(0)
     
     def save_results(self):
         """Save results to file"""

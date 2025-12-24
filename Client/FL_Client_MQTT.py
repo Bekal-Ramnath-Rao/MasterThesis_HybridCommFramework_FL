@@ -9,6 +9,7 @@ import json
 import pickle
 import base64
 import time
+import random
 import paho.mqtt.client as mqtt
 import os
 import logging
@@ -31,6 +32,7 @@ TOPIC_CLIENT_METRICS = f"fl/client/{CLIENT_ID}/metrics"
 TOPIC_TRAINING_CONFIG = "fl/training_config"
 TOPIC_START_TRAINING = "fl/start_training"
 TOPIC_START_EVALUATION = "fl/start_evaluation"
+TOPIC_TRAINING_COMPLETE = "fl/training_complete"
 
 
 class FederatedLearningClient:
@@ -49,6 +51,7 @@ class FederatedLearningClient:
         self.mqtt_client = mqtt.Client(client_id=f"fl_client_{client_id}")
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
+        self.mqtt_client.on_disconnect = self.on_disconnect
         
         # Prepare data and model
         self.prepare_data_and_model(dataframe)
@@ -130,8 +133,8 @@ class FederatedLearningClient:
             result4, mid4 = self.mqtt_client.subscribe(TOPIC_START_EVALUATION)
             print(f"  Subscribed to {TOPIC_START_EVALUATION} - Result: {result4}")
             
-            result5, mid5 = self.mqtt_client.subscribe('fl/training_complete')
-            print(f"  Subscribed to fl/training_complete - Result: {result5}")
+            result5, mid5 = self.mqtt_client.subscribe(TOPIC_TRAINING_COMPLETE)
+            print(f"  Subscribed to fl/training_complete (QoS 1) - Result: {result5}")
             
             # Send registration message
             self.mqtt_client.publish("fl/client_register", 
@@ -156,16 +159,28 @@ class FederatedLearningClient:
         except Exception as e:
             print(f"Client {self.client_id} error handling message: {e}")
     
+    def on_disconnect(self, client, userdata, rc):
+        """Callback when disconnected from MQTT broker"""
+        if rc == 0:
+            print(f"Client {self.client_id} clean disconnect from broker")
+            print(f"Client {self.client_id} exiting...")
+            # Stop the loop and exit
+            self.mqtt_client.loop_stop()
+            import sys
+            sys.exit(0)
+        else:
+            print(f"Client {self.client_id} unexpected disconnect, return code {rc}")
+            self.mqtt_client.loop_stop()
+    
     def handle_training_complete(self):
         """Handle training completion signal from server"""
         print("\n" + "="*70)
         print(f"Client {self.client_id} - Training completed!")
         print("="*70)
         print("\nDisconnecting from server...")
+        time.sleep(1)  # Brief delay before disconnect
         self.mqtt_client.disconnect()
-        self.mqtt_client.loop_stop()
-        import sys
-        sys.exit(0)
+        print(f"Client {self.client_id} disconnected successfully.")
     
     def handle_global_model(self, payload):
         """Receive and set global model weights"""
@@ -261,6 +276,11 @@ class FederatedLearningClient:
             "num_samples": num_samples,
             "metrics": metrics
         }
+        
+        # Introduce random delay before sending model update
+        delay = random.uniform(0.5, 3.0)  # Random delay between 0.5 and 3.0 seconds
+        print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
+        time.sleep(delay)
         
         self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, json.dumps(update_message))
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
