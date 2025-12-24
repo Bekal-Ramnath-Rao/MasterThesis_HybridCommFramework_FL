@@ -7,6 +7,7 @@ from tensorflow.keras.layers import Dense, LSTM
 from sklearn.preprocessing import MinMaxScaler
 import pickle
 import time
+import random
 import grpc
 import os
 import sys
@@ -299,6 +300,11 @@ class FederatedLearningClient:
         # Get model weights
         weights = self.model.get_weights()
         serialized_weights = pickle.dumps(weights)
+        
+        # Introduce random delay before sending model update
+        delay = random.uniform(0.5, 3.0)  # Random delay between 0.5 and 3.0 seconds
+        print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
+        time.sleep(delay)
         
         # Send model update to server
         response = self.stub.SendModelUpdate(

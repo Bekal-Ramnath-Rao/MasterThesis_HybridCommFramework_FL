@@ -9,6 +9,7 @@ import json
 import pickle
 import base64
 import time
+import random
 import pika
 import os
 import logging
@@ -338,6 +339,11 @@ class FederatedLearningClient:
             "num_samples": num_samples,
             "metrics": metrics
         }
+        
+        # Introduce random delay before sending model update
+        delay = random.uniform(0.5, 3.0)  # Random delay between 0.5 and 3.0 seconds
+        print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
+        time.sleep(delay)
         
         self.channel.basic_publish(
             exchange=EXCHANGE_CLIENT_UPDATES,
