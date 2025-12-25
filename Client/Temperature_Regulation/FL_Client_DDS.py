@@ -452,7 +452,7 @@ class FederatedLearningClient:
 def main():
     """Main entry point"""
     # Load and prepare data
-    data_path = os.path.join(os.path.dirname(__file__), 'Dataset/base_data_baseline_unique.csv')
+    data_path = os.path.join(os.path.dirname(__file__), '../Dataset/base_data_baseline_unique.csv')
     
     if not os.path.exists(data_path):
         print(f"Error: Data file not found at {data_path}")

@@ -623,7 +623,7 @@ class FederatedLearningServer:
         plt.tight_layout()
         
         # Save plot
-        results_dir = Path(__file__).parent / 'results'
+        results_dir = Path(__file__).parent.parent / 'results'
         results_dir.mkdir(exist_ok=True)
         plt.savefig(results_dir / 'dds_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Training metrics plot saved to {results_dir / 'dds_training_metrics.png'}")
@@ -633,7 +633,7 @@ class FederatedLearningServer:
     
     def save_results(self):
         """Save training results to CSV"""
-        results_dir = Path(__file__).parent / 'results'
+        results_dir = Path(__file__).parent.parent / 'results'
         results_dir.mkdir(exist_ok=True)
         
         results_df = pd.DataFrame({

@@ -410,7 +410,7 @@ class FederatedLearningClient:
 if __name__ == "__main__":
     # Load data
     print(f"Loading dataset for client {CLIENT_ID}...")
-    dataframe = pd.read_csv("Dataset/base_data_baseline_unique.csv")
+    dataframe = pd.read_csv("../Dataset/base_data_baseline_unique.csv")
     print(f"Dataset loaded: {dataframe.shape}")
     
     # Create and start client

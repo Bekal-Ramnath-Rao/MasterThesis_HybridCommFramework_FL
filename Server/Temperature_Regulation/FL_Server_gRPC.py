@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # Add Protocols directory to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'Protocols'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'Protocols'))
 
 # Import generated gRPC code
 import federated_learning_pb2
@@ -438,7 +438,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         plt.tight_layout()
         
         # Save plot
-        results_dir = Path(__file__).parent / 'results'
+        results_dir = Path(__file__).parent.parent / 'results'
         results_dir.mkdir(exist_ok=True)
         plt.savefig(results_dir / 'grpc_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Training metrics plot saved to {results_dir / 'grpc_training_metrics.png'}")
@@ -448,7 +448,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
     
     def save_results(self):
         """Save training results to CSV"""
-        results_dir = Path(__file__).parent / 'results'
+        results_dir = Path(__file__).parent.parent / 'results'
         results_dir.mkdir(exist_ok=True)
         
         results_df = pd.DataFrame({

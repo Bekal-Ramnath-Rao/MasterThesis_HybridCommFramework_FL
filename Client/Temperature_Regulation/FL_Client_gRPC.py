@@ -19,7 +19,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # Add Protocols directory to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'Protocols'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'Protocols'))
 
 # Import generated gRPC code
 import federated_learning_pb2
@@ -378,7 +378,7 @@ def main():
     print()
     
     # Load and prepare data
-    data_path = os.path.join(os.path.dirname(__file__), 'Dataset/base_data_baseline_unique.csv')
+    data_path = os.path.join(os.path.dirname(__file__), '../Dataset/base_data_baseline_unique.csv')
     
     if not os.path.exists(data_path):
         print(f"Error: Data file not found at {data_path}")
