@@ -8,6 +8,7 @@ from sklearn.preprocessing import MinMaxScaler
 import pickle
 import time
 import random
+import json
 import grpc
 import os
 import sys
@@ -90,15 +91,10 @@ class FederatedLearningClient:
         self.x_test = full_x_train_cid[split_idx:]
         self.y_test = full_y_train_cid[split_idx:]
         
-        # Create LSTM model
-        self.model = Sequential()
-        self.model.add(LSTM(50, activation='relu', input_shape=(1, X_normalized.shape[1])))
-        self.model.add(Dense(1))
-        self.model.compile(loss='mean_squared_error', optimizer='adam', 
-                          metrics=['mse', 'mae', 'mape'])
-        
+        # DO NOT create model here - wait for server to send it
         print(f"Client {self.client_id} initialized with {len(self.x_train)} training samples "
               f"and {len(self.x_test)} test samples")
+        print(f"Client {self.client_id} waiting for initial global model from server...")
     
     def connect(self):
         """Connect to gRPC server"""
@@ -163,14 +159,52 @@ class FederatedLearningClient:
                 )
                 
                 if global_model.available:
-                    # Update local model with initial global weights
-                    weights = pickle.loads(global_model.weights)
-                    self.model.set_weights(weights)
                     if global_model.round == 0:
+                        # Initial model - build architecture from server config
                         print(f"Client {self.client_id} received initial global model from server")
+                        
+                        # Parse model config if available
+                        if global_model.model_config:
+                            model_config = json.loads(global_model.model_config)
+                            
+                            # Build model from server's architecture
+                            self.model = Sequential()
+                            for layer_config in model_config['layers']:
+                                if layer_config['type'] == 'LSTM':
+                                    self.model.add(LSTM(
+                                        layer_config['units'],
+                                        activation=layer_config['activation'],
+                                        input_shape=tuple(layer_config['input_shape'])
+                                    ))
+                                elif layer_config['type'] == 'Dense':
+                                    self.model.add(Dense(layer_config['units']))
+                            
+                            # Compile with server's config
+                            compile_cfg = model_config['compile_config']
+                            self.model.compile(
+                                loss=compile_cfg['loss'],
+                                optimizer=compile_cfg['optimizer'],
+                                metrics=compile_cfg['metrics']
+                            )
+                            print(f"Client {self.client_id} built model from server configuration")
+                        else:
+                            # Fallback to hardcoded architecture
+                            self.model = Sequential()
+                            self.model.add(LSTM(50, activation='relu', input_shape=(1, 4)))
+                            self.model.add(Dense(1))
+                            self.model.compile(loss='mean_squared_error', optimizer='adam', 
+                                              metrics=['mse', 'mae', 'mape'])
+                        
+                        # Set initial weights
+                        weights = pickle.loads(global_model.weights)
+                        self.model.set_weights(weights)
+                        print(f"Client {self.client_id} model initialized with server weights")
                         self.current_round = 0
                         initial_model_received = True
                     else:
+                        # Updated model - just set weights
+                        weights = pickle.loads(global_model.weights)
+                        self.model.set_weights(weights)
                         print(f"Client {self.client_id} received global model for round {global_model.round}")
                         self.current_round = global_model.round
                         initial_model_received = True
@@ -253,6 +287,9 @@ class FederatedLearningClient:
                         # Evaluate
                         print(f"Client {self.client_id} starting evaluation for round {self.current_round}...")
                         self.evaluate_model()
+                        
+                        # Important: Add delay after evaluation to prevent immediate re-evaluation
+                        time.sleep(2)
                 
                 else:
                     # Wait before polling again
@@ -378,7 +415,7 @@ def main():
     print()
     
     # Load and prepare data
-    data_path = os.path.join(os.path.dirname(__file__), '../Dataset/base_data_baseline_unique.csv')
+    data_path = os.path.join(os.path.dirname(__file__), 'Dataset/base_data_baseline_unique.csv')
     
     if not os.path.exists(data_path):
         print(f"Error: Data file not found at {data_path}")

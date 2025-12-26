@@ -3,7 +3,10 @@ import pandas as pd
 import math
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Dense, Dropout, Flatten, Input
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.optimizers.schedules import ExponentialDecay
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from sklearn.preprocessing import MinMaxScaler
 import json
 import pickle
@@ -34,16 +37,10 @@ TOPIC_START_TRAINING = "fl/start_training"
 TOPIC_START_EVALUATION = "fl/start_evaluation"
 TOPIC_TRAINING_COMPLETE = "fl/training_complete"
 
-
 class FederatedLearningClient:
-    def __init__(self, client_id, num_clients, dataframe):
+    def __init__(self, client_id, num_clients, dataframe, train_generator=None, validation_generator=None):
         self.client_id = client_id
         self.num_clients = num_clients
-        self.model = None
-        self.x_train = None
-        self.y_train = None
-        self.x_test = None
-        self.y_test = None
         self.current_round = 0
         self.training_config = {"batch_size": 32, "local_epochs": 20}
         
@@ -54,10 +51,10 @@ class FederatedLearningClient:
         self.mqtt_client.on_disconnect = self.on_disconnect
         
         # Prepare data and model
-        self.prepare_data_and_model(dataframe)
-        
-    def prepare_data_and_model(self, dataframe):
-        """Prepare data partition for this client"""
+        self.prepare_data_and_model(train_generator, validation_generator)
+    
+    def prepare_data_and_model(self, train_generator, validation_generator):
+        """Prepare data partition and create LSTM model for this client"""
         # Extract relevant data
         X = dataframe[['Ambient_Temp', 'Cabin_Temp', 'Relative_Humidity', 'Solar_Load']]
         y = dataframe['Set_temp'].values.reshape(-1, 1)
@@ -94,11 +91,40 @@ class FederatedLearningClient:
         self.x_test = full_x_train_cid[split_idx:]
         self.y_test = full_y_train_cid[split_idx:]
         
-        # DO NOT create model here - wait for server to send it
+        # Create LSTM model
+        self.model = Sequential()
+        self.model.add(LSTM(50, activation='relu', input_shape=(1, X_normalized.shape[1])))
+        self.model.add(Dense(1))
+        self.model.compile(loss='mean_squared_error', optimizer='adam', 
+                          metrics=['mse', 'mae', 'mape'])
+        
         print(f"Client {self.client_id} initialized with {len(self.x_train)} training samples "
               f"and {len(self.x_test)} test samples")
-        print(f"Client {self.client_id} waiting for initial global model from server...")
     
+    def load_data(self,client_id):
+        # Initialize image data generator with rescaling
+        train_data_gen = ImageDataGenerator(rescale=1./255)
+        validation_data_gen = ImageDataGenerator(rescale=1./255)
+
+        # Load training and validation data
+        self.train_generator = train_data_gen.flow_from_directory(
+            f'data/client_{client_id}/train/',
+            target_size=(48, 48),
+            batch_size=64,
+            color_mode="grayscale",
+            class_mode='categorical'
+        )
+
+        self.validation_generator = validation_data_gen.flow_from_directory(
+            f'data/client_{client_id}/validation/',
+            target_size=(48, 48),
+            batch_size=64,
+            color_mode="grayscale",
+            class_mode='categorical'
+        )
+
+        return train_generator, validation_generator
+
     def serialize_weights(self, weights):
         """Serialize model weights for MQTT transmission"""
         serialized = pickle.dumps(weights)
@@ -110,7 +136,7 @@ class FederatedLearningClient:
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
-    
+
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
         if rc == 0:
@@ -137,7 +163,7 @@ class FederatedLearningClient:
             print(f"  Registration message sent")
         else:
             print(f"Client {self.client_id} failed to connect, return code {rc}")
-    
+
     def on_message(self, client, userdata, msg):
         """Callback when message received"""
         try:
@@ -153,7 +179,7 @@ class FederatedLearningClient:
                 self.handle_training_complete()
         except Exception as e:
             print(f"Client {self.client_id} error handling message: {e}")
-    
+
     def on_disconnect(self, client, userdata, rc):
         """Callback when disconnected from MQTT broker"""
         if rc == 0:
@@ -166,7 +192,7 @@ class FederatedLearningClient:
         else:
             print(f"Client {self.client_id} unexpected disconnect, return code {rc}")
             self.mqtt_client.loop_stop()
-    
+
     def handle_training_complete(self):
         """Handle training completion signal from server"""
         print("\n" + "="*70)
@@ -176,59 +202,25 @@ class FederatedLearningClient:
         time.sleep(1)  # Brief delay before disconnect
         self.mqtt_client.disconnect()
         print(f"Client {self.client_id} disconnected successfully.")
-    
+
     def handle_global_model(self, payload):
-        """Receive and set global model weights and architecture from server"""
+        """Receive and set global model weights"""
         data = json.loads(payload.decode())
         round_num = data['round']
         encoded_weights = data['weights']
         
         weights = self.deserialize_weights(encoded_weights)
+        self.model.set_weights(weights)
         
         if round_num == 0:
-            # Initial model from server - create model from server's config
+            # Initial model from server
             print(f"Client {self.client_id} received initial global model from server")
-            
-            model_config = data.get('model_config')
-            if model_config:
-                # Build model from server's architecture definition
-                self.model = Sequential()
-                for layer_config in model_config['layers']:
-                    if layer_config['type'] == 'LSTM':
-                        self.model.add(LSTM(
-                            layer_config['units'],
-                            activation=layer_config['activation'],
-                            input_shape=tuple(layer_config['input_shape'])
-                        ))
-                    elif layer_config['type'] == 'Dense':
-                        self.model.add(Dense(layer_config['units']))
-                
-                # Compile with server's config
-                compile_cfg = model_config['compile_config']
-                self.model.compile(
-                    loss=compile_cfg['loss'],
-                    optimizer=compile_cfg['optimizer'],
-                    metrics=compile_cfg['metrics']
-                )
-                print(f"Client {self.client_id} built model from server configuration")
-            else:
-                raise ValueError("No model configuration received from server!")
-            
-            # Set the initial weights from server
-            self.model.set_weights(weights)
-            print(f"Client {self.client_id} model initialized with server weights")
             self.current_round = 0
         else:
             # Updated model after aggregation
-            self.model.set_weights(weights)
             self.current_round = round_num
             print(f"Client {self.client_id} received global model for round {round_num}")
-    
-    def handle_training_config(self, payload):
-        """Update training configuration"""
-        self.training_config = json.loads(payload.decode())
-        print(f"Client {self.client_id} updated config: {self.training_config}")
-    
+
     def handle_start_training(self, payload):
         """Start local training when server signals"""
         data = json.loads(payload.decode())
@@ -246,7 +238,7 @@ class FederatedLearningClient:
             self.train_local_model()
         else:
             print(f"Client {self.client_id} round mismatch - received signal for round {round_num}, currently at {self.current_round}")
-    
+
     def handle_start_evaluation(self, payload):
         """Start evaluation when server signals"""
         data = json.loads(payload.decode())
@@ -260,7 +252,7 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} ready for next round {self.current_round}")
         else:
             print(f"Client {self.client_id} skipping evaluation signal for round {round_num} (current: {self.current_round})")
-    
+
     def train_local_model(self):
         """Train model on local data and send updates to server"""
         batch_size = self.training_config['batch_size']
@@ -362,15 +354,38 @@ class FederatedLearningClient:
                     print(f"  3. Firewall allows connection on port {MQTT_PORT}")
                     raise
 
+def load_data(client_id):
+    # Initialize image data generator with rescaling
+    train_data_gen = ImageDataGenerator(rescale=1./255)
+    validation_data_gen = ImageDataGenerator(rescale=1./255)
+
+    # Load training and validation data
+    train_generator = train_data_gen.flow_from_directory(
+        f'data/client_{client_id}/train/',
+        target_size=(48, 48),
+        batch_size=64,
+        color_mode="grayscale",
+        class_mode='categorical'
+    )
+
+    validation_generator = validation_data_gen.flow_from_directory(
+        f'data/client_{client_id}/validation/',
+        target_size=(48, 48),
+        batch_size=64,
+        color_mode="grayscale",
+        class_mode='categorical'
+    )
+
+    return train_generator, validation_generator
 
 if __name__ == "__main__":
     # Load data
     print(f"Loading dataset for client {CLIENT_ID}...")
-    dataframe = pd.read_csv("Dataset/base_data_baseline_unique.csv")
-    print(f"Dataset loaded: {dataframe.shape}")
+    train_generator, validation_generator = load_data(CLIENT_ID)
+    print(f"Dataset loaded")
     
     # Create and start client
-    client = FederatedLearningClient(CLIENT_ID, NUM_CLIENTS, dataframe)
+    client = FederatedLearningClient(CLIENT_ID, NUM_CLIENTS, train_generator, validation_generator)
     
     print(f"\n{'='*60}")
     print(f"Starting Federated Learning Client {CLIENT_ID}")

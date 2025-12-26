@@ -91,15 +91,10 @@ class FederatedLearningClient:
         self.x_test = full_x_train_cid[split_idx:]
         self.y_test = full_y_train_cid[split_idx:]
         
-        # Create LSTM model
-        self.model = Sequential()
-        self.model.add(LSTM(50, activation='relu', input_shape=(1, X_normalized.shape[1])))
-        self.model.add(Dense(1))
-        self.model.compile(loss='mean_squared_error', optimizer='adam', 
-                          metrics=['mse', 'mae', 'mape'])
-        
+        # DO NOT create model here - wait for server to send it
         print(f"Client {self.client_id} initialized with {len(self.x_train)} training samples "
               f"and {len(self.x_test)} test samples")
+        print(f"Client {self.client_id} waiting for initial global model from server...")
     
     def serialize_weights(self, weights):
         """Serialize model weights for AMQP transmission"""
@@ -225,14 +220,43 @@ class FederatedLearningClient:
             encoded_weights = data['weights']
             
             weights = self.deserialize_weights(encoded_weights)
-            self.model.set_weights(weights)
             
             if round_num == 0:
-                # Initial model from server
+                # Initial model from server - create model from server's config
                 print(f"Client {self.client_id} received initial global model from server")
+                
+                model_config = data.get('model_config')
+                if model_config:
+                    # Build model from server's architecture definition
+                    self.model = Sequential()
+                    for layer_config in model_config['layers']:
+                        if layer_config['type'] == 'LSTM':
+                            self.model.add(LSTM(
+                                layer_config['units'],
+                                activation=layer_config['activation'],
+                                input_shape=tuple(layer_config['input_shape'])
+                            ))
+                        elif layer_config['type'] == 'Dense':
+                            self.model.add(Dense(layer_config['units']))
+                
+                    # Compile with server's config
+                    compile_cfg = model_config['compile_config']
+                    self.model.compile(
+                        loss=compile_cfg['loss'],
+                        optimizer=compile_cfg['optimizer'],
+                        metrics=compile_cfg['metrics']
+                    )
+                    print(f"Client {self.client_id} built model from server configuration")
+                else:
+                    raise ValueError("No model configuration received from server!")
+                
+                # Set the initial weights from server
+                self.model.set_weights(weights)
+                print(f"Client {self.client_id} model initialized with server weights")
                 self.current_round = 0
             else:
                 # Updated model after aggregation
+                self.model.set_weights(weights)
                 self.current_round = round_num
                 print(f"Client {self.client_id} received global model for round {round_num}")
         except Exception as e:
@@ -410,7 +434,7 @@ class FederatedLearningClient:
 if __name__ == "__main__":
     # Load data
     print(f"Loading dataset for client {CLIENT_ID}...")
-    dataframe = pd.read_csv("../Dataset/base_data_baseline_unique.csv")
+    dataframe = pd.read_csv("Dataset/base_data_baseline_unique.csv")
     print(f"Dataset loaded: {dataframe.shape}")
     
     # Create and start client

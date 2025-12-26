@@ -186,10 +186,10 @@ class FederatedLearningServer:
                 self.continue_training()
     
     def distribute_initial_model(self):
-        """Distribute initial global model to all clients"""
+        """Distribute initial global model architecture and weights to all clients"""
         # Send training configuration to all clients
         self.mqtt_client.publish(TOPIC_TRAINING_CONFIG, 
-                                json.dumps(self.training_config))
+                            json.dumps(self.training_config))
         
         self.current_round = 1
         
@@ -197,18 +197,38 @@ class FederatedLearningServer:
         print(f"Distributing Initial Global Model")
         print(f"{'='*70}\n")
         
-        # Send initial global model to all clients
+        # Send initial global model with architecture configuration
         initial_model_message = {
             "round": 0,  # Round 0 = initial model distribution
-            "weights": self.serialize_weights(self.global_weights)
+            "weights": self.serialize_weights(self.global_weights),
+            "model_config": {
+                "architecture": "LSTM",
+                "layers": [
+                    {
+                        "type": "LSTM",
+                        "units": 50,
+                        "activation": "relu",
+                        "input_shape": [1, 4]
+                    },
+                    {
+                        "type": "Dense",
+                        "units": 1
+                    }
+                ],
+                "compile_config": {
+                    "loss": "mean_squared_error",
+                    "optimizer": "adam",
+                    "metrics": ["mse", "mae", "mape"]
+                }
+            }
         }
         
         self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, 
                                 json.dumps(initial_model_message))
         
-        print("Initial global model sent to all clients")
+        print("Initial global model (architecture + weights) sent to all clients")
         
-        # Wait for clients to receive and set the initial model
+        # Wait for clients to receive and build the model
         time.sleep(2)
         
         print(f"\n{'='*70}")
@@ -422,7 +442,7 @@ class FederatedLearningServer:
         plt.tight_layout()
         
         # Save to results folder
-        results_dir = Path(__file__).parent.parent / 'results'
+        results_dir = Path(__file__).parent / 'results'
         results_dir.mkdir(exist_ok=True)
         plt.savefig(results_dir / 'mqtt_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'mqtt_training_metrics.png'}")
@@ -439,7 +459,7 @@ class FederatedLearningServer:
     
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent.parent / 'results'
+        results_dir = Path(__file__).parent / 'results'
         results_dir.mkdir(exist_ok=True)
         
         results = {

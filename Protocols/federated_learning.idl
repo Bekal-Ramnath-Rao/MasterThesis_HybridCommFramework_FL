@@ -25,6 +25,7 @@ module FederatedLearning {
     struct GlobalModel {
         long round;
         sequence<octet> weights;  // Serialized model weights
+        string model_config_json; // JSON string containing model architecture configuration
     };
     
     // Model update from client

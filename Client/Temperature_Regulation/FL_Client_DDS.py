@@ -10,6 +10,7 @@ import time
 import random
 import os
 import logging
+import json
 
 # Add CycloneDDS DLL path
 cyclone_path = r"C:\Masters_Infotech\Semester_5\MT_SW_Addons\vcpkg\buildtrees\cyclonedds\x64-windows-rel\bin"
@@ -62,6 +63,7 @@ class TrainingCommand(IdlStruct):
 class GlobalModel(IdlStruct):
     round: int
     weights: sequence[int]
+    model_config_json: str = ""  # JSON string containing model configuration
 
 
 @dataclass
@@ -155,15 +157,10 @@ class FederatedLearningClient:
         self.x_test = full_x_train_cid[split_idx:]
         self.y_test = full_y_train_cid[split_idx:]
         
-        # Create LSTM model
-        self.model = Sequential()
-        self.model.add(LSTM(50, activation='relu', input_shape=(1, X_normalized.shape[1])))
-        self.model.add(Dense(1))
-        self.model.compile(loss='mean_squared_error', optimizer='adam', 
-                          metrics=['mse', 'mae', 'mape'])
-        
+        # DO NOT create model here - wait for server to send it
         print(f"Client {self.client_id} initialized with {len(self.x_train)} training samples "
               f"and {len(self.x_test)} test samples")
+        print(f"Client {self.client_id} waiting for initial global model from server...")
     
     def serialize_weights(self, weights):
         """Serialize model weights for DDS transmission"""
@@ -239,6 +236,9 @@ class FederatedLearningClient:
         
         try:
             while self.running:
+                # Check for global model updates
+                self.check_global_model()
+                
                 # Check for training commands
                 self.check_commands()
                 
@@ -279,27 +279,21 @@ class FederatedLearningClient:
                     self.running = False
                     return
                 
-    def check_commands(self):
-        """Check for training commands from server"""
-        samples = self.readers['command'].take()
-        
-        for sample in samples:
-            if sample:
-                if sample.training_complete:
-                    print(f"\nClient {self.client_id} - Training completed!")
-                    print("Disconnecting from server...")
-                    self.running = False
-                    return
-                
                 # Check if we're ready for this round (should have received global model first)
                 if sample.start_training:
                     if self.current_round == 0 and sample.round == 1:
                         # First training round with initial global model
+                        if self.model is None:
+                            print(f"Client {self.client_id} waiting for initial model before training...")
+                            return
                         self.current_round = sample.round
                         print(f"\nClient {self.client_id} starting training for round {self.current_round} with initial global model...")
                         self.train_local_model()
                     elif sample.round > self.current_round:
                         # Subsequent rounds
+                        if self.model is None:
+                            print(f"Client {self.client_id} ERROR: Model not initialized!")
+                            return
                         self.current_round = sample.round
                         print(f"\nClient {self.client_id} starting training for round {self.current_round}...")
                         self.train_local_model()
@@ -310,16 +304,53 @@ class FederatedLearningClient:
         
         for sample in samples:
             if sample:
-                # Update local model with global weights
+                round_num = sample.round
                 weights = self.deserialize_weights(sample.weights)
-                self.model.set_weights(weights)
                 
-                if sample.round == 0:
-                    # Initial model from server
+                if round_num == 0:
+                    # Initial model from server - create model from server's config
                     print(f"Client {self.client_id} received initial global model from server")
+                    
+                    # Parse model config if available (requires model_config_json field in GlobalModel IDL)
+                    if hasattr(sample, 'model_config_json') and sample.model_config_json:
+                        model_config = json.loads(sample.model_config_json)
+                        
+                        # Build model from server's architecture
+                        self.model = Sequential()
+                        for layer_config in model_config['layers']:
+                            if layer_config['type'] == 'LSTM':
+                                self.model.add(LSTM(
+                                    layer_config['units'],
+                                    activation=layer_config['activation'],
+                                    input_shape=tuple(layer_config['input_shape'])
+                                ))
+                            elif layer_config['type'] == 'Dense':
+                                self.model.add(Dense(layer_config['units']))
+                        
+                        # Compile with server's config
+                        compile_cfg = model_config['compile_config']
+                        self.model.compile(
+                            loss=compile_cfg['loss'],
+                            optimizer=compile_cfg['optimizer'],
+                            metrics=compile_cfg['metrics']
+                        )
+                        print(f"Client {self.client_id} built model from server configuration")
+                    else:
+                        # Fallback: hardcode architecture if server doesn't send config
+                        self.model = Sequential()
+                        self.model.add(LSTM(50, activation='relu', input_shape=(1, 4)))
+                        self.model.add(Dense(1))
+                        self.model.compile(loss='mean_squared_error', optimizer='adam', 
+                                          metrics=['mse', 'mae', 'mape'])
+                        print(f"Client {self.client_id} using hardcoded model architecture")
+                    
+                    # Set the initial weights from server
+                    self.model.set_weights(weights)
+                    print(f"Client {self.client_id} model initialized with server weights")
                     self.current_round = 0
-                elif sample.round == self.current_round:
+                elif round_num == self.current_round:
                     # Updated model after aggregation
+                    self.model.set_weights(weights)
                     print(f"Client {self.client_id} received global model for round {self.current_round}")
                     
                     # Evaluate immediately after receiving global model
@@ -452,7 +483,7 @@ class FederatedLearningClient:
 def main():
     """Main entry point"""
     # Load and prepare data
-    data_path = os.path.join(os.path.dirname(__file__), '../Dataset/base_data_baseline_unique.csv')
+    data_path = os.path.join(os.path.dirname(__file__), 'Dataset/base_data_baseline_unique.csv')
     
     if not os.path.exists(data_path):
         print(f"Error: Data file not found at {data_path}")

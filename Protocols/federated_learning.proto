@@ -42,6 +42,7 @@ message GlobalModel {
     int32 round = 1;
     bytes weights = 2;  // Serialized model weights
     bool available = 3;
+    string model_config = 4;  // JSON string containing model architecture configuration
 }
 
 message ModelUpdate {

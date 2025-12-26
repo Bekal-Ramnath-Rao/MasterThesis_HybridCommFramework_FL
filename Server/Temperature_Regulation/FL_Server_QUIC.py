@@ -212,13 +212,34 @@ class FederatedLearningServer:
         print(f"Distributing Initial Global Model")
         print(f"{'='*70}\n")
         
+        # Send initial global model with architecture configuration
         await self.broadcast_message({
             'type': 'global_model',
             'round': 0,
-            'weights': self.serialize_weights(self.global_weights)
+            'weights': self.serialize_weights(self.global_weights),
+            'model_config': {
+                "architecture": "LSTM",
+                "layers": [
+                    {
+                        "type": "LSTM",
+                        "units": 50,
+                        "activation": "relu",
+                        "input_shape": [1, 4]
+                    },
+                    {
+                        "type": "Dense",
+                        "units": 1
+                    }
+                ],
+                "compile_config": {
+                    "loss": "mean_squared_error",
+                    "optimizer": "adam",
+                    "metrics": ["mse", "mae", "mape"]
+                }
+            }
         })
         
-        print("Initial global model sent to all clients")
+        print("Initial global model (architecture + weights) sent to all clients")
         await asyncio.sleep(2)
         
         print(f"\n{'='*70}")

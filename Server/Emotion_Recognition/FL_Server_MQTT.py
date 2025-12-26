@@ -4,32 +4,30 @@ import json
 import pickle
 import base64
 import time
-import pika
 import os
+import paho.mqtt.client as mqtt
 from typing import List, Dict
 import matplotlib.pyplot as plt
 from pathlib import Path
 
 # Server Configuration
-AMQP_HOST = os.getenv("AMQP_HOST", "localhost")
-AMQP_PORT = int(os.getenv("AMQP_PORT", "5672"))
-AMQP_USER = os.getenv("AMQP_USER", "guest")
-AMQP_PASSWORD = os.getenv("AMQP_PASSWORD", "guest")
+MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")  # MQTT broker address
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))  # MQTT broker port
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
 
 # Convergence Settings (primary stopping criterion)
-CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
-CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
-MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))  # Loss improvement threshold
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))  # Rounds to wait for improvement
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))  # Minimum rounds before checking convergence
 
-# AMQP Exchanges and Queues
-EXCHANGE_BROADCAST = "fl_broadcast"
-EXCHANGE_CLIENT_UPDATES = "fl_client_updates"
-QUEUE_CLIENT_REGISTER = "fl.client.register"
-QUEUE_CLIENT_UPDATE = "fl.client.update"
-QUEUE_CLIENT_METRICS = "fl.client.metrics"
-
+# MQTT Topics
+TOPIC_GLOBAL_MODEL = "fl/global_model"
+TOPIC_CLIENT_REGISTER = "fl/client_register"
+TOPIC_TRAINING_CONFIG = "fl/training_config"
+TOPIC_START_TRAINING = "fl/start_training"
+TOPIC_START_EVALUATION = "fl/start_evaluation"
+TOPIC_TRAINING_COMPLETE = "fl/training_complete"
 
 class FederatedLearningServer:
     def __init__(self, num_clients, num_rounds):
@@ -64,175 +62,145 @@ class FederatedLearningServer:
             "local_epochs": 20
         }
         
-        # AMQP connection
-        self.connection = None
-        self.channel = None
-        self.consuming = False
-    
+        # Initialize MQTT client
+        self.mqtt_client = mqtt.Client(client_id="fl_server")
+        self.mqtt_client.on_connect = self.on_connect
+        self.mqtt_client.on_message = self.on_message
+
     def initialize_global_model(self):
         """Initialize the global model structure (LSTM for FL)"""
         import tensorflow as tf
         from tensorflow.keras.models import Sequential
-        from tensorflow.keras.layers import Dense, LSTM
-        
+        from tensorflow.keras.layers import Dense, Conv2D, MaxPooling2D, Dense, Dropout, Flatten, Input
+        from tensorflow.keras.optimizers import Adam
+        from tensorflow.keras.optimizers.schedules import ExponentialDecay
+        from tensorflow.keras.preprocessing.image import ImageDataGenerator
         # Create the same LSTM model structure as clients
         # Input shape: (1, 4) - 1 time step, 4 features
-        model = Sequential()
-        model.add(LSTM(50, activation='relu', input_shape=(1, 4)))
-        model.add(Dense(1))
-        model.compile(loss='mean_squared_error', optimizer='adam', 
-                     metrics=['mse', 'mae', 'mape'])
+        emotion_model = Sequential()
+        emotion_model.add(Input(shape=(48, 48, 1)))  # Input layer
+        emotion_model.add(Conv2D(32, kernel_size=(3, 3), activation='relu'))
+        emotion_model.add(Conv2D(64, kernel_size=(3, 3), activation='relu'))
+        emotion_model.add(MaxPooling2D(pool_size=(2, 2)))
+        emotion_model.add(Dropout(0.25))
+        emotion_model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
+        emotion_model.add(MaxPooling2D(pool_size=(2, 2)))
+        emotion_model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
+        emotion_model.add(MaxPooling2D(pool_size=(2, 2)))
+        emotion_model.add(Dropout(0.25))
+        emotion_model.add(Flatten())
+        emotion_model.add(Dense(1024, activation='relu'))
+        emotion_model.add(Dropout(0.5))
+        emotion_model.add(Dense(7, activation='softmax'))
         
         # Get initial weights
-        self.global_weights = model.get_weights()
+        self.global_weights = emotion_model.get_weights()
         
         print("\nGlobal model initialized with random weights")
         print(f"Model architecture: LSTM(50) -> Dense(1)")
         print(f"Number of weight layers: {len(self.global_weights)}")
-    
+
     def serialize_weights(self, weights):
-        """Serialize model weights for AMQP transmission"""
+        """Serialize model weights for MQTT transmission"""
         serialized = pickle.dumps(weights)
         encoded = base64.b64encode(serialized).decode('utf-8')
         return encoded
-    
+        
     def deserialize_weights(self, encoded_weights):
-        """Deserialize model weights received from AMQP"""
+        """Deserialize model weights received from MQTT"""
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
-    
-    def connect(self):
-        """Connect to RabbitMQ broker"""
-        max_retries = 5
-        retry_delay = 2
-        
-        for attempt in range(max_retries):
-            try:
-                print(f"Attempting to connect to RabbitMQ at {AMQP_HOST}:{AMQP_PORT}...")
-                credentials = pika.PlainCredentials(AMQP_USER, AMQP_PASSWORD)
-                parameters = pika.ConnectionParameters(
-                    host=AMQP_HOST,
-                    port=AMQP_PORT,
-                    credentials=credentials,
-                    heartbeat=600,
-                    blocked_connection_timeout=300
-                )
-                self.connection = pika.BlockingConnection(parameters)
-                self.channel = self.connection.channel()
-                
-                # Declare exchanges
-                self.channel.exchange_declare(exchange=EXCHANGE_BROADCAST, exchange_type='fanout', durable=True)
-                self.channel.exchange_declare(exchange=EXCHANGE_CLIENT_UPDATES, exchange_type='direct', durable=True)
-                
-                # Declare queues for receiving from clients
-                self.channel.queue_declare(queue=QUEUE_CLIENT_REGISTER, durable=True)
-                self.channel.queue_declare(queue=QUEUE_CLIENT_UPDATE, durable=True)
-                self.channel.queue_declare(queue=QUEUE_CLIENT_METRICS, durable=True)
-                
-                # Bind queues to exchange with routing keys
-                self.channel.queue_bind(exchange=EXCHANGE_CLIENT_UPDATES, queue=QUEUE_CLIENT_REGISTER, routing_key='client.register')
-                self.channel.queue_bind(exchange=EXCHANGE_CLIENT_UPDATES, queue=QUEUE_CLIENT_UPDATE, routing_key='client.update')
-                self.channel.queue_bind(exchange=EXCHANGE_CLIENT_UPDATES, queue=QUEUE_CLIENT_METRICS, routing_key='client.metrics')
-                
-                # Set up consumers
-                self.channel.basic_consume(queue=QUEUE_CLIENT_REGISTER, on_message_callback=self.on_client_register, auto_ack=True)
-                self.channel.basic_consume(queue=QUEUE_CLIENT_UPDATE, on_message_callback=self.on_client_update, auto_ack=True)
-                self.channel.basic_consume(queue=QUEUE_CLIENT_METRICS, on_message_callback=self.on_client_metrics, auto_ack=True)
-                
-                print(f"Server connected to RabbitMQ broker\n")
-                return True
-                
-            except Exception as e:
-                print(f"Connection attempt {attempt + 1}/{max_retries} failed: {e}")
-                if attempt < max_retries - 1:
-                    print(f"Retrying in {retry_delay} seconds...\n")
-                    time.sleep(retry_delay)
-                else:
-                    print(f"\nFailed to connect to RabbitMQ broker after {max_retries} attempts.")
-                    print(f"\nPlease ensure:")
-                    print(f"  1. RabbitMQ broker is running")
-                    print(f"  2. Broker address is correct: {AMQP_HOST}:{AMQP_PORT}")
-                    print(f"  3. Credentials are correct: {AMQP_USER}")
-                    raise
-    
-    def on_client_register(self, ch, method, properties, body):
+
+    def on_connect(self, client, userdata, flags, rc):
+        """Callback when connected to MQTT broker"""
+        if rc == 0:
+            print("Server connected to MQTT broker")
+            # Subscribe to client topics
+            result1, mid1 = self.mqtt_client.subscribe(TOPIC_CLIENT_REGISTER)
+            print(f"Subscribed to {TOPIC_CLIENT_REGISTER} - Result: {result1}")
+            
+            result2, mid2 = self.mqtt_client.subscribe("fl/client/+/update")
+            print(f"Subscribed to fl/client/+/update - Result: {result2}")
+            
+            result3, mid3 = self.mqtt_client.subscribe("fl/client/+/metrics")
+            print(f"Subscribed to fl/client/+/metrics - Result: {result3}")
+        else:
+            print(f"Server failed to connect, return code {rc}")
+
+    def on_message(self, client, userdata, msg):
+        """Callback when message received"""
+        try:
+            if msg.topic == TOPIC_CLIENT_REGISTER:
+                self.handle_client_registration(msg.payload)
+            elif "/update" in msg.topic:
+                self.handle_client_update(msg.payload)
+            elif "/metrics" in msg.topic:
+                self.handle_client_metrics(msg.payload)
+        except Exception as e:
+            print(f"Server error handling message: {e}")
+
+    def handle_client_registration(self, payload):
         """Handle client registration"""
-        try:
-            data = json.loads(body.decode())
-            client_id = data['client_id']
-            self.registered_clients.add(client_id)
-            print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
-            
-            # If all clients registered, distribute initial global model and start federated learning
-            if len(self.registered_clients) == self.num_clients:
-                print("\nAll clients registered. Distributing initial global model...\n")
-                time.sleep(2)
-                self.distribute_initial_model()
-                # Record training start time
-                self.start_time = time.time()
-                print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        except Exception as e:
-            print(f"Server error handling registration: {e}")
-    
-    def on_client_update(self, ch, method, properties, body):
+        data = json.loads(payload.decode())
+        client_id = data['client_id']
+        self.registered_clients.add(client_id)
+        print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
+        
+        # If all clients registered, distribute initial global model and start federated learning
+        if len(self.registered_clients) == self.num_clients:
+            print("\nAll clients registered. Distributing initial global model...\n")
+            time.sleep(2)  # Give clients time to be ready
+            self.distribute_initial_model()
+            # Record training start time
+            self.start_time = time.time()
+            print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    def handle_client_update(self, payload):
         """Handle model update from client"""
-        try:
-            data = json.loads(body.decode())
-            client_id = data['client_id']
-            round_num = data['round']
+        data = json.loads(payload.decode())
+        client_id = data['client_id']
+        round_num = data['round']
+        
+        if round_num == self.current_round:
+            self.client_updates[client_id] = {
+                'weights': self.deserialize_weights(data['weights']),
+                'num_samples': data['num_samples'],
+                'metrics': data['metrics']
+            }
             
-            if round_num == self.current_round:
-                self.client_updates[client_id] = {
-                    'weights': self.deserialize_weights(data['weights']),
-                    'num_samples': data['num_samples'],
-                    'metrics': data['metrics']
-                }
-                
-                print(f"Received update from client {client_id} "
-                      f"({len(self.client_updates)}/{self.num_clients})")
-                
-                # If all clients sent updates, aggregate
-                if len(self.client_updates) == self.num_clients:
-                    self.aggregate_models()
-        except Exception as e:
-            print(f"Server error handling client update: {e}")
-    
-    def on_client_metrics(self, ch, method, properties, body):
+            print(f"Received update from client {client_id} "
+                  f"({len(self.client_updates)}/{self.num_clients})")
+            
+            # If all clients sent updates, aggregate
+            if len(self.client_updates) == self.num_clients:
+                self.aggregate_models()
+
+    def handle_client_metrics(self, payload):
         """Handle evaluation metrics from client"""
-        try:
-            data = json.loads(body.decode())
-            client_id = data['client_id']
-            round_num = data['round']
+        data = json.loads(payload.decode())
+        client_id = data['client_id']
+        round_num = data['round']
+        
+        if round_num == self.current_round:
+            self.client_metrics[client_id] = {
+                'num_samples': data['num_samples'],
+                'metrics': data['metrics']
+            }
             
-            if round_num == self.current_round:
-                self.client_metrics[client_id] = {
-                    'num_samples': data['num_samples'],
-                    'metrics': data['metrics']
-                }
-                
-                print(f"Received metrics from client {client_id} "
-                      f"({len(self.client_metrics)}/{self.num_clients})")
-                
-                # If all clients sent metrics, aggregate and continue
-                if len(self.client_metrics) == self.num_clients:
-                    self.aggregate_metrics()
-                    self.continue_training()
-        except Exception as e:
-            print(f"Server error handling client metrics: {e}")
-    
+            print(f"Received metrics from client {client_id} "
+                  f"({len(self.client_metrics)}/{self.num_clients})")
+            
+            # If all clients sent metrics, aggregate and continue
+            if len(self.client_metrics) == self.num_clients:
+                self.aggregate_metrics()
+                self.continue_training()
+
     def distribute_initial_model(self):
         """Distribute initial global model to all clients"""
         # Send training configuration to all clients
-        self.channel.basic_publish(
-            exchange=EXCHANGE_BROADCAST,
-            routing_key='',
-            body=json.dumps({
-                "message_type": "training_config",
-                "config": self.training_config
-            }),
-            properties=pika.BasicProperties(delivery_mode=2)
-        )
+        self.mqtt_client.publish(TOPIC_TRAINING_CONFIG, 
+                                json.dumps(self.training_config))
         
         self.current_round = 1
         
@@ -240,39 +208,14 @@ class FederatedLearningServer:
         print(f"Distributing Initial Global Model")
         print(f"{'='*70}\n")
         
-        # Send initial global model with architecture configuration
+        # Send initial global model to all clients
         initial_model_message = {
-            "message_type": "global_model",
             "round": 0,  # Round 0 = initial model distribution
-            "weights": self.serialize_weights(self.global_weights),
-            "model_config": {
-                "architecture": "LSTM",
-                "layers": [
-                    {
-                        "type": "LSTM",
-                        "units": 50,
-                        "activation": "relu",
-                        "input_shape": [1, 4]
-                    },
-                    {
-                        "type": "Dense",
-                        "units": 1
-                    }
-                ],
-                "compile_config": {
-                    "loss": "mean_squared_error",
-                    "optimizer": "adam",
-                    "metrics": ["mse", "mae", "mape"]
-                }
-            }
+            "weights": self.serialize_weights(self.global_weights)
         }
         
-        self.channel.basic_publish(
-            exchange=EXCHANGE_BROADCAST,
-            routing_key='',
-            body=json.dumps(initial_model_message),
-            properties=pika.BasicProperties(delivery_mode=2)
-        )
+        self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, 
+                                json.dumps(initial_model_message))
         
         print("Initial global model sent to all clients")
         
@@ -284,16 +227,9 @@ class FederatedLearningServer:
         print(f"{'='*70}\n")
         
         # Signal clients to start training with the global model
-        self.channel.basic_publish(
-            exchange=EXCHANGE_BROADCAST,
-            routing_key='',
-            body=json.dumps({
-                "message_type": "start_training",
-                "round": self.current_round
-            }),
-            properties=pika.BasicProperties(delivery_mode=2)
-        )
-    
+        self.mqtt_client.publish(TOPIC_START_TRAINING,
+                                json.dumps({"round": self.current_round}))
+        
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
@@ -323,32 +259,20 @@ class FederatedLearningServer:
         
         # Send global model to all clients
         global_model_message = {
-            "message_type": "global_model",
             "round": self.current_round,
             "weights": self.serialize_weights(self.global_weights)
         }
         
-        self.channel.basic_publish(
-            exchange=EXCHANGE_BROADCAST,
-            routing_key='',
-            body=json.dumps(global_model_message),
-            properties=pika.BasicProperties(delivery_mode=2)
-        )
+        self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, 
+                                json.dumps(global_model_message))
         
         print(f"Aggregated global model from round {self.current_round} sent to all clients")
         
         # Request evaluation from clients
         time.sleep(1)
-        self.channel.basic_publish(
-            exchange=EXCHANGE_BROADCAST,
-            routing_key='',
-            body=json.dumps({
-                "message_type": "start_evaluation",
-                "round": self.current_round
-            }),
-            properties=pika.BasicProperties(delivery_mode=2)
-        )
-    
+        self.mqtt_client.publish(TOPIC_START_EVALUATION,
+                                json.dumps({"round": self.current_round}))
+        
     def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
         print(f"\nAggregating metrics from {len(self.client_metrics)} clients...")
@@ -384,7 +308,7 @@ class FederatedLearningServer:
         print(f"  MAE:  {aggregated_mae:.6f}")
         print(f"  MAPE: {aggregated_mape:.6f}")
         print(f"{'='*70}\n")
-    
+
     def continue_training(self):
         """Continue to next round or finish training"""
         # Clear updates and metrics for next round
@@ -402,18 +326,19 @@ class FederatedLearningServer:
             print("="*70 + "\n")
             self.converged = True
             
-            # Send training complete signal to all clients
-            self.channel.basic_publish(
-                exchange=EXCHANGE_BROADCAST,
-                routing_key='',
-                body=json.dumps({"message_type": "training_complete"}),
-                properties=pika.BasicProperties(delivery_mode=2)
-            )
-            time.sleep(1)  # Give clients time to receive the message
+            # Send training complete signal to all clients with QoS 1 (at least once delivery)
+            print("Sending training completion signal to all clients...")
+            print(f"Publishing to topic: {TOPIC_TRAINING_COMPLETE}")
+            result = self.mqtt_client.publish(TOPIC_TRAINING_COMPLETE, json.dumps({"message": "Training completed"}), qos=1)
+            print(f"Publish result: rc={result.rc}, mid={result.mid}")
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                print(f"ERROR: Failed to publish training completion message, rc={result.rc}")
+            else:
+                print(f"Training completion signal sent successfully (QoS 1)")
+            time.sleep(2)  # Give clients time to receive and process the message
             
-            self.plot_results()
             self.save_results()
-            self.stop()
+            self.plot_results()  # This will handle disconnection and exit
             return
         
         # Check if more rounds needed
@@ -427,15 +352,8 @@ class FederatedLearningServer:
             time.sleep(2)
             
             # Signal clients to start next training round
-            self.channel.basic_publish(
-                exchange=EXCHANGE_BROADCAST,
-                routing_key='',
-                body=json.dumps({
-                    "message_type": "start_training",
-                    "round": self.current_round
-                }),
-                properties=pika.BasicProperties(delivery_mode=2)
-            )
+            self.mqtt_client.publish(TOPIC_START_TRAINING,
+                                    json.dumps({"round": self.current_round}))
         else:
             self.convergence_time = time.time() - self.start_time if self.start_time else 0
             print("\n" + "="*70)
@@ -444,19 +362,20 @@ class FederatedLearningServer:
             print(f"Total Training Time: {self.convergence_time:.2f} seconds ({self.convergence_time/60:.2f} minutes)")
             print("="*70 + "\n")
             
-            # Send training complete signal to all clients
-            self.channel.basic_publish(
-                exchange=EXCHANGE_BROADCAST,
-                routing_key='',
-                body=json.dumps({"message_type": "training_complete"}),
-                properties=pika.BasicProperties(delivery_mode=2)
-            )
-            time.sleep(1)  # Give clients time to receive the message
+            # Send training complete signal to all clients with QoS 1 (at least once delivery)
+            print("Sending training completion signal to all clients...")
+            print(f"Publishing to topic: {TOPIC_TRAINING_COMPLETE}")
+            result = self.mqtt_client.publish(TOPIC_TRAINING_COMPLETE, json.dumps({"message": "Training completed"}), qos=1)
+            print(f"Publish result: rc={result.rc}, mid={result.mid}")
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                print(f"ERROR: Failed to publish training completion message, rc={result.rc}")
+            else:
+                print(f"Training completion signal sent successfully (QoS 1)")
+            time.sleep(2)  # Give clients time to receive and process the message
             
-            self.plot_results()
             self.save_results()
-            self.stop()
-    
+            self.plot_results()  # This will handle disconnection and exit
+
     def check_convergence(self):
         """Check if model has converged based on loss improvement"""
         if len(self.LOSS) == 0:
@@ -482,7 +401,7 @@ class FederatedLearningServer:
             if self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
                 return True
             return False
-    
+
     def plot_results(self):
         """Plot training metrics"""
         plt.figure(figsize=(15, 5))
@@ -516,14 +435,19 @@ class FederatedLearningServer:
         # Save to results folder
         results_dir = Path(__file__).parent.parent / 'results'
         results_dir.mkdir(exist_ok=True)
-        plt.savefig(results_dir / 'amqp_training_metrics.png', dpi=300, bbox_inches='tight')
-        print(f"Results plot saved to {results_dir / 'amqp_training_metrics.png'}")
-        plt.show()
+        plt.savefig(results_dir / 'mqtt_training_metrics.png', dpi=300, bbox_inches='tight')
+        print(f"Results plot saved to {results_dir / 'mqtt_training_metrics.png'}")
+        plt.show(block=False)  # Non-blocking show
         
-        # Disconnect and exit after plot is closed
+        # Disconnect and exit
         print("\nTraining complete. Disconnecting...")
-        self.stop()
-    
+        time.sleep(2)  # Give time for message delivery
+        self.mqtt_client.disconnect()
+        self.mqtt_client.loop_stop()
+        print("Server disconnected successfully.")
+        import sys
+        sys.exit(0)
+
     def save_results(self):
         """Save results to file"""
         results_dir = Path(__file__).parent.parent / 'results'
@@ -541,44 +465,50 @@ class FederatedLearningServer:
             "num_clients": self.num_clients
         }
         
-        results_file = results_dir / 'amqp_training_results.json'
+        results_file = results_dir / 'mqtt_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
         
         print(f"Results saved to {results_file}")
-    
-    def start(self):
-        """Start consuming messages"""
-        print("Waiting for clients to connect...\n")
-        self.consuming = True
-        try:
-            self.channel.start_consuming()
-        except KeyboardInterrupt:
-            print("\nServer stopping...")
-            self.stop()
-    
-    def stop(self):
-        """Stop consuming and close connection"""
-        if self.consuming:
-            self.channel.stop_consuming()
-        if self.connection and not self.connection.is_closed:
-            self.connection.close()
-        print("Server disconnected")
 
+    def start(self):
+        """Connect to MQTT broker and start server"""
+        max_retries = 5
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
+                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+                print(f"Successfully connected to MQTT broker!\n")
+                self.mqtt_client.loop_forever()
+                break
+            except Exception as e:
+                print(f"Connection attempt {attempt + 1}/{max_retries} failed: {e}")
+                if attempt < max_retries - 1:
+                    print(f"Retrying in {retry_delay} seconds...\n")
+                    time.sleep(retry_delay)
+                else:
+                    print(f"\nFailed to connect to MQTT broker after {max_retries} attempts.")
+                    print(f"\nPlease ensure:")
+                    print(f"  1. Mosquitto broker is running: net start mosquitto")
+                    print(f"  2. Broker address is correct: {MQTT_BROKER}:{MQTT_PORT}")
+                    print(f"  3. Firewall allows connection on port {MQTT_PORT}")
+                    raise
 
 if __name__ == "__main__":
     print(f"\n{'='*70}")
-    print(f"Federated Learning Server with AMQP")
-    print(f"Broker: {AMQP_HOST}:{AMQP_PORT}")
+    print(f"Federated Learning Server with MQTT")
+    print(f"Broker: {MQTT_BROKER}:{MQTT_PORT}")
     print(f"Clients: {NUM_CLIENTS}")
     print(f"Rounds: {NUM_ROUNDS}")
     print(f"{'='*70}\n")
+    print("Waiting for clients to connect...\n")
     
     server = FederatedLearningServer(NUM_CLIENTS, NUM_ROUNDS)
     
     try:
-        server.connect()
         server.start()
     except KeyboardInterrupt:
         print("\nServer shutting down...")
-        server.stop()
+        server.mqtt_client.disconnect()

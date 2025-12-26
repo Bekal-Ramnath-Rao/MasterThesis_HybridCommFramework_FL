@@ -3,6 +3,7 @@ import pandas as pd
 import pickle
 import time
 import os
+import json
 from pathlib import Path
 import matplotlib.pyplot as plt
 
@@ -58,6 +59,7 @@ class TrainingCommand(IdlStruct):
 class GlobalModel(IdlStruct):
     round: int
     weights: sequence[int]
+    model_config_json: str = ""  # JSON string for model configuration
 
 
 @dataclass
@@ -283,14 +285,37 @@ class FederatedLearningServer:
         print(f"Distributing Initial Global Model")
         print(f"{'='*70}\n")
         
+        # Prepare model configuration
+        model_config = {
+            "architecture": "LSTM",
+            "layers": [
+                {
+                    "type": "LSTM",
+                    "units": 50,
+                    "activation": "relu",
+                    "input_shape": [1, 4]
+                },
+                {
+                    "type": "Dense",
+                    "units": 1
+                }
+            ],
+            "compile_config": {
+                "loss": "mean_squared_error",
+                "optimizer": "adam",
+                "metrics": ["mse", "mae", "mape"]
+            }
+        }
+        
         # Send initial global model to all clients
         initial_model = GlobalModel(
             round=0,  # Round 0 = initial model distribution
-            weights=self.serialize_weights(self.global_weights)
+            weights=self.serialize_weights(self.global_weights),
+            model_config_json=json.dumps(model_config)
         )
         self.writers['global_model'].write(initial_model)
         
-        print("Initial global model sent to all clients")
+        print("Initial global model (architecture + weights) sent to all clients")
         
         # Wait for clients to receive and set the initial model
         time.sleep(2)

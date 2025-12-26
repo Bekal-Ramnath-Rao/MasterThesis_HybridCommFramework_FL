@@ -39,6 +39,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.registered_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
+        self.clients_evaluated = set()  # Track which clients have evaluated this round
         self.global_weights = None
         self.lock = threading.Lock()
         
@@ -161,12 +162,14 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             
             # Check if client should evaluate (after global model is ready)
             if self.evaluation_phase and client_round == self.current_round and self.global_weights is not None:
-                return federated_learning_pb2.TrainingStatus(
-                    should_train=False,
-                    round=self.current_round,
-                    should_evaluate=True,
-                    training_complete=False
-                )
+                # Only tell client to evaluate if it hasn't already
+                if client_id not in self.clients_evaluated:
+                    return federated_learning_pb2.TrainingStatus(
+                        should_train=False,
+                        round=self.current_round,
+                        should_evaluate=True,
+                        training_complete=False
+                    )
             
             # Check if client should train next round
             if not self.evaluation_phase and client_round < self.current_round:
@@ -188,7 +191,16 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
     def GetGlobalModel(self, request, context):
         """Send global model to client"""
         with self.lock:
-            # Record training start time on first client request
+            # Wait for all clients to register before distributing model
+            if not self.training_started:
+                return federated_learning_pb2.GlobalModel(
+                    round=0,
+                    weights=b'',
+                    available=False,
+                    model_config=""
+                )
+            
+            # Record training start time on first client request after all registered
             if self.start_time is None and request.round == 0:
                 self.start_time = time.time()
                 print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -198,10 +210,36 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 # For updates after aggregation, send current_round
                 round_to_send = 0 if request.round == 0 and self.training_started else self.current_round
                 
+                # Prepare model config for initial model (round 0)
+                model_config_json = ""
+                if round_to_send == 0:
+                    model_config = {
+                        "architecture": "LSTM",
+                        "layers": [
+                            {
+                                "type": "LSTM",
+                                "units": 50,
+                                "activation": "relu",
+                                "input_shape": [1, 4]
+                            },
+                            {
+                                "type": "Dense",
+                                "units": 1
+                            }
+                        ],
+                        "compile_config": {
+                            "loss": "mean_squared_error",
+                            "optimizer": "adam",
+                            "metrics": ["mse", "mae", "mape"]
+                        }
+                    }
+                    model_config_json = json.dumps(model_config)
+                
                 return federated_learning_pb2.GlobalModel(
                     round=round_to_send,
                     weights=self.serialize_weights(self.global_weights),
-                    available=True
+                    available=True,
+                    model_config=model_config_json
                 )
             else:
                 return federated_learning_pb2.GlobalModel(
@@ -251,6 +289,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     'num_samples': request.num_samples,
                     'metrics': dict(request.metrics)
                 }
+                self.clients_evaluated.add(client_id)  # Mark this client as evaluated
                 
                 print(f"Received metrics from client {client_id} "
                       f"({len(self.client_metrics)}/{self.num_clients})")
@@ -342,6 +381,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         # Clear updates and metrics for next round
         self.client_updates.clear()
         self.client_metrics.clear()
+        self.clients_evaluated.clear()  # Clear evaluated clients for next round
         self.evaluation_phase = False
         
         # Check for convergence (early stopping)
