@@ -38,93 +38,31 @@ TOPIC_START_EVALUATION = "fl/start_evaluation"
 TOPIC_TRAINING_COMPLETE = "fl/training_complete"
 
 class FederatedLearningClient:
-    def __init__(self, client_id, num_clients, dataframe, train_generator=None, validation_generator=None):
+    def __init__(self, client_id, num_clients, train_generator=None, validation_generator=None):
         self.client_id = client_id
         self.num_clients = num_clients
         self.current_round = 0
         self.training_config = {"batch_size": 32, "local_epochs": 20}
         
-        # Initialize MQTT client
-        self.mqtt_client = mqtt.Client(client_id=f"fl_client_{client_id}")
+        # Store data generators
+        self.train_generator = train_generator
+        self.validation_generator = validation_generator
+        
+        # Model will be initialized from server config
+        self.model = None
+        
+        # Initialize MQTT client with increased message size limit
+        # Use MQTTv5 for better large message handling
+        self.mqtt_client = mqtt.Client(client_id=f"fl_client_{client_id}", protocol=mqtt.MQTTv311)
+        self.mqtt_client.max_inflight_messages_set(20)
+        self.mqtt_client.max_queued_messages_set(0)  # Unlimited queue
+        # Set max packet size to 20MB (20 * 1024 * 1024)
+        self.mqtt_client._max_packet_size = 20 * 1024 * 1024
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
         self.mqtt_client.on_disconnect = self.on_disconnect
         
-        # Prepare data and model
-        self.prepare_data_and_model(train_generator, validation_generator)
     
-    def prepare_data_and_model(self, train_generator, validation_generator):
-        """Prepare data partition and create LSTM model for this client"""
-        # Extract relevant data
-        X = dataframe[['Ambient_Temp', 'Cabin_Temp', 'Relative_Humidity', 'Solar_Load']]
-        y = dataframe['Set_temp'].values.reshape(-1, 1)
-        
-        dataX = X.values
-        datay = y
-        
-        # Fix random seed for reproducibility
-        tf.random.set_seed(7)
-        
-        # Normalizing data
-        scaler_x = MinMaxScaler()
-        scaler_y = MinMaxScaler()
-        X_normalized = scaler_x.fit_transform(dataX)
-        y_normalized = scaler_y.fit_transform(datay)
-        
-        x_train = dataX
-        y_train = y_normalized
-        
-        # Reshape input to be [samples, time steps, features]
-        x_train = np.reshape(x_train, (x_train.shape[0], 1, x_train.shape[1]))
-        
-        # Partition data for this client
-        partition_size = math.floor(len(x_train) / self.num_clients)
-        idx_from = self.client_id * partition_size
-        idx_to = (self.client_id + 1) * partition_size
-        full_x_train_cid = x_train[idx_from:idx_to] / 255.0
-        full_y_train_cid = y_train[idx_from:idx_to]
-        
-        # Split into train and test (80/20)
-        split_idx = math.floor(len(full_x_train_cid) * 0.8)
-        self.x_train = full_x_train_cid[:split_idx]
-        self.y_train = full_y_train_cid[:split_idx]
-        self.x_test = full_x_train_cid[split_idx:]
-        self.y_test = full_y_train_cid[split_idx:]
-        
-        # Create LSTM model
-        self.model = Sequential()
-        self.model.add(LSTM(50, activation='relu', input_shape=(1, X_normalized.shape[1])))
-        self.model.add(Dense(1))
-        self.model.compile(loss='mean_squared_error', optimizer='adam', 
-                          metrics=['mse', 'mae', 'mape'])
-        
-        print(f"Client {self.client_id} initialized with {len(self.x_train)} training samples "
-              f"and {len(self.x_test)} test samples")
-    
-    def load_data(self,client_id):
-        # Initialize image data generator with rescaling
-        train_data_gen = ImageDataGenerator(rescale=1./255)
-        validation_data_gen = ImageDataGenerator(rescale=1./255)
-
-        # Load training and validation data
-        self.train_generator = train_data_gen.flow_from_directory(
-            f'data/client_{client_id}/train/',
-            target_size=(48, 48),
-            batch_size=64,
-            color_mode="grayscale",
-            class_mode='categorical'
-        )
-
-        self.validation_generator = validation_data_gen.flow_from_directory(
-            f'data/client_{client_id}/validation/',
-            target_size=(48, 48),
-            batch_size=64,
-            color_mode="grayscale",
-            class_mode='categorical'
-        )
-
-        return train_generator, validation_generator
-
     def serialize_weights(self, weights):
         """Serialize model weights for MQTT transmission"""
         serialized = pickle.dumps(weights)
@@ -136,37 +74,43 @@ class FederatedLearningClient:
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
-
+    
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
         if rc == 0:
             print(f"Client {self.client_id} connected to MQTT broker")
-            # Subscribe to topics
-            result1, mid1 = self.mqtt_client.subscribe(TOPIC_GLOBAL_MODEL)
-            print(f"  Subscribed to {TOPIC_GLOBAL_MODEL} - Result: {result1}")
+            # Subscribe to topics - use QoS 0 for large model messages
+            result1, mid1 = self.mqtt_client.subscribe(TOPIC_GLOBAL_MODEL, qos=0)
+            print(f"  Subscribed to {TOPIC_GLOBAL_MODEL} (QoS 0) - Result: {result1}")
             
-            result2, mid2 = self.mqtt_client.subscribe(TOPIC_TRAINING_CONFIG)
-            print(f"  Subscribed to {TOPIC_TRAINING_CONFIG} - Result: {result2}")
+            result2, mid2 = self.mqtt_client.subscribe(TOPIC_TRAINING_CONFIG, qos=1)
+            print(f"  Subscribed to {TOPIC_TRAINING_CONFIG} (QoS 1) - Result: {result2}")
             
-            result3, mid3 = self.mqtt_client.subscribe(TOPIC_START_TRAINING)
-            print(f"  Subscribed to {TOPIC_START_TRAINING} - Result: {result3}")
+            result3, mid3 = self.mqtt_client.subscribe(TOPIC_START_TRAINING, qos=1)
+            print(f"  Subscribed to {TOPIC_START_TRAINING} (QoS 1) - Result: {result3}")
             
-            result4, mid4 = self.mqtt_client.subscribe(TOPIC_START_EVALUATION)
-            print(f"  Subscribed to {TOPIC_START_EVALUATION} - Result: {result4}")
+            result4, mid4 = self.mqtt_client.subscribe(TOPIC_START_EVALUATION, qos=1)
+            print(f"  Subscribed to {TOPIC_START_EVALUATION} (QoS 1) - Result: {result4}")
             
-            result5, mid5 = self.mqtt_client.subscribe(TOPIC_TRAINING_COMPLETE)
-            print(f"  Subscribed to fl/training_complete (QoS 1) - Result: {result5}")
+            result5, mid5 = self.mqtt_client.subscribe(TOPIC_TRAINING_COMPLETE, qos=1)
+            print(f"  Subscribed to {TOPIC_TRAINING_COMPLETE} (QoS 1) - Result: {result5}")
+            
+            # Wait longer for subscriptions to be fully processed
+            print(f"  Waiting for subscriptions to be processed...")
+            time.sleep(2)
             
             # Send registration message
             self.mqtt_client.publish("fl/client_register", 
-                                    json.dumps({"client_id": self.client_id}))
+                                    json.dumps({"client_id": self.client_id}), qos=1)
             print(f"  Registration message sent")
         else:
             print(f"Client {self.client_id} failed to connect, return code {rc}")
-
+    
     def on_message(self, client, userdata, msg):
         """Callback when message received"""
         try:
+            print(f"Client {self.client_id} received message on topic: {msg.topic}, size: {len(msg.payload)} bytes")
+            
             if msg.topic == TOPIC_GLOBAL_MODEL:
                 self.handle_global_model(msg.payload)
             elif msg.topic == TOPIC_TRAINING_CONFIG:
@@ -178,8 +122,10 @@ class FederatedLearningClient:
             elif msg.topic == 'fl/training_complete':
                 self.handle_training_complete()
         except Exception as e:
-            print(f"Client {self.client_id} error handling message: {e}")
-
+            print(f"Client {self.client_id} error handling message on topic {msg.topic}: {e}")
+            import traceback
+            traceback.print_exc()
+    
     def on_disconnect(self, client, userdata, rc):
         """Callback when disconnected from MQTT broker"""
         if rc == 0:
@@ -192,7 +138,7 @@ class FederatedLearningClient:
         else:
             print(f"Client {self.client_id} unexpected disconnect, return code {rc}")
             self.mqtt_client.loop_stop()
-
+    
     def handle_training_complete(self):
         """Handle training completion signal from server"""
         print("\n" + "="*70)
@@ -202,29 +148,89 @@ class FederatedLearningClient:
         time.sleep(1)  # Brief delay before disconnect
         self.mqtt_client.disconnect()
         print(f"Client {self.client_id} disconnected successfully.")
-
+    
     def handle_global_model(self, payload):
-        """Receive and set global model weights"""
-        data = json.loads(payload.decode())
-        round_num = data['round']
-        encoded_weights = data['weights']
-        
-        weights = self.deserialize_weights(encoded_weights)
-        self.model.set_weights(weights)
-        
-        if round_num == 0:
-            # Initial model from server
-            print(f"Client {self.client_id} received initial global model from server")
-            self.current_round = 0
-        else:
-            # Updated model after aggregation
-            self.current_round = round_num
-            print(f"Client {self.client_id} received global model for round {round_num}")
-
+        """Receive and set global model weights and architecture from server"""
+        try:
+            data = json.loads(payload.decode())
+            round_num = data['round']
+            encoded_weights = data['weights']
+            
+            weights = self.deserialize_weights(encoded_weights)
+            
+            if round_num == 0:
+                # Initial model from server - create model from server's config
+                print(f"Client {self.client_id} received initial global model from server")
+                
+                model_config = data.get('model_config')
+                if model_config:
+                    # Build CNN model from server's architecture definition
+                    self.model = Sequential()
+                    self.model.add(Input(shape=tuple(model_config['input_shape'])))
+                    
+                    for layer_config in model_config['layers']:
+                        if layer_config['type'] == 'Conv2D':
+                            self.model.add(Conv2D(
+                                filters=layer_config['filters'],
+                                kernel_size=tuple(layer_config['kernel_size']),
+                                activation=layer_config.get('activation')
+                            ))
+                        elif layer_config['type'] == 'MaxPooling2D':
+                            self.model.add(MaxPooling2D(pool_size=tuple(layer_config['pool_size'])))
+                        elif layer_config['type'] == 'Dropout':
+                            self.model.add(Dropout(layer_config['rate']))
+                        elif layer_config['type'] == 'Flatten':
+                            self.model.add(Flatten())
+                        elif layer_config['type'] == 'Dense':
+                            self.model.add(Dense(
+                                units=layer_config['units'],
+                                activation=layer_config.get('activation')
+                            ))
+                    
+                    # Compile model for classification
+                    self.model.compile(
+                        loss='categorical_crossentropy',
+                        optimizer=Adam(learning_rate=0.0001),
+                        metrics=['accuracy']
+                    )
+                    print(f"Client {self.client_id} built CNN model from server configuration")
+                    print(f"  Input shape: {model_config['input_shape']}")
+                    print(f"  Output classes: {model_config['num_classes']}")
+                else:
+                    raise ValueError("No model configuration received from server!")
+                
+                # Set the initial weights from server
+                self.model.set_weights(weights)
+                print(f"Client {self.client_id} model initialized with server weights")
+                self.current_round = 0
+            else:
+                # Updated model after aggregation
+                if self.model is None:
+                    print(f"Client {self.client_id} ERROR: Received model for round {round_num} but local model not initialized!")
+                    return
+                self.model.set_weights(weights)
+                self.current_round = round_num
+                print(f"Client {self.client_id} received global model for round {round_num}")
+        except Exception as e:
+            print(f"Client {self.client_id} ERROR in handle_global_model: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def handle_training_config(self, payload):
+        """Update training configuration"""
+        self.training_config = json.loads(payload.decode())
+        print(f"Client {self.client_id} updated config: {self.training_config}")
+    
     def handle_start_training(self, payload):
         """Start local training when server signals"""
         data = json.loads(payload.decode())
         round_num = data['round']
+        
+        # Check if model is initialized
+        if self.model is None:
+            print(f"Client {self.client_id} ERROR: Model not initialized yet, cannot start training for round {round_num}")
+            print(f"Client {self.client_id} waiting for global model from server...")
+            return
         
         # Check if we're ready for this round (should have received global model first)
         if self.current_round == 0 and round_num == 1:
@@ -238,11 +244,16 @@ class FederatedLearningClient:
             self.train_local_model()
         else:
             print(f"Client {self.client_id} round mismatch - received signal for round {round_num}, currently at {self.current_round}")
-
+    
     def handle_start_evaluation(self, payload):
         """Start evaluation when server signals"""
         data = json.loads(payload.decode())
         round_num = data['round']
+        
+        # Check if model is initialized
+        if self.model is None:
+            print(f"Client {self.client_id} ERROR: Model not initialized yet, cannot evaluate for round {round_num}")
+            return
         
         if round_num == self.current_round:
             print(f"Client {self.client_id} starting evaluation for round {round_num}...")
@@ -252,36 +263,30 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} ready for next round {self.current_round}")
         else:
             print(f"Client {self.client_id} skipping evaluation signal for round {round_num} (current: {self.current_round})")
-
+    
     def train_local_model(self):
         """Train model on local data and send updates to server"""
         batch_size = self.training_config['batch_size']
         epochs = self.training_config['local_epochs']
         
-        # Train the model
+        # Train the model using generator
         history = self.model.fit(
-            self.x_train,
-            self.y_train,
-            batch_size=batch_size,
+            self.train_generator,
             epochs=epochs,
-            validation_split=0.1,
+            validation_data=self.validation_generator,
             verbose=2
         )
         
         # Get updated weights
         updated_weights = self.model.get_weights()
-        num_samples = len(self.x_train)
+        num_samples = self.train_generator.n  # Total number of training samples
         
-        # Prepare training metrics
+        # Prepare training metrics (for classification)
         metrics = {
             "loss": float(history.history["loss"][-1]),
-            "mse": float(history.history["mse"][-1]),
-            "mae": float(history.history["mae"][-1]),
-            "mape": float(history.history["mape"][-1]),
+            "accuracy": float(history.history["accuracy"][-1]),
             "val_loss": float(history.history["val_loss"][-1]),
-            "val_mse": float(history.history["val_mse"][-1]),
-            "val_mae": float(history.history["val_mae"][-1]),
-            "val_mape": float(history.history["val_mape"][-1]),
+            "val_accuracy": float(history.history["val_accuracy"][-1])
         }
         
         # Send model update to server
@@ -298,20 +303,19 @@ class FederatedLearningClient:
         print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
         time.sleep(delay)
         
-        self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, json.dumps(update_message))
+        # Use QoS 0 for large model update messages
+        self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, json.dumps(update_message), qos=0)
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
-        print(f"Training metrics - Loss: {metrics['loss']:.4f}, MSE: {metrics['mse']:.4f}, "
-              f"MAE: {metrics['mae']:.4f}, MAPE: {metrics['mape']:.4f}")
+        print(f"Training metrics - Loss: {metrics['loss']:.4f}, Accuracy: {metrics['accuracy']:.4f}")
     
     def evaluate_model(self):
-        """Evaluate model on test data and send metrics to server"""
-        loss, mse, mae, mape = self.model.evaluate(
-            self.x_test, self.y_test, 
-            batch_size=32, 
+        """Evaluate model on validation data and send metrics to server"""
+        loss, accuracy = self.model.evaluate(
+            self.validation_generator,
             verbose=0
         )
         
-        num_samples = len(self.x_test)
+        num_samples = self.validation_generator.n
         
         metrics_message = {
             "client_id": self.client_id,
@@ -319,15 +323,12 @@ class FederatedLearningClient:
             "num_samples": num_samples,
             "metrics": {
                 "loss": float(loss),
-                "mse": float(mse),
-                "mae": float(mae),
-                "mape": float(mape)
+                "accuracy": float(accuracy)
             }
         }
         
         self.mqtt_client.publish(TOPIC_CLIENT_METRICS, json.dumps(metrics_message))
-        print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, MSE: {mse:.4f}, "
-              f"MAE: {mae:.4f}, MAPE: {mape:.4f}")
+        print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
     
     def start(self):
         """Connect to MQTT broker and start listening"""
@@ -337,7 +338,8 @@ class FederatedLearningClient:
         for attempt in range(max_retries):
             try:
                 print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
-                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+                # Use 1 hour keepalive (3600 seconds) to prevent timeout during long training
+                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 3600)
                 print(f"Successfully connected to MQTT broker!\n")
                 self.mqtt_client.loop_forever()
                 break
@@ -361,7 +363,7 @@ def load_data(client_id):
 
     # Load training and validation data
     train_generator = train_data_gen.flow_from_directory(
-        f'data/client_{client_id}/train/',
+        f'Dataset/client_{client_id}/train/',
         target_size=(48, 48),
         batch_size=64,
         color_mode="grayscale",
@@ -369,7 +371,7 @@ def load_data(client_id):
     )
 
     validation_generator = validation_data_gen.flow_from_directory(
-        f'data/client_{client_id}/validation/',
+        f'Dataset/client_{client_id}/validation/',
         target_size=(48, 48),
         batch_size=64,
         color_mode="grayscale",

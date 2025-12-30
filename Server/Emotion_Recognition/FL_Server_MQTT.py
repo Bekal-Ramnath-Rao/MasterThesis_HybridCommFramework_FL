@@ -29,6 +29,7 @@ TOPIC_START_TRAINING = "fl/start_training"
 TOPIC_START_EVALUATION = "fl/start_evaluation"
 TOPIC_TRAINING_COMPLETE = "fl/training_complete"
 
+
 class FederatedLearningServer:
     def __init__(self, num_clients, num_rounds):
         self.num_clients = num_clients
@@ -39,10 +40,8 @@ class FederatedLearningServer:
         self.client_metrics = {}
         self.global_weights = None
         
-        # Metrics storage
-        self.MSE = []
-        self.MAE = []
-        self.MAPE = []
+        # Metrics storage (for classification)
+        self.ACCURACY = []
         self.LOSS = []
         self.ROUNDS = []
         
@@ -63,55 +62,78 @@ class FederatedLearningServer:
         }
         
         # Initialize MQTT client
-        self.mqtt_client = mqtt.Client(client_id="fl_server")
+        self.mqtt_client = mqtt.Client(client_id="fl_server", protocol=mqtt.MQTTv311)
+        # Set max packet size to 20MB for large model weights
+        self.mqtt_client._max_packet_size = 20 * 1024 * 1024
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
 
     def initialize_global_model(self):
-        """Initialize the global model structure (LSTM for FL)"""
+        """Initialize the global model structure (CNN for Emotion Recognition)"""
         import tensorflow as tf
         from tensorflow.keras.models import Sequential
         from tensorflow.keras.layers import Dense, Conv2D, MaxPooling2D, Dense, Dropout, Flatten, Input
         from tensorflow.keras.optimizers import Adam
         from tensorflow.keras.optimizers.schedules import ExponentialDecay
         from tensorflow.keras.preprocessing.image import ImageDataGenerator
-        # Create the same LSTM model structure as clients
-        # Input shape: (1, 4) - 1 time step, 4 features
-        emotion_model = Sequential()
-        emotion_model.add(Input(shape=(48, 48, 1)))  # Input layer
-        emotion_model.add(Conv2D(32, kernel_size=(3, 3), activation='relu'))
-        emotion_model.add(Conv2D(64, kernel_size=(3, 3), activation='relu'))
-        emotion_model.add(MaxPooling2D(pool_size=(2, 2)))
-        emotion_model.add(Dropout(0.25))
-        emotion_model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
-        emotion_model.add(MaxPooling2D(pool_size=(2, 2)))
-        emotion_model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
-        emotion_model.add(MaxPooling2D(pool_size=(2, 2)))
-        emotion_model.add(Dropout(0.25))
-        emotion_model.add(Flatten())
-        emotion_model.add(Dense(1024, activation='relu'))
-        emotion_model.add(Dropout(0.5))
-        emotion_model.add(Dense(7, activation='softmax'))
+        
+        # Define model configuration for clients
+        self.model_config = {
+            "input_shape": [48, 48, 1],
+            "layers": [
+                {"type": "Conv2D", "filters": 32, "kernel_size": [3, 3], "activation": "relu"},
+                {"type": "Conv2D", "filters": 64, "kernel_size": [3, 3], "activation": "relu"},
+                {"type": "MaxPooling2D", "pool_size": [2, 2]},
+                {"type": "Dropout", "rate": 0.25},
+                {"type": "Conv2D", "filters": 128, "kernel_size": [3, 3], "activation": "relu"},
+                {"type": "MaxPooling2D", "pool_size": [2, 2]},
+                {"type": "Conv2D", "filters": 128, "kernel_size": [3, 3], "activation": "relu"},
+                {"type": "MaxPooling2D", "pool_size": [2, 2]},
+                {"type": "Dropout", "rate": 0.25},
+                {"type": "Flatten"},
+                {"type": "Dense", "units": 1024, "activation": "relu"},
+                {"type": "Dropout", "rate": 0.5},
+                {"type": "Dense", "units": 7, "activation": "softmax"}
+            ],
+            "num_classes": 7
+        }
+        
+        # Create the CNN model structure
+        model = Sequential()
+        model.add(Input(shape=(48, 48, 1)))  # Input layer
+        model.add(Conv2D(32, kernel_size=(3, 3), activation='relu'))
+        model.add(Conv2D(64, kernel_size=(3, 3), activation='relu'))
+        model.add(MaxPooling2D(pool_size=(2, 2)))
+        model.add(Dropout(0.25))
+        model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
+        model.add(MaxPooling2D(pool_size=(2, 2)))
+        model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
+        model.add(MaxPooling2D(pool_size=(2, 2)))
+        model.add(Dropout(0.25))
+        model.add(Flatten())
+        model.add(Dense(1024, activation='relu'))
+        model.add(Dropout(0.5))
+        model.add(Dense(7, activation='softmax'))
         
         # Get initial weights
-        self.global_weights = emotion_model.get_weights()
+        self.global_weights = model.get_weights()
         
         print("\nGlobal model initialized with random weights")
-        print(f"Model architecture: LSTM(50) -> Dense(1)")
+        print(f"Model architecture: CNN for Emotion Recognition (7 classes)")
         print(f"Number of weight layers: {len(self.global_weights)}")
-
+    
     def serialize_weights(self, weights):
         """Serialize model weights for MQTT transmission"""
         serialized = pickle.dumps(weights)
         encoded = base64.b64encode(serialized).decode('utf-8')
         return encoded
-        
+    
     def deserialize_weights(self, encoded_weights):
         """Deserialize model weights received from MQTT"""
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
-
+    
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
         if rc == 0:
@@ -120,14 +142,15 @@ class FederatedLearningServer:
             result1, mid1 = self.mqtt_client.subscribe(TOPIC_CLIENT_REGISTER)
             print(f"Subscribed to {TOPIC_CLIENT_REGISTER} - Result: {result1}")
             
-            result2, mid2 = self.mqtt_client.subscribe("fl/client/+/update")
-            print(f"Subscribed to fl/client/+/update - Result: {result2}")
+            # Use QoS 0 for large model update messages
+            result2, mid2 = self.mqtt_client.subscribe("fl/client/+/update", qos=0)
+            print(f"Subscribed to fl/client/+/update (QoS 0) - Result: {result2}")
             
             result3, mid3 = self.mqtt_client.subscribe("fl/client/+/metrics")
             print(f"Subscribed to fl/client/+/metrics - Result: {result3}")
         else:
             print(f"Server failed to connect, return code {rc}")
-
+    
     def on_message(self, client, userdata, msg):
         """Callback when message received"""
         try:
@@ -139,7 +162,7 @@ class FederatedLearningServer:
                 self.handle_client_metrics(msg.payload)
         except Exception as e:
             print(f"Server error handling message: {e}")
-
+    
     def handle_client_registration(self, payload):
         """Handle client registration"""
         data = json.loads(payload.decode())
@@ -155,7 +178,7 @@ class FederatedLearningServer:
             # Record training start time
             self.start_time = time.time()
             print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-
+    
     def handle_client_update(self, payload):
         """Handle model update from client"""
         data = json.loads(payload.decode())
@@ -175,7 +198,7 @@ class FederatedLearningServer:
             # If all clients sent updates, aggregate
             if len(self.client_updates) == self.num_clients:
                 self.aggregate_models()
-
+    
     def handle_client_metrics(self, payload):
         """Handle evaluation metrics from client"""
         data = json.loads(payload.decode())
@@ -195,12 +218,13 @@ class FederatedLearningServer:
             if len(self.client_metrics) == self.num_clients:
                 self.aggregate_metrics()
                 self.continue_training()
-
+    
     def distribute_initial_model(self):
-        """Distribute initial global model to all clients"""
+        """Distribute initial global model architecture and weights to all clients"""
         # Send training configuration to all clients
         self.mqtt_client.publish(TOPIC_TRAINING_CONFIG, 
-                                json.dumps(self.training_config))
+                            json.dumps(self.training_config),
+                            qos=1)
         
         self.current_round = 1
         
@@ -208,19 +232,33 @@ class FederatedLearningServer:
         print(f"Distributing Initial Global Model")
         print(f"{'='*70}\n")
         
-        # Send initial global model to all clients
+        # Send initial global model with architecture configuration
         initial_model_message = {
             "round": 0,  # Round 0 = initial model distribution
-            "weights": self.serialize_weights(self.global_weights)
+            "weights": self.serialize_weights(self.global_weights),
+            "model_config": self.model_config  # Include model architecture
         }
         
-        self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, 
-                                json.dumps(initial_model_message))
+        message_json = json.dumps(initial_model_message)
+        message_size = len(message_json.encode('utf-8'))
         
-        print("Initial global model sent to all clients")
+        print(f"Initial model message size: {message_size / 1024:.2f} KB ({message_size} bytes)")
         
-        # Wait for clients to receive and set the initial model
-        time.sleep(2)
+        # Publish with QoS 0 (no retain) for large messages - more reliable for big payloads
+        result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, 
+                                         message_json,
+                                         qos=0)
+        
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            print("Initial global model (architecture + weights) sent to all clients successfully")
+        else:
+            print(f"ERROR: Failed to publish initial model, return code: {result.rc}")
+        
+        print(f"Model config: {len(self.model_config['layers'])} layers, {self.model_config['num_classes']} classes")
+        
+        # Wait for clients to receive and build the model
+        print("Waiting for clients to receive and build the model...")
+        time.sleep(5)
         
         print(f"\n{'='*70}")
         print(f"Starting Round {self.current_round}/{self.num_rounds}")
@@ -228,8 +266,9 @@ class FederatedLearningServer:
         
         # Signal clients to start training with the global model
         self.mqtt_client.publish(TOPIC_START_TRAINING,
-                                json.dumps({"round": self.current_round}))
-        
+                                json.dumps({"round": self.current_round}),
+                                qos=1)
+    
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
@@ -272,7 +311,7 @@ class FederatedLearningServer:
         time.sleep(1)
         self.mqtt_client.publish(TOPIC_START_EVALUATION,
                                 json.dumps({"round": self.current_round}))
-        
+    
     def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
         print(f"\nAggregating metrics from {len(self.client_metrics)} clients...")
@@ -281,34 +320,24 @@ class FederatedLearningServer:
         total_samples = sum(metric['num_samples'] 
                           for metric in self.client_metrics.values())
         
-        # Weighted average of metrics
-        aggregated_mse = sum(metric['metrics']['mse'] * metric['num_samples']
-                            for metric in self.client_metrics.values()) / total_samples
-        
-        aggregated_mae = sum(metric['metrics']['mae'] * metric['num_samples']
-                            for metric in self.client_metrics.values()) / total_samples
-        
-        aggregated_mape = sum(metric['metrics']['mape'] * metric['num_samples']
-                             for metric in self.client_metrics.values()) / total_samples
+        # Weighted average of metrics (for classification)
+        aggregated_accuracy = sum(metric['metrics']['accuracy'] * metric['num_samples']
+                                 for metric in self.client_metrics.values()) / total_samples
         
         aggregated_loss = sum(metric['metrics']['loss'] * metric['num_samples']
                              for metric in self.client_metrics.values()) / total_samples
         
         # Store metrics
-        self.MSE.append(aggregated_mse)
-        self.MAE.append(aggregated_mae)
-        self.MAPE.append(aggregated_mape)
+        self.ACCURACY.append(aggregated_accuracy)
         self.LOSS.append(aggregated_loss)
         self.ROUNDS.append(self.current_round)
         
         print(f"\n{'='*70}")
         print(f"Round {self.current_round} - Aggregated Metrics:")
-        print(f"  Loss: {aggregated_loss:.6f}")
-        print(f"  MSE:  {aggregated_mse:.6f}")
-        print(f"  MAE:  {aggregated_mae:.6f}")
-        print(f"  MAPE: {aggregated_mape:.6f}")
+        print(f"  Loss:     {aggregated_loss:.6f}")
+        print(f"  Accuracy: {aggregated_accuracy:.6f} ({aggregated_accuracy*100:.2f}%)")
         print(f"{'='*70}\n")
-
+    
     def continue_training(self):
         """Continue to next round or finish training"""
         # Clear updates and metrics for next round
@@ -375,7 +404,7 @@ class FederatedLearningServer:
             
             self.save_results()
             self.plot_results()  # This will handle disconnection and exit
-
+    
     def check_convergence(self):
         """Check if model has converged based on loss improvement"""
         if len(self.LOSS) == 0:
@@ -401,39 +430,31 @@ class FederatedLearningServer:
             if self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
                 return True
             return False
-
+    
     def plot_results(self):
         """Plot training metrics"""
-        plt.figure(figsize=(15, 5))
+        plt.figure(figsize=(12, 5))
         
-        # MSE Plot
-        plt.subplot(1, 3, 1)
-        plt.plot(self.ROUNDS, self.MSE, marker='o', linewidth=2, markersize=8)
+        # Loss Plot
+        plt.subplot(1, 2, 1)
+        plt.plot(self.ROUNDS, self.LOSS, marker='o', linewidth=2, markersize=8, color='red')
         plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Mean Squared Error (MSE)', fontsize=12)
-        plt.title('MSE over Federated Learning Rounds', fontsize=14)
+        plt.ylabel('Loss (Categorical Crossentropy)', fontsize=12)
+        plt.title('Loss over Federated Learning Rounds', fontsize=14)
         plt.grid(True, alpha=0.3)
         
-        # MAE Plot
-        plt.subplot(1, 3, 2)
-        plt.plot(self.ROUNDS, self.MAE, marker='s', linewidth=2, markersize=8, color='orange')
+        # Accuracy Plot
+        plt.subplot(1, 2, 2)
+        plt.plot(self.ROUNDS, [acc*100 for acc in self.ACCURACY], marker='s', linewidth=2, markersize=8, color='green')
         plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Mean Absolute Error (MAE)', fontsize=12)
-        plt.title('MAE over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        # MAPE Plot
-        plt.subplot(1, 3, 3)
-        plt.plot(self.ROUNDS, self.MAPE, marker='^', linewidth=2, markersize=8, color='green')
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Mean Absolute Percentage Error (MAPE)', fontsize=12)
-        plt.title('MAPE over Federated Learning Rounds', fontsize=14)
+        plt.ylabel('Accuracy (%)', fontsize=12)
+        plt.title('Accuracy over Federated Learning Rounds', fontsize=14)
         plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
         
         # Save to results folder
-        results_dir = Path(__file__).parent.parent / 'results'
+        results_dir = Path(__file__).parent / 'results'
         results_dir.mkdir(exist_ok=True)
         plt.savefig(results_dir / 'mqtt_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'mqtt_training_metrics.png'}")
@@ -447,22 +468,22 @@ class FederatedLearningServer:
         print("Server disconnected successfully.")
         import sys
         sys.exit(0)
-
+    
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent.parent / 'results'
+        results_dir = Path(__file__).parent / 'results'
         results_dir.mkdir(exist_ok=True)
         
         results = {
             "rounds": self.ROUNDS,
-            "mse": self.MSE,
-            "mae": self.MAE,
-            "mape": self.MAPE,
+            "accuracy": self.ACCURACY,
             "loss": self.LOSS,
             "convergence_time_seconds": self.convergence_time,
             "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
             "total_rounds": len(self.ROUNDS),
-            "num_clients": self.num_clients
+            "num_clients": self.num_clients,
+            "final_accuracy": self.ACCURACY[-1] if self.ACCURACY else None,
+            "final_loss": self.LOSS[-1] if self.LOSS else None
         }
         
         results_file = results_dir / 'mqtt_training_results.json'
@@ -470,7 +491,7 @@ class FederatedLearningServer:
             json.dump(results, f, indent=2)
         
         print(f"Results saved to {results_file}")
-
+    
     def start(self):
         """Connect to MQTT broker and start server"""
         max_retries = 5
@@ -479,7 +500,8 @@ class FederatedLearningServer:
         for attempt in range(max_retries):
             try:
                 print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
-                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+                # Use 1 hour keepalive (3600 seconds) to prevent timeout during long training
+                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 3600)
                 print(f"Successfully connected to MQTT broker!\n")
                 self.mqtt_client.loop_forever()
                 break
@@ -495,6 +517,7 @@ class FederatedLearningServer:
                     print(f"  2. Broker address is correct: {MQTT_BROKER}:{MQTT_PORT}")
                     print(f"  3. Firewall allows connection on port {MQTT_PORT}")
                     raise
+
 
 if __name__ == "__main__":
     print(f"\n{'='*70}")
