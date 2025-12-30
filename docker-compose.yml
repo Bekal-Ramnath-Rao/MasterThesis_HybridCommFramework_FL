@@ -1,0 +1,334 @@
+version: '3.8'
+
+services:
+  # ============================================================================
+  # MQTT Protocol Setup (Emotion Recognition)
+  # ============================================================================
+  
+  # MQTT Broker (Mosquitto)
+  mqtt-broker:
+    image: eclipse-mosquitto:2
+    container_name: fl-mqtt-broker
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mqtt-config:/mosquitto/config
+    networks:
+      - fl-mqtt-network
+    command: mosquitto -c /mosquitto-no-auth.conf
+
+  # MQTT FL Server (Emotion Recognition)
+  fl-server-mqtt-emotion:
+    build:
+      context: .
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-mqtt-emotion
+    depends_on:
+      - mqtt-broker
+    environment:
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+    command: python -u Server/Emotion_Recognition/FL_Server_MQTT.py
+    networks:
+      - fl-mqtt-network
+    volumes:
+      - ./Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+
+  # MQTT FL Client 1 (Emotion Recognition)
+  fl-client-mqtt-emotion-1:
+    build:
+      context: .
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-mqtt-emotion-1
+    depends_on:
+      - fl-server-mqtt-emotion
+    environment:
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+    command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
+    networks:
+      - fl-mqtt-network
+
+  # MQTT FL Client 2 (Emotion Recognition)
+  fl-client-mqtt-emotion-2:
+    build:
+      context: .
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-mqtt-emotion-2
+    depends_on:
+      - fl-server-mqtt-emotion
+    environment:
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+    command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
+    networks:
+      - fl-mqtt-network
+
+  # ============================================================================
+  # AMQP Protocol Setup (Emotion Recognition)
+  # ============================================================================
+  
+  # RabbitMQ Broker
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: fl-rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    networks:
+      - fl-amqp-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # AMQP FL Server (Emotion Recognition)
+  fl-server-amqp-emotion:
+    build:
+      context: .
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-amqp-emotion
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      - AMQP_HOST=rabbitmq
+      - AMQP_PORT=5672
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+    command: python -u Server/Emotion_Recognition/FL_Server_AMQP.py
+    networks:
+      - fl-amqp-network
+    volumes:
+      - ./Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+
+  # AMQP FL Client 1 (Emotion Recognition)
+  fl-client-amqp-emotion-1:
+    build:
+      context: .
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-amqp-emotion-1
+    depends_on:
+      - fl-server-amqp-emotion
+    environment:
+      - AMQP_HOST=rabbitmq
+      - AMQP_PORT=5672
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+    command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
+    networks:
+      - fl-amqp-network
+
+  # AMQP FL Client 2 (Emotion Recognition)
+  fl-client-amqp-emotion-2:
+    build:
+      context: .
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-amqp-emotion-2
+    depends_on:
+      - fl-server-amqp-emotion
+    environment:
+      - AMQP_HOST=rabbitmq
+      - AMQP_PORT=5672
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+    command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
+    networks:
+      - fl-amqp-network
+
+  # ============================================================================
+  # gRPC Protocol Setup (Emotion Recognition)
+  # ============================================================================
+  
+  # gRPC FL Server (Emotion Recognition)
+  fl-server-grpc-emotion:
+    build:
+      context: .
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-grpc-emotion
+    ports:
+      - "50051:50051"
+    environment:
+      - GRPC_PORT=50051
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+    command: python -u Server/Emotion_Recognition/FL_Server_gRPC.py
+    networks:
+      - fl-grpc-network
+    volumes:
+      - ./Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+
+  # gRPC FL Client 1 (Emotion Recognition)
+  fl-client-grpc-emotion-1:
+    build:
+      context: .
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-grpc-emotion-1
+    depends_on:
+      - fl-server-grpc-emotion
+    environment:
+      - GRPC_HOST=fl-server-grpc-emotion
+      - GRPC_PORT=50051
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+    command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
+    networks:
+      - fl-grpc-network
+
+  # gRPC FL Client 2 (Emotion Recognition)
+  fl-client-grpc-emotion-2:
+    build:
+      context: .
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-grpc-emotion-2
+    depends_on:
+      - fl-server-grpc-emotion
+    environment:
+      - GRPC_HOST=fl-server-grpc-emotion
+      - GRPC_PORT=50051
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+    command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
+    networks:
+      - fl-grpc-network
+
+  # ============================================================================
+  # QUIC Protocol Setup (Emotion Recognition)
+  # ============================================================================
+  
+  # QUIC FL Server (Emotion Recognition)
+  fl-server-quic-emotion:
+    build:
+      context: .
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-quic-emotion
+    ports:
+      - "4433:4433/udp"
+    environment:
+      - QUIC_HOST=0.0.0.0
+      - QUIC_PORT=4433
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+    command: python -u Server/Emotion_Recognition/FL_Server_QUIC.py
+    networks:
+      - fl-quic-network
+    volumes:
+      - ./Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+      - ./certs:/app/certs
+
+  # QUIC FL Client 1 (Emotion Recognition)
+  fl-client-quic-emotion-1:
+    build:
+      context: .
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-quic-emotion-1
+    depends_on:
+      - fl-server-quic-emotion
+    environment:
+      - QUIC_HOST=fl-server-quic-emotion
+      - QUIC_PORT=4433
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+    command: python -u Client/Emotion_Recognition/FL_Client_QUIC.py
+    networks:
+      - fl-quic-network
+    volumes:
+      - ./certs:/app/certs
+
+  # QUIC FL Client 2 (Emotion Recognition)
+  fl-client-quic-emotion-2:
+    build:
+      context: .
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-quic-emotion-2
+    depends_on:
+      - fl-server-quic-emotion
+    environment:
+      - QUIC_HOST=fl-server-quic-emotion
+      - QUIC_PORT=4433
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+    command: python -u Client/Emotion_Recognition/FL_Client_QUIC.py
+    networks:
+      - fl-quic-network
+    volumes:
+      - ./certs:/app/certs
+
+  # ============================================================================
+  # DDS Protocol Setup (Emotion Recognition)
+  # ============================================================================
+  
+  # DDS FL Server (Emotion Recognition)
+  fl-server-dds-emotion:
+    build:
+      context: .
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-dds-emotion
+    environment:
+      - DDS_DOMAIN_ID=0
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+    command: python -u Server/Emotion_Recognition/FL_Server_DDS.py
+    networks:
+      - fl-dds-network
+    volumes:
+      - ./Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+
+  # DDS FL Client 1 (Emotion Recognition)
+  fl-client-dds-emotion-1:
+    build:
+      context: .
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-dds-emotion-1
+    depends_on:
+      - fl-server-dds-emotion
+    environment:
+      - DDS_DOMAIN_ID=0
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+    command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
+    networks:
+      - fl-dds-network
+
+  # DDS FL Client 2 (Emotion Recognition)
+  fl-client-dds-emotion-2:
+    build:
+      context: .
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-dds-emotion-2
+    depends_on:
+      - fl-server-dds-emotion
+    environment:
+      - DDS_DOMAIN_ID=0
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+    command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
+    networks:
+      - fl-dds-network
+
+networks:
+  fl-mqtt-network:
+    driver: bridge
+  fl-amqp-network:
+    driver: bridge
+  fl-grpc-network:
+    driver: bridge
+  fl-quic-network:
+    driver: bridge
+  fl-dds-network:
+    driver: bridge
+
+volumes:
+  mqtt-data:
+  rabbitmq-data:

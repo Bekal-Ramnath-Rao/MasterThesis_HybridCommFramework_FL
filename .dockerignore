@@ -1,0 +1,70 @@
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Documentation (not needed in container)
+*.md
+docs/
+
+# Results and logs (mounted as volumes)
+results/
+logs/
+*.json
+*.csv
+
+# Jupyter Notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Large dataset files (should be mounted as volumes if needed)
+# Uncomment these if you want to exclude datasets from image
+# Client/Emotion_Recognition/Dataset/FER2013/
+# Client/Emotion_Recognition/Dataset/FER2013Train/
+# Client/Emotion_Recognition/Dataset/FER2013Test/
+# Client/Emotion_Recognition/Dataset/FER2013Valid/
+
+# Test files
+test_*.py
+*_test.py
+
+# Certificate files (will be generated or mounted)
+*.pem
+*.key
+*.crt
+*.cert
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
