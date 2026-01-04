@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     libssl-dev \
     libffi-dev \
+    iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements file

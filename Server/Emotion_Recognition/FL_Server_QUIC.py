@@ -516,17 +516,18 @@ async def main():
         idle_timeout=3600.0,  # 1 hour idle timeout (training can take long)
     )
     
-    # Check if certificates exist, otherwise generate them
-    cert_file = Path(__file__).parent / "cert.pem"
-    key_file = Path(__file__).parent / "key.pem"
+    # Check if certificates exist in the certs directory
+    cert_dir = Path(__file__).parent.parent.parent / "certs"
+    cert_file = cert_dir / "server-cert.pem"
+    key_file = cert_dir / "server-key.pem"
     
     if not cert_file.exists() or not key_file.exists():
         print("❌ Certificates not found. Please run generate_certs.py first.")
-        print("   Or copy the certificates from Temperature_Regulation directory.")
+        print(f"   Expected location: {cert_dir}")
         import sys
         sys.exit(1)
     
-    print(f"✓ Loading certificates from {cert_file.parent}")
+    print(f"✓ Loading certificates from {cert_dir}")
     configuration.load_cert_chain(str(cert_file), str(key_file))
     
     # Create protocol factory

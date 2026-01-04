@@ -96,9 +96,11 @@ class FederatedLearningClient:
         
         x_train = np.reshape(x_train, (x_train.shape[0], 1, x_train.shape[1]))
         
+        # Partition data for this client (use client_id - 1 for 0-based indexing)
+        client_index = self.client_id - 1  # Convert 1-based to 0-based
         partition_size = math.floor(len(x_train) / self.num_clients)
-        idx_from = self.client_id * partition_size
-        idx_to = (self.client_id + 1) * partition_size
+        idx_from = client_index * partition_size
+        idx_to = (client_index + 1) * partition_size
         full_x_train_cid = x_train[idx_from:idx_to] / 255.0
         full_y_train_cid = y_train[idx_from:idx_to]
         
@@ -198,9 +200,9 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} model initialized with server weights")
             self.current_round = 0
         else:
-            # Updated model after aggregation
+            # Updated model after aggregation - don't change current_round
+            # as it was already updated by handle_start_evaluation
             self.model.set_weights(weights)
-            self.current_round = round_num
             print(f"Client {self.client_id} received global model for round {round_num}")
     
     async def handle_start_training(self, message):
@@ -325,6 +327,12 @@ class FederatedLearningClient:
     async def start(self):
         """Connect to QUIC server and start client"""
         configuration = QuicConfiguration(is_client=True)
+        
+        # Load CA certificate for verification (optional - set verify_mode to False for testing)
+        # cert_dir = Path(__file__).parent.parent.parent / "certs"
+        # ca_cert = cert_dir / "server-cert.pem"
+        # if ca_cert.exists():
+        #     configuration.load_verify_locations(str(ca_cert))
         configuration.verify_mode = False  # For testing; use proper certs in production
         
         print(f"Attempting to connect to QUIC server at {QUIC_HOST}:{QUIC_PORT}...")
@@ -353,7 +361,7 @@ class FederatedLearningClient:
 
 async def main():
     print(f"Loading dataset for client {CLIENT_ID}...")
-    dataframe = pd.read_csv("Dataset/base_data_baseline_unique.csv")
+    dataframe = pd.read_csv("Client/Temperature_Regulation/Dataset/base_data_baseline_unique.csv")
     print(f"Dataset loaded: {dataframe.shape}")
     
     client = FederatedLearningClient(CLIENT_ID, NUM_CLIENTS, dataframe)

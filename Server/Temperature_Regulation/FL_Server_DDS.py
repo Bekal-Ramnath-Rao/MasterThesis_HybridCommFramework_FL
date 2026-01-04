@@ -27,6 +27,7 @@ from typing import List
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
+NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
 
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -684,7 +685,7 @@ class FederatedLearningServer:
         
         results_df = pd.concat([results_df, summary_df], ignore_index=True)
         
-        results_file = results_dir / 'dds_training_results.csv'
+        results_file = results_dir / f'dds_{NETWORK_SCENARIO}_training_results.csv'
         results_df.to_csv(results_file, index=False)
         print(f"Training results saved to {results_file}")
     

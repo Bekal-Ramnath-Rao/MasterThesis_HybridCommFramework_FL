@@ -15,6 +15,7 @@ MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")  # MQTT broker address
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))  # MQTT broker port
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
+NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
 
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))  # Loss improvement threshold
@@ -474,7 +475,7 @@ class FederatedLearningServer:
             "num_clients": self.num_clients
         }
         
-        results_file = results_dir / 'mqtt_training_results.json'
+        results_file = results_dir / f'mqtt_{NETWORK_SCENARIO}_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
         

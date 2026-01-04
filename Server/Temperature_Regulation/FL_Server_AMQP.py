@@ -17,6 +17,7 @@ AMQP_USER = os.getenv("AMQP_USER", "guest")
 AMQP_PASSWORD = os.getenv("AMQP_PASSWORD", "guest")
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
+NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
 
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -541,7 +542,7 @@ class FederatedLearningServer:
             "num_clients": self.num_clients
         }
         
-        results_file = results_dir / 'amqp_training_results.json'
+        results_file = results_dir / f'amqp_{NETWORK_SCENARIO}_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
         

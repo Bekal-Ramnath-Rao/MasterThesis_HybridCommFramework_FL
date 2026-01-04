@@ -482,6 +482,12 @@ async def main():
         max_data=50 * 1024 * 1024,
         idle_timeout=300.0,  # 5 minutes idle timeout
     )
+    
+    # Load CA certificate for verification (optional - set verify_mode to False for testing)
+    # cert_dir = Path(__file__).parent.parent.parent / "certs"
+    # ca_cert = cert_dir / "server-cert.pem"
+    # if ca_cert.exists():
+    #     configuration.load_verify_locations(str(ca_cert))
     configuration.verify_mode = False
     
     # Create protocol factory

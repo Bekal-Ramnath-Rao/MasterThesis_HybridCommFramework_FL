@@ -80,10 +80,11 @@ class FederatedLearningClient:
         # Reshape input to be [samples, time steps, features]
         x_train = np.reshape(x_train, (x_train.shape[0], 1, x_train.shape[1]))
         
-        # Partition data for this client
+        # Partition data for this client (use client_id - 1 for 0-based indexing)
+        client_index = self.client_id - 1  # Convert 1-based to 0-based
         partition_size = math.floor(len(x_train) / self.num_clients)
-        idx_from = self.client_id * partition_size
-        idx_to = (self.client_id + 1) * partition_size
+        idx_from = client_index * partition_size
+        idx_to = (client_index + 1) * partition_size
         full_x_train_cid = x_train[idx_from:idx_to] / 255.0
         full_y_train_cid = y_train[idx_from:idx_to]
         
@@ -366,7 +367,7 @@ class FederatedLearningClient:
 if __name__ == "__main__":
     # Load data
     print(f"Loading dataset for client {CLIENT_ID}...")
-    dataframe = pd.read_csv("Dataset/base_data_baseline_unique.csv")
+    dataframe = pd.read_csv("Client/Temperature_Regulation/Dataset/base_data_baseline_unique.csv")
     print(f"Dataset loaded: {dataframe.shape}")
     
     # Create and start client

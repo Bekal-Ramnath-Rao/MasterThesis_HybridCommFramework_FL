@@ -24,6 +24,7 @@ GRPC_HOST = os.getenv("GRPC_HOST", "0.0.0.0")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
+NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
 
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -514,7 +515,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         
         results_df = pd.concat([results_df, summary_df], ignore_index=True)
         
-        results_file = results_dir / 'grpc_training_results.csv'
+        results_file = results_dir / f'grpc_{NETWORK_SCENARIO}_training_results.csv'
         results_df.to_csv(results_file, index=False)
         print(f"Training results saved to {results_file}")
 

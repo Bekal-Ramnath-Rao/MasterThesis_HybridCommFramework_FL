@@ -372,7 +372,7 @@ class FederatedLearningClient:
 
 async def main():
     # Setup data generators
-    client_data_dir = f'Dataset/client_{CLIENT_ID}'
+    client_data_dir = f'Client/Emotion_Recognition/Dataset/client_{CLIENT_ID}'
     
     if not os.path.exists(client_data_dir):
         print(f"Error: Client data directory not found: {client_data_dir}")
@@ -427,6 +427,12 @@ async def main():
         max_data=50 * 1024 * 1024,  # 50 MB total connection data
         idle_timeout=3600.0,  # 1 hour idle timeout (training can take long)
     )
+    
+    # Load CA certificate for verification (optional - set verify_mode to False for testing)
+    # cert_dir = Path(__file__).parent.parent.parent / "certs"
+    # ca_cert = cert_dir / "server-cert.pem"
+    # if ca_cert.exists():
+    #     configuration.load_verify_locations(str(ca_cert))
     configuration.verify_mode = False  # Disable certificate verification for testing
     
     # Create protocol factory

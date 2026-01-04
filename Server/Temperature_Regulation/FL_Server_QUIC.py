@@ -18,6 +18,7 @@ QUIC_HOST = os.getenv("QUIC_HOST", "localhost")
 QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
+NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
 
 # Convergence Settings
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -450,7 +451,7 @@ class FederatedLearningServer:
             "num_clients": self.num_clients
         }
         
-        results_file = results_dir / 'quic_training_results.json'
+        results_file = results_dir / f'quic_{NETWORK_SCENARIO}_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
         
@@ -473,7 +474,23 @@ async def main():
         is_client=False,
         max_datagram_frame_size=65536,
     )
-    configuration.load_cert_chain("cert.pem", "key.pem")
+    
+    # Load certificates from certs directory
+    # In Docker, certs are mounted at /app/certs/
+    cert_dir = Path("/app/certs") if Path("/app/certs").exists() else Path(__file__).parent.parent.parent / "certs"
+    cert_file = cert_dir / "server-cert.pem"
+    key_file = cert_dir / "server-key.pem"
+    
+    if not cert_file.exists() or not key_file.exists():
+        print("❌ Certificates not found. Please run generate_certs.py first.")
+        print(f"   Expected location: {cert_dir}")
+        print(f"   Cert file: {cert_file}")
+        print(f"   Key file: {key_file}")
+        import sys
+        sys.exit(1)
+    
+    print(f"✓ Loading certificates from {cert_dir}")
+    configuration.load_cert_chain(str(cert_file), str(key_file))
     
     # Create protocol factory
     def create_protocol(*args, **kwargs):

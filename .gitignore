@@ -113,3 +113,9 @@ Supervised/plots/
 !DISTRIBUTED_SETUP.md
 !TROUBLESHOOT_MQTT.md
 !mosquitto_custom.conf
+
+# log files
+*.txt
+
+# plant uml files
+*.puml

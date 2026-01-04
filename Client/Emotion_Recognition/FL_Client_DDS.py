@@ -456,7 +456,7 @@ def load_data(client_id):
 
     # Load training and validation data
     train_generator = train_data_gen.flow_from_directory(
-        f'Dataset/client_{client_id}/train/',
+        f'Client/Emotion_Recognition/Dataset/client_{client_id}/train/',
         target_size=(48, 48),
         batch_size=64,
         color_mode="grayscale",
@@ -464,7 +464,7 @@ def load_data(client_id):
     )
 
     validation_generator = validation_data_gen.flow_from_directory(
-        f'Dataset/client_{client_id}/validation/',
+        f'Client/Emotion_Recognition/Dataset/client_{client_id}/validation/',
         target_size=(48, 48),
         batch_size=64,
         color_mode="grayscale",
