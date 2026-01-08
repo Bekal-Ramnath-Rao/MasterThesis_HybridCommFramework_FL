@@ -88,7 +88,7 @@ Example usage:
     
     # Step 1: Consolidate results
     if not args.skip_consolidate:
-        cmd = ["python", "consolidate_results.py", "--use-case", args.use_case]
+        cmd = ["python", "Network_Simulation/consolidate_results.py", "--use-case", args.use_case]
         if args.scenarios:
             cmd.extend(["--scenarios"] + args.scenarios)
         
@@ -104,7 +104,7 @@ Example usage:
         
         for scenario in scenarios:
             cmd = [
-                "python", "compare_protocols.py",
+                "python", "Network_Simulation/compare_protocols.py",
                 "--use-case", args.use_case,
                 "--scenarios", scenario,
                 "--output-dir", args.output_dir
@@ -118,7 +118,7 @@ Example usage:
     
     # Step 3: Comprehensive network scenario evaluation
     cmd = [
-        "python", "evaluate_network_scenarios.py",
+        "python", "Network_Simulation/evaluate_network_scenarios.py",
         "--use-case", args.use_case,
         "--output-dir", args.output_dir
     ]
