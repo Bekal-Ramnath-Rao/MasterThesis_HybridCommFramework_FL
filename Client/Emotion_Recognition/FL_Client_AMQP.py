@@ -117,16 +117,89 @@ class FederatedLearningClient:
                     print(f"  3. Credentials are correct: {AMQP_USER}")
                     raise
     
+    def reconnect(self):
+        """Reconnect to RabbitMQ broker after connection loss"""
+        print(f"Client {self.client_id} attempting to reconnect...")
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                if self.connection and not self.connection.is_closed:
+                    try:
+                        self.connection.close()
+                    except:
+                        pass
+                
+                credentials = pika.PlainCredentials(AMQP_USER, AMQP_PASSWORD)
+                parameters = pika.ConnectionParameters(
+                    host=AMQP_HOST,
+                    port=AMQP_PORT,
+                    credentials=credentials,
+                    heartbeat=600,
+                    blocked_connection_timeout=300
+                )
+                self.connection = pika.BlockingConnection(parameters)
+                self.channel = self.connection.channel()
+                
+                # Redeclare exchanges
+                self.channel.exchange_declare(exchange=EXCHANGE_BROADCAST, exchange_type='fanout', durable=True)
+                self.channel.exchange_declare(exchange=EXCHANGE_CLIENT_UPDATES, exchange_type='direct', durable=True)
+                
+                print(f"Client {self.client_id} reconnected successfully")
+                return True
+                
+            except Exception as e:
+                print(f"Reconnection attempt {attempt + 1}/{max_retries} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+        
+        return False
+    
+    def publish_with_retry(self, exchange, routing_key, body, properties=None, max_retries=3):
+        """Publish message with automatic retry and reconnection"""
+        for attempt in range(max_retries):
+            try:
+                if properties is None:
+                    properties = pika.BasicProperties(delivery_mode=2)
+                    
+                self.channel.basic_publish(
+                    exchange=exchange,
+                    routing_key=routing_key,
+                    body=body,
+                    properties=properties
+                )
+                return True
+                
+            except (pika.exceptions.StreamLostError, 
+                    pika.exceptions.ConnectionWrongStateError,
+                    pika.exceptions.AMQPConnectionError) as e:
+                print(f"Client {self.client_id} publish failed (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    if self.reconnect():
+                        print(f"Client {self.client_id} retrying publish...")
+                        time.sleep(0.5)
+                    else:
+                        print(f"Client {self.client_id} reconnection failed")
+                        return False
+                else:
+                    print(f"Client {self.client_id} failed to publish after {max_retries} attempts")
+                    return False
+        
+        return False
+    
     def send_registration(self):
         """Send registration message to server"""
         registration = {"client_id": self.client_id}
-        self.channel.basic_publish(
+        if self.publish_with_retry(
             exchange=EXCHANGE_CLIENT_UPDATES,
             routing_key='client.register',
             body=json.dumps(registration),
             properties=pika.BasicProperties(delivery_mode=2)
-        )
-        print(f"Client {self.client_id} registration sent")
+        ):
+            print(f"Client {self.client_id} registration sent")
+        else:
+            print(f"Client {self.client_id} ERROR: Failed to send registration")
     
     def on_broadcast_message(self, ch, method, properties, body):
         """Unified handler for all broadcast messages - routes based on message_type"""
@@ -331,14 +404,17 @@ class FederatedLearningClient:
         print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
         time.sleep(delay)
         
-        self.channel.basic_publish(
+        # Publish with retry logic
+        if self.publish_with_retry(
             exchange=EXCHANGE_CLIENT_UPDATES,
             routing_key='client.update',
             body=json.dumps(update_message),
             properties=pika.BasicProperties(delivery_mode=2)
-        )
-        
-        print(f"Client {self.client_id} sent model update for round {self.current_round}")
+        ):
+            print(f"Client {self.client_id} sent model update for round {self.current_round}")
+        else:
+            print(f"Client {self.client_id} ERROR: Failed to send model update for round {self.current_round}")
+            return
         print(f"Training metrics - Loss: {metrics['loss']:.4f}, Accuracy: {metrics['accuracy']:.4f}")
     
     def evaluate_model(self):
@@ -360,14 +436,15 @@ class FederatedLearningClient:
             }
         }
         
-        self.channel.basic_publish(
+        if self.publish_with_retry(
             exchange=EXCHANGE_CLIENT_UPDATES,
             routing_key='client.metrics',
             body=json.dumps(metrics_message),
             properties=pika.BasicProperties(delivery_mode=2)
-        )
-        
-        print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
+        ):
+            print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
+        else:
+            print(f"Client {self.client_id} ERROR: Failed to send evaluation metrics")
     
     def start(self):
         """Start consuming messages"""
