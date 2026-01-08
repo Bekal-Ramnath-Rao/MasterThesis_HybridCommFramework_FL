@@ -11,6 +11,7 @@ import os
 from datetime import datetime
 from typing import List, Dict
 import argparse
+from pathlib import Path
 
 
 class ExperimentRunner:
@@ -19,8 +20,15 @@ class ExperimentRunner:
     def __init__(self, use_case: str = "emotion", num_rounds: int = 10):
         self.use_case = use_case
         self.num_rounds = num_rounds
-        self.results_dir = f"experiment_results/{use_case}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        os.makedirs(self.results_dir, exist_ok=True)
+        
+        # Get the script's directory and project root
+        script_dir = Path(__file__).parent.absolute()
+        project_root = script_dir.parent
+        
+        # Set paths relative to project root
+        self.results_dir = project_root / "experiment_results" / f"{use_case}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        self.results_dir = str(self.results_dir)
         
         # Define protocols to test
         self.protocols = ["mqtt", "amqp", "grpc", "quic", "dds"]
@@ -35,11 +43,12 @@ class ExperimentRunner:
             "satellite"
         ]
         
-        # Docker compose file mapping
+        # Docker compose file mapping (relative to project root)
+        docker_dir = project_root / "Docker"
         self.compose_files = {
-            "emotion": "docker-compose-emotion.yml",
-            "mentalstate": "docker-compose-mentalstate.yml",
-            "temperature": "docker-compose-temperature.yml"
+            "emotion": str(docker_dir / "docker-compose-emotion.yml"),
+            "mentalstate": str(docker_dir / "docker-compose-mentalstate.yml"),
+            "temperature": str(docker_dir / "docker-compose-temperature.yml")
         }
         
         # Service name patterns
@@ -67,14 +76,17 @@ class ExperimentRunner:
             }
         }
     
-    def run_command(self, command: List[str], check=True, env_vars: Dict[str, str] = None) -> subprocess.CompletedProcess:
+    def run_command(self, command: List[str], check=True, env_vars: Dict[str, str] = None, cwd: str = None) -> subprocess.CompletedProcess:
         """Execute a shell command with optional environment variables"""
         print(f"[CMD] {' '.join(command)}")
         env = os.environ.copy()
         if env_vars:
             env.update(env_vars)
             print(f"[ENV] {env_vars}")
-        return subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', check=check, env=env)
+        # Use project root as working directory if not specified
+        if cwd is None:
+            cwd = str(Path(__file__).parent.parent)
+        return subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', check=check, env=env, cwd=cwd)
     
     def start_containers(self, protocol: str, scenario: str = "excellent"):
         """Start Docker containers for a specific protocol with staged startup"""
@@ -106,6 +118,8 @@ class ExperimentRunner:
             result = self.run_command(cmd_broker)
             if result.returncode != 0:
                 print(f"[ERROR] Failed to start broker")
+                print(f"[ERROR] stdout: {result.stdout}")
+                print(f"[ERROR] stderr: {result.stderr}")
                 return False
             
             print(f"Waiting 10 seconds for broker to initialize...")
@@ -118,6 +132,8 @@ class ExperimentRunner:
             result = self.run_command(cmd_server)
             if result.returncode != 0:
                 print(f"[ERROR] Failed to start server")
+                print(f"[ERROR] stdout: {result.stdout}")
+                print(f"[ERROR] stderr: {result.stderr}")
                 return False
             
             print(f"Waiting 8 seconds for server to initialize...")
@@ -130,6 +146,8 @@ class ExperimentRunner:
             result = self.run_command(cmd_clients)
             if result.returncode != 0:
                 print(f"[ERROR] Failed to start clients")
+                print(f"[ERROR] stdout: {result.stdout}")
+                print(f"[ERROR] stderr: {result.stderr}")
                 return False
             
             print(f"Waiting 5 seconds for clients to connect...")
@@ -161,6 +179,12 @@ class ExperimentRunner:
         services = self.service_patterns[self.use_case][protocol]
         
         # Apply network conditions to each container individually
+        import sys
+        from pathlib import Path
+        # Add parent directory to path to import network_simulator
+        parent_dir = str(Path(__file__).parent.parent)
+        if parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
         from network_simulator import NetworkSimulator
         sim = NetworkSimulator(verbose=True)
         
