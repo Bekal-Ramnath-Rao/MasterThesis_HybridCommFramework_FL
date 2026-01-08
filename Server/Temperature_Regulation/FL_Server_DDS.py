@@ -325,14 +325,18 @@ class FederatedLearningServer:
         print(f"Starting Round {self.current_round}/{self.num_rounds}")
         print(f"{'='*70}\n")
         
-        # Send training command to start first round
+        # Send training command to start first round with retry for poor network conditions
         command = TrainingCommand(
             round=self.current_round,
             start_training=True,
             start_evaluation=False,
             training_complete=False
         )
-        self.writers['command'].write(command)
+        # Send multiple times to ensure delivery under poor network conditions
+        for retry in range(3):
+            self.writers['command'].write(command)
+            if retry < 2:
+                time.sleep(0.5)
     
     def check_model_updates(self):
         """Check for model updates from clients"""
@@ -428,7 +432,7 @@ class FederatedLearningServer:
         )
         self.writers['global_model'].write(global_model)
         
-        # Send evaluation command
+        # Send evaluation command with retry for poor network conditions
         time.sleep(1)
         command = TrainingCommand(
             round=self.current_round,
@@ -436,23 +440,34 @@ class FederatedLearningServer:
             start_evaluation=True,
             training_complete=False
         )
-        self.writers['command'].write(command)
+        # Send multiple times to ensure delivery
+        for retry in range(3):
+            self.writers['command'].write(command)
+            if retry < 2:
+                time.sleep(0.5)
         
         self.evaluation_phase = True
         
         # Wait for all evaluation metrics
         self.wait_for_evaluation_metrics()
         
-        # After receiving all metrics, aggregate and continue
-        if len(self.client_metrics) == self.num_clients:
+        # After receiving metrics (even if timeout), aggregate and continue
+        # This ensures training doesn't stall under poor network conditions
+        if len(self.client_metrics) > 0:
+            if len(self.client_metrics) < self.num_clients:
+                print(f"⚠ Proceeding with partial metrics ({len(self.client_metrics)}/{self.num_clients}) due to network conditions")
             self.aggregate_metrics()
+            self.continue_training()
+        else:
+            print(f"⚠ WARNING: No metrics received. Skipping round {self.current_round}")
             self.continue_training()
     
     def wait_for_evaluation_metrics(self):
         """Actively wait for evaluation metrics from all clients"""
         print(f"\nWaiting for evaluation metrics from {self.num_clients} clients...")
-        timeout = 60  # 60 seconds timeout
+        timeout = 300  # 300 seconds (5 minutes) timeout for poor network conditions
         start_time = time.time()
+        check_count = 0
         
         while len(self.client_metrics) < self.num_clients:
             if time.time() - start_time > timeout:
@@ -478,7 +493,11 @@ class FederatedLearningServer:
                         print(f"Progress: {len(self.client_metrics)}/{self.num_clients} clients")
             
             if len(self.client_metrics) < self.num_clients:
-                time.sleep(0.1)  # Short sleep before next check
+                time.sleep(0.5)  # Longer sleep for poor network
+                check_count += 1
+                if check_count % 20 == 0:
+                    elapsed = time.time() - start_time
+                    print(f"Still waiting for metrics ({len(self.client_metrics)}/{self.num_clients}) - {elapsed:.1f}s elapsed")
         
         if len(self.client_metrics) == self.num_clients:
             print(f"✓ All evaluation metrics received!")
@@ -559,14 +578,18 @@ class FederatedLearningServer:
             
             time.sleep(2)
             
-            # Send training command for next round
+            # Send training command for next round with retry
             command = TrainingCommand(
                 round=self.current_round,
                 start_training=True,
                 start_evaluation=False,
                 training_complete=False
             )
-            self.writers['command'].write(command)
+            # Send multiple times to ensure delivery under poor network conditions
+            for retry in range(3):
+                self.writers['command'].write(command)
+                if retry < 2:
+                    time.sleep(0.5)
         else:
             self.convergence_time = time.time() - self.start_time if self.start_time else 0
             print("\n" + "="*70)
@@ -575,14 +598,18 @@ class FederatedLearningServer:
             print(f"Total Training Time: {self.convergence_time:.2f} seconds ({self.convergence_time/60:.2f} minutes)")
             print("="*70 + "\n")
             
-            # Send completion signal
+            # Send completion signal with retry
             command = TrainingCommand(
                 round=self.current_round,
                 start_training=False,
                 start_evaluation=False,
                 training_complete=True
             )
-            self.writers['command'].write(command)
+            # Send multiple times to ensure all clients receive it
+            for retry in range(3):
+                self.writers['command'].write(command)
+                if retry < 2:
+                    time.sleep(0.5)
             
             self.training_complete = True
             self.plot_results()

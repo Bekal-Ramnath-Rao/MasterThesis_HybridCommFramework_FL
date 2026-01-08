@@ -4,8 +4,11 @@ import json
 import pickle
 import base64
 import time
+import sys
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
 from collections import Counter
 from sklearn.model_selection import train_test_split
 import pika
@@ -21,6 +24,11 @@ AMQP_PASSWORD = os.getenv("AMQP_PASSWORD", "guest")
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "16"))
 
+# Convergence Settings
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+
 # AMQP Exchanges and Queues
 EXCHANGE_BROADCAST = "fl_broadcast"
 EXCHANGE_CLIENT_UPDATES = "fl_client_updates"
@@ -33,12 +41,10 @@ SEED = 42
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "Client", "MentalState_Recognition", "Dataset")
 FS = 256
 WIN_S = 1.0
 WIN = int(FS * WIN_S)
 STRIDE = 128
-TEST_FRAC = 0.20
 BATCH = 256
 
 # Band-power features
@@ -199,15 +205,21 @@ class FederatedLearningServer:
         self.client_metrics = {}
         self.global_weights = None
 
-        # Metrics storage
+        # Metrics storage (from client reports)
         self.LOSS = []
         self.ACC = []
         self.TOP2 = []
         self.ROUNDS = []
+        
+        # Convergence tracking
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
+        self.start_time = None
+        self.convergence_time = None
+        self.converged = False
 
-        # Initialize global model and test data
+        # Initialize global model
         self.initialize_global_model()
-        self.load_test_data()
 
         # Training configuration
         self.training_config = {
@@ -225,31 +237,6 @@ class FederatedLearningServer:
         model = build_model()
         self.global_weights = model.get_weights()
         print(f"Model initialized with {len(self.global_weights)} weight layers")
-
-    def load_test_data(self):
-        """Load and prepare test data for evaluation"""
-        print(f"\nLoading test data from {DATA_DIR}...")
-        all_files = find_all_csvs(DATA_DIR)
-
-        X_list, y_list = [], []
-        for fid, f in enumerate(all_files):
-            out = csv_to_windows(f, fid)
-            if out is None:
-                continue
-            Xi, yi, fi = out
-            X_list.append(Xi)
-            y_list.append(yi)
-
-        X_all = np.concatenate(X_list, axis=0).astype("float32")
-        y_all = np.concatenate(y_list, axis=0).astype("int64")
-
-        # Split into train/test
-        _, self.X_test, _, self.y_test = train_test_split(
-            X_all, y_all, test_size=TEST_FRAC, random_state=SEED, stratify=y_all
-        )
-
-        print(f"Test set: {len(self.y_test)} samples, shape: {self.X_test.shape}")
-        print(f"Test class distribution: {dict(Counter(self.y_test))}")
 
     def serialize_weights(self, weights):
         """Serialize model weights for AMQP transmission"""
@@ -356,11 +343,22 @@ class FederatedLearningServer:
             print(f"Server error handling client update: {e}")
 
     def on_client_metrics(self, ch, method, properties, body):
-        """Handle evaluation metrics from client (not used for server evaluation)"""
+        """Handle evaluation metrics from client"""
         try:
             data = json.loads(body.decode())
             client_id = data['client_id']
-            print(f"Received metrics from client {client_id}")
+            
+            # Store client metrics
+            self.client_metrics[client_id] = {
+                'loss': data.get('loss', 0),
+                'accuracy': data.get('accuracy', 0),
+                'top2_accuracy': data.get('top2_accuracy', 0)
+            }
+            
+            print(f"Received metrics from client {client_id}: "
+                  f"Loss={data.get('loss', 0):.4f}, "
+                  f"Acc={data.get('accuracy', 0):.4f}, "
+                  f"Top2={data.get('top2_accuracy', 0):.4f}")
         except Exception as e:
             print(f"Server error handling client metrics: {e}")
 
@@ -377,6 +375,7 @@ class FederatedLearningServer:
         )
 
         self.current_round = 1
+        self.start_time = time.time()  # Start timing
 
         print(f"\n{'=' * 70}")
         print(f"Distributing Initial Global Model")
@@ -464,58 +463,98 @@ class FederatedLearningServer:
         self.continue_training()
 
     def evaluate_global_model(self):
-        """Evaluate global model on test set"""
-        print(f"\nEvaluating global model on test set...")
-
-        # Create model and set weights
-        model = build_model()
-        model.set_weights(self.global_weights)
-
-        # Prepare test data
-        yte_oh = tf.one_hot(self.y_test, NUM_CLASSES, dtype=tf.float32)
-        ds_te = tf.data.Dataset.from_tensor_slices((self.X_test, yte_oh))
-        ds_te = ds_te.batch(BATCH).prefetch(tf.data.AUTOTUNE)
-
-        # Evaluate
-        loss, acc, top2 = model.evaluate(ds_te, verbose=0)
-
-        # Store metrics
-        self.LOSS.append(float(loss))
-        self.ACC.append(float(acc))
-        self.TOP2.append(float(top2))
+        """Aggregate and display client-reported metrics"""
+        if not self.client_metrics:
+            print("No client metrics available yet")
+            return
+        
+        # Average client metrics
+        avg_loss = np.mean([m['loss'] for m in self.client_metrics.values()])
+        avg_acc = np.mean([m['accuracy'] for m in self.client_metrics.values()])
+        avg_top2 = np.mean([m['top2_accuracy'] for m in self.client_metrics.values()])
+        
+        # Store aggregated metrics
+        self.LOSS.append(float(avg_loss))
+        self.ACC.append(float(avg_acc))
+        self.TOP2.append(float(avg_top2))
         self.ROUNDS.append(self.current_round)
-
+        
         print(f"\n{'=' * 70}")
-        print(f"Round {self.current_round} - Global Test Metrics:")
-        print(f"  Loss: {loss:.6f}")
-        print(f"  Accuracy: {acc:.6f}")
-        print(f"  Top-2 Accuracy: {top2:.6f}")
+        print(f"Round {self.current_round} - Aggregated Client Metrics:")
+        print(f"  Avg Loss: {avg_loss:.6f}")
+        print(f"  Avg Accuracy: {avg_acc:.6f}")
+        print(f"  Avg Top-2 Accuracy: {avg_top2:.6f}")
         print(f"{'=' * 70}\n")
+        
+        # Check convergence
+        self.check_convergence(avg_loss)
+    
+    def check_convergence(self, current_loss):
+        """Check if training has converged"""
+        if self.current_round < MIN_ROUNDS:
+            return False
+        
+        improvement = self.best_loss - current_loss
+        
+        if improvement > CONVERGENCE_THRESHOLD:
+            self.best_loss = current_loss
+            self.rounds_without_improvement = 0
+            print(f"Improvement detected: {improvement:.6f}")
+        else:
+            self.rounds_without_improvement += 1
+            print(f"No significant improvement for {self.rounds_without_improvement} rounds")
+        
+        if self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
+            self.convergence_time = time.time() - self.start_time if self.start_time else 0
+            print(f"\n{'=' * 70}")
+            print("CONVERGENCE ACHIEVED!")
+            print(f"Training stopped early at round {self.current_round}/{self.num_rounds}")
+            print(f"No improvement for {CONVERGENCE_PATIENCE} consecutive rounds")
+            print(f"Best loss: {self.best_loss:.6f}")
+            print(f"Time to Convergence: {self.convergence_time:.2f} seconds ({self.convergence_time/60:.2f} minutes)")
+            print(f"{'=' * 70}\n")
+            self.converged = True
+            self.finish_training()
+            return True
+        
+        return False
+    
+    def finish_training(self):
+        """Complete training and cleanup"""
+        print("\nSending training completion signal to all clients...")
+        self.channel.basic_publish(
+            exchange=EXCHANGE_BROADCAST,
+            routing_key='',
+            body=json.dumps({
+                "message_type": "training_complete",
+                "message": "Training completed"
+            }),
+            properties=pika.BasicProperties(delivery_mode=2)
+        )
+        print("Training completion signal sent successfully")
+        time.sleep(2)
+        
+        self.save_results()
+        self.plot_results()
 
     def continue_training(self):
         """Continue to next round or finish training"""
+        # Evaluate client metrics before continuing
+        self.evaluate_global_model()
+        
         self.client_updates.clear()
+        self.client_metrics.clear()
 
         if self.current_round >= self.num_rounds:
+            self.convergence_time = time.time() - self.start_time if self.start_time else 0
             print("\n" + "=" * 70)
             print("TRAINING COMPLETED!")
-            print(f"Total rounds: {self.num_rounds}")
+            print(f"Maximum rounds ({self.num_rounds}) reached")
             print(f"Best accuracy: {max(self.ACC):.6f}")
+            print(f"Total Training Time: {self.convergence_time:.2f} seconds ({self.convergence_time/60:.2f} minutes)")
             print("=" * 70 + "\n")
 
-            self.channel.basic_publish(
-                exchange=EXCHANGE_BROADCAST,
-                routing_key='',
-                body=json.dumps({
-                    "message_type": "training_complete",
-                    "message": "Training completed"
-                }),
-                properties=pika.BasicProperties(delivery_mode=2)
-            )
-            time.sleep(2)
-
-            self.save_results()
-            self.connection.close()
+            self.finish_training()
             return
 
         # Start next round
@@ -544,18 +583,72 @@ class FederatedLearningServer:
             "best_accuracy": max(self.ACC) if self.ACC else 0,
             "best_round": self.ROUNDS[np.argmax(self.ACC)] if self.ACC else 0,
             "num_clients": self.num_clients,
-            "num_rounds": self.num_rounds
+            "num_rounds": self.num_rounds,
+            "convergence_time_seconds": self.convergence_time,
+            "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
+            "total_rounds": len(self.ROUNDS),
+            "converged": self.converged
         }
 
         results_dir = os.path.join(os.path.dirname(__file__), "results")
         os.makedirs(results_dir, exist_ok=True)
-        results_file = os.path.join(results_dir, "amqp_training_results.json")
+        
+        network_scenario = os.getenv("NETWORK_SCENARIO", "default")
+        results_file = os.path.join(results_dir, f"amqp_{network_scenario}_training_results.json")
 
         with open(results_file, "w") as f:
             json.dump(results, f, indent=2)
 
-        print(f"\n[RESULTS] Saved to {results_file}")
+        print(f"Results saved to {results_file}")
         print(f"[RESULTS] Best accuracy: {results['best_accuracy']:.6f} at round {results['best_round']}")
+    
+    def plot_results(self):
+        """Plot and save training metrics"""
+        if not self.ROUNDS:
+            print("No training data to plot")
+            return
+        
+        plt.figure(figsize=(15, 5))
+        
+        # Loss plot
+        plt.subplot(1, 3, 1)
+        plt.plot(self.ROUNDS, self.LOSS, marker='o', linewidth=2, markersize=8, color='red')
+        plt.xlabel('Round', fontsize=12)
+        plt.ylabel('Loss', fontsize=12)
+        plt.title('Loss over Federated Learning Rounds', fontsize=14)
+        plt.grid(True, alpha=0.3)
+        
+        # Accuracy plot
+        plt.subplot(1, 3, 2)
+        plt.plot(self.ROUNDS, self.ACC, marker='s', linewidth=2, markersize=8, color='blue')
+        plt.xlabel('Round', fontsize=12)
+        plt.ylabel('Accuracy', fontsize=12)
+        plt.title('Accuracy over Federated Learning Rounds', fontsize=14)
+        plt.grid(True, alpha=0.3)
+        
+        # Top-2 Accuracy plot
+        plt.subplot(1, 3, 3)
+        plt.plot(self.ROUNDS, self.TOP2, marker='^', linewidth=2, markersize=8, color='green')
+        plt.xlabel('Round', fontsize=12)
+        plt.ylabel('Top-2 Accuracy', fontsize=12)
+        plt.title('Top-2 Accuracy over Federated Learning Rounds', fontsize=14)
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Save to results folder
+        results_dir = Path(__file__).parent / 'results'
+        results_dir.mkdir(exist_ok=True)
+        plt.savefig(results_dir / 'amqp_training_metrics.png', dpi=300, bbox_inches='tight')
+        print(f"Results plot saved to {results_dir / 'amqp_training_metrics.png'}")
+        plt.show(block=False)
+        
+        # Disconnect and exit
+        print("\nTraining complete. Disconnecting...")
+        time.sleep(2)
+        self.connection.close()
+        print("Server disconnected successfully.")
+        sys.exit(0)
 
     def run(self):
         """Run the federated learning server"""
