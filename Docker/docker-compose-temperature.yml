@@ -22,7 +22,7 @@ services:
       - "1884:1883"
       - "9002:9001"
     volumes:
-      - ./mqtt-config:/mosquitto/config
+      - ../mqtt-config:/mosquitto/config
     networks:
       - fl-mqtt-network-temp
     command: mosquitto -c /mosquitto-no-auth.conf
@@ -30,7 +30,7 @@ services:
   # MQTT FL Server (Temperature Regulation)
   fl-server-mqtt-temp:
     build:
-      context: .
+      context: ..
       dockerfile: Server/Dockerfile
     container_name: fl-server-mqtt-temp
     cap_add:
@@ -46,12 +46,12 @@ services:
     networks:
       - fl-mqtt-network-temp
     volumes:
-      - ./Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
 
   # MQTT FL Client 1 (Temperature Regulation)
   fl-client-mqtt-temp-1:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-mqtt-temp-1
     cap_add:
@@ -65,14 +65,14 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
     volumes:
-      - ./Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
     networks:
       - fl-mqtt-network-temp
 
   # MQTT FL Client 2 (Temperature Regulation)
   fl-client-mqtt-temp-2:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-mqtt-temp-2
     cap_add:
@@ -86,7 +86,7 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
     volumes:
-      - ./Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
     networks:
       - fl-mqtt-network-temp
 
@@ -115,7 +115,7 @@ services:
   # AMQP FL Server (Temperature Regulation)
   fl-server-amqp-temp:
     build:
-      context: .
+      context: ..
       dockerfile: Server/Dockerfile
     container_name: fl-server-amqp-temp
     cap_add:
@@ -132,12 +132,12 @@ services:
     networks:
       - fl-amqp-network-temp
     volumes:
-      - ./Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
 
   # AMQP FL Client 1 (Temperature Regulation)
   fl-client-amqp-temp-1:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-amqp-temp-1
     cap_add:
@@ -151,14 +151,14 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
     volumes:
-      - ./Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
     networks:
       - fl-amqp-network-temp
 
   # AMQP FL Client 2 (Temperature Regulation)
   fl-client-amqp-temp-2:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-amqp-temp-2
     cap_add:
@@ -172,7 +172,7 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
     volumes:
-      - ./Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
     networks:
       - fl-amqp-network-temp
 
@@ -183,7 +183,7 @@ services:
   # gRPC FL Server (Temperature Regulation)
   fl-server-grpc-temp:
     build:
-      context: .
+      context: ..
       dockerfile: Server/Dockerfile
     container_name: fl-server-grpc-temp
     cap_add:
@@ -198,12 +198,12 @@ services:
     networks:
       - fl-grpc-network-temp
     volumes:
-      - ./Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
 
   # gRPC FL Client 1 (Temperature Regulation)
   fl-client-grpc-temp-1:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-grpc-temp-1
     cap_add:
@@ -217,15 +217,15 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
     volumes:
-      - ./Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
-      - ./certs:/app/certs
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../certs:/app/certs
     networks:
       - fl-grpc-network-temp
 
   # gRPC FL Client 2 (Temperature Regulation)
   fl-client-grpc-temp-2:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-grpc-temp-2
     cap_add:
@@ -239,8 +239,8 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
     volumes:
-      - ./Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
-      - ./certs:/app/certs
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../certs:/app/certs
     networks:
       - fl-grpc-network-temp
 
@@ -251,7 +251,7 @@ services:
   # QUIC FL Server (Temperature Regulation)
   fl-server-quic-temp:
     build:
-      context: .
+      context: ..
       dockerfile: Server/Dockerfile
     container_name: fl-server-quic-temp
     cap_add:
@@ -267,13 +267,13 @@ services:
     networks:
       - fl-quic-network-temp
     volumes:
-      - ./Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
-      - ./certs:/app/certs
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+      - ../certs:/app/certs
 
   # QUIC FL Client 1 (Temperature Regulation)
   fl-client-quic-temp-1:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-quic-temp-1
     cap_add:
@@ -287,15 +287,15 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
     volumes:
-      - ./Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
-      - ./certs:/app/certs
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../certs:/app/certs
     networks:
       - fl-quic-network-temp
 
   # QUIC FL Client 2 (Temperature Regulation)
   fl-client-quic-temp-2:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-quic-temp-2
     cap_add:
@@ -309,8 +309,8 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
     volumes:
-      - ./Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
-      - ./certs:/app/certs
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../certs:/app/certs
     networks:
       - fl-quic-network-temp
 
@@ -321,7 +321,7 @@ services:
   # DDS FL Server (Temperature Regulation)
   fl-server-dds-temp:
     build:
-      context: .
+      context: ..
       dockerfile: Server/Dockerfile
     container_name: fl-server-dds-temp
     cap_add:
@@ -334,12 +334,12 @@ services:
     networks:
       - fl-dds-network-temp
     volumes:
-      - ./Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
 
   # DDS FL Client 1 (Temperature Regulation)
   fl-client-dds-temp-1:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-dds-temp-1
     cap_add:
@@ -352,14 +352,14 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
     volumes:
-      - ./Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
     networks:
       - fl-dds-network-temp
 
   # DDS FL Client 2 (Temperature Regulation)
   fl-client-dds-temp-2:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-dds-temp-2
     cap_add:
@@ -372,7 +372,7 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
     volumes:
-      - ./Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
     networks:
       - fl-dds-network-temp
 
@@ -391,3 +391,6 @@ networks:
 volumes:
   mqtt-data-temp:
   rabbitmq-data-temp:
+
+
+

@@ -1,0 +1,384 @@
+version: '3.8'
+
+services:
+  # ============================================================================
+  # MQTT Protocol Setup (Mental State Recognition)
+  # ============================================================================
+  
+  # MQTT Broker (Mosquitto)
+  mqtt-broker-mental:
+    image: eclipse-mosquitto:2
+    container_name: mqtt-broker-mental
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ../mqtt-config:/mosquitto/config
+    networks:
+      - fl-mqtt-network
+    command: mosquitto -c /mosquitto-no-auth.conf
+
+  # MQTT FL Server (Mental State Recognition)
+  fl-server-mqtt-mental:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-mqtt-mental
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - mqtt-broker-mental
+    environment:
+      - MQTT_BROKER=mqtt-broker-mental
+      - MQTT_PORT=1883
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+    command: python -u Server/MentalState_Recognition/FL_Server_MQTT.py
+    networks:
+      - fl-mqtt-network
+    volumes:
+      - ../Server/MentalState_Recognition/results:/app/Server/MentalState_Recognition/results
+  # MQTT FL Client 1 (Mental State Recognition)
+  fl-client-mqtt-mental-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-mqtt-mental-1
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-mqtt-mental
+    environment:
+      - MQTT_BROKER=mqtt-broker-mental
+      - MQTT_PORT=1883
+      - CLIENT_ID=0
+      - NUM_CLIENTS=2
+    command: python -u Client/MentalState_Recognition/FL_Client_MQTT.py
+    volumes:
+      - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
+    networks:
+      - fl-mqtt-network
+
+  # MQTT FL Client 2 (Mental State Recognition)
+  fl-client-mqtt-mental-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-mqtt-mental-2
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-mqtt-mental
+    environment:
+      - MQTT_BROKER=mqtt-broker-mental
+      - MQTT_PORT=1883
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+    command: python -u Client/MentalState_Recognition/FL_Client_MQTT.py
+    volumes:
+      - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
+    networks:
+      - fl-mqtt-network
+
+  # ============================================================================
+  # AMQP Protocol Setup (Mental State Recognition)
+  # ============================================================================
+  
+  # RabbitMQ Broker
+  rabbitmq-mental:
+    image: rabbitmq:3-management
+    container_name: fl-rabbitmq-mental
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    networks:
+      - fl-amqp-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # AMQP FL Server (Mental State Recognition)
+  fl-server-amqp-mental:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-amqp-mental
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - rabbitmq-mental
+    environment:
+      - AMQP_HOST=rabbitmq-mental
+      - AMQP_PORT=5672
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+    command: python -u Server/MentalState_Recognition/FL_Server_AMQP.py
+    networks:
+      - fl-amqp-network
+    volumes:
+      - ../Server/MentalState_Recognition/results:/app/Server/MentalState_Recognition/results
+  # AMQP FL Client 1 (Mental State Recognition)
+  fl-client-amqp-mental-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-amqp-mental-1
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-amqp-mental
+    environment:
+      - AMQP_HOST=rabbitmq-mental
+      - AMQP_PORT=5672
+      - CLIENT_ID=0
+      - NUM_CLIENTS=2
+    command: python -u Client/MentalState_Recognition/FL_Client_AMQP.py
+    volumes:
+      - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
+    networks:
+      - fl-amqp-network
+
+  # AMQP FL Client 2 (Mental State Recognition)
+  fl-client-amqp-mental-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-amqp-mental-2
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-amqp-mental
+    environment:
+      - AMQP_HOST=rabbitmq-mental
+      - AMQP_PORT=5672
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+    command: python -u Client/MentalState_Recognition/FL_Client_AMQP.py
+    volumes:
+      - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
+    networks:
+      - fl-amqp-network
+
+  # ============================================================================
+  # gRPC Protocol Setup (Mental State Recognition)
+  # ============================================================================
+  
+  # gRPC FL Server (Mental State Recognition)
+  fl-server-grpc-mental:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-grpc-mental
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "50051:50051"
+    environment:
+      - GRPC_PORT=50051
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+    command: python -u Server/MentalState_Recognition/FL_Server_gRPC.py
+    networks:
+      - fl-grpc-network
+    volumes:
+      - ../Server/MentalState_Recognition/results:/app/Server/MentalState_Recognition/results
+
+  # gRPC FL Client 1 (Mental State Recognition)
+  fl-client-grpc-mental-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-grpc-mental-1
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-grpc-mental
+    environment:
+      - GRPC_HOST=fl-server-grpc-mental
+      - GRPC_PORT=50051
+      - CLIENT_ID=0
+      - NUM_CLIENTS=2
+    command: python -u Client/MentalState_Recognition/FL_Client_gRPC.py
+    volumes:
+      - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
+      - ../certs:/app/certs
+    networks:
+      - fl-grpc-network
+
+  # gRPC FL Client 2 (Mental State Recognition)
+  fl-client-grpc-mental-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-grpc-mental-2
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-grpc-mental
+    environment:
+      - GRPC_HOST=fl-server-grpc-mental
+      - GRPC_PORT=50051
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+    command: python -u Client/MentalState_Recognition/FL_Client_gRPC.py
+    volumes:
+      - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
+      - ../certs:/app/certs
+    networks:
+      - fl-grpc-network
+
+  # ============================================================================
+  # QUIC Protocol Setup (Mental State Recognition)
+  # ============================================================================
+  
+  # QUIC FL Server (Mental State Recognition)
+  fl-server-quic-mental:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-quic-mental
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "4433:4433/udp"
+    environment:
+      - QUIC_HOST=0.0.0.0
+      - QUIC_PORT=4433
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+    command: python -u Server/MentalState_Recognition/FL_Server_QUIC.py
+    networks:
+      - fl-quic-network
+    volumes:
+      - ../Server/MentalState_Recognition/results:/app/Server/MentalState_Recognition/results
+      - ../certs:/app/certs
+
+  # QUIC FL Client 1 (Mental State Recognition)
+  fl-client-quic-mental-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-quic-mental-1
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-quic-mental
+    environment:
+      - QUIC_HOST=fl-server-quic-mental
+      - QUIC_PORT=4433
+      - CLIENT_ID=0
+      - NUM_CLIENTS=2
+    command: python -u Client/MentalState_Recognition/FL_Client_QUIC.py
+    volumes:
+      - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
+      - ../certs:/app/certs
+    networks:
+      - fl-quic-network
+
+  # QUIC FL Client 2 (Mental State Recognition)
+  fl-client-quic-mental-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-quic-mental-2
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-quic-mental
+    environment:
+      - QUIC_HOST=fl-server-quic-mental
+      - QUIC_PORT=4433
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+    command: python -u Client/MentalState_Recognition/FL_Client_QUIC.py
+    volumes:
+      - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
+      - ../certs:/app/certs
+    networks:
+      - fl-quic-network
+
+  # ============================================================================
+  # DDS Protocol Setup (Mental State Recognition)
+  # ============================================================================
+  
+  # DDS FL Server (Mental State Recognition)
+  fl-server-dds-mental:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-dds-mental
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - DDS_DOMAIN_ID=0
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+    command: python -u Server/MentalState_Recognition/FL_Server_DDS.py
+    networks:
+      - fl-dds-network
+    volumes:
+      - ../Server/MentalState_Recognition/results:/app/Server/MentalState_Recognition/results
+
+  # DDS FL Client 1 (Mental State Recognition)
+  fl-client-dds-mental-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-dds-mental-1
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-dds-mental
+    environment:
+      - DDS_DOMAIN_ID=0
+      - CLIENT_ID=0
+      - NUM_CLIENTS=2
+    command: python -u Client/MentalState_Recognition/FL_Client_DDS.py
+    volumes:
+      - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
+    networks:
+      - fl-dds-network
+
+  # DDS FL Client 2 (Mental State Recognition)
+  fl-client-dds-mental-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-dds-mental-2
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-dds-mental
+    environment:
+      - DDS_DOMAIN_ID=0
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+    command: python -u Client/MentalState_Recognition/FL_Client_DDS.py
+    volumes:
+      - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
+    networks:
+      - fl-dds-network
+
+networks:
+  fl-mqtt-network:
+    driver: bridge
+  fl-amqp-network:
+    driver: bridge
+  fl-grpc-network:
+    driver: bridge
+  fl-quic-network:
+    driver: bridge
+  fl-dds-network:
+    driver: bridge
+
+volumes:
+  mqtt-data:
+  rabbitmq-data:
+
+
+

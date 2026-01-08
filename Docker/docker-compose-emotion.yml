@@ -1,4 +1,4 @@
-﻿version: '3.8'
+version: '3.8'
 
 services:
   # ============================================================================
@@ -13,7 +13,7 @@ services:
       - "1883:1883"
       - "9001:9001"
     volumes:
-      - ./mqtt-config:/mosquitto/config
+      - ../mqtt-config:/mosquitto/config
     networks:
       - fl-mqtt-network
     command: mosquitto -c /mosquitto-no-auth.conf
@@ -21,7 +21,7 @@ services:
   # MQTT FL Server (Emotion Recognition)
   fl-server-mqtt-emotion:
     build:
-      context: .
+      context: ..
       dockerfile: Server/Dockerfile
     container_name: fl-server-mqtt-emotion
     cap_add:
@@ -37,12 +37,12 @@ services:
     networks:
       - fl-mqtt-network
     volumes:
-      - ./Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+      - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
 
   # MQTT FL Client 1 (Emotion Recognition)
   fl-client-mqtt-emotion-1:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-mqtt-emotion-1
     cap_add:
@@ -56,14 +56,14 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
     volumes:
-      - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-mqtt-network
 
   # MQTT FL Client 2 (Emotion Recognition)
   fl-client-mqtt-emotion-2:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-mqtt-emotion-2
     cap_add:
@@ -77,7 +77,7 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
     volumes:
-      - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-mqtt-network
 
@@ -106,7 +106,7 @@ services:
   # AMQP FL Server (Emotion Recognition)
   fl-server-amqp-emotion:
     build:
-      context: .
+      context: ..
       dockerfile: Server/Dockerfile
     container_name: fl-server-amqp-emotion
     cap_add:
@@ -123,12 +123,12 @@ services:
     networks:
       - fl-amqp-network
     volumes:
-      - ./Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+      - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
 
   # AMQP FL Client 1 (Emotion Recognition)
   fl-client-amqp-emotion-1:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-amqp-emotion-1
     cap_add:
@@ -142,14 +142,14 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
     volumes:
-      - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-amqp-network
 
   # AMQP FL Client 2 (Emotion Recognition)
   fl-client-amqp-emotion-2:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-amqp-emotion-2
     cap_add:
@@ -163,7 +163,7 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
     volumes:
-      - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-amqp-network
 
@@ -174,7 +174,7 @@ services:
   # gRPC FL Server (Emotion Recognition)
   fl-server-grpc-emotion:
     build:
-      context: .
+      context: ..
       dockerfile: Server/Dockerfile
     container_name: fl-server-grpc-emotion
     cap_add:
@@ -189,12 +189,12 @@ services:
     networks:
       - fl-grpc-network
     volumes:
-      - ./Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+      - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
 
   # gRPC FL Client 1 (Emotion Recognition)
   fl-client-grpc-emotion-1:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-grpc-emotion-1
     cap_add:
@@ -208,15 +208,15 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
     volumes:
-      - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      - ./certs:/app/certs
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../certs:/app/certs
     networks:
       - fl-grpc-network
 
   # gRPC FL Client 2 (Emotion Recognition)
   fl-client-grpc-emotion-2:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-grpc-emotion-2
     cap_add:
@@ -230,8 +230,8 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
     volumes:
-      - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      - ./certs:/app/certs
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../certs:/app/certs
     networks:
       - fl-grpc-network
 
@@ -242,7 +242,7 @@ services:
   # QUIC FL Server (Emotion Recognition)
   fl-server-quic-emotion:
     build:
-      context: .
+      context: ..
       dockerfile: Server/Dockerfile
     container_name: fl-server-quic-emotion
     cap_add:
@@ -258,13 +258,13 @@ services:
     networks:
       - fl-quic-network
     volumes:
-      - ./Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
-      - ./certs:/app/certs
+      - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+      - ../certs:/app/certs
 
   # QUIC FL Client 1 (Emotion Recognition)
   fl-client-quic-emotion-1:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-quic-emotion-1
     cap_add:
@@ -278,15 +278,15 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Emotion_Recognition/FL_Client_QUIC.py
     volumes:
-      - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      - ./certs:/app/certs
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../certs:/app/certs
     networks:
       - fl-quic-network
 
   # QUIC FL Client 2 (Emotion Recognition)
   fl-client-quic-emotion-2:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-quic-emotion-2
     cap_add:
@@ -300,8 +300,8 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Emotion_Recognition/FL_Client_QUIC.py
     volumes:
-      - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      - ./certs:/app/certs
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../certs:/app/certs
     networks:
       - fl-quic-network
 
@@ -312,7 +312,7 @@ services:
   # DDS FL Server (Emotion Recognition)
   fl-server-dds-emotion:
     build:
-      context: .
+      context: ..
       dockerfile: Server/Dockerfile
     container_name: fl-server-dds-emotion
     cap_add:
@@ -325,12 +325,12 @@ services:
     networks:
       - fl-dds-network
     volumes:
-      - ./Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+      - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
 
   # DDS FL Client 1 (Emotion Recognition)
   fl-client-dds-emotion-1:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-dds-emotion-1
     cap_add:
@@ -343,14 +343,14 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     volumes:
-      - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-dds-network
 
   # DDS FL Client 2 (Emotion Recognition)
   fl-client-dds-emotion-2:
     build:
-      context: .
+      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-dds-emotion-2
     cap_add:
@@ -363,7 +363,7 @@ services:
       - NUM_CLIENTS=2
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     volumes:
-      - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-dds-network
 
@@ -382,3 +382,6 @@ networks:
 volumes:
   mqtt-data:
   rabbitmq-data:
+
+
+
