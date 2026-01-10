@@ -20,7 +20,8 @@ class NetworkScenarioEvaluator:
     def __init__(self, use_case="temperature"):
         self.use_case = use_case
         self.protocols = ["mqtt", "amqp", "grpc", "quic", "dds"]
-        self.scenarios = ["excellent", "good", "moderate", "poor", "very_poor", "satellite"]
+        self.scenarios = ["excellent", "good", "moderate", "poor", "very_poor", "satellite",
+                         "congested_light", "congested_moderate", "congested_heavy"]
         self.results = {}  # {scenario: {protocol: data}}
         
         # Network scenario descriptions for visualization
@@ -30,7 +31,10 @@ class NetworkScenarioEvaluator:
             "moderate": "Moderate (4G/LTE)\n50ms latency",
             "poor": "Poor (3G)\n100ms latency",
             "very_poor": "Very Poor (2G)\n300ms latency",
-            "satellite": "Satellite\n600ms latency"
+            "satellite": "Satellite\n600ms latency",
+            "congested_light": "Light Congestion\n30ms latency",
+            "congested_moderate": "Moderate Congestion\n75ms latency",
+            "congested_heavy": "Heavy Congestion\n150ms latency"
         }
         
     def load_all_results(self):
@@ -42,6 +46,8 @@ class NetworkScenarioEvaluator:
             return False
         
         loaded_count = 0
+        
+        # Load standard scenarios
         for scenario in self.scenarios:
             self.results[scenario] = {}
             for protocol in self.protocols:
@@ -51,6 +57,29 @@ class NetworkScenarioEvaluator:
                         self.results[scenario][protocol] = json.load(f)
                         loaded_count += 1
                         print(f"✓ Loaded {protocol.upper()} - {scenario}")
+        
+        # Load congestion variant results
+        congestion_levels = ["none", "light", "moderate", "heavy", "extreme"]
+        for base_scenario in ["excellent", "good", "moderate", "poor", "very_poor", "satellite",
+                             "congested_light", "congested_moderate", "congested_heavy"]:
+            for congestion in congestion_levels:
+                if congestion == "none":
+                    continue
+                    
+                scenario_key = f"{base_scenario}_congestion_{congestion}"
+                
+                # Check if any results exist for this combination
+                has_results = False
+                for protocol in self.protocols:
+                    result_file = results_dir / f"{protocol}_{base_scenario}_congestion_{congestion}_training_results.json"
+                    if result_file.exists():
+                        if scenario_key not in self.results:
+                            self.results[scenario_key] = {}
+                        with open(result_file, 'r') as f:
+                            self.results[scenario_key][protocol] = json.load(f)
+                            loaded_count += 1
+                            has_results = True
+                            print(f"✓ Loaded {protocol.upper()} - {base_scenario} + {congestion} congestion")
         
         print(f"\n✓ Loaded {loaded_count} result files\n")
         return loaded_count > 0
@@ -287,15 +316,24 @@ class NetworkScenarioEvaluator:
         
         # Create a comprehensive CSV
         rows = []
-        for scenario in self.scenarios:
-            if scenario not in self.results:
-                continue
+        for scenario in self.results.keys():  # Use all loaded scenarios
             for protocol in self.protocols:
                 if protocol in self.results[scenario]:
                     data = self.results[scenario][protocol]
+                    
+                    # Parse scenario and congestion level
+                    base_scenario = scenario
+                    congestion_level = "none"
+                    if "_congestion_" in scenario:
+                        parts = scenario.split("_congestion_")
+                        base_scenario = parts[0]
+                        congestion_level = parts[1] if len(parts) > 1 else "none"
+                    
                     rows.append({
                         'use_case': self.use_case,
-                        'scenario': scenario,
+                        'base_scenario': base_scenario,
+                        'congestion_level': congestion_level,
+                        'scenario_full': scenario,
                         'protocol': protocol,
                         'rounds': data.get('total_rounds', 0),
                         'time_seconds': data.get('convergence_time_seconds', 0),
@@ -311,6 +349,14 @@ class NetworkScenarioEvaluator:
             output_file = f"{output_dir}/{self.use_case}_all_scenarios_comparison.csv"
             df.to_csv(output_file, index=False)
             print(f"✓ Exported comprehensive results to: {output_file}")
+            
+            # Also create separate CSV for congestion analysis if congestion data exists
+            congestion_rows = [r for r in rows if r['congestion_level'] != 'none']
+            if congestion_rows:
+                df_congestion = pd.DataFrame(congestion_rows)
+                output_file_congestion = f"{output_dir}/{self.use_case}_congestion_comparison.csv"
+                df_congestion.to_csv(output_file_congestion, index=False)
+                print(f"✓ Exported congestion results to: {output_file_congestion}")
         else:
             print("No data to export")
 

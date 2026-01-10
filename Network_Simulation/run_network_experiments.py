@@ -8,6 +8,7 @@ import subprocess
 import time
 import json
 import os
+import sys
 from datetime import datetime
 from typing import List, Dict
 import argparse
@@ -17,9 +18,10 @@ from pathlib import Path
 class ExperimentRunner:
     """Automates running FL experiments across different network conditions"""
     
-    def __init__(self, use_case: str = "emotion", num_rounds: int = 10):
+    def __init__(self, use_case: str = "emotion", num_rounds: int = 10, enable_congestion: bool = False):
         self.use_case = use_case
         self.num_rounds = num_rounds
+        self.enable_congestion = enable_congestion
         
         # Get the script's directory and project root
         script_dir = Path(__file__).parent.absolute()
@@ -29,6 +31,21 @@ class ExperimentRunner:
         self.results_dir = project_root / "experiment_results" / f"{use_case}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.results_dir = str(self.results_dir)
+        
+        # Initialize congestion manager if enabled
+        self.congestion_manager = None
+        if enable_congestion:
+            # Import congestion_manager module
+            if str(script_dir) not in sys.path:
+                sys.path.insert(0, str(script_dir))
+            try:
+                from congestion_manager import CongestionManager
+                self.congestion_manager = CongestionManager(use_case=use_case, verbose=False)
+                print(f"[INFO] Congestion manager initialized")
+            except ImportError as e:
+                print(f"[WARNING] Could not import CongestionManager: {e}")
+                print(f"[WARNING] Congestion features will be disabled")
+                self.enable_congestion = False
         
         # Define protocols to test
         self.protocols = ["mqtt", "amqp", "grpc", "quic", "dds"]
@@ -40,7 +57,10 @@ class ExperimentRunner:
             "moderate",
             "poor",
             "very_poor",
-            "satellite"
+            "satellite",
+            "congested_light",
+            "congested_moderate",
+            "congested_heavy"
         ]
         
         # Docker compose file mapping (relative to project root)
@@ -88,7 +108,7 @@ class ExperimentRunner:
             cwd = str(Path(__file__).parent.parent)
         return subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', check=check, env=env, cwd=cwd)
     
-    def start_containers(self, protocol: str, scenario: str = "excellent"):
+    def start_containers(self, protocol: str, scenario: str = "excellent", congestion_level: str = "none"):
         """Start Docker containers for a specific protocol with staged startup"""
         compose_file = self.compose_files[self.use_case]
         services = self.service_patterns[self.use_case][protocol]
@@ -96,6 +116,8 @@ class ExperimentRunner:
         print(f"\n{'='*70}")
         print(f"Starting containers for {protocol.upper()} protocol...")
         print(f"Network Scenario: {scenario.upper()}")
+        if self.enable_congestion and congestion_level != "none":
+            print(f"Congestion Level: {congestion_level.upper()}")
         print(f"{'='*70}")
         
         # Separate services into broker, server, and clients
@@ -113,7 +135,7 @@ class ExperimentRunner:
         
         # Stage 1: Start broker first (if exists)
         if broker:
-            print(f"\n[Stage 1/3] Starting broker: {broker}")
+            print(f"\n[Stage 1/4] Starting broker: {broker}")
             cmd_broker = ["docker-compose", "-f", compose_file, "up", "-d", broker]
             result = self.run_command(cmd_broker)
             if result.returncode != 0:
@@ -127,7 +149,8 @@ class ExperimentRunner:
         
         # Stage 2: Start server
         if server:
-            print(f"\n[Stage 2/3] Starting server: {server}")
+            stage_num = "[Stage 2/4]" if broker else "[Stage 1/4]"
+            print(f"\n{stage_num} Starting server: {server}")
             cmd_server = ["docker-compose", "-f", compose_file, "up", "-d", server]
             result = self.run_command(cmd_server)
             if result.returncode != 0:
@@ -139,9 +162,20 @@ class ExperimentRunner:
             print(f"Waiting 8 seconds for server to initialize...")
             time.sleep(8)
         
-        # Stage 3: Start clients
+        # Stage 3: Start traffic generators (if congestion enabled)
+        if self.enable_congestion and congestion_level != "none" and self.congestion_manager:
+            stage_num = "[Stage 3/4]"
+            print(f"\n{stage_num} Starting traffic generators (Congestion Level: {congestion_level.upper()})")
+            if not self.congestion_manager.start_traffic_generators(congestion_level):
+                print(f"[WARNING] Failed to start traffic generators, continuing without congestion...")
+            else:
+                print(f"Waiting 5 seconds for traffic to stabilize...")
+                time.sleep(5)
+        
+        # Stage 4: Start clients
         if clients:
-            print(f"\n[Stage 3/3] Starting clients: {', '.join(clients)}")
+            stage_num = "[Stage 4/4]" if (broker and self.enable_congestion and congestion_level != "none") else "[Stage 3/4]"
+            print(f"\n{stage_num} Starting clients: {', '.join(clients)}")
             cmd_clients = ["docker-compose", "-f", compose_file, "up", "-d"] + clients
             result = self.run_command(cmd_clients)
             if result.returncode != 0:
@@ -296,17 +330,19 @@ class ExperimentRunner:
         
         print(f"Results saved to: {exp_dir}")
     
-    def run_single_experiment(self, protocol: str, scenario: str):
+    def run_single_experiment(self, protocol: str, scenario: str, congestion_level: str = "none"):
         """Run a single experiment with specific protocol and network scenario"""
         print(f"\n{'#'*70}")
         print(f"# EXPERIMENT: {protocol.upper()} - {scenario.upper()}")
         print(f"# Use Case: {self.use_case.title()}")
         print(f"# Rounds: {self.num_rounds}")
+        if self.enable_congestion and congestion_level != "none":
+            print(f"# Congestion Level: {congestion_level.upper()}")
         print(f"{'#'*70}\n")
         
         try:
-            # 1. Start containers
-            if not self.start_containers(protocol,scenario):
+            # 1. Start containers (includes traffic generators if congestion enabled)
+            if not self.start_containers(protocol, scenario, congestion_level):
                 print(f"[ERROR] Failed to start containers for {protocol}")
                 return False
             
@@ -319,9 +355,16 @@ class ExperimentRunner:
                 print(f"[WARNING] Experiment may not have completed")
             
             # 4. Collect results
-            self.collect_results(protocol, scenario)
+            result_suffix = f"{scenario}_congestion_{congestion_level}" if congestion_level != "none" else scenario
+            self.collect_results(protocol, result_suffix)
             
-            # 5. Stop containers
+            # 5. Stop traffic generators (if running)
+            if self.enable_congestion and self.congestion_manager and congestion_level != "none":
+                print(f"\n[Congestion] Stopping traffic generators...")
+                self.congestion_manager.stop_traffic_generators()
+                time.sleep(2)
+            
+            # 6. Stop containers
             self.stop_containers(protocol)
             
             print(f"\n✓ Experiment completed: {protocol.upper()} - {scenario.upper()}\n")
@@ -332,12 +375,18 @@ class ExperimentRunner:
             self.stop_containers(protocol)
             return False
     
-    def run_all_experiments(self, protocols: List[str] = None, scenarios: List[str] = None):
+    def run_all_experiments(self, protocols: List[str] = None, scenarios: List[str] = None, 
+                          congestion_levels: List[str] = None):
         """Run experiments for all protocol and network combinations"""
         protocols = protocols or self.protocols
         scenarios = scenarios or self.network_scenarios
+        congestion_levels = congestion_levels or ["none"]
         
-        total_experiments = len(protocols) * len(scenarios)
+        # If congestion is not enabled, force congestion_levels to ["none"]
+        if not self.enable_congestion:
+            congestion_levels = ["none"]
+        
+        total_experiments = len(protocols) * len(scenarios) * len(congestion_levels)
         current = 0
         
         print(f"\n{'='*70}")
@@ -346,6 +395,8 @@ class ExperimentRunner:
         print(f"Use Case: {self.use_case.title()}")
         print(f"Protocols: {', '.join(protocols)}")
         print(f"Network Scenarios: {', '.join(scenarios)}")
+        if self.enable_congestion and len(congestion_levels) > 1 or congestion_levels[0] != "none":
+            print(f"Congestion Levels: {', '.join(congestion_levels)}")
         print(f"Total Experiments: {total_experiments}")
         print(f"Results Directory: {self.results_dir}")
         print(f"{'='*70}\n")
@@ -356,18 +407,24 @@ class ExperimentRunner:
         
         for protocol in protocols:
             for scenario in scenarios:
-                current += 1
-                print(f"\n{'*'*70}")
-                print(f"Progress: {current}/{total_experiments}")
-                print(f"{'*'*70}")
-                
-                if self.run_single_experiment(protocol, scenario):
-                    successful += 1
-                else:
-                    failed += 1
-                
-                # Brief pause between experiments
-                time.sleep(5)
+                for congestion_level in congestion_levels:
+                    current += 1
+                    print(f"\n{'*'*70}")
+                    print(f"Progress: {current}/{total_experiments}")
+                    print(f"{'*'*70}")
+                    
+                    if self.run_single_experiment(protocol, scenario, congestion_level):
+                        successful += 1
+                    else:
+                        failed += 1
+                    
+                    # Brief pause between experiments
+                    time.sleep(5)
+        
+        # Final cleanup
+        if self.enable_congestion and self.congestion_manager:
+            print("\n[Congestion] Final cleanup - stopping all traffic generators...")
+            self.congestion_manager.stop_traffic_generators()
         
         # Summary
         duration = time.time() - start_time
@@ -398,35 +455,60 @@ def main():
                        help="Specific protocols to test (default: all)")
     parser.add_argument("--scenarios", "-s",
                        nargs="+",
-                       choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite"],
+                       choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
+                               "congested_light", "congested_moderate", "congested_heavy"],
                        help="Specific network scenarios to test (default: all)")
     parser.add_argument("--rounds", "-r",
                        type=int,
                        default=10,
                        help="Number of FL rounds (default: 10)")
+    parser.add_argument("--enable-congestion", action="store_true",
+                       help="Enable network congestion using traffic generators")
+    parser.add_argument("--congestion-level", "-c",
+                       choices=["none", "light", "moderate", "heavy", "extreme"],
+                       help="Congestion level for experiments (requires --enable-congestion)")
+    parser.add_argument("--congestion-levels",
+                       nargs="+",
+                       choices=["none", "light", "moderate", "heavy", "extreme"],
+                       help="Multiple congestion levels to test (requires --enable-congestion)")
     parser.add_argument("--single", action="store_true",
                        help="Run single experiment (requires --protocol and --scenario)")
     parser.add_argument("--protocol",
                        choices=["mqtt", "amqp", "grpc", "quic", "dds"],
                        help="Protocol for single experiment")
     parser.add_argument("--scenario",
-                       choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite"],
+                       choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
+                               "congested_light", "congested_moderate", "congested_heavy"],
                        help="Network scenario for single experiment")
     
     args = parser.parse_args()
     
-    runner = ExperimentRunner(use_case=args.use_case, num_rounds=args.rounds)
+    # Determine congestion level(s)
+    congestion_levels = None
+    if args.enable_congestion:
+        if args.congestion_levels:
+            congestion_levels = args.congestion_levels
+        elif args.congestion_level:
+            congestion_levels = [args.congestion_level]
+        else:
+            # Default to moderate congestion if enabled but no level specified
+            congestion_levels = ["moderate"]
+    
+    runner = ExperimentRunner(use_case=args.use_case, num_rounds=args.rounds, 
+                            enable_congestion=args.enable_congestion)
     
     if args.single:
         if not args.protocol or not args.scenario:
             print("[ERROR] --single requires both --protocol and --scenario")
             parser.print_help()
             return
-        runner.run_single_experiment(args.protocol, args.scenario)
+        congestion = args.congestion_level if args.enable_congestion and args.congestion_level else "none"
+        runner.run_single_experiment(args.protocol, args.scenario, congestion)
     else:
         runner.run_all_experiments(
             protocols=args.protocols,
-            scenarios=args.scenarios
+            scenarios=args.scenarios,
+            congestion_levels=congestion_levels
         )
 
 

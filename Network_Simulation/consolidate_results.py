@@ -63,7 +63,8 @@ def consolidate_results(use_case="temperature", scenarios=None):
     results_dir.mkdir(parents=True, exist_ok=True)
     
     # All available network scenarios
-    all_scenarios = ["excellent", "good", "moderate", "poor", "very_poor", "satellite"]
+    all_scenarios = ["excellent", "good", "moderate", "poor", "very_poor", "satellite",
+                    "congested_light", "congested_moderate", "congested_heavy"]
     if scenarios is None:
         scenarios = all_scenarios
     
@@ -76,21 +77,52 @@ def consolidate_results(use_case="temperature", scenarios=None):
             if scenario not in all_results:
                 all_results[scenario] = {}
             
-            for proto_dir in exp_dir.glob(f"*_{scenario}"):
-                protocol = proto_dir.name.replace(f"_{scenario}", "")
+            # Match both standard format and congestion format
+            # Standard: mqtt_excellent
+            # Congestion: mqtt_excellent_congestion_moderate
+            for proto_dir in exp_dir.glob(f"*_{scenario}*"):
+                dir_name = proto_dir.name
+                
+                # Extract protocol name (first part before first underscore)
+                protocol = dir_name.split('_')[0]
+                
+                # Check if this is a congestion experiment
+                congestion_level = None
+                if '_congestion_' in dir_name:
+                    # Extract congestion level
+                    parts = dir_name.split('_congestion_')
+                    if len(parts) > 1:
+                        congestion_level = parts[1]
+                        # Create scenario key with congestion info
+                        scenario_key = f"{scenario}_congestion_{congestion_level}"
+                        if scenario_key not in all_results:
+                            all_results[scenario_key] = {}
+                        target_dict = all_results[scenario_key]
+                    else:
+                        target_dict = all_results[scenario]
+                else:
+                    # Standard scenario without congestion
+                    target_dict = all_results[scenario]
+                
                 log_file = proto_dir / "server_logs.txt"
                 
-                if log_file.exists() and protocol not in all_results[scenario]:
+                if log_file.exists() and protocol not in target_dict:
+                    scenario_label = scenario_key if congestion_level else scenario
                     print(f"Extracting {protocol.upper()} results from {proto_dir}...")
                     results = extract_results_from_logs(log_file)
                     
                     if results:
-                        # Add scenario info to results
+                        # Add scenario and congestion info to results
                         results["scenario"] = scenario
-                        all_results[scenario][protocol] = results
+                        if congestion_level:
+                            results["congestion_level"] = congestion_level
+                        target_dict[protocol] = results
                         
-                        # Save to results directory with scenario in filename
-                        output_file = results_dir / f"{protocol}_{scenario}_training_results.json"
+                        # Save to results directory with scenario and congestion in filename
+                        if congestion_level:
+                            output_file = results_dir / f"{protocol}_{scenario}_congestion_{congestion_level}_training_results.json"
+                        else:
+                            output_file = results_dir / f"{protocol}_{scenario}_training_results.json"
                         with open(output_file, 'w') as f:
                             json.dump(results, f, indent=2)
                         print(f"  ✓ Saved to {output_file}")
@@ -101,15 +133,30 @@ def consolidate_results(use_case="temperature", scenarios=None):
     print(f"\n{'='*80}")
     print(f"Consolidated Results Summary")
     print(f"{'='*80}")
-    for scenario in scenarios:
-        if scenario in all_results and all_results[scenario]:
-            print(f"\n{scenario.upper()} Network Scenario:")
-            for protocol in sorted(all_results[scenario].keys()):
-                results = all_results[scenario][protocol]
+    
+    # Group scenarios by base scenario and congestion
+    for base_scenario in ["excellent", "good", "moderate", "poor", "very_poor", "satellite",
+                         "congested_light", "congested_moderate", "congested_heavy"]:
+        # Check base scenario
+        if base_scenario in all_results and all_results[base_scenario]:
+            print(f"\n{base_scenario.upper().replace('_', ' ')} Network Scenario:")
+            for protocol in sorted(all_results[base_scenario].keys()):
+                results = all_results[base_scenario][protocol]
+                congestion_info = f" (no congestion)" if "congestion_level" not in results else ""
                 print(f"  - {protocol.upper()}: {results['total_rounds']} rounds, "
-                      f"{results['convergence_time_seconds']:.2f}s")
-        else:
-            print(f"\n{scenario.upper()} Network Scenario: No results found")
+                      f"{results['convergence_time_seconds']:.2f}s{congestion_info}")
+        
+        # Check for congestion variants
+        congestion_keys = [k for k in all_results.keys() if k.startswith(f"{base_scenario}_congestion_")]
+        for scenario_key in sorted(congestion_keys):
+            if all_results[scenario_key]:
+                congestion_level = scenario_key.split('_congestion_')[1]
+                print(f"  └─ WITH {congestion_level.upper()} CONGESTION:")
+                for protocol in sorted(all_results[scenario_key].keys()):
+                    results = all_results[scenario_key][protocol]
+                    print(f"     - {protocol.upper()}: {results['total_rounds']} rounds, "
+                          f"{results['convergence_time_seconds']:.2f}s")
+    
     print(f"\n{'='*80}")
     
     return all_results
@@ -120,7 +167,8 @@ if __name__ == "__main__":
     parser.add_argument("--use-case", default="temperature", 
                        choices=["temperature", "emotion", "mentalstate"])
     parser.add_argument("--scenarios", nargs="+",
-                       choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite"],
+                       choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
+                               "congested_light", "congested_moderate", "congested_heavy"],
                        help="Specific scenarios to consolidate (default: all)")
     args = parser.parse_args()
     

@@ -56,7 +56,8 @@ Example usage:
                        help="Use case to evaluate (default: temperature)")
     parser.add_argument("--scenarios", "-s",
                        nargs="+",
-                       choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite"],
+                       choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
+                               "congested_light", "congested_moderate", "congested_heavy"],
                        help="Specific scenarios to evaluate (default: all available)")
     parser.add_argument("--output-dir", "-o",
                        default="comparison_results",
@@ -100,7 +101,8 @@ Example usage:
     
     # Step 2: Compare protocols for each scenario (optional)
     if not args.skip_comparison:
-        scenarios = args.scenarios if args.scenarios else ["excellent", "good", "moderate", "poor", "very_poor", "satellite"]
+        scenarios = args.scenarios if args.scenarios else ["excellent", "good", "moderate", "poor", "very_poor", "satellite",
+                                                          "congested_light", "congested_moderate", "congested_heavy"]
         
         for scenario in scenarios:
             cmd = [

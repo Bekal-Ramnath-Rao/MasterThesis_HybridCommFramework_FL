@@ -364,6 +364,164 @@ services:
     networks:
       - fl-dds-network
 
+  # ============================================================================
+  # Traffic Generator Containers (for Congestion Testing)
+  # ============================================================================
+  
+  http-traffic-gen-1-mental:
+    image: alpine:latest
+    container_name: http-traffic-gen-1-mental
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - fl-mqtt-network
+      - fl-amqp-network
+      - fl-grpc-network
+      - fl-quic-network
+      - fl-dds-network
+    command: >
+      sh -c "
+      apk add --no-cache curl &&
+      echo 'Starting HTTP traffic generator...' &&
+      while true; do
+        curl -s -o /dev/null http://fl-server-mqtt-mental:5000 2>/dev/null || true;
+        curl -s -o /dev/null http://fl-server-amqp-mental:5000 2>/dev/null || true;
+        curl -s -o /dev/null http://fl-server-grpc-mental:50051 2>/dev/null || true;
+        sleep 0.5;
+      done
+      "
+    restart: unless-stopped
+    profiles:
+      - congestion
+
+  http-traffic-gen-2-mental:
+    image: alpine:latest
+    container_name: http-traffic-gen-2-mental
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - fl-mqtt-network
+      - fl-amqp-network
+      - fl-grpc-network
+      - fl-quic-network
+      - fl-dds-network
+    command: >
+      sh -c "
+      apk add --no-cache curl &&
+      while true; do
+        curl -s -o /dev/null http://mqtt-broker-mental:1883 2>/dev/null || true;
+        curl -s -o /dev/null http://rabbitmq-mental:5672 2>/dev/null || true;
+        sleep 1;
+      done
+      "
+    restart: unless-stopped
+    profiles:
+      - congestion
+
+  bandwidth-hog-mental:
+    image: alpine:latest
+    container_name: bandwidth-hog-mental
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - fl-mqtt-network
+      - fl-amqp-network
+      - fl-grpc-network
+      - fl-quic-network
+      - fl-dds-network
+    command: >
+      sh -c "
+      apk add --no-cache iperf3 &&
+      while true; do
+        iperf3 -c fl-server-mqtt-mental -u -b 20M -t 10 2>/dev/null || true;
+        iperf3 -c fl-server-amqp-mental -u -b 20M -t 10 2>/dev/null || true;
+        sleep 5;
+      done
+      "
+    restart: unless-stopped
+    profiles:
+      - congestion
+
+  packet-spammer-mental:
+    image: alpine:latest
+    container_name: packet-spammer-mental
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - fl-mqtt-network
+      - fl-amqp-network
+      - fl-grpc-network
+      - fl-quic-network
+      - fl-dds-network
+    command: >
+      sh -c "
+      while true; do
+        ping -i 0.1 -s 64 fl-server-mqtt-mental -c 100 2>/dev/null || true;
+        ping -i 0.1 -s 64 fl-server-amqp-mental -c 100 2>/dev/null || true;
+        sleep 2;
+      done
+      "
+    restart: unless-stopped
+    profiles:
+      - congestion
+
+  connection-flooder-mental:
+    image: python:3.9-alpine
+    container_name: connection-flooder-mental
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - fl-mqtt-network
+      - fl-amqp-network
+      - fl-grpc-network
+      - fl-quic-network
+      - fl-dds-network
+    command:
+      - /bin/sh
+      - -c
+      - |
+        pip install --no-cache-dir paho-mqtt pika >/dev/null 2>&1
+        python -c 'import time, socket, threading
+        from datetime import datetime
+        def flood_connections(host, port, num_conns=10):
+            while True:
+                try:
+                    threads = []
+                    for i in range(num_conns):
+                        def connect():
+                            try:
+                                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                s.settimeout(2)
+                                s.connect((host, port))
+                                s.sendall(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+                                s.recv(1024)
+                                s.close()
+                            except:
+                                pass
+                        t = threading.Thread(target=connect)
+                        threads.append(t)
+                        t.start()
+                    for t in threads:
+                        t.join(timeout=3)
+                    time.sleep(0.5)
+                except:
+                    time.sleep(1)
+        print(f"[{datetime.now()}] Starting connection flooder...")
+        targets = [("mqtt-broker-mental", 1883), ("rabbitmq-mental", 5672), ("fl-server-grpc-mental", 50051)]
+        threads = []
+        for host, port in targets:
+            t = threading.Thread(target=flood_connections, args=(host, port, 5))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+        while True:
+            time.sleep(60)
+            print(f"[{datetime.now()}] Connection flooder still running...")
+        '
+    restart: unless-stopped
+    profiles:
+      - congestion
+
 networks:
   fl-mqtt-network:
     driver: bridge

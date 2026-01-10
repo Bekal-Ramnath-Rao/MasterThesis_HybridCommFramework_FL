@@ -56,6 +56,27 @@ class NetworkSimulator:
             "jitter": "50ms",
             "bandwidth": "5mbit",
             "loss": "2%"
+        },
+        "congested_light": {
+            "name": "Light Congestion (Shared Network)",
+            "latency": "30ms",
+            "jitter": "15ms",
+            "bandwidth": "10mbit",
+            "loss": "1.5%"
+        },
+        "congested_moderate": {
+            "name": "Moderate Congestion (Peak Hours)",
+            "latency": "75ms",
+            "jitter": "35ms",
+            "bandwidth": "5mbit",
+            "loss": "3.5%"
+        },
+        "congested_heavy": {
+            "name": "Heavy Congestion (Network Overload)",
+            "latency": "150ms",
+            "jitter": "60ms",
+            "bandwidth": "2mbit",
+            "loss": "6%"
         }
     }
     
