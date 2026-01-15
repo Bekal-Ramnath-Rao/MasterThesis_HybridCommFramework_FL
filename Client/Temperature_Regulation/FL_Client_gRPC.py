@@ -9,11 +9,18 @@ import pickle
 import time
 import random
 import json
-import grpc
 import os
 import sys
 import logging
 import threading
+import grpc
+
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+from quantization_client import Quantization, QuantizationConfig
 
 # Make TensorFlow logs less verbose
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -38,6 +45,15 @@ class FederatedLearningClient:
         self.client_id = client_id
         self.num_clients = num_clients
         self.model = None
+        
+        # Initialize quantization compression
+        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        if use_quantization:
+            self.quantizer = Quantization(QuantizationConfig())
+            print(f"Client {self.client_id}: Quantization enabled")
+        else:
+            self.quantizer = None
+            print(f"Client {self.client_id}: Quantization disabled")
         self.x_train = None
         self.y_train = None
         self.x_test = None
@@ -197,14 +213,36 @@ class FederatedLearningClient:
                                               metrics=['mse', 'mae', 'mape'])
                         
                         # Set initial weights
-                        weights = pickle.loads(global_model.weights)
+                        try:
+                            candidate = pickle.loads(global_model.weights)
+                            if isinstance(candidate, dict) and 'quantization_params' in candidate:
+                                # Received compressed dict
+                                if self.quantizer is not None:
+                                    weights = self.quantizer.decompress(candidate)
+                                else:
+                                    # If client has no quantizer, try to deserialize raw weights from server
+                                    weights = []
+                            else:
+                                weights = candidate
+                        except Exception:
+                            weights = pickle.loads(global_model.weights)
                         self.model.set_weights(weights)
                         print(f"Client {self.client_id} model initialized with server weights")
                         self.current_round = 0
                         initial_model_received = True
                     else:
                         # Updated model - just set weights
-                        weights = pickle.loads(global_model.weights)
+                        try:
+                            candidate = pickle.loads(global_model.weights)
+                            if isinstance(candidate, dict) and 'quantization_params' in candidate:
+                                if self.quantizer is not None:
+                                    weights = self.quantizer.decompress(candidate)
+                                else:
+                                    weights = []
+                            else:
+                                weights = candidate
+                        except Exception:
+                            weights = pickle.loads(global_model.weights)
                         self.model.set_weights(weights)
                         print(f"Client {self.client_id} received global model for round {global_model.round}")
                         self.current_round = global_model.round
@@ -337,7 +375,12 @@ class FederatedLearningClient:
         
         # Get model weights
         weights = self.model.get_weights()
-        serialized_weights = pickle.dumps(weights)
+        # If quantization enabled, send the compressed data dict pickled
+        if self.quantizer is not None:
+            compressed_data = self.quantizer.compress(weights, data_type="weights")
+            serialized_weights = pickle.dumps(compressed_data)
+        else:
+            serialized_weights = pickle.dumps(weights)
         
         # Introduce random delay before sending model update
         delay = random.uniform(0.5, 3.0)  # Random delay between 0.5 and 3.0 seconds

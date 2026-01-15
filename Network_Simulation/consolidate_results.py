@@ -41,10 +41,8 @@ def extract_results_from_logs(log_file):
         conv_time_sec = 0
         conv_time_min = 0
     
-    if not rounds:
-        return None
-    
-    return {
+    # Extract compression technique metrics
+    result = {
         "rounds": rounds,
         "mse": mse,
         "mae": mae,
@@ -55,10 +53,61 @@ def extract_results_from_logs(log_file):
         "total_rounds": len(rounds),
         "num_clients": 2
     }
+    
+    # Detect quantization metrics
+    quantization_enabled = 'USE_QUANTIZATION' in content or 'Quantization' in content
+    if quantization_enabled:
+        # Extract quantization bits
+        bits_pattern = r'QUANTIZATION_BITS[=:]\s*(\d+)'
+        bits_match = re.search(bits_pattern, content)
+        if bits_match:
+            result["quantization_bits"] = int(bits_match.group(1))
+        
+        # Extract compression ratio
+        compression_pattern = r'Compression\s+[Rr]atio[:\s]+([\d.]+)'
+        compression_matches = re.findall(compression_pattern, content)
+        if compression_matches:
+            result["avg_quantization_compression"] = sum(float(c) for c in compression_matches) / len(compression_matches)
+    
+    # Detect pruning metrics
+    pruning_enabled = 'USE_PRUNING' in content or 'Pruning' in content or 'sparsity' in content.lower()
+    if pruning_enabled:
+        # Extract sparsity
+        sparsity_pattern = r'(?:Overall\s+)?Sparsity[:\s]+([\d.]+)%'
+        sparsity_matches = re.findall(sparsity_pattern, content, re.IGNORECASE)
+        if sparsity_matches:
+            result["avg_sparsity_pct"] = sum(float(s) for s in sparsity_matches) / len(sparsity_matches)
+        
+        # Extract compression ratio from pruning
+        pruning_compression_pattern = r'Compression\s+[Rr]atio[:\s]+([\d.]+)x?'
+        pruning_compression_matches = re.findall(pruning_compression_pattern, content)
+        if pruning_compression_matches:
+            result["avg_pruning_compression"] = sum(float(c) for c in pruning_compression_matches) / len(pruning_compression_matches)
+        
+        # Extract communication savings
+        comm_savings_pattern = r'(?:Comm.*?reduction|Size\s+reduction|Communication\s+[Ss]avings)[:\s]+([\d.]+)%'
+        comm_savings_matches = re.findall(comm_savings_pattern, content, re.IGNORECASE)
+        if comm_savings_matches:
+            result["communication_savings_pct"] = sum(float(c) for c in comm_savings_matches) / len(comm_savings_matches)
+    
+    # Mark which compression techniques are enabled
+    if quantization_enabled:
+        result["uses_quantization"] = True
+    if pruning_enabled:
+        result["uses_pruning"] = True
+    
+    if not rounds:
+        return None
+    
+    return result
 
-def consolidate_results(use_case="temperature", scenarios=None):
+def consolidate_results(use_case="temperature", scenarios=None, experiment_folder=None):
     """Consolidate all experiment results across all network scenarios"""
-    exp_base = Path("experiment_results")
+    if experiment_folder:
+        exp_base = Path("experiment_results") / experiment_folder
+    else:
+        exp_base = Path("experiment_results")
+    
     results_dir = Path(f"Server/{use_case.title()}_Regulation/results")
     results_dir.mkdir(parents=True, exist_ok=True)
     
@@ -71,7 +120,13 @@ def consolidate_results(use_case="temperature", scenarios=None):
     # Find all experiment directories
     all_results = {}  # {scenario: {protocol: results}}
     
-    for exp_dir in exp_base.glob(f"{use_case}_*"):
+    # If experiment_folder is specified, use it directly; otherwise search for matching folders
+    if experiment_folder:
+        exp_dirs = [exp_base] if exp_base.exists() else []
+    else:
+        exp_dirs = list(exp_base.glob(f"{use_case}_*"))
+    
+    for exp_dir in exp_dirs:
         # Find protocol subdirectories for all scenarios
         for scenario in scenarios:
             if scenario not in all_results:
@@ -143,8 +198,20 @@ def consolidate_results(use_case="temperature", scenarios=None):
             for protocol in sorted(all_results[base_scenario].keys()):
                 results = all_results[base_scenario][protocol]
                 congestion_info = f" (no congestion)" if "congestion_level" not in results else ""
+                
+                # Build compression info string
+                compression_info = []
+                if results.get("uses_quantization"):
+                    bits = results.get("quantization_bits", "?")
+                    compression_info.append(f"Q:{bits}bit")
+                if results.get("uses_pruning"):
+                    sparsity = results.get("avg_sparsity_pct", 0)
+                    compression_info.append(f"P:{sparsity:.1f}%")
+                
+                compression_str = f" [{', '.join(compression_info)}]" if compression_info else ""
+                
                 print(f"  - {protocol.upper()}: {results['total_rounds']} rounds, "
-                      f"{results['convergence_time_seconds']:.2f}s{congestion_info}")
+                      f"{results['convergence_time_seconds']:.2f}s{congestion_info}{compression_str}")
         
         # Check for congestion variants
         congestion_keys = [k for k in all_results.keys() if k.startswith(f"{base_scenario}_congestion_")]
@@ -154,8 +221,20 @@ def consolidate_results(use_case="temperature", scenarios=None):
                 print(f"  └─ WITH {congestion_level.upper()} CONGESTION:")
                 for protocol in sorted(all_results[scenario_key].keys()):
                     results = all_results[scenario_key][protocol]
+                    
+                    # Build compression info string
+                    compression_info = []
+                    if results.get("uses_quantization"):
+                        bits = results.get("quantization_bits", "?")
+                        compression_info.append(f"Q:{bits}bit")
+                    if results.get("uses_pruning"):
+                        sparsity = results.get("avg_sparsity_pct", 0)
+                        compression_info.append(f"P:{sparsity:.1f}%")
+                    
+                    compression_str = f" [{', '.join(compression_info)}]" if compression_info else ""
+                    
                     print(f"     - {protocol.upper()}: {results['total_rounds']} rounds, "
-                          f"{results['convergence_time_seconds']:.2f}s")
+                          f"{results['convergence_time_seconds']:.2f}s{compression_str}")
     
     print(f"\n{'='*80}")
     
@@ -170,6 +249,8 @@ if __name__ == "__main__":
                        choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
                                "congested_light", "congested_moderate", "congested_heavy"],
                        help="Specific scenarios to consolidate (default: all)")
+    parser.add_argument("--experiment-folder", 
+                       help="Name of specific experiment folder in experiment_results/ to process")
     args = parser.parse_args()
     
-    consolidate_results(args.use_case, args.scenarios)
+    consolidate_results(args.use_case, args.scenarios, args.experiment_folder)

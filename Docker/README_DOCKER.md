@@ -2,7 +2,10 @@
 
 This document provides comprehensive instructions for running the Federated Learning framework using Docker containers.
 
-> **🌐 NEW: Network Simulation Support**  
+> **� NEW: Quantization Compression Support**  
+> All protocols now support quantization compression (up to 4x reduction in model size) via simple environment variables! See **[DOCKER_QUANTIZATION_GUIDE.md](../DOCKER_QUANTIZATION_GUIDE.md)** for complete guide.
+
+> **�🌐 NEW: Network Simulation Support**  
 > You can now simulate various network conditions (latency, bandwidth, packet loss) to evaluate protocol performance under different scenarios. See **[README_NETWORK_SIMULATION.md](README_NETWORK_SIMULATION.md)** for details!
 
 ## 📋 Prerequisites
@@ -31,7 +34,14 @@ The framework includes separate docker-compose files for each use case to avoid 
 - **[docker-compose-temperature.yml](docker-compose-temperature.yml)** - Temperature Regulation
 
 Each file has isolated networks, different ports, and appropriate DDS domain IDs to prevent conflicts.
+## 🔥 Quantization-Enabled Docker Compose Files
 
+**NEW:** Pre-configured files with quantization compression enabled:
+
+- **[docker-compose-quantized.yml](docker-compose-quantized.yml)** - MQTT with 8-bit quantization (4x compression)
+- **[docker-compose-all-protocols-quantized.yml](docker-compose-all-protocols-quantized.yml)** - Multi-protocol with quantization
+
+See **[DOCKER_QUANTIZATION_GUIDE.md](../DOCKER_QUANTIZATION_GUIDE.md)** for complete quantization setup guide.
 ## �🚀 Quick Start
 
 ### 1. Generate SSL Certificates (Required for QUIC/gRPC)

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Automated Network Experiment Runner
 Runs FL experiments across all protocols and network conditions
@@ -14,21 +15,53 @@ from typing import List, Dict
 import argparse
 from pathlib import Path
 
+# Set UTF-8 encoding for Windows console
+if sys.platform == 'win32':
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+
 
 class ExperimentRunner:
     """Automates running FL experiments across different network conditions"""
     
-    def __init__(self, use_case: str = "emotion", num_rounds: int = 10, enable_congestion: bool = False):
+    def __init__(self, use_case: str = "emotion", num_rounds: int = 10, enable_congestion: bool = False,
+                 use_quantization: bool = False, quantization_params: Dict[str, str] = None):
         self.use_case = use_case
         self.num_rounds = num_rounds
         self.enable_congestion = enable_congestion
+        self.use_quantization = use_quantization
+        # quantization_params expected to be a dict of simple string values
+        self.quantization_params = quantization_params or {}
+        
+        # Print quantization status
+        if self.use_quantization:
+            print(f"\n{'='*70}")
+            print("QUANTIZATION ENABLED")
+            print(f"Parameters: {self.quantization_params}")
+            print(f"{'='*70}\n")
+        else:
+            print(f"\n{'='*70}")
+            print("QUANTIZATION DISABLED")
+            print(f"{'='*70}\n")
         
         # Get the script's directory and project root
         script_dir = Path(__file__).parent.absolute()
         project_root = script_dir.parent
         
+        # Build descriptive folder name
+        folder_parts = [use_case]
+        if use_quantization:
+            folder_parts.append("quantized")
+            if quantization_params.get('QUANTIZATION_BITS'):
+                folder_parts.append(f"{quantization_params['QUANTIZATION_BITS']}bit")
+        if enable_congestion:
+            folder_parts.append("congestion")
+        folder_parts.append(datetime.now().strftime('%Y%m%d_%H%M%S'))
+        folder_name = "_".join(folder_parts)
+        
         # Set paths relative to project root
-        self.results_dir = project_root / "experiment_results" / f"{use_case}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        self.results_dir = project_root / "experiment_results" / folder_name
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.results_dir = str(self.results_dir)
         
@@ -100,6 +133,17 @@ class ExperimentRunner:
         """Execute a shell command with optional environment variables"""
         print(f"[CMD] {' '.join(command)}")
         env = os.environ.copy()
+        # Inject quantization-related environment variables for subprocesses when enabled
+        if getattr(self, 'use_quantization', False):
+            env.update({"USE_QUANTIZATION": "1"})
+            # Add any explicit quantization params passed to the runner
+            for k, v in self.quantization_params.items():
+                # Ensure keys are prefixed consistently (caller should pass keys like 'QUANTIZATION_BITS')
+                env[str(k)] = str(v)
+            # Print quantization env vars for debugging
+            quant_env = {k: v for k, v in env.items() if 'QUANTIZATION' in k or k == 'USE_QUANTIZATION'}
+            if quant_env:
+                print(f"[QUANTIZATION ENV] {quant_env}")
         if env_vars:
             env.update(env_vars)
             print(f"[ENV] {env_vars}")
@@ -187,7 +231,7 @@ class ExperimentRunner:
             print(f"Waiting 5 seconds for clients to connect...")
             time.sleep(5)
         
-        print(f"\n✓ All containers started successfully with staged delays")
+        print(f"\n[OK] All containers started successfully with staged delays")
         return True
     
     def stop_containers(self, protocol: str):
@@ -367,7 +411,7 @@ class ExperimentRunner:
             # 6. Stop containers
             self.stop_containers(protocol)
             
-            print(f"\n✓ Experiment completed: {protocol.upper()} - {scenario.upper()}\n")
+            print(f"\n[OK] Experiment completed: {protocol.upper()} - {scenario.upper()}\n")
             return True
             
         except Exception as e:
@@ -480,6 +524,18 @@ def main():
                        choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
                                "congested_light", "congested_moderate", "congested_heavy"],
                        help="Network scenario for single experiment")
+    parser.add_argument("--use-quantization", action="store_true",
+                help="Enable quantization for clients and servers (sets USE_QUANTIZATION env var)")
+    parser.add_argument("--quantization-strategy",
+                choices=["qat", "ptq", "parameter_quantization"],
+                help="Quantization strategy to set in environment (QUANTIZATION_STRATEGY)")
+    parser.add_argument("--quantization-bits", type=int,
+                choices=[8, 16, 32],
+                help="Bit width for quantization (QUANTIZATION_BITS)")
+    parser.add_argument("--quantization-symmetric", action="store_true",
+                help="Set QUANTIZATION_SYMMETRIC=1 if symmetric quantization should be used")
+    parser.add_argument("--quantization-per-channel", action="store_true",
+                help="Set QUANTIZATION_PER_CHANNEL=1 if per-channel quantization should be used")
     
     args = parser.parse_args()
     
@@ -494,8 +550,22 @@ def main():
             # Default to moderate congestion if enabled but no level specified
             congestion_levels = ["moderate"]
     
+    # Build quantization params dict to pass into runner
+    quant_params = {}
+    if args.use_quantization:
+        if args.quantization_strategy:
+            quant_params["QUANTIZATION_STRATEGY"] = args.quantization_strategy
+        if args.quantization_bits:
+            quant_params["QUANTIZATION_BITS"] = str(args.quantization_bits)
+        if args.quantization_symmetric:
+            quant_params["QUANTIZATION_SYMMETRIC"] = "1"
+        if args.quantization_per_channel:
+            quant_params["QUANTIZATION_PER_CHANNEL"] = "1"
+
     runner = ExperimentRunner(use_case=args.use_case, num_rounds=args.rounds, 
-                            enable_congestion=args.enable_congestion)
+                            enable_congestion=args.enable_congestion,
+                            use_quantization=args.use_quantization,
+                            quantization_params=quant_params)
     
     if args.single:
         if not args.protocol or not args.scenario:

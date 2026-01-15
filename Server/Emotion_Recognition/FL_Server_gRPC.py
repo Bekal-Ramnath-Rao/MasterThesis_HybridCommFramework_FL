@@ -10,6 +10,19 @@ import sys
 import matplotlib.pyplot as plt
 from pathlib import Path
 
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+try:
+    from quantization_server import ServerQuantizationHandler, QuantizationConfig
+    QUANTIZATION_AVAILABLE = True
+except ImportError:
+    print("Warning: Quantization module not available")
+    QUANTIZATION_AVAILABLE = False
+
+
 # Add Protocols directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'Protocols'))
 
@@ -53,6 +66,18 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.converged = False
         self.start_time = None
         self.convergence_time = None
+        
+        # Initialize quantization handler
+        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        if use_quantization and QUANTIZATION_AVAILABLE:
+            self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
+            print("Server: Quantization enabled")
+        else:
+            self.quantization_handler = None
+            if use_quantization and not QUANTIZATION_AVAILABLE:
+                print("Server: Quantization requested but not available")
+            else:
+                print("Server: Quantization disabled")
         
         # Initialize global model
         self.initialize_global_model()
@@ -174,7 +199,15 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     model_config=''
                 )
             
-            serialized_weights = self.serialize_weights(self.global_weights)
+            # Compress or serialize global weights
+            if self.quantization_handler is not None:
+                compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+                stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
+                print(f"Server: Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
+                # Pickle compressed dict so gRPC bytes field can carry metadata
+                serialized_weights = pickle.dumps(compressed_data)
+            else:
+                serialized_weights = self.serialize_weights(self.global_weights)
             model_config_json = json.dumps(self.model_config) if self.current_round == 0 else ''
             
             return federated_learning_pb2.GlobalModel(
@@ -197,7 +230,23 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 )
             
             # Deserialize weights
-            weights = self.deserialize_weights(request.weights)
+            # Decompress or deserialize client weights (handle pickled compressed dicts)
+            if request.weights:
+                if self.quantization_handler is not None:
+                    try:
+                        candidate = pickle.loads(request.weights)
+                        if isinstance(candidate, dict) and 'compressed_data' in candidate:
+                            weights = self.quantization_handler.decompress_client_update(request.client_id, candidate)
+                            print(f"Server: Received and decompressed update from client {request.client_id}")
+                        else:
+                            weights = candidate
+                    except Exception:
+                        # Fallback to regular deserialization
+                        weights = self.deserialize_weights(request.weights)
+                else:
+                    weights = self.deserialize_weights(request.weights)
+            else:
+                weights = None
             
             # Extract metrics from map
             metrics = dict(request.metrics)

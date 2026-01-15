@@ -12,6 +12,19 @@ import sys
 import matplotlib.pyplot as plt
 from pathlib import Path
 
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+try:
+    from quantization_server import ServerQuantizationHandler, QuantizationConfig
+    QUANTIZATION_AVAILABLE = True
+except ImportError:
+    print("Warning: Quantization module not available")
+    QUANTIZATION_AVAILABLE = False
+
+
 # Add Protocols directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'Protocols'))
 
@@ -57,6 +70,18 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.converged = False
         self.start_time = None
         self.convergence_time = None
+        
+        # Initialize quantization handler
+        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        if use_quantization and QUANTIZATION_AVAILABLE:
+            self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
+            print("Server: Quantization enabled")
+        else:
+            self.quantization_handler = None
+            if use_quantization and not QUANTIZATION_AVAILABLE:
+                print("Server: Quantization requested but not available")
+            else:
+                print("Server: Quantization disabled")
         
         # Initialize global model
         self.initialize_global_model()
@@ -236,9 +261,19 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     }
                     model_config_json = json.dumps(model_config)
                 
+                # Compress or serialize global weights
+                if self.quantization_handler is not None:
+                    compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+                    stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
+                    print(f"Server: Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
+                    # Send pickled compressed dict so clients receive metadata
+                    serialized_weights = pickle.dumps(compressed_data)
+                else:
+                    serialized_weights = self.serialize_weights(self.global_weights)
+                
                 return federated_learning_pb2.GlobalModel(
                     round=round_to_send,
-                    weights=self.serialize_weights(self.global_weights),
+                    weights=serialized_weights,
                     available=True,
                     model_config=model_config_json
                 )
@@ -256,8 +291,30 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             round_num = request.round
             
             if round_num == self.current_round:
+                # Decompress or deserialize client weights
+                if self.quantization_handler is not None and request.weights:
+                    # request.weights may be raw serialized weights or a pickled compressed_data dict
+                    try:
+                        candidate = pickle.loads(request.weights)
+                        if isinstance(candidate, dict) and 'compressed_data' in candidate:
+                            # it's a compressed_data dict produced by client
+                            weights = self.quantization_handler.decompress_client_update(request.client_id, candidate)
+                            print(f"Server: Received and decompressed compressed dict update from client {request.client_id}")
+                        else:
+                            # it's raw serialized weights
+                            weights = self.deserialize_weights(request.weights)
+                    except Exception:
+                        # If unpickle fails, try regular deserialization
+                        try:
+                            weights = self.deserialize_weights(request.weights)
+                        except Exception:
+                            # As a final fallback, treat request.weights as empty list
+                            weights = []
+                else:
+                    weights = self.deserialize_weights(request.weights)
+                
                 self.client_updates[client_id] = {
-                    'weights': self.deserialize_weights(request.weights),
+                    'weights': weights,
                     'num_samples': request.num_samples,
                     'metrics': dict(request.metrics)
                 }

@@ -18,6 +18,8 @@ services:
   mqtt-broker-temp:
     image: eclipse-mosquitto:2
     container_name: fl-mqtt-broker-temp
+    cap_add:
+      - NET_ADMIN
     ports:
       - "1884:1883"
       - "9002:9001"
@@ -42,6 +44,11 @@ services:
       - MQTT_PORT=1883
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Server/Temperature_Regulation/FL_Server_MQTT.py
     networks:
       - fl-mqtt-network-temp
@@ -63,6 +70,11 @@ services:
       - MQTT_PORT=1883
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
@@ -84,6 +96,11 @@ services:
       - MQTT_PORT=1883
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
@@ -98,6 +115,8 @@ services:
   rabbitmq-temp:
     image: rabbitmq:3-management
     container_name: fl-rabbitmq-temp
+    cap_add:
+      - NET_ADMIN
     ports:
       - "5673:5672"
       - "15673:15672"
@@ -128,6 +147,11 @@ services:
       - AMQP_PORT=5672
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Server/Temperature_Regulation/FL_Server_AMQP.py
     networks:
       - fl-amqp-network-temp
@@ -149,6 +173,11 @@ services:
       - AMQP_PORT=5672
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
@@ -170,6 +199,11 @@ services:
       - AMQP_PORT=5672
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
@@ -194,6 +228,11 @@ services:
       - GRPC_PORT=50051
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Server/Temperature_Regulation/FL_Server_gRPC.py
     networks:
       - fl-grpc-network-temp
@@ -215,6 +254,11 @@ services:
       - GRPC_PORT=50051
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
@@ -237,6 +281,11 @@ services:
       - GRPC_PORT=50051
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
@@ -263,6 +312,11 @@ services:
       - QUIC_PORT=4433
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Server/Temperature_Regulation/FL_Server_QUIC.py
     networks:
       - fl-quic-network-temp
@@ -285,6 +339,11 @@ services:
       - QUIC_PORT=4433
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
@@ -307,6 +366,11 @@ services:
       - QUIC_PORT=4433
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
@@ -330,6 +394,11 @@ services:
       - DDS_DOMAIN_ID=2
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Server/Temperature_Regulation/FL_Server_DDS.py
     networks:
       - fl-dds-network-temp
@@ -350,6 +419,11 @@ services:
       - DDS_DOMAIN_ID=2
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
@@ -370,6 +444,11 @@ services:
       - DDS_DOMAIN_ID=2
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
@@ -558,6 +637,8 @@ networks:
 volumes:
   mqtt-data-temp:
   rabbitmq-data-temp:
+
+
 
 
 

@@ -188,11 +188,11 @@ class ProtocolComparator:
         
         results = self.results[scenario]
         
-        print(f"\n{'='*90}")
+        print(f"\n{'='*100}")
         print(f"Protocol Performance Summary - {self.use_case.title()} ({scenario.title()} Network)")
-        print(f"{'='*90}")
-        print(f"{'Protocol':<10} {'Rounds':<8} {'Time (s)':<12} {'Time (min)':<12} {'Final Loss':<12} {'Final MSE':<12}")
-        print(f"{'-'*90}")
+        print(f"{'='*100}")
+        print(f"{'Protocol':<10} {'Rounds':<8} {'Time (s)':<12} {'Time (min)':<12} {'Final Loss':<12} {'Final MSE':<12} {'Compression':<20}")
+        print(f"{'-'*100}")
         
         for protocol in sorted(results.keys()):
             data = results[protocol]
@@ -204,9 +204,19 @@ class ProtocolComparator:
             final_loss = loss_values[-1] if loss_values else 0
             final_mse = mse_values[-1] if mse_values else 0
             
-            print(f"{protocol.upper():<10} {rounds:<8} {time_s:<12.2f} {time_m:<12.2f} {final_loss:<12.6f} {final_mse:<12.6f}")
+            # Build compression info
+            compression_parts = []
+            if data.get("uses_quantization"):
+                bits = data.get("quantization_bits", "?")
+                compression_parts.append(f"Q:{bits}bit")
+            if data.get("uses_pruning"):
+                sparsity = data.get("avg_sparsity_pct", 0)
+                compression_parts.append(f"P:{sparsity:.1f}%")
+            compression_info = ", ".join(compression_parts) if compression_parts else "None"
+            
+            print(f"{protocol.upper():<10} {rounds:<8} {time_s:<12.2f} {time_m:<12.2f} {final_loss:<12.6f} {final_mse:<12.6f} {compression_info:<20}")
         
-        print(f"{'='*90}\n")
+        print(f"{'='*100}\n")
 
 
 def main():
@@ -217,11 +227,14 @@ def main():
                        help="Use case to compare")
     parser.add_argument("--scenarios", "-s",
                        nargs="+",
-                       choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite"],
+                       choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
+                               "congested_light", "congested_moderate", "congested_heavy"],
                        help="Network scenarios to compare (default: all available)")
     parser.add_argument("--output-dir", "-o",
                        default="comparison_results",
                        help="Directory to save comparison plots")
+    parser.add_argument("--experiment-folder",
+                       help="Name of experiment folder (for naming output files)")
     
     args = parser.parse_args()
     

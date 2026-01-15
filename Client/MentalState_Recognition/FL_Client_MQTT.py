@@ -13,6 +13,14 @@ import logging
 import numpy as np
 import tensorflow as tf
 import paho.mqtt.client as mqtt
+
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+from quantization_client import Quantization, QuantizationConfig
+
 from collections import Counter
 
 # Import data partitioner
@@ -54,6 +62,15 @@ class FederatedLearningClient:
         self.client_id = client_id
         self.num_clients = num_clients
         self.model = None
+        
+        # Initialize quantization compression
+        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        if use_quantization:
+            self.quantizer = Quantization(QuantizationConfig())
+            print(f"Client {self.client_id}: Quantization enabled")
+        else:
+            self.quantizer = None
+            print(f"Client {self.client_id}: Quantization disabled")
         self.x_train = None
         self.y_train = None
         self.current_round = 0
@@ -248,9 +265,15 @@ class FederatedLearningClient:
         """Receive and set global model weights"""
         data = json.loads(payload.decode())
         round_num = data['round']
-        encoded_weights = data['weights']
-        
-        weights = self.deserialize_weights(encoded_weights)
+        # Check if weights are quantized
+            if 'quantized_data' in data and self.quantizer is not None:
+                compressed_data = data['quantized_data']
+                weights = self.quantizer.decompress(compressed_data)
+                if round_num > 0:
+                    print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            else:
+                encoded_weights = data['weights']
+                weights = self.deserialize_weights(encoded_weights)
         
         if round_num == 0:
             print(f"\n[Client {self.client_id}] Received initial global model")

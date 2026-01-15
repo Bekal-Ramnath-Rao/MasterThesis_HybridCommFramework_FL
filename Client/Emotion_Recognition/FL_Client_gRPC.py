@@ -9,6 +9,14 @@ import time
 import random
 import json
 import grpc
+
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+from quantization_client import Quantization, QuantizationConfig
+
 import os
 import sys
 import logging
@@ -37,6 +45,15 @@ class FederatedLearningClient:
         self.client_id = client_id
         self.num_clients = num_clients
         self.model = None
+        
+        # Initialize quantization compression
+        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        if use_quantization:
+            self.quantizer = Quantization(QuantizationConfig())
+            print(f"Client {self.client_id}: Quantization enabled")
+        else:
+            self.quantizer = None
+            print(f"Client {self.client_id}: Quantization disabled")
         self.train_generator = train_generator
         self.validation_generator = validation_generator
         self.current_round = 0
@@ -198,7 +215,20 @@ class FederatedLearningClient:
     def receive_global_model(self, model_update):
         """Receive and set global model weights from server"""
         try:
-            weights = pickle.loads(model_update.weights)
+            # Decompress or deserialize weights
+            if self.quantizer is not None and model_update.weights:
+                try:
+                    candidate = pickle.loads(model_update.weights)
+                    if isinstance(candidate, dict) and 'quantization_params' in candidate:
+                        weights = self.quantizer.decompress(candidate)
+                        print(f"Client {self.client_id}: Received and decompressed quantized global model")
+                    else:
+                        weights = candidate
+                except Exception:
+                    # Fallback to regular deserialization if unpickle fails
+                    weights = pickle.loads(model_update.weights)
+            else:
+                weights = pickle.loads(model_update.weights)
             
             if model_update.round == 0 and model_update.model_config:
                 # Initial model - build from config
@@ -269,8 +299,15 @@ class FederatedLearningClient:
             updated_weights = self.model.get_weights()
             num_samples = self.train_generator.n
             
-            # Serialize weights
-            serialized_weights = pickle.dumps(updated_weights)
+            # Compress or serialize weights
+            if self.quantizer is not None:
+                compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
+                stats = self.quantizer.get_compression_stats(updated_weights, compressed_data)
+                print(f"Client {self.client_id}: Compressed weights - Ratio: {stats['compression_ratio']:.2f}x, Original: {stats['original_size_mb']:.2f}MB, Compressed: {stats['compressed_size_mb']:.2f}MB")
+                # Send pickled compressed dict so server can read quantization metadata
+                serialized_weights = pickle.dumps(compressed_data)
+            else:
+                serialized_weights = pickle.dumps(updated_weights)
             
             # Prepare metrics
             metrics = {

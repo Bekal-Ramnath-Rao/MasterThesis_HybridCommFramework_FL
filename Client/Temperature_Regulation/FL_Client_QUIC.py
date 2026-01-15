@@ -64,6 +64,15 @@ class FederatedLearningClient:
         self.client_id = client_id
         self.num_clients = num_clients
         self.model = None
+        
+        # Initialize quantization compression
+        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        if use_quantization:
+            self.quantizer = Quantization(QuantizationConfig())
+            print(f"Client {self.client_id}: Quantization enabled")
+        else:
+            self.quantizer = None
+            print(f"Client {self.client_id}: Quantization disabled")
         self.x_train = None
         self.y_train = None
         self.x_test = None
@@ -164,7 +173,15 @@ class FederatedLearningClient:
         round_num = message['round']
         encoded_weights = message['weights']
         
-        weights = self.deserialize_weights(encoded_weights)
+        # Decompress or deserialize weights
+        if 'quantized_data' in message and self.quantizer is not None:
+            weights = self.quantizer.decompress(message['quantized_data'])
+            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+        elif 'compressed_data' in message and self.quantizer is not None:
+            weights = self.quantizer.decompress(message['compressed_data'])
+            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+        else:
+            weights = self.deserialize_weights(encoded_weights)
         
         if round_num == 0:
             # Initial model from server - create model from server's config
@@ -208,6 +225,11 @@ class FederatedLearningClient:
     async def handle_start_training(self, message):
         """Start local training when server signals"""
         round_num = message['round']
+        
+        # Ensure model is initialized before training
+        if self.model is None:
+            print(f"Client {self.client_id} waiting for global model before training...")
+            return
         
         if self.current_round == 0 and round_num == 1:
             self.current_round = round_num

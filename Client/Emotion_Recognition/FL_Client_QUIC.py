@@ -72,6 +72,15 @@ class FederatedLearningClient:
         self.client_id = client_id
         self.num_clients = num_clients
         self.model = None
+        
+        # Initialize quantization compression
+        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        if use_quantization:
+            self.quantizer = Quantization(QuantizationConfig())
+            print(f"Client {self.client_id}: Quantization enabled")
+        else:
+            self.quantizer = None
+            print(f"Client {self.client_id}: Quantization disabled")
         self.train_generator = train_generator
         self.validation_generator = validation_generator
         self.current_round = 0
@@ -158,7 +167,15 @@ class FederatedLearningClient:
         round_num = message['round']
         encoded_weights = message['weights']
         
-        weights = self.deserialize_weights(encoded_weights)
+        # Decompress or deserialize weights
+        if 'quantized_data' in message and self.quantizer is not None:
+            weights = self.quantizer.decompress(message['quantized_data'])
+            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+        elif 'compressed_data' in message and self.quantizer is not None:
+            weights = self.quantizer.decompress(message['compressed_data'])
+            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+        else:
+            weights = self.deserialize_weights(encoded_weights)
         
         if round_num == 0:
             # Initial model from server - create model from server's config
@@ -310,12 +327,24 @@ class FederatedLearningClient:
         print(f"Client {self.client_id} training complete - "
               f"Loss: {final_loss:.4f}, Accuracy: {final_accuracy:.4f}")
         
+        # Prepare weights (compress if quantization enabled)
+        updated_weights = self.model.get_weights()
+        if self.quantizer is not None:
+            compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
+            stats = self.quantizer.get_compression_stats(updated_weights, compressed_data)
+            print(f"Client {self.client_id}: Compressed weights - Ratio: {stats['compression_ratio']:.2f}x, Size: {stats['compressed_size_mb']:.2f}MB")
+            weights_data = compressed_data
+            weights_key = 'compressed_data'
+        else:
+            weights_data = self.serialize_weights(updated_weights)
+            weights_key = 'weights'
+        
         # Send model update to server
         await self.send_message({
             'type': 'model_update',
             'client_id': self.client_id,
             'round': self.current_round,
-            'weights': self.serialize_weights(self.model.get_weights()),
+            weights_key: weights_data,
             'num_samples': self.train_generator.n,
             'metrics': {
                 'loss': final_loss,

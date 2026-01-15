@@ -355,8 +355,15 @@ class FederatedLearningServer:
         print(f"[DEBUG] Server received model_update - client_id={client_id}, round_num={round_num}, current_round={self.current_round}")
 
         if round_num == self.current_round:
+            # Decompress or deserialize client weights
+            if 'compressed_data' in message and self.quantization_handler is not None:
+                weights = self.quantization_handler.decompress_client_update(message['client_id'], message['compressed_data'])
+                print(f"Server: Received and decompressed update from client {message['client_id']}")
+            else:
+                weights = self.deserialize_weights(message['weights'])
+            
             self.client_updates[client_id] = {
-                'weights': self.deserialize_weights(message['weights']),
+                'weights': weights,
                 'num_samples': message['num_samples']
             }
 
@@ -387,10 +394,22 @@ class FederatedLearningServer:
         print(f"{'=' * 70}\n")
 
         print(f"[DEBUG] Sending initial model - round=0, has_config=True")
+        
+        # Prepare global model (compress if quantization enabled)
+        if self.quantization_handler is not None:
+            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
+            print(f"Server: Compressed initial global model - Ratio: {stats['compression_ratio']:.2f}x")
+            weights_data = compressed_data
+            weights_key = 'quantized_data'
+        else:
+            weights_data = self.serialize_weights(self.global_weights)
+            weights_key = 'weights'
+        
         await self.broadcast_message({
             'type': 'global_model',
             'round': 0,
-            'weights': self.serialize_weights(self.global_weights),
+            weights_key: weights_data,
             'model_config': {
                 "architecture": "CNN+BiLSTM+MHA",
                 "input_shape": [256, 20],
@@ -437,10 +456,22 @@ class FederatedLearningServer:
 
         # Send the aggregated model with the current round number
         # (the round that just completed)
+        
+        # Prepare global model (compress if quantization enabled)
+        if self.quantization_handler is not None:
+            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
+            print(f"Server: Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
+            weights_data = compressed_data
+            weights_key = 'quantized_data'
+        else:
+            weights_data = self.serialize_weights(self.global_weights)
+            weights_key = 'weights'
+        
         await self.broadcast_message({
             'type': 'global_model',
             'round': self.current_round,
-            'weights': self.serialize_weights(self.global_weights)
+            weights_key: weights_data
         })
 
         print(f"Aggregated global model from round {self.current_round} sent to all clients\n")

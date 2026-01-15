@@ -13,6 +13,14 @@ import logging
 import numpy as np
 import tensorflow as tf
 import grpc
+
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+from quantization_client import Quantization, QuantizationConfig
+
 import threading
 from collections import Counter
 
@@ -52,6 +60,15 @@ class FederatedLearningClient:
         self.client_id = client_id
         self.num_clients = num_clients
         self.model = None
+        
+        # Initialize quantization compression
+        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        if use_quantization:
+            self.quantizer = Quantization(QuantizationConfig())
+            print(f"Client {self.client_id}: Quantization enabled")
+        else:
+            self.quantizer = None
+            print(f"Client {self.client_id}: Quantization disabled")
         self.x_train = None
         self.y_train = None
         self.current_round = 0
@@ -407,7 +424,22 @@ class FederatedLearningClient:
         try:
             print(f"[DEBUG] Client {self.client_id} receive_global_model - round={model_update.round}, has_config={bool(model_update.model_config)}, model exists={self.model is not None}")
             
-            weights = pickle.loads(model_update.weights)
+            # Decompress or deserialize weights (handle pickled compressed dicts)
+            if model_update.weights:
+                if self.quantizer is not None:
+                    try:
+                        candidate = pickle.loads(model_update.weights)
+                        if isinstance(candidate, dict) and 'quantization_params' in candidate:
+                            weights = self.quantizer.decompress(candidate)
+                            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+                        else:
+                            weights = candidate
+                    except Exception:
+                        weights = pickle.loads(model_update.weights)
+                else:
+                    weights = pickle.loads(model_update.weights)
+            else:
+                weights = None
             
             # Build model if we receive config (first time initialization)
             if model_update.model_config and self.model is None:
@@ -475,8 +507,15 @@ class FederatedLearningClient:
             final_loss = float(history.history['loss'][-1]) if 'loss' in history.history else 0.0
             final_acc = float(history.history['acc'][-1]) if 'acc' in history.history else 0.0
             
-            # Serialize weights
-            serialized_weights = pickle.dumps(updated_weights)
+            # Compress or serialize weights
+            if self.quantizer is not None:
+                compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
+                stats = self.quantizer.get_compression_stats(updated_weights, compressed_data)
+                print(f"Client {self.client_id}: Compressed weights - Ratio: {stats['compression_ratio']:.2f}x, Original: {stats['original_size_mb']:.2f}MB, Compressed: {stats['compressed_size_mb']:.2f}MB")
+                # Send pickled compressed dict so server can read quantization metadata
+                serialized_weights = pickle.dumps(compressed_data)
+            else:
+                serialized_weights = pickle.dumps(updated_weights)
             
             # Random delay before sending
             delay = random.uniform(0.5, 3.0)

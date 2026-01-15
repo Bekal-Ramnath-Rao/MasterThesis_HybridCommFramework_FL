@@ -7,7 +7,14 @@ Runs the complete evaluation pipeline: consolidate -> compare -> comprehensive a
 import subprocess
 import argparse
 import os
+import sys
 from pathlib import Path
+
+# Set UTF-8 encoding for Windows console
+if sys.platform == 'win32':
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
 
 
 def run_command(cmd, description):
@@ -39,17 +46,23 @@ This script runs the complete evaluation pipeline:
 4. Export CSV data
 
 Example usage:
-  # Evaluate all scenarios for temperature use case
-  python evaluate_all.py --use-case temperature
+  # Evaluate specific experiment folder
+  python evaluate_all.py --experiment-folder temperature_quantized_8bit_20260110_195711
 
-  # Evaluate specific scenarios
-  python evaluate_all.py --use-case temperature --scenarios excellent good moderate
+  # Evaluate with congestion experiments
+  python evaluate_all.py --experiment-folder temperature_quantized_8bit_congestion_20260111_100707
+
+  # Evaluate specific scenarios from a folder
+  python evaluate_all.py --experiment-folder temperature_quantized_8bit_20260110_195711 --scenarios excellent good moderate
 
   # Skip comparison plots (faster)
-  python evaluate_all.py --use-case temperature --skip-comparison
+  python evaluate_all.py --experiment-folder temperature_quantized_8bit_20260110_195711 --skip-comparison
         """
     )
     
+    parser.add_argument("--experiment-folder", "-e",
+                       required=True,
+                       help="Name of the experiment folder in experiment_results/ to evaluate")
     parser.add_argument("--use-case", "-u",
                        choices=["emotion", "mentalstate", "temperature"],
                        default="temperature",
@@ -60,8 +73,8 @@ Example usage:
                                "congested_light", "congested_moderate", "congested_heavy"],
                        help="Specific scenarios to evaluate (default: all available)")
     parser.add_argument("--output-dir", "-o",
-                       default="comparison_results",
-                       help="Directory to save evaluation results (default: comparison_results)")
+                       default=None,
+                       help="Directory to save evaluation results (default: comparison_results/<experiment-folder>)")
     parser.add_argument("--skip-consolidate", action="store_true",
                        help="Skip the consolidation step (if already done)")
     parser.add_argument("--skip-comparison", action="store_true",
@@ -71,9 +84,26 @@ Example usage:
     
     args = parser.parse_args()
     
+    # Validate experiment folder exists
+    exp_folder_path = Path("experiment_results") / args.experiment_folder
+    if not exp_folder_path.exists():
+        print(f"\n✗ Error: Experiment folder not found: {exp_folder_path}")
+        print(f"\nAvailable folders in experiment_results/:")
+        exp_base = Path("experiment_results")
+        if exp_base.exists():
+            for folder in sorted(exp_base.iterdir()):
+                if folder.is_dir():
+                    print(f"  - {folder.name}")
+        return 1
+    
+    # Set output directory to match experiment folder name if not specified
+    if args.output_dir is None:
+        args.output_dir = os.path.join("comparison_results", args.experiment_folder)
+    
     print("\n" + "="*80)
     print("MASTER EVALUATION PIPELINE")
     print("="*80)
+    print(f"Experiment Folder: {args.experiment_folder}")
     print(f"Use Case: {args.use_case.title()}")
     print(f"Scenarios: {', '.join(args.scenarios) if args.scenarios else 'All available'}")
     print(f"Output Directory: {args.output_dir}")
@@ -83,13 +113,20 @@ Example usage:
     os.makedirs(args.output_dir, exist_ok=True)
     
     success_count = 0
-    total_steps = 3 if not args.skip_consolidate else 2
+    # Calculate total steps: consolidate (0 or 1) + comparison (0 or 1) + comprehensive (1)
+    total_steps = 1  # Comprehensive analysis always runs
+    if not args.skip_consolidate:
+        total_steps += 1
     if not args.skip_comparison:
         total_steps += 1
     
     # Step 1: Consolidate results
     if not args.skip_consolidate:
-        cmd = ["python", "Network_Simulation/consolidate_results.py", "--use-case", args.use_case]
+        cmd = [
+            "python", "Network_Simulation/consolidate_results.py", 
+            "--use-case", args.use_case,
+            "--experiment-folder", args.experiment_folder
+        ]
         if args.scenarios:
             cmd.extend(["--scenarios"] + args.scenarios)
         
@@ -97,7 +134,6 @@ Example usage:
             success_count += 1
     else:
         print("\n⊳ Skipping consolidation step")
-        success_count += 1
     
     # Step 2: Compare protocols for each scenario (optional)
     if not args.skip_comparison:
@@ -109,7 +145,8 @@ Example usage:
                 "python", "Network_Simulation/compare_protocols.py",
                 "--use-case", args.use_case,
                 "--scenarios", scenario,
-                "--output-dir", args.output_dir
+                "--output-dir", args.output_dir,
+                "--experiment-folder", args.experiment_folder
             ]
             
             run_command(cmd, f"STEP 2.{scenarios.index(scenario)+1}: Comparing protocols for {scenario} scenario")
@@ -122,7 +159,8 @@ Example usage:
     cmd = [
         "python", "Network_Simulation/evaluate_network_scenarios.py",
         "--use-case", args.use_case,
-        "--output-dir", args.output_dir
+        "--output-dir", args.output_dir,
+        "--experiment-folder", args.experiment_folder
     ]
     
     if args.export_csv:

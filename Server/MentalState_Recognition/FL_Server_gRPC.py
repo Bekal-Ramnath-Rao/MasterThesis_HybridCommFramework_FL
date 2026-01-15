@@ -372,9 +372,19 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
                 print(f"[DEBUG] GetGlobalModel - Sending round {round_to_send} to client {request.client_id} (request.round={request.round})")
                 
+                # Compress or serialize global weights
+                if self.quantization_handler is not None:
+                    compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+                    stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
+                    print(f"Server: Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
+                    # Pickle compressed dict so gRPC bytes field can carry metadata
+                    serialized_weights = pickle.dumps(compressed_data)
+                else:
+                    serialized_weights = self.serialize_weights(self.global_weights)
+                
                 return federated_learning_pb2.GlobalModel(
                     round=round_to_send,
-                    weights=self.serialize_weights(self.global_weights),
+                    weights=serialized_weights,
                     available=True,
                     model_config=model_config_json
                 )
@@ -393,8 +403,25 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             round_num = request.round
 
             if round_num == self.current_round:
+                # Decompress or deserialize client weights (handle pickled compressed dicts)
+                if request.weights:
+                    if self.quantization_handler is not None:
+                        try:
+                            candidate = pickle.loads(request.weights)
+                            if isinstance(candidate, dict) and 'compressed_data' in candidate:
+                                weights = self.quantization_handler.decompress_client_update(request.client_id, candidate)
+                                print(f"Server: Received and decompressed update from client {request.client_id}")
+                            else:
+                                weights = candidate
+                        except Exception:
+                            weights = self.deserialize_weights(request.weights)
+                    else:
+                        weights = self.deserialize_weights(request.weights)
+                else:
+                    weights = None
+                
                 self.client_updates[client_id] = {
-                    'weights': self.deserialize_weights(request.weights),
+                    'weights': weights,
                     'num_samples': request.num_samples,
                     'round': round_num
                 }

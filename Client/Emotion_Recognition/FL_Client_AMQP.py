@@ -10,6 +10,14 @@ import base64
 import time
 import random
 import pika
+
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+from quantization_client import Quantization, QuantizationConfig
+
 import os
 import logging
 
@@ -35,6 +43,15 @@ class FederatedLearningClient:
         self.client_id = client_id
         self.num_clients = num_clients
         self.model = None
+        
+        # Initialize quantization compression
+        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        if use_quantization:
+            self.quantizer = Quantization(QuantizationConfig())
+            print(f"Client {self.client_id}: Quantization enabled")
+        else:
+            self.quantizer = None
+            print(f"Client {self.client_id}: Quantization disabled")
         self.train_generator = train_generator
         self.validation_generator = validation_generator
         self.current_round = 0
@@ -241,9 +258,15 @@ class FederatedLearningClient:
                 return
             
             round_num = data['round']
-            encoded_weights = data['weights']
-            
-            weights = self.deserialize_weights(encoded_weights)
+            # Check if weights are quantized
+            if 'quantized_data' in data and self.quantizer is not None:
+                compressed_data = data['quantized_data']
+                weights = self.quantizer.decompress(compressed_data)
+                if round_num > 0:
+                    print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            else:
+                encoded_weights = data['weights']
+                weights = self.deserialize_weights(encoded_weights)
             
             if round_num == 0:
                 # Initial model from server - create model from server's config
@@ -390,11 +413,27 @@ class FederatedLearningClient:
             "val_accuracy": float(history.history["val_accuracy"][-1])
         }
         
-        # Send model update to server
-        update_message = {
-            "client_id": self.client_id,
-            "round": self.current_round,
-            "weights": self.serialize_weights(updated_weights),
+        # Compress weights if quantization is enabled
+        if self.quantizer is not None:
+            compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
+            stats = self.quantizer.get_compression_stats(updated_weights, compressed_data)
+            print(f"Client {self.client_id}: Compressed weights - "
+                  f"Ratio: {stats['compression_ratio']:.2f}x, "
+                  f"Size: {stats['compressed_size_mb']:.2f}MB")
+            
+            update_message = {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "compressed_data": compressed_data,
+                "num_samples": num_samples,
+                "metrics": metrics
+            }
+        else:
+            # Send model update without compression
+            update_message = {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "weights": self.serialize_weights(updated_weights),
             "num_samples": num_samples,
             "metrics": metrics
         }

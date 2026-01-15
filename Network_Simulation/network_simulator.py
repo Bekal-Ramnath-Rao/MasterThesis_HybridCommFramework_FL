@@ -109,12 +109,31 @@ class NetworkSimulator:
         # Most containers use eth0 as the default interface
         return "eth0"
     
+    def check_tc_available(self, container_name: str) -> bool:
+        """Check if tc command is available in the container"""
+        try:
+            result = self.run_command([
+                "docker", "exec", container_name,
+                "sh", "-c", "command -v tc"
+            ], check=False)
+            return result.returncode == 0
+        except Exception:
+            return False
+    
     def apply_network_conditions(self, container_name: str, conditions: Dict[str, str]):
         """Apply network conditions to a specific container"""
         try:
             print(f"\n{'='*60}")
             print(f"Applying network conditions to: {container_name}")
             print(f"{'='*60}")
+            
+            # Check if tc command is available
+            if not self.check_tc_available(container_name):
+                print(f"[WARNING] Container {container_name} does not have 'tc' command (iproute2 package)")
+                print(f"[WARNING] Skipping network conditions for {container_name}")
+                print(f"[INFO] To enable network simulation on this container, install iproute2 package")
+                print(f"{'='*60}\n")
+                return True  # Return True to not count as failure, just skipped
             
             # First, reset any existing tc rules
             self.reset_container_network(container_name)

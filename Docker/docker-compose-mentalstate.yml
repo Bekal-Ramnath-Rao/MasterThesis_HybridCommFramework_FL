@@ -33,6 +33,11 @@ services:
       - MQTT_PORT=1883
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Server/MentalState_Recognition/FL_Server_MQTT.py
     networks:
       - fl-mqtt-network
@@ -53,6 +58,11 @@ services:
       - MQTT_PORT=1883
       - CLIENT_ID=0
       - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/MentalState_Recognition/FL_Client_MQTT.py
     volumes:
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
@@ -74,6 +84,11 @@ services:
       - MQTT_PORT=1883
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/MentalState_Recognition/FL_Client_MQTT.py
     volumes:
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset

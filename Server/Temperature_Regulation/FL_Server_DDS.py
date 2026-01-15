@@ -3,8 +3,22 @@ import pandas as pd
 import pickle
 import time
 import os
+import sys
 import json
 from pathlib import Path
+
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+try:
+    from quantization_server import ServerQuantizationHandler, QuantizationConfig
+    QUANTIZATION_AVAILABLE = True
+except ImportError:
+    print("Warning: Quantization module not available")
+    QUANTIZATION_AVAILABLE = False
+
 import matplotlib.pyplot as plt
 
 # Add CycloneDDS DLL path
@@ -118,6 +132,18 @@ class FederatedLearningServer:
         self.converged = False
         self.start_time = None
         self.convergence_time = None
+        
+        # Initialize quantization handler
+        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        if use_quantization and QUANTIZATION_AVAILABLE:
+            self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
+            print("Server: Quantization enabled")
+        else:
+            self.quantization_handler = None
+            if use_quantization and not QUANTIZATION_AVAILABLE:
+                print("Server: Quantization requested but not available")
+            else:
+                print("Server: Quantization disabled")
         
         # Initialize global model
         self.initialize_global_model()
@@ -308,10 +334,19 @@ class FederatedLearningServer:
             }
         }
         
-        # Send initial global model to all clients
+# Compress or serialize global weights
+        if self.quantization_handler is not None:
+            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
+            print(f"Server: Compressed initial global model - Ratio: {stats['compression_ratio']:.2f}x")
+            serialized_weights = compressed_data
+        else:
+            serialized_weights = self.serialize_weights(self.global_weights)
+        
+                # Send initial global model to all clients
         initial_model = GlobalModel(
             round=0,  # Round 0 = initial model distribution
-            weights=self.serialize_weights(self.global_weights),
+            weights=serialized_weights,
             model_config_json=json.dumps(model_config)
         )
         self.writers['global_model'].write(initial_model)
@@ -347,8 +382,19 @@ class FederatedLearningServer:
                 client_id = sample.client_id
                 
                 if client_id not in self.client_updates:
+                    # Decompress or deserialize client weights
+                    if self.quantization_handler is not None:
+                        try:
+                            weights = self.quantization_handler.decompress_client_update(sample.client_id, bytes(sample.weights))
+                            print(f"Server: Received and decompressed update from client {sample.client_id}")
+                        except:
+                            # Fallback to regular deserialization
+                            weights = self.deserialize_weights(sample.weights)
+                    else:
+                        weights = self.deserialize_weights(sample.weights)
+                    
                     self.client_updates[client_id] = {
-                        'weights': self.deserialize_weights(sample.weights),
+                        'weights': weights,
                         'num_samples': sample.num_samples,
                         'metrics': {
                             'loss': sample.loss,
@@ -426,9 +472,18 @@ class FederatedLearningServer:
         print(f"Sending global model to clients...\n")
         
         # Publish global model
+        # Compress or serialize global weights
+        if self.quantization_handler is not None:
+            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
+            print(f"Server: Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
+            serialized_weights = compressed_data
+        else:
+            serialized_weights = self.serialize_weights(self.global_weights)
+        
         global_model = GlobalModel(
             round=self.current_round,
-            weights=self.serialize_weights(self.global_weights)
+            weights=serialized_weights
         )
         self.writers['global_model'].write(global_model)
         

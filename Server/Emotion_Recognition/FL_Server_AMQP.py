@@ -5,9 +5,23 @@ import base64
 import time
 import pika
 import os
+import sys
 from typing import List, Dict
 import matplotlib.pyplot as plt
 from pathlib import Path
+
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+try:
+    from quantization_server import ServerQuantizationHandler, QuantizationConfig
+    QUANTIZATION_AVAILABLE = True
+except ImportError:
+    print("Warning: Quantization module not available")
+    QUANTIZATION_AVAILABLE = False
+
 
 # Server Configuration
 AMQP_HOST = os.getenv("AMQP_HOST", "localhost")
@@ -51,6 +65,18 @@ class FederatedLearningServer:
         self.converged = False
         self.start_time = None
         self.convergence_time = None
+        
+        # Initialize quantization handler
+        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        if use_quantization and QUANTIZATION_AVAILABLE:
+            self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
+            print("Server: Quantization enabled")
+        else:
+            self.quantization_handler = None
+            if use_quantization and not QUANTIZATION_AVAILABLE:
+                print("Server: Quantization requested but not available")
+            else:
+                print("Server: Quantization disabled")
         
         # Initialize global model
         self.initialize_global_model()
@@ -199,8 +225,18 @@ class FederatedLearningServer:
             round_num = data['round']
             
             if round_num == self.current_round:
+                # Check if update is compressed
+                if 'compressed_data' in data and self.quantization_handler is not None:
+                    weights = self.quantization_handler.decompress_client_update(
+                        client_id, 
+                        data['compressed_data']
+                    )
+                    print(f"Received and decompressed update from client {client_id}")
+                else:
+                    weights = self.deserialize_weights(data['weights'])
+                
                 self.client_updates[client_id] = {
-                    'weights': self.deserialize_weights(data['weights']),
+                    'weights': weights,
                     'num_samples': data['num_samples'],
                     'metrics': data['metrics']
                 }
@@ -256,11 +292,22 @@ class FederatedLearningServer:
         print(f"Distributing Initial Global Model")
         print(f"{'='*70}\n")
         
-        # Send initial global model with architecture configuration
-        initial_model_message = {
-            "message_type": "global_model",
-            "round": 0,  # Round 0 = initial model distribution
-            "weights": self.serialize_weights(self.global_weights),
+        # Optionally compress global model
+        if self.quantization_handler is not None:
+            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            stats = self.quantization_handler.get_compression_stats(self.global_weights, compressed_data)
+            print(f"Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
+            
+            initial_model_message = {
+                "round": 0,
+                "quantized_data": compressed_data,
+                "model_config": self.model_config
+            }
+        else:
+            # Send initial global model with architecture configuration
+            initial_model_message = {
+                "round": 0,
+                "weights": self.serialize_weights(self.global_weights),
             "model_config": {
                 "input_shape": [48, 48, 1],
                 "num_classes": 7,
@@ -336,11 +383,17 @@ class FederatedLearningServer:
         
         self.global_weights = aggregated_weights
         
-        # Send global model to all clients
-        global_model_message = {
-            "message_type": "global_model",
-            "round": self.current_round,
-            "weights": self.serialize_weights(self.global_weights)
+        # Optionally compress before sending
+        if self.quantization_handler is not None:
+            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            global_model_message = {
+                "round": self.current_round,
+                "quantized_data": compressed_data
+            }
+        else:
+            global_model_message = {
+                "round": self.current_round,
+                "weights": self.serialize_weights(self.global_weights)
         }
         
         self.channel.basic_publish(

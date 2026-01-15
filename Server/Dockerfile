@@ -27,6 +27,9 @@ COPY Protocols/ ./Protocols/
 # Copy the Server directory
 COPY Server/ ./Server/
 
+# Copy Client/Compression_Technique for quantization support (needed by Server)
+COPY Client/Compression_Technique/ ./Client/Compression_Technique/
+
 # Create results directory
 RUN mkdir -p /app/Server/results \
     /app/Server/Emotion_Recognition/results \

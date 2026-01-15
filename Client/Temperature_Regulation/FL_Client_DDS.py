@@ -9,6 +9,7 @@ import pickle
 import time
 import random
 import os
+import sys
 import logging
 import json
 
@@ -18,6 +19,14 @@ if cyclone_path not in os.environ.get('PATH', ''):
     os.environ['PATH'] = cyclone_path + os.pathsep + os.environ.get('PATH', '')
 
 from cyclonedds.domain import DomainParticipant
+
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+from quantization_client import Quantization, QuantizationConfig
+
 from cyclonedds.topic import Topic
 from cyclonedds.sub import DataReader
 from cyclonedds.pub import DataWriter
@@ -103,6 +112,15 @@ class FederatedLearningClient:
         self.client_id = client_id
         self.num_clients = num_clients
         self.model = None
+        
+        # Initialize quantization compression
+        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        if use_quantization:
+            self.quantizer = Quantization(QuantizationConfig())
+            print(f"Client {self.client_id}: Quantization enabled")
+        else:
+            self.quantizer = None
+            print(f"Client {self.client_id}: Quantization disabled")
         self.x_train = None
         self.y_train = None
         self.x_test = None
@@ -380,7 +398,14 @@ class FederatedLearningClient:
         
         # Get model weights
         weights = self.model.get_weights()
-        serialized_weights = self.serialize_weights(weights)
+        # Compress or serialize weights
+        if self.quantizer is not None:
+            compressed_data = self.quantizer.compress(weights, data_type="weights")
+            stats = self.quantizer.get_compression_stats(weights, compressed_data)
+            print(f"Client {self.client_id}: Compressed weights - Ratio: {stats['compression_ratio']:.2f}x, Size: {stats['compressed_size_mb']:.2f}MB")
+            serialized_weights = compressed_data
+        else:
+            serialized_weights = self.serialize_weights(weights)
         
         # Introduce random delay before sending model update
         delay = random.uniform(0.5, 3.0)  # Random delay between 0.5 and 3.0 seconds

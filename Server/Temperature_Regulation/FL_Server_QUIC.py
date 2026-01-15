@@ -5,10 +5,24 @@ import pickle
 import base64
 import time
 import os
+import sys
 import asyncio
 from typing import Dict, Optional
 import matplotlib.pyplot as plt
 from pathlib import Path
+
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+try:
+    from quantization_server import ServerQuantizationHandler, QuantizationConfig
+    QUANTIZATION_AVAILABLE = True
+except ImportError:
+    print("Warning: Quantization module not available")
+    QUANTIZATION_AVAILABLE = False
+
 from aioquic.asyncio import QuicConnectionProtocol, serve
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import QuicEvent, StreamDataReceived
@@ -80,6 +94,18 @@ class FederatedLearningServer:
         
         # Protocol reference
         self.protocol: Optional[FederatedLearningServerProtocol] = None
+        
+        # Initialize quantization handler
+        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        if use_quantization and QUANTIZATION_AVAILABLE:
+            self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
+            print("Server: Quantization enabled")
+        else:
+            self.quantization_handler = None
+            if use_quantization and not QUANTIZATION_AVAILABLE:
+                print("Server: Quantization requested but not available")
+            else:
+                print("Server: Quantization disabled")
         
         # Initialize global model
         self.initialize_global_model()
@@ -170,8 +196,15 @@ class FederatedLearningServer:
         round_num = message['round']
         
         if round_num == self.current_round:
+            # Decompress or deserialize client weights
+            if 'compressed_data' in message and self.quantization_handler is not None:
+                weights = self.quantization_handler.decompress_client_update(message['client_id'], message['compressed_data'])
+                print(f"Server: Received and decompressed update from client {message['client_id']}")
+            else:
+                weights = self.deserialize_weights(message['weights'])
+            
             self.client_updates[client_id] = {
-                'weights': self.deserialize_weights(message['weights']),
+                'weights': weights,
                 'num_samples': message['num_samples'],
                 'metrics': message['metrics']
             }
@@ -273,10 +306,21 @@ class FederatedLearningServer:
         
         self.global_weights = aggregated_weights
         
+        # Prepare global model (compress if quantization enabled)
+        if self.quantization_handler is not None:
+            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
+            print(f"Server: Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
+            weights_data = compressed_data
+            weights_key = 'quantized_data'
+        else:
+            weights_data = self.serialize_weights(self.global_weights)
+            weights_key = 'weights'
+        
         await self.broadcast_message({
             'type': 'global_model',
             'round': self.current_round,
-            'weights': self.serialize_weights(self.global_weights)
+        weights_key: weights_data
         })
         
         print(f"Aggregated global model from round {self.current_round} sent to all clients")

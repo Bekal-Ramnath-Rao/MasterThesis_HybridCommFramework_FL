@@ -376,6 +376,8 @@ def main():
                        help="Directory to save evaluation results")
     parser.add_argument("--export-csv", action="store_true",
                        help="Export results to CSV")
+    parser.add_argument("--experiment-folder",
+                       help="Name of experiment folder (for naming output files)")
     
     args = parser.parse_args()
     

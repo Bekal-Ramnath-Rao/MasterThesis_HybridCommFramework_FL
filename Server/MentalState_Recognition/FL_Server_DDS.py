@@ -1,4 +1,5 @@
 import os
+import sys
 import glob
 import json
 import pickle
@@ -473,8 +474,19 @@ class FederatedLearningServer:
                 client_id = sample.client_id
 
                 if client_id not in self.client_updates:
+                    # Decompress or deserialize client weights
+                    if self.quantization_handler is not None:
+                        try:
+                            weights = self.quantization_handler.decompress_client_update(sample.client_id, bytes(sample.weights))
+                            print(f"Server: Received and decompressed update from client {sample.client_id}")
+                        except:
+                            # Fallback to regular deserialization
+                            weights = self.deserialize_weights(sample.weights)
+                    else:
+                        weights = self.deserialize_weights(sample.weights)
+                    
                     self.client_updates[client_id] = {
-                        'weights': self.deserialize_weights(sample.weights),
+                        'weights': weights,
                         'num_samples': sample.num_samples
                     }
 
