@@ -2,6 +2,7 @@
 numpy>=1.24.0
 pandas>=2.0.0
 matplotlib>=3.7.0
+seaborn>=0.12.0
 scikit-learn>=1.3.0
 
 # Deep Learning Framework
@@ -26,6 +27,18 @@ protobuf>=4.25.0
 # DDS Protocol Support (Eclipse Cyclone DDS)
 cyclonedds>=0.10.0
 
+# Model Persistence and Serialization
+joblib>=1.3.0
+
+# System Monitoring
+psutil>=5.9.0
+
+# Configuration and Data Formats
+PyYAML>=6.0.0
+
+# SSL/TLS Certificate Generation
+cryptography>=41.0.0
+
 # Additional Python Standard Libraries (typically included, but listed for clarity)
 # pathlib - built-in
 # datetime - built-in
@@ -33,3 +46,22 @@ cyclonedds>=0.10.0
 # logging - built-in
 # math - built-in
 # os - built-in
+# sys - built-in
+# json - built-in
+# pickle - built-in
+# base64 - built-in
+# time - built-in
+# random - built-in
+# subprocess - built-in
+# threading - built-in
+# argparse - built-in
+# re - built-in
+# glob - built-in
+# enum - built-in
+# dataclasses - built-in
+# collections - built-in
+# concurrent.futures - built-in
+# importlib - built-in
+# ipaddress - built-in
+# warnings - built-in
+# platform - built-in
