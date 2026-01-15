@@ -1,0 +1,2131 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Network Experiments - Temperature (All Protocols)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Network_Simulation/run_network_experiments.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "args": [
+                "--use-case", "temperature",
+                "--protocols", "mqtt", "amqp", "grpc", "quic", "dds",
+                "--scenarios", "excellent",
+                "--rounds", "1000"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1"
+            }
+        },
+        {
+            "name": "Network Experiments - Temperature (MQTT Only)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/run_network_experiments.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "args": [
+                "--use-case", "temperature",
+                "--protocols", "mqtt",
+                "--scenarios", "excellent",
+                "--rounds", "1000"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1"
+            }
+        },
+        {
+            "name": "Network Experiments - Custom",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Network_Simulation/run_network_experiments.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "justMyCode": false,
+            "args": [
+                "--use-case", "mentalstate",
+                "--protocols", "mqtt",
+                "--scenarios", "excellent",
+                "--rounds", "100"
+            ],
+            "env": {
+                "PYTHONUNBUFFERED": "1"
+            }
+        },
+        {
+            "name": "FL Server (MQTT) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Temperature_Regulation/FL_Server_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "MQTT_BROKER": "localhost",
+                "MQTT_PORT": "1883",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Server (MQTT) - Remote Broker",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Temperature_Regulation/FL_Server_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "MQTT_BROKER": "192.168.0.101",
+                "MQTT_PORT": "1883",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 0 (MQTT) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "MQTT_BROKER": "localhost",
+                "MQTT_PORT": "1883",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 0 (MQTT) - Remote Broker",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "MQTT_BROKER": "192.168.0.101",
+                "MQTT_PORT": "1883",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 1 (MQTT) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "MQTT_BROKER": "localhost",
+                "MQTT_PORT": "1883",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 1 (MQTT) - Remote Broker",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "MQTT_BROKER": "192.168.0.101",
+                "MQTT_PORT": "1883",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Server (AMQP) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Temperature_Regulation/FL_Server_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "AMQP_HOST": "localhost",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "guest",
+                "AMQP_PASSWORD": "guest",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Server (AMQP) - Remote Broker",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Temperature_Regulation/FL_Server_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "AMQP_HOST": "192.168.0.101",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "fluser",
+                "AMQP_PASSWORD": "flpassword",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 0 (AMQP) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "AMQP_HOST": "localhost",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "guest",
+                "AMQP_PASSWORD": "guest",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 0 (AMQP) - Remote Broker",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "AMQP_HOST": "192.168.0.101",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "fluser",
+                "AMQP_PASSWORD": "flpassword",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 1 (AMQP) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "AMQP_HOST": "localhost",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "guest",
+                "AMQP_PASSWORD": "guest",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 1 (AMQP) - Remote Broker",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "AMQP_HOST": "192.168.0.101",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "fluser",
+                "AMQP_PASSWORD": "flpassword",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Server (gRPC) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Temperature_Regulation/FL_Server_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "GRPC_HOST": "0.0.0.0",
+                "GRPC_PORT": "50051",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Server (gRPC) - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Temperature_Regulation/FL_Server_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "GRPC_HOST": "0.0.0.0",
+                "GRPC_PORT": "50051",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 0 (gRPC) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "GRPC_HOST": "localhost",
+                "GRPC_PORT": "50051",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 0 (gRPC) - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "GRPC_HOST": "192.168.0.101",
+                "GRPC_PORT": "50051",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 1 (gRPC) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "GRPC_HOST": "localhost",
+                "GRPC_PORT": "50051",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 1 (gRPC) - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "GRPC_HOST": "192.168.0.101",
+                "GRPC_PORT": "50051",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Server (DDS) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Temperature_Regulation/FL_Server_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "DDS_DOMAIN_ID": "0",  // DDS uses automatic peer discovery - no broker address needed
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Server (DDS) - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Temperature_Regulation/FL_Server_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "DDS_DOMAIN_ID": "0",  // Same as local - DDS discovers peers automatically on network
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 0 (DDS) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "DDS_DOMAIN_ID": "0",  // Domain ID for peer discovery
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 0 (DDS) - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "DDS_DOMAIN_ID": "0",  // Clients on same domain auto-discover each other
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 1 (DDS) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "DDS_DOMAIN_ID": "0",  // Domain ID for peer discovery
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 1 (DDS) - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "DDS_DOMAIN_ID": "0",  // Clients on same domain auto-discover each other
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Server (QUIC) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Temperature_Regulation/FL_Server_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Server (QUIC) - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Temperature_Regulation/FL_Server_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "QUIC_HOST": "192.168.0.101",
+                "QUIC_PORT": "4433",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 0 (QUIC) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 0 (QUIC) - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "QUIC_HOST": "192.168.0.101",
+                "QUIC_PORT": "4433",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 1 (QUIC) - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "FL Client 1 (QUIC) - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Temperature_Regulation/FL_Client_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Temperature_Regulation",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "QUIC_HOST": "192.168.0.101",
+                "QUIC_PORT": "4433",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Server MQTT",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Emotion_Recognition/FL_Server_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "MQTT_BROKER": "localhost",
+                "MQTT_PORT": "1883",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "1000",
+                "CONVERGENCE_THRESHOLD": "0.001",
+                "CONVERGENCE_PATIENCE": "2",
+                "MIN_ROUNDS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Client 1 MQTT",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "MQTT_BROKER": "localhost",
+                "MQTT_PORT": "1883",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 2 MQTT",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "MQTT_BROKER": "localhost",
+                "MQTT_PORT": "1883",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 3 MQTT",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "MQTT_BROKER": "localhost",
+                "MQTT_PORT": "1883",
+                "CLIENT_ID": "3",
+                "NUM_CLIENTS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Server MQTT - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Emotion_Recognition/FL_Server_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "MQTT_BROKER": "192.168.0.101",
+                "MQTT_PORT": "1883",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "1000",
+                "CONVERGENCE_THRESHOLD": "0.001",
+                "CONVERGENCE_PATIENCE": "2",
+                "MIN_ROUNDS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Client 1 MQTT - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "MQTT_BROKER": "192.168.0.101",
+                "MQTT_PORT": "1883",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 2 MQTT - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "MQTT_BROKER": "192.168.0.101",
+                "MQTT_PORT": "1883",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 3 MQTT - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "MQTT_BROKER": "192.168.0.101",
+                "MQTT_PORT": "1883",
+                "CLIENT_ID": "3",
+                "NUM_CLIENTS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Server gRPC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Emotion_Recognition/FL_Server_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "GRPC_HOST": "0.0.0.0",
+                "GRPC_PORT": "50051",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "1000",
+                "CONVERGENCE_THRESHOLD": "0.001",
+                "CONVERGENCE_PATIENCE": "2",
+                "MIN_ROUNDS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Server gRPC - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Emotion_Recognition/FL_Server_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "GRPC_HOST": "0.0.0.0",
+                "GRPC_PORT": "50051",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "1000",
+                "CONVERGENCE_THRESHOLD": "0.001",
+                "CONVERGENCE_PATIENCE": "2",
+                "MIN_ROUNDS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Client 1 gRPC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "GRPC_HOST": "localhost",
+                "GRPC_PORT": "50051",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 1 gRPC - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "GRPC_HOST": "192.168.0.101",
+                "GRPC_PORT": "50051",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 2 gRPC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "GRPC_HOST": "localhost",
+                "GRPC_PORT": "50051",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 2 gRPC - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "GRPC_HOST": "192.168.0.101",
+                "GRPC_PORT": "50051",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 3 gRPC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "GRPC_HOST": "localhost",
+                "GRPC_PORT": "50051",
+                "CLIENT_ID": "3",
+                "NUM_CLIENTS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Client 3 gRPC - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "GRPC_HOST": "192.168.0.101",
+                "GRPC_PORT": "50051",
+                "CLIENT_ID": "3",
+                "NUM_CLIENTS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Server DDS - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Emotion_Recognition/FL_Server_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "DDS_DOMAIN_ID": "0",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "1000",
+                "CONVERGENCE_THRESHOLD": "0.001",
+                "CONVERGENCE_PATIENCE": "2",
+                "MIN_ROUNDS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Server DDS - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Emotion_Recognition/FL_Server_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "DDS_DOMAIN_ID": "0",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "1000",
+                "CONVERGENCE_THRESHOLD": "0.001",
+                "CONVERGENCE_PATIENCE": "2",
+                "MIN_ROUNDS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Client 1 DDS - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "DDS_DOMAIN_ID": "0",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 1 DDS - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "DDS_DOMAIN_ID": "0",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 2 DDS - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "DDS_DOMAIN_ID": "0",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 2 DDS - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "DDS_DOMAIN_ID": "0",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 3 DDS - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "DDS_DOMAIN_ID": "0",
+                "CLIENT_ID": "3",
+                "NUM_CLIENTS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Client 3 DDS - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "DDS_DOMAIN_ID": "0",
+                "CLIENT_ID": "3",
+                "NUM_CLIENTS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Server AMQP - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Emotion_Recognition/FL_Server_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "AMQP_HOST": "localhost",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "guest",
+                "AMQP_PASSWORD": "guest",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "1000",
+                "CONVERGENCE_THRESHOLD": "0.001",
+                "CONVERGENCE_PATIENCE": "2",
+                "MIN_ROUNDS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Server AMQP - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Emotion_Recognition/FL_Server_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "AMQP_HOST": "192.168.0.101",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "fluser",
+                "AMQP_PASSWORD": "flpassword",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "1000",
+                "CONVERGENCE_THRESHOLD": "0.001",
+                "CONVERGENCE_PATIENCE": "2",
+                "MIN_ROUNDS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Client 1 AMQP - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "AMQP_HOST": "localhost",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "guest",
+                "AMQP_PASSWORD": "guest",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 1 AMQP - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "AMQP_HOST": "192.168.0.101",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "fluser",
+                "AMQP_PASSWORD": "flpassword",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 2 AMQP - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "AMQP_HOST": "localhost",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "guest",
+                "AMQP_PASSWORD": "guest",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 2 AMQP - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "AMQP_HOST": "192.168.0.101",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "fluser",
+                "AMQP_PASSWORD": "flpassword",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 3 AMQP - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "AMQP_HOST": "localhost",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "guest",
+                "AMQP_PASSWORD": "guest",
+                "CLIENT_ID": "3",
+                "NUM_CLIENTS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Client 3 AMQP - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "AMQP_HOST": "192.168.0.101",
+                "AMQP_PORT": "5672",
+                "AMQP_USER": "fluser",
+                "AMQP_PASSWORD": "flpassword",
+                "CLIENT_ID": "3",
+                "NUM_CLIENTS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Server QUIC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Emotion_Recognition/FL_Server_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "1000",
+                "CONVERGENCE_THRESHOLD": "0.001",
+                "CONVERGENCE_PATIENCE": "2",
+                "MIN_ROUNDS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Server QUIC - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Emotion_Recognition/FL_Server_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "QUIC_HOST": "192.168.0.101",
+                "QUIC_PORT": "4433",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "1000",
+                "CONVERGENCE_THRESHOLD": "0.001",
+                "CONVERGENCE_PATIENCE": "2",
+                "MIN_ROUNDS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Client 1 QUIC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 1 QUIC - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "QUIC_HOST": "192.168.0.101",
+                "QUIC_PORT": "4433",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 2 QUIC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 2 QUIC - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "QUIC_HOST": "192.168.0.101",
+                "QUIC_PORT": "4433",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "Emotion: Client 3 QUIC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433",
+                "CLIENT_ID": "3",
+                "NUM_CLIENTS": "3"
+            }
+        },
+        {
+            "name": "Emotion: Client 3 QUIC - Remote",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "QUIC_HOST": "192.168.0.101",
+                "QUIC_PORT": "4433",
+                "CLIENT_ID": "3",
+                "NUM_CLIENTS": "3"
+            }
+        },
+        {
+            "name": "MentalState: Server MQTT - Local (2 Clients)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/MentalState_Recognition/FL_Server_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "MQTT_BROKER": "localhost",
+                "MQTT_PORT": "1883",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "16"
+            }
+        },
+        {
+            "name": "MentalState: Server MQTT - Local (3 Clients)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/MentalState_Recognition/FL_Server_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "MQTT_BROKER": "localhost",
+                "MQTT_PORT": "1883",
+                "NUM_CLIENTS": "3",
+                "NUM_ROUNDS": "16"
+            }
+        },
+        {
+            "name": "MentalState: Client 0 MQTT - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "NUM_CLIENTS": "2",
+                "MQTT_BROKER": "localhost",
+                "MQTT_PORT": "1883"
+            }
+        },
+        {
+            "name": "MentalState: Client 1 MQTT - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2",
+                "MQTT_BROKER": "localhost",
+                "MQTT_PORT": "1883"
+            }
+        },
+        {
+            "name": "MentalState: Client 2 MQTT - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_MQTT.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "3",
+                "MQTT_BROKER": "localhost",
+                "MQTT_PORT": "1883"
+            }
+        },
+        {
+            "name": "MentalState: Server AMQP - Local (2 Clients)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/MentalState_Recognition/FL_Server_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "AMQP_HOST": "localhost",
+                "AMQP_PORT": "5672",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "16"
+            }
+        },
+        {
+            "name": "MentalState: Server AMQP - Local (3 Clients)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/MentalState_Recognition/FL_Server_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "AMQP_HOST": "localhost",
+                "AMQP_PORT": "5672",
+                "NUM_CLIENTS": "3",
+                "NUM_ROUNDS": "16"
+            }
+        },
+        {
+            "name": "MentalState: Client 0 AMQP - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "NUM_CLIENTS": "2",
+                "AMQP_HOST": "localhost",
+                "AMQP_PORT": "5672"
+            }
+        },
+        {
+            "name": "MentalState: Client 1 AMQP - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2",
+                "AMQP_HOST": "localhost",
+                "AMQP_PORT": "5672"
+            }
+        },
+        {
+            "name": "MentalState: Client 2 AMQP - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_AMQP.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "3",
+                "AMQP_HOST": "localhost",
+                "AMQP_PORT": "5672"
+            }
+        },
+        {
+            "name": "MentalState: Server DDS - Local (2 Clients)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/MentalState_Recognition/FL_Server_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "16"
+            }
+        },
+        {
+            "name": "MentalState: Server DDS - Local (3 Clients)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/MentalState_Recognition/FL_Server_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "NUM_CLIENTS": "3",
+                "NUM_ROUNDS": "16"
+            }
+        },
+        {
+            "name": "MentalState: Client 0 DDS - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "MentalState: Client 1 DDS - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2"
+            }
+        },
+        {
+            "name": "MentalState: Client 2 DDS - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_DDS.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "3"
+            }
+        },
+        {
+            "name": "MentalState: Server gRPC - Local (2 Clients)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/MentalState_Recognition/FL_Server_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "GRPC_HOST": "localhost",
+                "GRPC_PORT": "50051",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "16"
+            }
+        },
+        {
+            "name": "MentalState: Server gRPC - Local (3 Clients)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/MentalState_Recognition/FL_Server_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "GRPC_HOST": "localhost",
+                "GRPC_PORT": "50051",
+                "NUM_CLIENTS": "3",
+                "NUM_ROUNDS": "16"
+            }
+        },
+        {
+            "name": "MentalState: Client 0 gRPC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "NUM_CLIENTS": "2",
+                "GRPC_HOST": "localhost",
+                "GRPC_PORT": "50051"
+            }
+        },
+        {
+            "name": "MentalState: Client 1 gRPC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2",
+                "GRPC_HOST": "localhost",
+                "GRPC_PORT": "50051"
+            }
+        },
+        {
+            "name": "MentalState: Client 2 gRPC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_gRPC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "3",
+                "GRPC_HOST": "localhost",
+                "GRPC_PORT": "50051"
+            }
+        },
+        {
+            "name": "MentalState: Server QUIC - Local (2 Clients)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/MentalState_Recognition/FL_Server_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "16"
+            }
+        },
+        {
+            "name": "MentalState: Server QUIC - Local (3 Clients)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/MentalState_Recognition/FL_Server_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433",
+                "NUM_CLIENTS": "3",
+                "NUM_ROUNDS": "16"
+            }
+        },
+        {
+            "name": "MentalState: Client 0 QUIC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "0",
+                "NUM_CLIENTS": "2",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433"
+            }
+        },
+        {
+            "name": "MentalState: Client 1 QUIC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433"
+            }
+        },
+        {
+            "name": "MentalState: Client 2 QUIC - Local",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/MentalState_Recognition/FL_Client_QUIC.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/MentalState_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "3",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433"
+            }
+        }
+    ],
+    "compounds": [
+        {
+            "name": "FL Server + Clients (MQTT - Local)",
+            "configurations": [
+                "FL Server (MQTT) - Local",
+                "FL Client 0 (MQTT) - Local",
+                "FL Client 1 (MQTT) - Local"
+            ],
+            "stopAll": true
+        },
+        {
+            "name": "FL Server + Clients (MQTT - Remote)",
+            "configurations": [
+                "FL Server (MQTT) - Remote Broker",
+                "FL Client 0 (MQTT) - Remote Broker",
+                "FL Client 1 (MQTT) - Remote Broker"
+            ],
+            "stopAll": true
+        },
+        {
+            "name": "FL Server + Clients (AMQP - Local)",
+            "configurations": [
+                "FL Server (AMQP) - Local",
+                "FL Client 0 (AMQP) - Local",
+                "FL Client 1 (AMQP) - Local"
+            ],
+            "stopAll": true
+        },
+        {
+            "name": "FL Server + Clients (AMQP - Remote)",
+            "configurations": [
+                "FL Server (AMQP) - Remote Broker",
+                "FL Client 0 (AMQP) - Remote Broker",
+                "FL Client 1 (AMQP) - Remote Broker"
+            ],
+            "stopAll": true
+        },
+        {
+            "name": "FL Server + Clients (gRPC - Local)",
+            "configurations": [
+                "FL Server (gRPC) - Local",
+                "FL Client 0 (gRPC) - Local",
+                "FL Client 1 (gRPC) - Local"
+            ],
+            "stopAll": true
+        },
+        {
+            "name": "FL Server + Clients (gRPC - Remote)",
+            "configurations": [
+                "FL Server (gRPC) - Remote",
+                "FL Client 0 (gRPC) - Remote",
+                "FL Client 1 (gRPC) - Remote"
+            ],
+            "stopAll": true
+        },
+        {
+            "name": "FL Server + Clients (DDS - Local)",
+            "configurations": [
+                "FL Server (DDS) - Local",
+                "FL Client 0 (DDS) - Local",
+                "FL Client 1 (DDS) - Local"
+            ],
+            "stopAll": true
+        },
+        {
+            "name": "FL Server + Clients (DDS - Remote)",
+            "configurations": [
+                "FL Server (DDS) - Remote",
+                "FL Client 0 (DDS) - Remote",
+                "FL Client 1 (DDS) - Remote"
+            ],
+            "stopAll": true
+        },
+        {
+            "name": "FL Server + Clients (QUIC - Local)",
+            "configurations": [
+                "FL Server (QUIC) - Local",
+                "FL Client 0 (QUIC) - Local",
+                "FL Client 1 (QUIC) - Local"
+            ],
+            "stopAll": true
+        },
+        {
+            "name": "FL Server + Clients (QUIC - Remote)",
+            "configurations": [
+                "FL Server (QUIC) - Remote",
+                "FL Client 0 (QUIC) - Remote",
+                "FL Client 1 (QUIC) - Remote"
+            ],
+            "stopAll": true
+        },
+        {
+            "name": "Emotion: Server + 2 Clients",
+            "configurations": [
+                "Emotion: Server MQTT",
+                "Emotion: Client 1 MQTT",
+                "Emotion: Client 2 MQTT"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 1
+            }
+        },
+        {
+            "name": "Emotion: Server + 3 Clients",
+            "configurations": [
+                "Emotion: Server MQTT",
+                "Emotion: Client 1 MQTT",
+                "Emotion: Client 2 MQTT",
+                "Emotion: Client 3 MQTT"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 2
+            }
+        },
+        {
+            "name": "Emotion: Server + 2 Clients (MQTT - Remote)",
+            "configurations": [
+                "Emotion: Server MQTT - Remote",
+                "Emotion: Client 1 MQTT - Remote",
+                "Emotion: Client 2 MQTT - Remote"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 3
+            }
+        },
+        {
+            "name": "Emotion: Server + 3 Clients (MQTT - Remote)",
+            "configurations": [
+                "Emotion: Server MQTT - Remote",
+                "Emotion: Client 1 MQTT - Remote",
+                "Emotion: Client 2 MQTT - Remote",
+                "Emotion: Client 3 MQTT - Remote"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 4
+            }
+        },
+        {
+            "name": "Emotion: Server + 2 Clients (gRPC - Local)",
+            "configurations": [
+                "Emotion: Server gRPC - Local",
+                "Emotion: Client 1 gRPC - Local",
+                "Emotion: Client 2 gRPC - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 5
+            }
+        },
+        {
+            "name": "Emotion: Server + 3 Clients (gRPC - Local)",
+            "configurations": [
+                "Emotion: Server gRPC - Local",
+                "Emotion: Client 1 gRPC - Local",
+                "Emotion: Client 2 gRPC - Local",
+                "Emotion: Client 3 gRPC - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 6
+            }
+        },
+        {
+            "name": "Emotion: Server + 2 Clients (gRPC - Remote)",
+            "configurations": [
+                "Emotion: Server gRPC - Remote",
+                "Emotion: Client 1 gRPC - Remote",
+                "Emotion: Client 2 gRPC - Remote"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 7
+            }
+        },
+        {
+            "name": "Emotion: Server + 3 Clients (gRPC - Remote)",
+            "configurations": [
+                "Emotion: Server gRPC - Remote",
+                "Emotion: Client 1 gRPC - Remote",
+                "Emotion: Client 2 gRPC - Remote",
+                "Emotion: Client 3 gRPC - Remote"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 8
+            }
+        },
+        {
+            "name": "Emotion: Server + 2 Clients (DDS - Local)",
+            "configurations": [
+                "Emotion: Server DDS - Local",
+                "Emotion: Client 1 DDS - Local",
+                "Emotion: Client 2 DDS - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 9
+            }
+        },
+        {
+            "name": "Emotion: Server + 3 Clients (DDS - Local)",
+            "configurations": [
+                "Emotion: Server DDS - Local",
+                "Emotion: Client 1 DDS - Local",
+                "Emotion: Client 2 DDS - Local",
+                "Emotion: Client 3 DDS - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 10
+            }
+        },
+        {
+            "name": "Emotion: Server + 2 Clients (DDS - Remote)",
+            "configurations": [
+                "Emotion: Server DDS - Remote",
+                "Emotion: Client 1 DDS - Remote",
+                "Emotion: Client 2 DDS - Remote"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 11
+            }
+        },
+        {
+            "name": "Emotion: Server + 3 Clients (DDS - Remote)",
+            "configurations": [
+                "Emotion: Server DDS - Remote",
+                "Emotion: Client 1 DDS - Remote",
+                "Emotion: Client 2 DDS - Remote",
+                "Emotion: Client 3 DDS - Remote"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 12
+            }
+        },
+        {
+            "name": "Emotion: Server + 2 Clients (AMQP - Local)",
+            "configurations": [
+                "Emotion: Server AMQP - Local",
+                "Emotion: Client 1 AMQP - Local",
+                "Emotion: Client 2 AMQP - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 13
+            }
+        },
+        {
+            "name": "Emotion: Server + 3 Clients (AMQP - Local)",
+            "configurations": [
+                "Emotion: Server AMQP - Local",
+                "Emotion: Client 1 AMQP - Local",
+                "Emotion: Client 2 AMQP - Local",
+                "Emotion: Client 3 AMQP - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 14
+            }
+        },
+        {
+            "name": "Emotion: Server + 2 Clients (AMQP - Remote)",
+            "configurations": [
+                "Emotion: Server AMQP - Remote",
+                "Emotion: Client 1 AMQP - Remote",
+                "Emotion: Client 2 AMQP - Remote"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 15
+            }
+        },
+        {
+            "name": "Emotion: Server + 3 Clients (AMQP - Remote)",
+            "configurations": [
+                "Emotion: Server AMQP - Remote",
+                "Emotion: Client 1 AMQP - Remote",
+                "Emotion: Client 2 AMQP - Remote",
+                "Emotion: Client 3 AMQP - Remote"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 16
+            }
+        },
+        {
+            "name": "Emotion: Server + 2 Clients (QUIC - Local)",
+            "configurations": [
+                "Emotion: Server QUIC - Local",
+                "Emotion: Client 1 QUIC - Local",
+                "Emotion: Client 2 QUIC - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 17
+            }
+        },
+        {
+            "name": "Emotion: Server + 3 Clients (QUIC - Local)",
+            "configurations": [
+                "Emotion: Server QUIC - Local",
+                "Emotion: Client 1 QUIC - Local",
+                "Emotion: Client 2 QUIC - Local",
+                "Emotion: Client 3 QUIC - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 18
+            }
+        },
+        {
+            "name": "Emotion: Server + 2 Clients (QUIC - Remote)",
+            "configurations": [
+                "Emotion: Server QUIC - Remote",
+                "Emotion: Client 1 QUIC - Remote",
+                "Emotion: Client 2 QUIC - Remote"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 19
+            }
+        },
+        {
+            "name": "Emotion: Server + 3 Clients (QUIC - Remote)",
+            "configurations": [
+                "Emotion: Server QUIC - Remote",
+                "Emotion: Client 1 QUIC - Remote",
+                "Emotion: Client 2 QUIC - Remote",
+                "Emotion: Client 3 QUIC - Remote"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "Emotion Recognition",
+                "order": 20
+            }
+        },
+        {
+            "name": "MentalState MQTT: 2 Clients Complete",
+            "configurations": [
+                "MentalState: Server MQTT - Local (2 Clients)",
+                "MentalState: Client 0 MQTT - Local",
+                "MentalState: Client 1 MQTT - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "MentalState Recognition",
+                "order": 1
+            }
+        },
+        {
+            "name": "MentalState MQTT: 3 Clients Complete",
+            "configurations": [
+                "MentalState: Server MQTT - Local (3 Clients)",
+                "MentalState: Client 0 MQTT - Local",
+                "MentalState: Client 1 MQTT - Local",
+                "MentalState: Client 2 MQTT - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "MentalState Recognition",
+                "order": 2
+            }
+        },
+        {
+            "name": "MentalState AMQP: 2 Clients Complete",
+            "configurations": [
+                "MentalState: Server AMQP - Local (2 Clients)",
+                "MentalState: Client 0 AMQP - Local",
+                "MentalState: Client 1 AMQP - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "MentalState Recognition",
+                "order": 3
+            }
+        },
+        {
+            "name": "MentalState AMQP: 3 Clients Complete",
+            "configurations": [
+                "MentalState: Server AMQP - Local (3 Clients)",
+                "MentalState: Client 0 AMQP - Local",
+                "MentalState: Client 1 AMQP - Local",
+                "MentalState: Client 2 AMQP - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "MentalState Recognition",
+                "order": 4
+            }
+        },
+        {
+            "name": "MentalState DDS: 2 Clients Complete",
+            "configurations": [
+                "MentalState: Server DDS - Local (2 Clients)",
+                "MentalState: Client 0 DDS - Local",
+                "MentalState: Client 1 DDS - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "MentalState Recognition",
+                "order": 5
+            }
+        },
+        {
+            "name": "MentalState DDS: 3 Clients Complete",
+            "configurations": [
+                "MentalState: Server DDS - Local (3 Clients)",
+                "MentalState: Client 0 DDS - Local",
+                "MentalState: Client 1 DDS - Local",
+                "MentalState: Client 2 DDS - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "MentalState Recognition",
+                "order": 6
+            }
+        },
+        {
+            "name": "MentalState gRPC: 2 Clients Complete",
+            "configurations": [
+                "MentalState: Server gRPC - Local (2 Clients)",
+                "MentalState: Client 0 gRPC - Local",
+                "MentalState: Client 1 gRPC - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "MentalState Recognition",
+                "order": 7
+            }
+        },
+        {
+            "name": "MentalState gRPC: 3 Clients Complete",
+            "configurations": [
+                "MentalState: Server gRPC - Local (3 Clients)",
+                "MentalState: Client 0 gRPC - Local",
+                "MentalState: Client 1 gRPC - Local",
+                "MentalState: Client 2 gRPC - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "MentalState Recognition",
+                "order": 8
+            }
+        },
+        {
+            "name": "MentalState QUIC: 2 Clients Complete",
+            "configurations": [
+                "MentalState: Server QUIC - Local (2 Clients)",
+                "MentalState: Client 0 QUIC - Local",
+                "MentalState: Client 1 QUIC - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "MentalState Recognition",
+                "order": 9
+            }
+        },
+        {
+            "name": "MentalState QUIC: 3 Clients Complete",
+            "configurations": [
+                "MentalState: Server QUIC - Local (3 Clients)",
+                "MentalState: Client 0 QUIC - Local",
+                "MentalState: Client 1 QUIC - Local",
+                "MentalState: Client 2 QUIC - Local"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "MentalState Recognition",
+                "order": 10
+            }
+        }
+    ]
+}
+

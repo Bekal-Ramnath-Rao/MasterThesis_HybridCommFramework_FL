@@ -21,7 +21,7 @@ env/
 #virtual environment
 .venv/
 # IDEs
-.vscode/
+#.vscode/
 .idea/
 *.swp
 *.swo
@@ -54,7 +54,7 @@ checkpoints/
 *.log
 logs/
 *.out
-*.json
+*experiment_results/*.json
 
 # Mosquitto
 mosquitto.log
@@ -105,6 +105,11 @@ dmypy.json
 # Plots directory
 plots/
 Supervised/plots/
+
+# JSON files
+*.json
+!launch.json
+!.vscode/launch.json
 
 # Keep specific files
 !requirements.txt
