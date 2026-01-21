@@ -326,12 +326,21 @@ class FederatedLearningClient:
         try:
             batch_size = self.training_config['batch_size']
             epochs = self.training_config['local_epochs']
+            # Limit steps per epoch for faster training (configurable via env)
+            try:
+                steps_per_epoch = int(os.getenv("STEPS_PER_EPOCH", "100"))
+                val_steps = int(os.getenv("VAL_STEPS", "25"))
+            except Exception:
+                steps_per_epoch = 100
+                val_steps = 25
             
             # Train the model
             history = self.model.fit(
                 self.train_generator,
                 epochs=epochs,
                 validation_data=self.validation_generator,
+                steps_per_epoch=steps_per_epoch,
+                validation_steps=val_steps,
                 verbose=2
             )
             

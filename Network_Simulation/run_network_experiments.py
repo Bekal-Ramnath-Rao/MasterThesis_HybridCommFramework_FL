@@ -205,8 +205,8 @@ class ExperimentRunner:
                 print(f"[ERROR] stderr: {result.stderr}")
                 return False
             
-            print(f"Waiting 10 seconds for broker to initialize...")
-            time.sleep(10)
+            print(f"Waiting 5 seconds for broker to initialize...")
+            time.sleep(5)
         
         # Stage 2: Start server
         if server:
@@ -220,8 +220,8 @@ class ExperimentRunner:
                 print(f"[ERROR] stderr: {result.stderr}")
                 return False
             
-            print(f"Waiting 8 seconds for server to initialize...")
-            time.sleep(8)
+            print(f"Waiting 5 seconds for server to initialize...")
+            time.sleep(5)
         
         # Stage 3: Start traffic generators (if congestion enabled)
         if self.enable_congestion and congestion_level != "none" and self.congestion_manager:
@@ -245,8 +245,8 @@ class ExperimentRunner:
                 print(f"[ERROR] stderr: {result.stderr}")
                 return False
             
-            print(f"Waiting 10 seconds for clients to connect...")
-            time.sleep(10)
+            print(f"Waiting 5 seconds for clients to connect...")
+            time.sleep(5)
         
         print(f"\n[OK] All containers started successfully with staged delays")
         return True
@@ -477,8 +477,8 @@ class ExperimentRunner:
             "excellent": 3600,      # 1 hour
             "good": 3600,           # 1 hour
             "moderate": 5400,       # 1.5 hours
-            "poor": 7200,           # 2 hours
-            "very_poor": 10800,     # 3 hours (300ms latency + 5% loss = very slow)
+            "poor": 14400,           # 4 hours
+            "very_poor": 21600,     # 6 hours (300ms latency + 5% loss = very slow)
             "satellite": 9000,      # 2.5 hours (600ms latency)
             "congested_light": 5400,   # 1.5 hours
             "congested_moderate": 7200, # 2 hours

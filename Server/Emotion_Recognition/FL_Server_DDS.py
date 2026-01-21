@@ -453,7 +453,7 @@ class FederatedLearningServer:
             if not sample or not hasattr(sample, 'round'):
                 #print(f"[DEBUG] Skipping invalid model_update sample: {type(sample).__name__}")
                 continue
-            print(f"[DEBUG] Processing model_update sample: client_id={sample.client_id if hasattr(sample, 'client_id') else 'N/A'}, round={sample.round}, current_round={self.current_round}")
+            #print(f"[DEBUG] Processing model_update sample: client_id={sample.client_id if hasattr(sample, 'client_id') else 'N/A'}, round={sample.round}, current_round={self.current_round}")
             sys.stdout.flush()
             if sample.round == self.current_round and hasattr(sample, 'client_id'):
                 client_id = sample.client_id

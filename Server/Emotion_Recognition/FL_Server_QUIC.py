@@ -45,16 +45,16 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
         self._stream_buffers = {}  # Buffer for incomplete messages
     
     def quic_event_received(self, event: QuicEvent):
-        print(f"[DEBUG] quic_event_received called, event type: {type(event).__name__}")
+        #print(f"[DEBUG] quic_event_received called, event type: {type(event).__name__}")
         if isinstance(event, StreamDataReceived):
-            print(f"[DEBUG] Server received data on stream {event.stream_id}, size={len(event.data)} bytes, end_stream={event.end_stream}")
+            #print(f"[DEBUG] Server received data on stream {event.stream_id}, size={len(event.data)} bytes, end_stream={event.end_stream}")
             # Get or create buffer for this stream
             if event.stream_id not in self._stream_buffers:
                 self._stream_buffers[event.stream_id] = b''
             
             # Append new data to buffer
             self._stream_buffers[event.stream_id] += event.data
-            print(f"[DEBUG] Stream {event.stream_id} buffer now has {len(self._stream_buffers[event.stream_id])} bytes")
+            #print(f"[DEBUG] Stream {event.stream_id} buffer now has {len(self._stream_buffers[event.stream_id])} bytes")
             
             # Send flow control updates to allow more data
             self.transmit()
@@ -66,7 +66,7 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                     try:
                         data = message_data.decode('utf-8')
                         message = json.loads(data)
-                        print(f"[DEBUG] Server decoded message on stream {event.stream_id}: type={message.get('type')}")
+                        #print(f"[DEBUG] Server decoded message on stream {event.stream_id}: type={message.get('type')}")
                         if self.server:
                             asyncio.create_task(self.server.handle_message(message, self))
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -76,12 +76,12 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
             
             # If stream ended and buffer has remaining data, try to process it
             if event.end_stream:
-                print(f"[DEBUG] Stream {event.stream_id} ended, processing remaining buffer ({len(self._stream_buffers[event.stream_id])} bytes)")
+                #print(f"[DEBUG] Stream {event.stream_id} ended, processing remaining buffer ({len(self._stream_buffers[event.stream_id])} bytes)")
                 if self._stream_buffers[event.stream_id]:
                     try:
                         data = self._stream_buffers[event.stream_id].decode('utf-8')
                         message = json.loads(data)
-                        print(f"[DEBUG] Server decoded remaining buffer from stream {event.stream_id}: type={message.get('type')}")
+                        #print(f"[DEBUG] Server decoded remaining buffer from stream {event.stream_id}: type={message.get('type')}")
                         if self.server:
                             asyncio.create_task(self.server.handle_message(message, self))
                         self._stream_buffers[event.stream_id] = b''
@@ -211,7 +211,7 @@ class FederatedLearningServer:
     async def broadcast_message(self, message):
         """Broadcast message to all registered clients"""
         msg_type = message.get('type')
-        print(f"[DEBUG] Server broadcasting message type: {msg_type} to {len(self.registered_clients)} clients")
+        #print(f"[DEBUG] Server broadcasting message type: {msg_type} to {len(self.registered_clients)} clients")
         for client_id in self.registered_clients.keys():
             await self.send_message(client_id, message)
     
@@ -220,7 +220,7 @@ class FederatedLearningServer:
         try:
             msg_type = message.get('type')
             client_id = message.get('client_id', 'unknown')
-            print(f"[DEBUG] Server received message type: {msg_type} from client {client_id}")
+            #print(f"[DEBUG] Server received message type: {msg_type} from client {client_id}")
             
             if msg_type == 'register':
                 await self.handle_client_registration(message, protocol)
@@ -250,7 +250,7 @@ class FederatedLearningServer:
         """Handle model update from client"""
         client_id = message['client_id']
         round_num = message['round']
-        print(f"[DEBUG] handle_client_update: client={client_id}, msg_round={round_num}, server_current_round={self.current_round}")
+        #print(f"[DEBUG] handle_client_update: client={client_id}, msg_round={round_num}, server_current_round={self.current_round}")
         if round_num == self.current_round:
             # Decompress or deserialize client weights
             if 'compressed_data' in message and self.quantization_handler is not None:
@@ -273,7 +273,7 @@ class FederatedLearningServer:
                     import traceback; traceback.print_exc()
                     return
                 dt = time.time() - start_t
-                print(f"[DEBUG] Deserialized weights from client {client_id} in {dt:.2f}s")
+                #print(f"[DEBUG] Deserialized weights from client {client_id} in {dt:.2f}s")
             
             self.client_updates[client_id] = {
                 'weights': weights,
@@ -286,8 +286,8 @@ class FederatedLearningServer:
             
             if len(self.client_updates) == self.num_clients:
                 await self.aggregate_models()
-        else:
-            print(f"[DEBUG] Ignoring model_update from client {client_id} for round {round_num} (server at {self.current_round})")
+        #else:
+            #print(f"[DEBUG] Ignoring model_update from client {client_id} for round {round_num} (server at {self.current_round})")
     
     async def handle_client_metrics(self, message):
         """Handle evaluation metrics from client"""

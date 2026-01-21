@@ -159,11 +159,11 @@ class FederatedLearningClient:
         """Send message to server via QUIC stream"""
         if self.protocol:
             msg_type = message.get('type')
-            print(f"[DEBUG] Client {self.client_id} sending message type: {msg_type}")
+            #print(f"[DEBUG] Client {self.client_id} sending message type: {msg_type}")
             
             # Add newline delimiter for message framing
             data = (json.dumps(message) + '\n').encode('utf-8')
-            print(f"[DEBUG] Client {self.client_id} message size: {len(data)} bytes")
+            #print(f"[DEBUG] Client {self.client_id} message size: {len(data)} bytes")
             
             self.stream_id = self.protocol._quic.get_next_available_stream_id()
             # Send data with end_stream=True to ensure it's processed
@@ -174,28 +174,29 @@ class FederatedLearningClient:
             
             # For large messages, give more time for transmission
             if len(data) > 1000000:  # > 1MB
-                print(f"[DEBUG] Client {self.client_id} waiting for large message transmission...")
+                #print(f"[DEBUG] Client {self.client_id} waiting for large message transmission...")
                 # Multiple transmit calls with delays for very large messages
                 for i in range(5):
                     await asyncio.sleep(1)
                     self.protocol.transmit()
-                    print(f"[DEBUG] Client {self.client_id} transmit call {i+1}/5")
+                    #print(f"[DEBUG] Client {self.client_id} transmit call {i+1}/5")
             else:
                 await asyncio.sleep(0.5)
             
-            print(f"[DEBUG] Client {self.client_id} sent {msg_type} on stream {self.stream_id}")
+            #print(f"[DEBUG] Client {self.client_id} sent {msg_type} on stream {self.stream_id}")
     
     async def handle_message(self, message):
         """Handle incoming messages from server"""
         try:
             msg_type = message.get('type')
-            print(f"[DEBUG] Client {self.client_id} received message type: {msg_type}")
+            #print(f"[DEBUG] Client {self.client_id} received message type: {msg_type}")
             
             if msg_type == 'training_config':
                 await self.handle_training_config(message)
             elif msg_type == 'global_model':
                 await self.handle_global_model(message)
             elif msg_type == 'start_training':
+                #print(f"[DEBUG] Client {self.client_id} handling start_training for round {message.get('round')}")
                 await self.handle_start_training(message)
             elif msg_type == 'start_evaluation':
                 await self.handle_start_evaluation(message)
@@ -229,7 +230,7 @@ class FederatedLearningClient:
         if round_num == 0:
             # If we've already moved past initialization, ignore repeated initial models
             if self.current_round > 0:
-                print(f"Client {self.client_id} ignoring duplicate initial global model (already in round {self.current_round})")
+                #print(f"Client {self.client_id} ignoring duplicate initial global model (already in round {self.current_round})")
                 return
             # Initial model from server - create model from server's config
             print(f"Client {self.client_id} received initial global model from server")
@@ -346,46 +347,45 @@ class FederatedLearningClient:
         """Train model on local data and send updates to server"""
         batch_size = self.training_config['batch_size']
         epochs = self.training_config['local_epochs']
+        # Limit steps per epoch for faster training (configurable via env)
+        try:
+            steps_per_epoch = int(os.getenv("STEPS_PER_EPOCH", "100"))
+            val_steps = int(os.getenv("VAL_STEPS", "25"))
+        except Exception:
+            steps_per_epoch = 100
+            val_steps = 25
         
         print(f"Training on {self.train_generator.n} samples for {epochs} epochs...")
         
-        # Start a keep-alive task to prevent idle timeout during training
-        keep_alive_task = asyncio.create_task(self._keep_alive_during_training())
+        # Train the model directly (synchronous call is faster, no executor overhead)
+        history = self.model.fit(
+            self.train_generator,
+            epochs=epochs,
+            steps_per_epoch=steps_per_epoch,
+            validation_data=self.validation_generator,
+            validation_steps=val_steps,
+            verbose=2
+        )
         
-        try:
-            # Train in a thread pool to avoid blocking
-            loop = asyncio.get_event_loop()
-            
-            # Create a function with all parameters for fit
-            def train_model():
-                return self.model.fit(
-                    self.train_generator,
-                    epochs=epochs,
-                    verbose=1
-                )
-            
-            history = await loop.run_in_executor(None, train_model)
-        finally:
-            # Cancel keep-alive task
-            keep_alive_task.cancel()
-            try:
-                await keep_alive_task
-            except asyncio.CancelledError:
-                pass
-        
-        # Prepare training metrics
-        final_loss = float(history.history['loss'][-1])
-        final_accuracy = float(history.history['accuracy'][-1])
-        
-        print(f"Client {self.client_id} training complete - "
-              f"Loss: {final_loss:.4f}, Accuracy: {final_accuracy:.4f}")
-        
-        # Prepare weights (compress if quantization enabled)
+        # Get updated weights
         updated_weights = self.model.get_weights()
+        num_samples = self.train_generator.n  # Total number of training samples
+        
+        # Prepare training metrics (for classification)
+        metrics = {
+            "loss": float(history.history["loss"][-1]),
+            "accuracy": float(history.history["accuracy"][-1]),
+            "val_loss": float(history.history["val_loss"][-1]),
+            "val_accuracy": float(history.history["val_accuracy"][-1])
+        }
+        
+        # Compress weights if quantization is enabled
         if self.quantizer is not None:
             compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
             stats = self.quantizer.get_compression_stats(updated_weights, compressed_data)
-            print(f"Client {self.client_id}: Compressed weights - Ratio: {stats['compression_ratio']:.2f}x, Size: {stats['compressed_size_mb']:.2f}MB")
+            print(f"Client {self.client_id}: Compressed weights - "
+                  f"Ratio: {stats['compression_ratio']:.2f}x, "
+                  f"Size: {stats['compressed_size_mb']:.2f}MB")
             weights_data = compressed_data
             weights_key = 'compressed_data'
         else:
@@ -398,34 +398,20 @@ class FederatedLearningClient:
             'client_id': self.client_id,
             'round': self.current_round,
             weights_key: weights_data,
-            'num_samples': self.train_generator.n,
-            'metrics': {
-                'loss': final_loss,
-                'accuracy': final_accuracy
-            }
+            'num_samples': num_samples,
+            'metrics': metrics
         })
-    
-    async def _keep_alive_during_training(self):
-        """Send periodic pings to keep connection alive during training"""
-        while True:
-            await asyncio.sleep(30)  # Ping every 30 seconds
-            if self.protocol:
-                self.protocol.transmit()
     
     async def evaluate_model(self):
         """Evaluate model on validation data and send metrics to server"""
         print(f"Evaluating on {self.validation_generator.n} validation samples...")
         
-        # Evaluate in a thread pool to avoid blocking
+        # Evaluate in thread pool (quick operation, <1s)
         loop = asyncio.get_event_loop()
-        
-        def evaluate():
-            return self.model.evaluate(
-                self.validation_generator,
-                verbose=1
-            )
-        
-        results = await loop.run_in_executor(None, evaluate)
+        results = await loop.run_in_executor(
+            None,
+            lambda: self.model.evaluate(self.validation_generator, verbose=0)
+        )
         
         loss, accuracy = results[0], results[1]
         
