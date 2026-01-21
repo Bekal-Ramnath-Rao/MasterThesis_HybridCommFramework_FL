@@ -26,11 +26,12 @@ class ExperimentRunner:
     """Automates running FL experiments across different network conditions"""
     
     def __init__(self, use_case: str = "emotion", num_rounds: int = 10, enable_congestion: bool = False,
-                 use_quantization: bool = False, quantization_params: Dict[str, str] = None):
+                 use_quantization: bool = False, quantization_params: Dict[str, str] = None, enable_gpu: bool = False):
         self.use_case = use_case
         self.num_rounds = num_rounds
         self.enable_congestion = enable_congestion
         self.use_quantization = use_quantization
+        self.enable_gpu = enable_gpu
         # quantization_params expected to be a dict of simple string values
         self.quantization_params = quantization_params or {}
         
@@ -104,6 +105,13 @@ class ExperimentRunner:
             "temperature": str(docker_dir / "docker-compose-temperature.yml")
         }
         
+        # GPU overlay files
+        self.gpu_overlay_files = {
+            "emotion": str(docker_dir / "docker-compose-emotion.gpu.yml"),
+            "mentalstate": str(docker_dir / "docker-compose-mentalstate.gpu.yml"),
+            "temperature": str(docker_dir / "docker-compose-temperature.gpu.yml")
+        }
+        
         # Service name patterns
         self.service_patterns = {
             "emotion": {
@@ -155,11 +163,20 @@ class ExperimentRunner:
     def start_containers(self, protocol: str, scenario: str = "excellent", congestion_level: str = "none"):
         """Start Docker containers for a specific protocol with staged startup"""
         compose_file = self.compose_files[self.use_case]
+        
+        # Build compose command with GPU overlay if enabled
+        compose_cmd_base = ["docker", "compose", "-f", compose_file]
+        if self.enable_gpu:
+            gpu_overlay = self.gpu_overlay_files[self.use_case]
+            compose_cmd_base.extend(["-f", gpu_overlay])
+        
         services = self.service_patterns[self.use_case][protocol]
         
         print(f"\n{'='*70}")
         print(f"Starting containers for {protocol.upper()} protocol...")
         print(f"Network Scenario: {scenario.upper()}")
+        if self.enable_gpu:
+            print(f"GPU Acceleration: ENABLED (2x RTX 3080)")
         if self.enable_congestion and congestion_level != "none":
             print(f"Congestion Level: {congestion_level.upper()}")
         print(f"{'='*70}")
@@ -180,7 +197,7 @@ class ExperimentRunner:
         # Stage 1: Start broker first (if exists)
         if broker:
             print(f"\n[Stage 1/4] Starting broker: {broker}")
-            cmd_broker = ["docker-compose", "-f", compose_file, "up", "-d", broker]
+            cmd_broker = compose_cmd_base + ["up", "-d", broker]
             result = self.run_command(cmd_broker)
             if result.returncode != 0:
                 print(f"[ERROR] Failed to start broker")
@@ -195,7 +212,7 @@ class ExperimentRunner:
         if server:
             stage_num = "[Stage 2/4]" if broker else "[Stage 1/4]"
             print(f"\n{stage_num} Starting server: {server}")
-            cmd_server = ["docker-compose", "-f", compose_file, "up", "-d", server]
+            cmd_server = compose_cmd_base + ["up", "-d", server]
             result = self.run_command(cmd_server)
             if result.returncode != 0:
                 print(f"[ERROR] Failed to start server")
@@ -220,7 +237,7 @@ class ExperimentRunner:
         if clients:
             stage_num = "[Stage 4/4]" if (broker and self.enable_congestion and congestion_level != "none") else "[Stage 3/4]"
             print(f"\n{stage_num} Starting clients: {', '.join(clients)}")
-            cmd_clients = ["docker-compose", "-f", compose_file, "up", "-d"] + clients
+            cmd_clients = compose_cmd_base + ["up", "-d"] + clients
             result = self.run_command(cmd_clients)
             if result.returncode != 0:
                 print(f"[ERROR] Failed to start clients")
@@ -228,8 +245,8 @@ class ExperimentRunner:
                 print(f"[ERROR] stderr: {result.stderr}")
                 return False
             
-            print(f"Waiting 5 seconds for clients to connect...")
-            time.sleep(5)
+            print(f"Waiting 10 seconds for clients to connect...")
+            time.sleep(10)
         
         print(f"\n[OK] All containers started successfully with staged delays")
         return True
@@ -241,7 +258,13 @@ class ExperimentRunner:
         
         print(f"\nStopping containers for {protocol.upper()} protocol...")
         
-        cmd = ["docker-compose", "-f", compose_file, "down"]
+        # Build compose command with GPU overlay if enabled
+        cmd = ["docker", "compose", "-f", compose_file]
+        if self.enable_gpu:
+            gpu_overlay = self.gpu_overlay_files[self.use_case]
+            cmd.extend(["-f", gpu_overlay])
+        cmd.append("down")
+        
         self.run_command(cmd, check=False)
         
         # Give time for containers to fully stop
@@ -272,9 +295,15 @@ class ExperimentRunner:
         
         conditions = sim.NETWORK_SCENARIOS[scenario]
         
-        # Apply to all containers in this protocol
+        # Apply to all containers EXCEPT brokers (brokers should be reliable infrastructure)
+        # Only apply to FL clients and servers
         success_count = 0
         for container in services:
+            # Skip brokers - they represent reliable infrastructure
+            if 'broker' in container.lower() or 'rabbitmq' in container.lower():
+                print(f"[INFO] Skipping network conditions for broker: {container} (infrastructure)")
+                continue
+            
             try:
                 if sim.apply_network_conditions(container, conditions):
                     success_count += 1
@@ -293,6 +322,17 @@ class ExperimentRunner:
         services = self.service_patterns[self.use_case][protocol]
         server_container = [s for s in services if "server" in s][0]
         
+        # Common completion markers that servers print when training ends
+        completion_markers = [
+            "TRAINING COMPLETE",
+            "Training Complete",
+            "Training completed",
+            "All rounds completed",
+            "Converged",
+            "Results saved to",
+            "Experiment finished",
+        ]
+
         start_time = time.time()
         while time.time() - start_time < timeout:
             # Check if server container is still running
@@ -309,10 +349,42 @@ class ExperimentRunner:
                 "docker", "logs", "--tail", "50", server_container
             ], check=False)
             
-            if "Training completed" in logs.stdout or "All rounds completed" in logs.stdout:
-                print(f"Training completed successfully!")
+            # If any known completion marker appears, treat as complete
+            if any(marker in (logs.stdout or "") for marker in completion_markers):
+                print(f"Training completed successfully (marker detected)!")
                 time.sleep(5)  # Give time for final results to be written
                 return True
+
+            # Check if training has reached the target number of rounds
+            # by examining the results file content (not just existence)
+            results_dir = f"/app/Server/{self.use_case.title()}_Recognition/results"
+            expected_json = f"{protocol}_training_results.json"
+            
+            # Read the results file content to check if expected rounds are complete
+            read_results = self.run_command([
+                "docker", "exec", server_container, "cat",
+                f"{results_dir}/{expected_json}"
+            ], check=False)
+            
+            if read_results.returncode == 0 and read_results.stdout:
+                try:
+                    results_data = json.loads(read_results.stdout)
+                    # Check if we have results for all expected rounds
+                    if isinstance(results_data, dict):
+                        rounds_completed = results_data.get("rounds_completed", 0)
+                        if rounds_completed >= self.num_rounds:
+                            print(f"Training completed successfully ({rounds_completed}/{self.num_rounds} rounds)!")
+                            time.sleep(3)
+                            return True
+                        else:
+                            print(f"Progress: {rounds_completed}/{self.num_rounds} rounds completed...")
+                    elif isinstance(results_data, list) and len(results_data) >= self.num_rounds:
+                        print(f"Training completed successfully ({len(results_data)}/{self.num_rounds} rounds)!")
+                        time.sleep(3)
+                        return True
+                except json.JSONDecodeError:
+                    # File exists but not valid JSON yet (still being written)
+                    pass
             
             time.sleep(10)  # Check every 10 seconds
         
@@ -340,6 +412,21 @@ class ExperimentRunner:
             f.write(logs.stdout or "")
             f.write("\n\n=== STDERR ===\n\n")
             f.write(logs.stderr or "")
+
+        # Save client logs as well for debugging client-side behavior
+        client_containers = [s for s in services if "client" in s]
+        if client_containers:
+            print(f"Collecting logs for clients: {', '.join(client_containers)}")
+            for client in client_containers:
+                try:
+                    c_logs = self.run_command(["docker", "logs", client], check=False)
+                    out_path = os.path.join(exp_dir, f"{client}_logs.txt")
+                    with open(out_path, "w", encoding='utf-8', errors='replace') as cf:
+                        cf.write(c_logs.stdout or "")
+                        cf.write("\n\n=== STDERR ===\n\n")
+                        cf.write(c_logs.stderr or "")
+                except Exception as e:
+                    print(f"[WARNING] Failed to collect logs for {client}: {e}")
         
         # Copy result files if they exist
         # Try to copy from container
@@ -384,6 +471,21 @@ class ExperimentRunner:
             print(f"# Congestion Level: {congestion_level.upper()}")
         print(f"{'#'*70}\n")
         
+        # Adaptive timeout based on network scenario
+        # Poor networks need much more time due to retransmissions and delays
+        timeout_map = {
+            "excellent": 3600,      # 1 hour
+            "good": 3600,           # 1 hour
+            "moderate": 5400,       # 1.5 hours
+            "poor": 7200,           # 2 hours
+            "very_poor": 10800,     # 3 hours (300ms latency + 5% loss = very slow)
+            "satellite": 9000,      # 2.5 hours (600ms latency)
+            "congested_light": 5400,   # 1.5 hours
+            "congested_moderate": 7200, # 2 hours
+            "congested_heavy": 9000     # 2.5 hours
+        }
+        timeout = timeout_map.get(scenario, 3600)
+        
         try:
             # 1. Start containers (includes traffic generators if congestion enabled)
             if not self.start_containers(protocol, scenario, congestion_level):
@@ -394,8 +496,9 @@ class ExperimentRunner:
             if not self.apply_network_scenario(scenario, protocol):
                 print(f"[WARNING] Failed to apply network scenario {scenario}, continuing anyway...")
             
-            # 3. Wait for completion
-            if not self.wait_for_completion(protocol, timeout=3600):
+            # 3. Wait for completion with adaptive timeout
+            print(f"[INFO] Using timeout: {timeout}s ({timeout/3600:.1f} hours) for {scenario} network")
+            if not self.wait_for_completion(protocol, timeout=timeout):
                 print(f"[WARNING] Experiment may not have completed")
             
             # 4. Collect results
@@ -536,6 +639,8 @@ def main():
                 help="Set QUANTIZATION_SYMMETRIC=1 if symmetric quantization should be used")
     parser.add_argument("--quantization-per-channel", action="store_true",
                 help="Set QUANTIZATION_PER_CHANNEL=1 if per-channel quantization should be used")
+    parser.add_argument("--enable-gpu", "-g", action="store_true",
+                help="Enable GPU acceleration using NVIDIA runtime (requires nvidia-docker)")
     
     args = parser.parse_args()
     
@@ -565,7 +670,8 @@ def main():
     runner = ExperimentRunner(use_case=args.use_case, num_rounds=args.rounds, 
                             enable_congestion=args.enable_congestion,
                             use_quantization=args.use_quantization,
-                            quantization_params=quant_params)
+                            quantization_params=quant_params,
+                            enable_gpu=args.enable_gpu)
     
     if args.single:
         if not args.protocol or not args.scenario:

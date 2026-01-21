@@ -72,7 +72,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.convergence_time = None
         
         # Initialize quantization handler
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        use_quantization = os.getenv("USE_QUANTIZATION", "false").lower() == "true"
         if use_quantization and QUANTIZATION_AVAILABLE:
             self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
             print("Server: Quantization enabled")
@@ -89,7 +89,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         # Training configuration
         self.training_config = {
             "batch_size": 32,
-            "local_epochs": 20
+            "local_epochs": 5
         }
         
         # Status flags

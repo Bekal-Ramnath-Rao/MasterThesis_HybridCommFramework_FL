@@ -21,10 +21,11 @@ except ImportError:
 
 import matplotlib.pyplot as plt
 
-# Add CycloneDDS DLL path
-cyclone_path = r"C:\Masters_Infotech\Semester_5\MT_SW_Addons\vcpkg\buildtrees\cyclonedds\x64-windows-rel\bin"
-if cyclone_path not in os.environ.get('PATH', ''):
-    os.environ['PATH'] = cyclone_path + os.pathsep + os.environ.get('PATH', '')
+# Add CycloneDDS DLL path (only for Windows environments)
+if sys.platform == 'win32':
+    cyclone_path = os.getenv('CYCLONEDDS_HOME', r"C:\Masters_Infotech\Semester_5\MT_SW_Addons\vcpkg\buildtrees\cyclonedds\x64-windows-rel\bin")
+    if cyclone_path and cyclone_path not in os.environ.get('PATH', ''):
+        os.environ['PATH'] = cyclone_path + os.pathsep + os.environ.get('PATH', '')
 
 from cyclonedds.domain import DomainParticipant
 from cyclonedds.topic import Topic
@@ -134,7 +135,7 @@ class FederatedLearningServer:
         self.convergence_time = None
         
         # Initialize quantization handler
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        use_quantization = os.getenv("USE_QUANTIZATION", "false").lower() == "true"
         if use_quantization and QUANTIZATION_AVAILABLE:
             self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
             print("Server: Quantization enabled")
@@ -151,7 +152,7 @@ class FederatedLearningServer:
         # Training configuration
         self.training_config = {
             "batch_size": 32,
-            "local_epochs": 20
+            "local_epochs": 5
         }
         
         # Status flags

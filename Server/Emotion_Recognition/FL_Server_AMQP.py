@@ -66,8 +66,9 @@ class FederatedLearningServer:
         self.start_time = None
         self.convergence_time = None
         
-        # Initialize quantization handler
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization handler (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization and QUANTIZATION_AVAILABLE:
             self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
             print("Server: Quantization enabled")
@@ -82,9 +83,10 @@ class FederatedLearningServer:
         self.initialize_global_model()
         
         # Training configuration
+        # Training configuration broadcast to AMQP clients
         self.training_config = {
             "batch_size": 32,
-            "local_epochs": 20
+            "local_epochs": 20  # Reduced from 20 for faster experiments
         }
         
         # AMQP connection
@@ -126,6 +128,27 @@ class FederatedLearningServer:
         
         # Get initial weights
         self.global_weights = model.get_weights()
+        
+        # Store model configuration for sending to clients
+        self.model_config = {
+            "input_shape": [48, 48, 1],
+            "num_classes": 7,
+            "layers": [
+                {"type": "Conv2D", "filters": 32, "kernel_size": [3, 3], "activation": "relu"},
+                {"type": "Conv2D", "filters": 64, "kernel_size": [3, 3], "activation": "relu"},
+                {"type": "MaxPooling2D", "pool_size": [2, 2]},
+                {"type": "Dropout", "rate": 0.25},
+                {"type": "Conv2D", "filters": 128, "kernel_size": [3, 3], "activation": "relu"},
+                {"type": "MaxPooling2D", "pool_size": [2, 2]},
+                {"type": "Conv2D", "filters": 128, "kernel_size": [3, 3], "activation": "relu"},
+                {"type": "MaxPooling2D", "pool_size": [2, 2]},
+                {"type": "Dropout", "rate": 0.25},
+                {"type": "Flatten"},
+                {"type": "Dense", "units": 1024, "activation": "relu"},
+                {"type": "Dropout", "rate": 0.5},
+                {"type": "Dense", "units": 7, "activation": "softmax"}
+            ]
+        }
         
         print("\nGlobal CNN model initialized for emotion recognition")
         print(f"Model architecture: CNN with {len(self.global_weights)} weight layers")
@@ -227,9 +250,16 @@ class FederatedLearningServer:
             if round_num == self.current_round:
                 # Check if update is compressed
                 if 'compressed_data' in data and self.quantization_handler is not None:
+                    compressed_update = data['compressed_data']
+                    # If client sent serialized base64 string, decode and unpickle
+                    if isinstance(compressed_update, str):
+                        try:
+                            compressed_update = pickle.loads(base64.b64decode(compressed_update.encode('utf-8')))
+                        except Exception as e:
+                            print(f"Server error decoding compressed_data from client {client_id}: {e}")
                     weights = self.quantization_handler.decompress_client_update(
                         client_id, 
-                        data['compressed_data']
+                        compressed_update
                     )
                     print(f"Received and decompressed update from client {client_id}")
                 else:
@@ -297,15 +327,19 @@ class FederatedLearningServer:
             compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
             stats = self.quantization_handler.get_compression_stats(self.global_weights, compressed_data)
             print(f"Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
-            
+
+            # Serialize compressed data to JSON-safe base64 string
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             initial_model_message = {
+                "message_type": "global_model",
                 "round": 0,
-                "quantized_data": compressed_data,
+                "quantized_data": serialized,
                 "model_config": self.model_config
             }
         else:
             # Send initial global model with architecture configuration
             initial_model_message = {
+                "message_type": "global_model",
                 "round": 0,
                 "weights": self.serialize_weights(self.global_weights),
             "model_config": {
@@ -329,23 +363,31 @@ class FederatedLearningServer:
             }
         }
         
+        message_json = json.dumps(initial_model_message)
+        message_size = len(message_json.encode('utf-8'))
+        print(f"Initial model message size: {message_size / 1024:.2f} KB ({message_size} bytes)")
+        print(f"Model config: {len(initial_model_message.get('model_config', {}).get('layers', []))} layers")
+        
+        print("\nPublishing initial model to clients...")
         self.channel.basic_publish(
             exchange=EXCHANGE_BROADCAST,
             routing_key='',
-            body=json.dumps(initial_model_message),
+            body=message_json,
             properties=pika.BasicProperties(delivery_mode=2)
         )
         
         print("Initial global model sent to all clients")
         
         # Wait for clients to receive and set the initial model
-        time.sleep(2)
+        print("Waiting for clients to receive and build the model...")
+        time.sleep(3)
         
         print(f"\n{'='*70}")
         print(f"Starting Round {self.current_round}/{self.num_rounds}")
         print(f"{'='*70}\n")
         
         # Signal clients to start training with the global model
+        print("Signaling clients to start training...")
         self.channel.basic_publish(
             exchange=EXCHANGE_BROADCAST,
             routing_key='',
@@ -355,6 +397,7 @@ class FederatedLearningServer:
             }),
             properties=pika.BasicProperties(delivery_mode=2)
         )
+        print("Start training signal sent successfully\n")
     
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
@@ -386,12 +429,16 @@ class FederatedLearningServer:
         # Optionally compress before sending
         if self.quantization_handler is not None:
             compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            # Serialize compressed data to JSON-safe base64 string
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             global_model_message = {
+                "message_type": "global_model",
                 "round": self.current_round,
-                "quantized_data": compressed_data
+                "quantized_data": serialized
             }
         else:
             global_model_message = {
+                "message_type": "global_model",
                 "round": self.current_round,
                 "weights": self.serialize_weights(self.global_weights)
         }

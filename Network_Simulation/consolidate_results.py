@@ -17,8 +17,10 @@ def extract_results_from_logs(log_file):
     mae = []
     mape = []
     loss = []
+    accuracy = []
     
     # Pattern for round metrics (handles both formats: "Round X -" and "Round X ")
+    # Old format: Loss: X MSE: X MAE: X MAPE: X
     pattern = r'Round (\d+)\s*-?\s*Aggregated Metrics:\s+Loss: ([\d.]+)\s+MSE:\s+([\d.]+)\s+MAE:\s+([\d.]+)\s+MAPE:\s+([\d.]+)'
     matches = re.findall(pattern, content, re.MULTILINE | re.DOTALL)
     
@@ -29,6 +31,16 @@ def extract_results_from_logs(log_file):
         mse.append(float(mse_val))
         mae.append(float(mae_val))
         mape.append(float(mape_val))
+    
+    # If old format not found, try newer format with Accuracy
+    if not rounds:
+        pattern_new = r'Round (\d+)\s*-?\s*Aggregated Metrics:\s+Loss:\s+([\d.]+)\s+Accuracy:\s+([\d.]+)%?'
+        matches = re.findall(pattern_new, content, re.MULTILINE | re.DOTALL)
+        for match in matches:
+            round_num, loss_val, acc_val = match
+            rounds.append(int(round_num))
+            loss.append(float(loss_val))
+            accuracy.append(float(acc_val) / 100.0 if float(acc_val) > 1 else float(acc_val))
     
     # Extract convergence time
     time_pattern = r'Time to Convergence: ([\d.]+) seconds \(([\d.]+) minutes\)'
@@ -44,15 +56,22 @@ def extract_results_from_logs(log_file):
     # Extract compression technique metrics
     result = {
         "rounds": rounds,
-        "mse": mse,
-        "mae": mae,
-        "mape": mape,
         "loss": loss,
         "convergence_time_seconds": conv_time_sec,
         "convergence_time_minutes": conv_time_min,
         "total_rounds": len(rounds),
         "num_clients": 2
     }
+    
+    # Add optional metrics if found
+    if mse:
+        result["mse"] = mse
+    if mae:
+        result["mae"] = mae
+    if mape:
+        result["mape"] = mape
+    if accuracy:
+        result["accuracy"] = accuracy
     
     # Detect quantization metrics
     quantization_enabled = 'USE_QUANTIZATION' in content or 'Quantization' in content
@@ -108,8 +127,13 @@ def consolidate_results(use_case="temperature", scenarios=None, experiment_folde
     else:
         exp_base = Path("experiment_results")
     
-    results_dir = Path(f"Server/{use_case.title()}_Regulation/results")
-    results_dir.mkdir(parents=True, exist_ok=True)
+    # Save results back to the experiment directory, not to Server directory
+    # This prevents cross-contamination between experiments
+    if experiment_folder:
+        results_dir = Path("experiment_results") / experiment_folder
+    else:
+        results_dir = Path(f"Server/{use_case.title()}_Regulation/results")
+        results_dir.mkdir(parents=True, exist_ok=True)
     
     # All available network scenarios
     all_scenarios = ["excellent", "good", "moderate", "poor", "very_poor", "satellite",
@@ -173,11 +197,13 @@ def consolidate_results(use_case="temperature", scenarios=None, experiment_folde
                             results["congestion_level"] = congestion_level
                         target_dict[protocol] = results
                         
-                        # Save to results directory with scenario and congestion in filename
+                        # Save JSON directly in the protocol directory (not in a separate results folder)
+                        # Use scenario-specific filename
                         if congestion_level:
-                            output_file = results_dir / f"{protocol}_{scenario}_congestion_{congestion_level}_training_results.json"
+                            output_file = proto_dir / f"{protocol}_{scenario}_congestion_{congestion_level}_training_results.json"
                         else:
-                            output_file = results_dir / f"{protocol}_{scenario}_training_results.json"
+                            output_file = proto_dir / f"{protocol}_{scenario}_training_results.json"
+                        
                         with open(output_file, 'w') as f:
                             json.dump(results, f, indent=2)
                         print(f"  ✓ Saved to {output_file}")

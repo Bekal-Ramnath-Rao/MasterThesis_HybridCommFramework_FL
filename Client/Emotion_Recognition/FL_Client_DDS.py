@@ -1,20 +1,60 @@
 import numpy as np
+import os
+import sys
+import logging
+import json
+import pickle
+import time
+import random
+
+# GPU Configuration - Must be done BEFORE TensorFlow import
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+# Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
+gpu_device = os.environ.get("GPU_DEVICE_ID", "0")
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
+os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
+
+# Disable Grappler layout optimizer to avoid NCHW transpose errors in logs
+os.environ["TF_ENABLE_LAYOUT_OPTIMIZER"] = "0"
+
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, Dense, Dropout, Flatten, Input
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-import pickle
-import time
-import random
-import os
-import sys
-import logging
-import json
 
 # Make TensorFlow logs less verbose
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
+# Ensure Keras uses channels_last image data format
+tf.keras.backend.set_image_data_format('channels_last')
+
+# Verify GPU availability
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    print(f"GPUs available: {len(gpus)}")
+    for i, gpu in enumerate(gpus):
+        print(f"  GPU {i}: {gpu}")
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print("GPU memory growth enabled")
+        
+        # Set GPU memory limit to avoid OOM (RTX 3080 has 10GB, reserve 7GB per process)
+        # This prevents one process from consuming all GPU memory
+        for gpu in gpus:
+            try:
+                tf.config.set_logical_device_configuration(
+                    gpu,
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=7000)]  # 7GB per GPU
+                )
+            except RuntimeError:
+                pass  # GPU already configured
+    except RuntimeError as e:
+        print(f"Error setting GPU memory growth: {e}")
+else:
+    print("No GPUs found. Running on CPU.")
 
 # Add CycloneDDS DLL path
 cyclone_path = r"C:\Masters_Infotech\Semester_5\MT_SW_Addons\vcpkg\buildtrees\cyclonedds\x64-windows-rel\bin"
@@ -108,8 +148,9 @@ class FederatedLearningClient:
         self.num_clients = num_clients
         self.model = None
         
-        # Initialize quantization compression
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization compression (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization:
             self.quantizer = Quantization(QuantizationConfig())
             print(f"Client {self.client_id}: Quantization enabled")
@@ -244,6 +285,7 @@ class FederatedLearningClient:
         
         for sample in samples:
             if sample:
+                print(f"Client {self.client_id} received command: round={sample.round}, start_training={sample.start_training}, start_evaluation={sample.start_evaluation}, training_complete={sample.training_complete}")
                 if sample.training_complete:
                     print(f"\nClient {self.client_id} - Training completed!")
                     self.running = False
@@ -267,6 +309,18 @@ class FederatedLearningClient:
                         self.current_round = sample.round
                         print(f"\nClient {self.client_id} starting training for round {self.current_round}...")
                         self.train_local_model()
+
+        # Fallback: if we've received the initial global model but no command within a short window,
+        # and server status indicates training has started, proactively begin round 1.
+        status_samples = self.readers['status'].take()
+        for status in status_samples:
+            if status and not self.current_round and status.training_started and not status.training_complete:
+                if self.model is not None:
+                    self.current_round = max(1, status.current_round)
+                    print(f"\n[Fallback] Client {self.client_id} starting training for round {self.current_round} based on server status...")
+                    self.train_local_model()
+                else:
+                    print(f"[Fallback] Client {self.client_id} awaiting model before starting training...")
     
     def check_global_model(self):
         """Check for global model updates from server"""
@@ -278,7 +332,10 @@ class FederatedLearningClient:
                 weights = self.deserialize_weights(sample.weights)
                 
                 if round_num == 0:
-                    # Initial model from server - create model from server's config
+                    # Initial model from server - avoid rebuilding if already initialized
+                    if self.model is not None:
+                        print(f"Client {self.client_id} ignoring duplicate initial global model")
+                        continue
                     print(f"Client {self.client_id} received initial global model from server")
                     
                     # Parse model config if available
@@ -475,25 +532,39 @@ class FederatedLearningClient:
 
 def load_data(client_id):
     """Load emotion recognition data for this client"""
+    # Detect environment: Docker uses /app prefix, local uses relative path
+    if os.path.exists('/app'):
+        base_path = '/app/Client/Emotion_Recognition/Dataset'
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(os.path.dirname(script_dir))
+        base_path = os.path.join(project_root, 'Client', 'Emotion_Recognition', 'Dataset')
+    
+    train_path = os.path.join(base_path, f'client_{client_id}', 'train')
+    validation_path = os.path.join(base_path, f'client_{client_id}', 'validation')
+    print(f"Dataset base path: {base_path}")
+    
     # Initialize image data generator with rescaling
     train_data_gen = ImageDataGenerator(rescale=1./255)
     validation_data_gen = ImageDataGenerator(rescale=1./255)
 
     # Load training and validation data
     train_generator = train_data_gen.flow_from_directory(
-        f'Client/Emotion_Recognition/Dataset/client_{client_id}/train/',
+        train_path,
         target_size=(48, 48),
-        batch_size=64,
+        batch_size=32,
         color_mode="grayscale",
-        class_mode='categorical'
+        class_mode='categorical',
+        shuffle=True
     )
 
     validation_generator = validation_data_gen.flow_from_directory(
-        f'Client/Emotion_Recognition/Dataset/client_{client_id}/validation/',
+        validation_path,
         target_size=(48, 48),
-        batch_size=64,
+        batch_size=32,
         color_mode="grayscale",
-        class_mode='categorical'
+        class_mode='categorical',
+        shuffle=False
     )
 
     return train_generator, validation_generator

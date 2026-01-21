@@ -1,6 +1,27 @@
 import numpy as np
 import pandas as pd
 import math
+import os
+import sys
+import logging
+import json
+import pickle
+import base64
+import time
+import random
+import paho.mqtt.client as mqtt
+
+# GPU Configuration - Must be done BEFORE TensorFlow import
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+# Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
+gpu_device = os.environ.get("GPU_DEVICE_ID", "0")
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
+os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
+
+# Disable Grappler layout optimizer to avoid NCHW transpose errors in logs
+os.environ["TF_ENABLE_LAYOUT_OPTIMIZER"] = "0"
+
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, Dense, Dropout, Flatten, Input
@@ -8,15 +29,39 @@ from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.optimizers.schedules import ExponentialDecay
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from sklearn.preprocessing import MinMaxScaler
-import json
-import pickle
-import base64
-import time
-import random
-import paho.mqtt.client as mqtt
-import os
-import sys
-import logging
+
+# Make TensorFlow logs less verbose
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
+# Ensure Keras uses channels_last image data format
+tf.keras.backend.set_image_data_format('channels_last')
+
+# Verify GPU availability
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    print(f"GPUs available: {len(gpus)}")
+    for i, gpu in enumerate(gpus):
+        print(f"  GPU {i}: {gpu}")
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print("GPU memory growth enabled")
+        
+        # Set GPU memory limit to avoid OOM (RTX 3080 has 10GB, reserve 7GB per process)
+        # This prevents one process from consuming all GPU memory
+        # Lower limit for TensorFlow 2.20+ XLA command buffers
+        for gpu in gpus:
+            try:
+                tf.config.set_logical_device_configuration(
+                    gpu,
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=7000)]  # 7GB per GPU
+                )
+            except RuntimeError:
+                pass  # GPU already configured
+    except RuntimeError as e:
+        print(f"Error setting GPU memory growth: {e}")
+else:
+    print("No GPUs found. Running on CPU.")
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -24,10 +69,6 @@ if compression_path not in sys.path:
     sys.path.insert(0, compression_path)
 
 from quantization_client import Quantization, QuantizationConfig
-
-# Make TensorFlow logs less verbose
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # MQTT Configuration
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")  # MQTT broker address
@@ -50,7 +91,12 @@ class FederatedLearningClient:
         self.client_id = client_id
         self.num_clients = num_clients
         self.current_round = 0
+        # Default batch size adjusted for separate GPUs
         self.training_config = {"batch_size": 32, "local_epochs": 20}
+        # Deduplication tracking
+        self.last_global_round = -1
+        self.last_training_round = -1
+        self.evaluated_rounds = set()
         
         # Store data generators
         self.train_generator = train_generator
@@ -59,8 +105,9 @@ class FederatedLearningClient:
         # Model will be initialized from server config
         self.model = None
         
-        # Initialize quantization compression
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization compression (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization:
             self.quantizer = Quantization(QuantizationConfig())
             print(f"Client {self.client_id}: Quantization enabled")
@@ -97,8 +144,8 @@ class FederatedLearningClient:
         if rc == 0:
             print(f"Client {self.client_id} connected to MQTT broker")
             # Subscribe to topics - use QoS 0 for large model messages
-            result1, mid1 = self.mqtt_client.subscribe(TOPIC_GLOBAL_MODEL, qos=0)
-            print(f"  Subscribed to {TOPIC_GLOBAL_MODEL} (QoS 0) - Result: {result1}")
+            result1, mid1 = self.mqtt_client.subscribe(TOPIC_GLOBAL_MODEL, qos=1)
+            print(f"  Subscribed to {TOPIC_GLOBAL_MODEL} (QoS 1) - Result: {result1}")
             
             result2, mid2 = self.mqtt_client.subscribe(TOPIC_TRAINING_CONFIG, qos=1)
             print(f"  Subscribed to {TOPIC_TRAINING_CONFIG} (QoS 1) - Result: {result2}")
@@ -154,7 +201,9 @@ class FederatedLearningClient:
             sys.exit(0)
         else:
             print(f"Client {self.client_id} unexpected disconnect, return code {rc}")
-            self.mqtt_client.loop_stop()
+            print(f"Client {self.client_id} attempting to reconnect...")
+            # Don't stop the loop - paho-mqtt will automatically reconnect
+            # The loop_forever() will handle reconnection attempts
     
     def handle_training_complete(self):
         """Handle training completion signal from server"""
@@ -171,11 +220,21 @@ class FederatedLearningClient:
         try:
             data = json.loads(payload.decode())
             round_num = data['round']
+            # Ignore duplicate global model for the same round
+            if round_num <= self.last_global_round:
+                print(f"Client {self.client_id} ignoring duplicate global model for round {round_num}")
+                return
             
             # Check if weights are quantized
             if 'quantized_data' in data and self.quantizer is not None:
                 # Decompress quantized weights
                 compressed_data = data['quantized_data']
+                # If server sent serialized base64 string, decode and unpickle
+                if isinstance(compressed_data, str):
+                    try:
+                        compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
+                    except Exception as e:
+                        print(f"Client {self.client_id} error decoding quantized_data: {e}")
                 weights = self.quantizer.decompress(compressed_data)
                 if round_num > 0:
                     print(f"Client {self.client_id}: Received and decompressed quantized global model")
@@ -229,6 +288,8 @@ class FederatedLearningClient:
                 self.model.set_weights(weights)
                 print(f"Client {self.client_id} model initialized with server weights")
                 self.current_round = 0
+                # Mark initial global model processed to ignore duplicates
+                self.last_global_round = 0
             else:
                 # Updated model after aggregation
                 if self.model is None:
@@ -236,6 +297,7 @@ class FederatedLearningClient:
                     return
                 self.model.set_weights(weights)
                 self.current_round = round_num
+                self.last_global_round = round_num
                 print(f"Client {self.client_id} received global model for round {round_num}")
         except Exception as e:
             print(f"Client {self.client_id} ERROR in handle_global_model: {e}")
@@ -258,14 +320,23 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} waiting for global model from server...")
             return
         
-        # Check if we're ready for this round (should have received global model first)
+        # Check for duplicate training signals
+        if self.last_training_round == round_num:
+            print(f"Client {self.client_id} ignoring duplicate start training for round {round_num}")
+            return
+        
+        # Check if we're ready for this round
         if self.current_round == 0 and round_num == 1:
             # First training round with initial global model
             self.current_round = round_num
+            self.last_training_round = round_num
             print(f"\nClient {self.client_id} starting training for round {round_num} with initial global model...")
             self.train_local_model()
-        elif round_num == self.current_round:
-            # Subsequent rounds
+        elif round_num >= self.current_round and round_num <= self.current_round + 1:
+            # Next round - use model from current_round (might be round_num-1 if global model arrives late)
+            # This handles race condition where start_training arrives before global_model
+            self.current_round = round_num
+            self.last_training_round = round_num
             print(f"\nClient {self.client_id} starting training for round {round_num}...")
             self.train_local_model()
         else:
@@ -282,11 +353,16 @@ class FederatedLearningClient:
             return
         
         if round_num == self.current_round:
+            if round_num in self.evaluated_rounds:
+                print(f"Client {self.client_id} ignoring duplicate evaluation for round {round_num}")
+                return
             print(f"Client {self.client_id} starting evaluation for round {round_num}...")
             self.evaluate_model()
             # After evaluation, prepare for next round
-            self.current_round = round_num + 1
-            print(f"Client {self.client_id} ready for next round {self.current_round}")
+            # Do NOT increment current_round here; wait for server's start_training signal
+            # to advance to the next round. This keeps round alignment consistent.
+            self.evaluated_rounds.add(round_num)
+            print(f"Client {self.client_id} evaluation completed for round {round_num}. Awaiting start_training for round {round_num + 1}.")
         else:
             print(f"Client {self.client_id} skipping evaluation signal for round {round_num} (current: {self.current_round})")
     
@@ -294,13 +370,56 @@ class FederatedLearningClient:
         """Train model on local data and send updates to server"""
         batch_size = self.training_config['batch_size']
         epochs = self.training_config['local_epochs']
+        # Limit steps per epoch for faster smoke tests (configurable via env)
+        try:
+            steps_per_epoch = int(os.getenv("STEPS_PER_EPOCH", "100"))
+            val_steps = int(os.getenv("VAL_STEPS", "25"))
+        except Exception:
+            steps_per_epoch = 100
+            val_steps = 25
         
+        # Add training progress callbacks
+        class BatchLogger(tf.keras.callbacks.Callback):
+            def __init__(self, client_id: int, frequency: int = 100):
+                super().__init__()
+                self.client_id = client_id
+                self.frequency = frequency
+            def on_train_batch_end(self, batch, logs=None):
+                if batch % self.frequency == 0:
+                    logs = logs or {}
+                    loss = logs.get('loss')
+                    acc = logs.get('accuracy')
+                    try:
+                        print(f"[BatchLogger] Client {self.client_id} batch {batch}: loss={loss:.4f}, acc={acc:.4f}")
+                    except Exception:
+                        print(f"[BatchLogger] Client {self.client_id} batch {batch}: logs={logs}")
+
+        class EpochLogger(tf.keras.callbacks.Callback):
+            def __init__(self, client_id: int, total_epochs: int):
+                super().__init__()
+                self.client_id = client_id
+                self.total_epochs = total_epochs
+            def on_epoch_end(self, epoch, logs=None):
+                logs = logs or {}
+                loss = logs.get('loss')
+                acc = logs.get('accuracy')
+                val_loss = logs.get('val_loss')
+                val_acc = logs.get('val_accuracy')
+                try:
+                    print(f"[EpochLogger] Client {self.client_id} epoch {epoch+1}/{self.total_epochs}: "
+                          f"loss={loss:.4f}, acc={acc:.4f}, val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
+                except Exception:
+                    print(f"[EpochLogger] Client {self.client_id} epoch {epoch+1}/{self.total_epochs}: logs={logs}")
+
         # Train the model using generator
         history = self.model.fit(
             self.train_generator,
             epochs=epochs,
             validation_data=self.validation_generator,
-            verbose=2
+            steps_per_epoch=steps_per_epoch,
+            validation_steps=val_steps,
+            verbose=2,
+            callbacks=[BatchLogger(self.client_id), EpochLogger(self.client_id, epochs)]
         )
         
         # Get updated weights
@@ -324,11 +443,13 @@ class FederatedLearningClient:
                   f"Ratio: {stats['compression_ratio']:.2f}x, "
                   f"Size: {stats['compressed_size_mb']:.2f}MB")
             
+            # Serialize compressed data to JSON-safe base64 string
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             # Send compressed update
             update_message = {
                 "client_id": self.client_id,
                 "round": self.current_round,
-                "compressed_data": compressed_data,
+                "compressed_data": serialized,
                 "num_samples": num_samples,
                 "metrics": metrics
             }
@@ -347,10 +468,27 @@ class FederatedLearningClient:
         print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
         time.sleep(delay)
         
-        # Use QoS 0 for large model update messages
-        self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, json.dumps(update_message), qos=0)
-        print(f"Client {self.client_id} sent model update for round {self.current_round}")
-        print(f"Training metrics - Loss: {metrics['loss']:.4f}, Accuracy: {metrics['accuracy']:.4f}")
+        # Serialize and send model update with error handling
+        try:
+            payload = json.dumps(update_message)
+            payload_size_mb = len(payload) / (1024 * 1024)
+            print(f"Client {self.client_id} serialized update size: {payload_size_mb:.2f} MB")
+            
+            # Use QoS 1 for reliable delivery of large model update messages
+            result = self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, payload, qos=1)
+            
+            # Wait for the message to be published
+            result.wait_for_publish(timeout=30)
+            
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                print(f"Client {self.client_id} sent model update for round {self.current_round}")
+                print(f"Training metrics - Loss: {metrics['loss']:.4f}, Accuracy: {metrics['accuracy']:.4f}")
+            else:
+                print(f"Client {self.client_id} ERROR: Failed to send model update, rc={result.rc}")
+        except Exception as e:
+            print(f"Client {self.client_id} ERROR serializing/sending update: {e}")
+            import traceback
+            traceback.print_exc()
     
     def evaluate_model(self):
         """Evaluate model on validation data and send metrics to server"""
@@ -383,9 +521,11 @@ class FederatedLearningClient:
             try:
                 print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
                 # Use 1 hour keepalive (3600 seconds) to prevent timeout during long training
+                # Enable automatic reconnection on connection loss
+                self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=120)
                 self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 3600)
                 print(f"Successfully connected to MQTT broker!\n")
-                self.mqtt_client.loop_forever()
+                self.mqtt_client.loop_forever(retry_first_connection=True)
                 break
             except Exception as e:
                 print(f"Connection attempt {attempt + 1}/{max_retries} failed: {e}")
@@ -401,25 +541,44 @@ class FederatedLearningClient:
                     raise
 
 def load_data(client_id):
+    # Detect environment: Docker uses /app prefix, local uses relative path
+    if os.path.exists('/app'):
+        # Running in Docker container
+        base_path = '/app/Client/Emotion_Recognition/Dataset'
+    else:
+        # Running locally - use path relative to project root
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(os.path.dirname(script_dir))
+        base_path = os.path.join(project_root, 'Client', 'Emotion_Recognition', 'Dataset')
+    
+    train_path = os.path.join(base_path, f'client_{client_id}', 'train')
+    validation_path = os.path.join(base_path, f'client_{client_id}', 'validation')
+    
+    print(f"Dataset base path: {base_path}")
+    print(f"Train path: {train_path}")
+    print(f"Validation path: {validation_path}")
+    
     # Initialize image data generator with rescaling
     train_data_gen = ImageDataGenerator(rescale=1./255)
     validation_data_gen = ImageDataGenerator(rescale=1./255)
 
     # Load training and validation data
     train_generator = train_data_gen.flow_from_directory(
-        f'Client/Emotion_Recognition/Dataset/client_{client_id}/train/',
+        train_path,
         target_size=(48, 48),
-        batch_size=64,
+        batch_size=32,
         color_mode="grayscale",
-        class_mode='categorical'
+        class_mode='categorical',
+        shuffle=True
     )
 
     validation_generator = validation_data_gen.flow_from_directory(
-        f'Client/Emotion_Recognition/Dataset/client_{client_id}/validation/',
+        validation_path,
         target_size=(48, 48),
-        batch_size=64,
+        batch_size=32,
         color_mode="grayscale",
-        class_mode='categorical'
+        class_mode='categorical',
+        shuffle=False
     )
 
     return train_generator, validation_generator

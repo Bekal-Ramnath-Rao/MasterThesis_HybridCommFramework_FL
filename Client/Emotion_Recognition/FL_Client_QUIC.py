@@ -1,9 +1,4 @@
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Dense, Dropout, Flatten, Input
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
 import json
 import pickle
 import base64
@@ -11,14 +6,67 @@ import time
 import asyncio
 import os
 import logging
+import sys
 from aioquic.asyncio import connect
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import QuicEvent, StreamDataReceived
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 
+# GPU Configuration - Must be done BEFORE TensorFlow import
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+# Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
+gpu_device = os.environ.get("GPU_DEVICE_ID", "0")
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
+os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
+
+# Disable Grappler layout optimizer to avoid NCHW transpose errors in logs
+os.environ["TF_ENABLE_LAYOUT_OPTIMIZER"] = "0"
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Dense, Dropout, Flatten, Input
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
 # Make TensorFlow logs less verbose
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
+# Ensure Keras uses channels_last image data format
+tf.keras.backend.set_image_data_format('channels_last')
+
+# Verify GPU availability
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    print(f"GPUs available: {len(gpus)}")
+    for i, gpu in enumerate(gpus):
+        print(f"  GPU {i}: {gpu}")
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print("GPU memory growth enabled")
+        
+        # Set GPU memory limit to avoid OOM (RTX 3080 has 10GB, reserve 7GB per process)
+        # This prevents one process from consuming all GPU memory
+        for gpu in gpus:
+            try:
+                tf.config.set_logical_device_configuration(
+                    gpu,
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=7000)]  # 7GB per GPU
+                )
+            except RuntimeError:
+                pass  # GPU already configured
+    except RuntimeError as e:
+        print(f"Error setting GPU memory growth: {e}")
+else:
+    print("No GPUs found. Running on CPU.")
+
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+from quantization_client import Quantization, QuantizationConfig
 
 # QUIC Configuration
 QUIC_HOST = os.getenv("QUIC_HOST", "localhost")
@@ -73,8 +121,9 @@ class FederatedLearningClient:
         self.num_clients = num_clients
         self.model = None
         
-        # Initialize quantization compression
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization compression (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization:
             self.quantizer = Quantization(QuantizationConfig())
             print(f"Client {self.client_id}: Quantization enabled")
@@ -178,6 +227,10 @@ class FederatedLearningClient:
             weights = self.deserialize_weights(encoded_weights)
         
         if round_num == 0:
+            # If we've already moved past initialization, ignore repeated initial models
+            if self.current_round > 0:
+                print(f"Client {self.client_id} ignoring duplicate initial global model (already in round {self.current_round})")
+                return
             # Initial model from server - create model from server's config
             print(f"Client {self.client_id} received initial global model from server")
             
@@ -401,7 +454,16 @@ class FederatedLearningClient:
 
 async def main():
     # Setup data generators
-    client_data_dir = f'Client/Emotion_Recognition/Dataset/client_{CLIENT_ID}'
+    # Detect environment: Docker uses /app prefix, local uses relative path
+    if os.path.exists('/app'):
+        base_path = '/app/Client/Emotion_Recognition/Dataset'
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(os.path.dirname(script_dir))
+        base_path = os.path.join(project_root, 'Client', 'Emotion_Recognition', 'Dataset')
+    
+    client_data_dir = os.path.join(base_path, f'client_{CLIENT_ID}')
+    print(f"Dataset base path: {base_path}")
     
     if not os.path.exists(client_data_dir):
         print(f"Error: Client data directory not found: {client_data_dir}")
@@ -423,7 +485,7 @@ async def main():
     val_datagen = ImageDataGenerator(rescale=1./255)
     
     train_generator = train_datagen.flow_from_directory(
-        f'{client_data_dir}/train',
+        os.path.join(client_data_dir, 'train'),
         target_size=(48, 48),
         batch_size=32,
         color_mode='grayscale',
@@ -432,7 +494,7 @@ async def main():
     )
     
     validation_generator = val_datagen.flow_from_directory(
-        f'{client_data_dir}/validation',
+        os.path.join(client_data_dir, 'validation'),
         target_size=(48, 48),
         batch_size=32,
         color_mode='grayscale',

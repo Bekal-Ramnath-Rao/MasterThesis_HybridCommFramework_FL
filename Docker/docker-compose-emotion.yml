@@ -10,13 +10,13 @@ services:
     image: eclipse-mosquitto:2
     container_name: fl-mqtt-broker
     ports:
-      - "1883:1883"
-      - "9001:9001"
+      - "31883:1883"
+      - "39001:9001"
     volumes:
       - ../mqtt-config:/mosquitto/config
     networks:
       - fl-mqtt-network
-    command: mosquitto -c /mosquitto-no-auth.conf
+    command: mosquitto -c /mosquitto/config/mosquitto.conf
 
   # MQTT FL Server (Emotion Recognition)
   fl-server-mqtt-emotion:
@@ -43,6 +43,7 @@ services:
       - fl-mqtt-network
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # MQTT FL Client 1 (Emotion Recognition)
   fl-client-mqtt-emotion-1:
@@ -69,6 +70,7 @@ services:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-mqtt-network
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # MQTT FL Client 2 (Emotion Recognition)
   fl-client-mqtt-emotion-2:
@@ -95,6 +97,7 @@ services:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-mqtt-network
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # ============================================================================
   # AMQP Protocol Setup (Emotion Recognition)
@@ -139,6 +142,7 @@ services:
       - fl-amqp-network
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # AMQP FL Client 1 (Emotion Recognition)
   fl-client-amqp-emotion-1:
@@ -160,6 +164,7 @@ services:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-amqp-network
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # AMQP FL Client 2 (Emotion Recognition)
   fl-client-amqp-emotion-2:
@@ -181,6 +186,7 @@ services:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-amqp-network
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # ============================================================================
   # gRPC Protocol Setup (Emotion Recognition)
@@ -205,6 +211,7 @@ services:
       - fl-grpc-network
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # gRPC FL Client 1 (Emotion Recognition)
   fl-client-grpc-emotion-1:
@@ -227,6 +234,7 @@ services:
       - ../certs:/app/certs
     networks:
       - fl-grpc-network
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # gRPC FL Client 2 (Emotion Recognition)
   fl-client-grpc-emotion-2:
@@ -249,6 +257,7 @@ services:
       - ../certs:/app/certs
     networks:
       - fl-grpc-network
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # ============================================================================
   # QUIC Protocol Setup (Emotion Recognition)
@@ -275,6 +284,7 @@ services:
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
       - ../certs:/app/certs
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # QUIC FL Client 1 (Emotion Recognition)
   fl-client-quic-emotion-1:
@@ -297,6 +307,7 @@ services:
       - ../certs:/app/certs
     networks:
       - fl-quic-network
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # QUIC FL Client 2 (Emotion Recognition)
   fl-client-quic-emotion-2:
@@ -319,6 +330,7 @@ services:
       - ../certs:/app/certs
     networks:
       - fl-quic-network
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # ============================================================================
   # DDS Protocol Setup (Emotion Recognition)
@@ -341,6 +353,7 @@ services:
       - fl-dds-network
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # DDS FL Client 1 (Emotion Recognition)
   fl-client-dds-emotion-1:
@@ -361,6 +374,7 @@ services:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-dds-network
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # DDS FL Client 2 (Emotion Recognition)
   fl-client-dds-emotion-2:
@@ -381,6 +395,7 @@ services:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-dds-network
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # ============================================================================
   # Traffic Generator Containers (for Congestion Testing)

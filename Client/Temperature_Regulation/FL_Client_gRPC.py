@@ -46,8 +46,9 @@ class FederatedLearningClient:
         self.num_clients = num_clients
         self.model = None
         
-        # Initialize quantization compression
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization compression (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization:
             self.quantizer = Quantization(QuantizationConfig())
             print(f"Client {self.client_id}: Quantization enabled")
@@ -59,7 +60,7 @@ class FederatedLearningClient:
         self.x_test = None
         self.y_test = None
         self.current_round = 0
-        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        self.training_config = {"batch_size": 16, "local_epochs": 20}
         
         # gRPC connection
         self.channel = None
@@ -459,7 +460,14 @@ def main():
     print()
     
     # Load and prepare data
-    data_path = 'Client/Temperature_Regulation/Dataset/base_data_baseline_unique.csv'
+    # Detect environment and construct dataset path
+    if os.path.exists('/app'):
+        data_path = '/app/Client/Temperature_Regulation/Dataset/base_data_baseline_unique.csv'
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(os.path.dirname(script_dir))
+        data_path = os.path.join(project_root, 'Client', 'Temperature_Regulation', 'Dataset', 'base_data_baseline_unique.csv')
+    print(f"Dataset path: {data_path}")
     
     if not os.path.exists(data_path):
         print(f"Error: Data file not found at {data_path}")

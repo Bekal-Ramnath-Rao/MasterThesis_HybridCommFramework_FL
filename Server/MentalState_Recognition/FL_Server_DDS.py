@@ -10,6 +10,18 @@ from collections import Counter
 from sklearn.model_selection import train_test_split
 import tensorflow as tf
 
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+try:
+    from quantization_server import ServerQuantizationHandler, QuantizationConfig
+    QUANTIZATION_AVAILABLE = True
+except ImportError:
+    print("Warning: Quantization module not available")
+    QUANTIZATION_AVAILABLE = False
+
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 # Add CycloneDDS DLL path
@@ -265,6 +277,19 @@ class FederatedLearningServer:
         self.ACC = []
         self.TOP2 = []
         self.ROUNDS = []
+
+        # Initialize quantization handler (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
+        if use_quantization and QUANTIZATION_AVAILABLE:
+            self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
+            print("Server: Quantization enabled")
+        else:
+            self.quantization_handler = None
+            if use_quantization and not QUANTIZATION_AVAILABLE:
+                print("Server: Quantization requested but not available")
+            else:
+                print("Server: Quantization disabled")
 
         # Initialize global model and test data
         self.initialize_global_model()

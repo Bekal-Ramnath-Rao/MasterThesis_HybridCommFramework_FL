@@ -16,7 +16,7 @@ services:
       - ./mqtt-config:/mosquitto/config
     networks:
       - fl-mqtt-network
-    command: mosquitto -c /mosquitto-no-auth.conf
+    command: mosquitto -c /mosquitto/config/mosquitto.conf
 
   # MQTT FL Server (Emotion Recognition)
   fl-server-mqtt-emotion:

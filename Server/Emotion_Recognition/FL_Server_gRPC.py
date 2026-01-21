@@ -67,8 +67,9 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.start_time = None
         self.convergence_time = None
         
-        # Initialize quantization handler
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization handler (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization and QUANTIZATION_AVAILABLE:
             self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
             print("Server: Quantization enabled")
@@ -83,9 +84,10 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.initialize_global_model()
         
         # Training configuration
+        # Training configuration broadcast to gRPC clients
         self.training_config = {
             "batch_size": 32,
-            "local_epochs": 20
+            "local_epochs": 20  # Reduced from 20 for faster experiments
         }
         
         # Status flags
@@ -192,6 +194,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         """Send global model weights and configuration to client"""
         with self.lock:
             if self.global_weights is None:
+                print(f"Client {request.client_id}: Model not yet initialized")
                 return federated_learning_pb2.GlobalModel(
                     round=0,
                     weights=b'',
@@ -209,6 +212,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             else:
                 serialized_weights = self.serialize_weights(self.global_weights)
             model_config_json = json.dumps(self.model_config) if self.current_round == 0 else ''
+            
+            print(f"Client {request.client_id}: Sending global model (round {self.current_round}, {len(serialized_weights)/1024:.2f} KB)")
             
             return federated_learning_pb2.GlobalModel(
                 round=self.current_round,
@@ -322,7 +327,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             self.training_started = True
             self.start_time = time.time()
             self.current_round = 1
-            
+        
         print("\n" + "="*70)
         print("STARTING FEDERATED LEARNING")
         print("="*70)
@@ -330,7 +335,10 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         print(f"Maximum rounds: {self.num_rounds}")
         print(f"Convergence threshold: {CONVERGENCE_THRESHOLD}")
         print(f"Patience: {CONVERGENCE_PATIENCE} rounds")
+        print(f"Global model ready: {self.global_weights is not None}")
+        print(f"Model layers: {len(self.global_weights) if self.global_weights else 0}")
         print("="*70 + "\n")
+        print("Clients can now call GetGlobalModel to fetch initial weights...")
     
     def aggregate_updates(self):
         """Aggregate client model updates using FedAvg"""

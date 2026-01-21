@@ -27,10 +27,23 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # GPU Configuration
+# GPU Configuration
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
-    for g in gpus:
-        tf.config.experimental.set_memory_growth(g, True)
+    try:
+        # Set memory growth to avoid allocating all GPU memory at once
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        
+        # Set memory limit to prevent OOM with large CNN+BiLSTM+MHA model
+        # Allow ~7GB per GPU (conservative for 10GB cards with overhead)
+        tf.config.set_logical_device_configuration(
+            gpus[0],
+            [tf.config.LogicalDeviceConfiguration(memory_limit=7168)]
+        )
+        print(f"[GPU] Configured with memory growth and 7GB limit")
+    except RuntimeError as e:
+        print(f"[GPU] Configuration error: {e}")
 
 # QUIC Configuration
 QUIC_HOST = os.getenv("QUIC_HOST", "localhost")
@@ -75,8 +88,9 @@ class FederatedLearningClient:
         self.num_clients = num_clients
         self.model = None
         
-        # Initialize quantization compression
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization compression (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization:
             self.quantizer = Quantization(QuantizationConfig())
             print(f"Client {self.client_id}: Quantization enabled")
@@ -87,7 +101,7 @@ class FederatedLearningClient:
         self.y_train = None
         self.current_round = 0
         self.training_config = {
-            "batch_size": 256,
+            "batch_size": 16,
             "local_epochs": 5,
             "val_split": 0.10
         }
@@ -108,9 +122,14 @@ class FederatedLearningClient:
         """Load and partition EEG data for this client using data_partitioner"""
         print(f"\n[Client {self.client_id}] Preparing data...")
         
-        # Get data directory
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        data_dir = os.path.join(script_dir, "Dataset")
+        # Get data directory - detect environment
+        if os.path.exists('/app'):
+            data_dir = '/app/Client/MentalState_Recognition/Dataset'
+        else:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(os.path.dirname(script_dir))
+            data_dir = os.path.join(project_root, 'Client', 'MentalState_Recognition', 'Dataset')
+        print(f"Dataset path: {data_dir}")
         
         # Use data partitioner to get non-IID data
         self.x_train, self.y_train = get_client_data(

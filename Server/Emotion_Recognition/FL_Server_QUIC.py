@@ -5,6 +5,7 @@ import base64
 import time
 import os
 import asyncio
+import sys
 from typing import Dict, Optional
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -115,8 +116,9 @@ class FederatedLearningServer:
         # Protocol reference
         self.protocol: Optional[FederatedLearningServerProtocol] = None
         
-        # Initialize quantization handler
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization handler (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization and QUANTIZATION_AVAILABLE:
             self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
             print("Server: Quantization enabled")
@@ -131,9 +133,11 @@ class FederatedLearningServer:
         self.initialize_global_model()
         
         # Training configuration
+        # Training configuration sent to clients
+        # Reduced batch size to 16 to prevent GPU OOM on RTX 3080 (10GB)
         self.training_config = {
             "batch_size": 32,
-            "local_epochs": 20
+            "local_epochs": 20  # Reduced from 20 for faster experiments
         }
     
     def initialize_global_model(self):
@@ -246,14 +250,30 @@ class FederatedLearningServer:
         """Handle model update from client"""
         client_id = message['client_id']
         round_num = message['round']
-        
+        print(f"[DEBUG] handle_client_update: client={client_id}, msg_round={round_num}, server_current_round={self.current_round}")
         if round_num == self.current_round:
             # Decompress or deserialize client weights
             if 'compressed_data' in message and self.quantization_handler is not None:
+                start_t = time.time()
                 weights = self.quantization_handler.decompress_client_update(message['client_id'], message['compressed_data'])
-                print(f"Server: Received and decompressed update from client {message['client_id']}")
+                dt = time.time() - start_t
+                print(f"Server: Received and decompressed update from client {message['client_id']} in {dt:.2f}s")
             else:
-                weights = self.deserialize_weights(message['weights'])
+                # Offload heavy deserialization to thread pool to avoid blocking event loop
+                encoded = message.get('weights')
+                if encoded is None:
+                    print(f"[ERROR] Missing 'weights' in model_update from client {client_id}")
+                    return
+                start_t = time.time()
+                loop = asyncio.get_event_loop()
+                try:
+                    weights = await loop.run_in_executor(None, self.deserialize_weights, encoded)
+                except Exception as e:
+                    print(f"[ERROR] Failed to deserialize weights from client {client_id}: {e}")
+                    import traceback; traceback.print_exc()
+                    return
+                dt = time.time() - start_t
+                print(f"[DEBUG] Deserialized weights from client {client_id} in {dt:.2f}s")
             
             self.client_updates[client_id] = {
                 'weights': weights,
@@ -266,6 +286,8 @@ class FederatedLearningServer:
             
             if len(self.client_updates) == self.num_clients:
                 await self.aggregate_models()
+        else:
+            print(f"[DEBUG] Ignoring model_update from client {client_id} for round {round_num} (server at {self.current_round})")
     
     async def handle_client_metrics(self, message):
         """Handle evaluation metrics from client"""
@@ -332,25 +354,31 @@ class FederatedLearningServer:
             weights_data = self.serialize_weights(self.global_weights)
             weights_key = 'weights'
         
-        await self.broadcast_message({
-            'type': 'global_model',
-            'round': 0,
-            weights_key: weights_data,
-            'model_config': model_config
-        })
+        print("Publishing initial model to clients (sending multiple times for reliability)...")
+        for i in range(3):
+            await self.broadcast_message({
+                'type': 'global_model',
+                'round': 0,
+                weights_key: weights_data,
+                'model_config': model_config
+            })
+            print(f"  Attempt {i+1}/3: Initial model broadcast complete")
+            await asyncio.sleep(0.5)
         
         print("Initial global model (architecture + weights) sent to all clients")
         print("Waiting for clients to initialize their models (TensorFlow + CNN building)...")
-        await asyncio.sleep(10)
+        await asyncio.sleep(8)
         
         print(f"\n{'='*70}")
         print(f"Starting Round {self.current_round}/{self.num_rounds}")
         print(f"{'='*70}\n")
         
+        print("Signaling clients to start training...")
         await self.broadcast_message({
             'type': 'start_training',
             'round': self.current_round
         })
+        print("Start training signal sent successfully\n")
     
     async def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""

@@ -243,7 +243,7 @@ class ServerQuantizationHandler:
     
     def should_use_quantization(self) -> bool:
         """Check if quantization should be applied"""
-        return os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        return os.getenv("USE_QUANTIZATION", "false").lower() == "true"
     
     def get_compression_stats(
         self,

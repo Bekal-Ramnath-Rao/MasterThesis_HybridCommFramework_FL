@@ -1,0 +1,453 @@
+# Docker Compose for Emotion Recognition with GPU Support (Device-Isolated)
+# This version isolates GPU devices to prevent memory contention between clients
+# Client 1 uses GPU 0, Client 2 uses GPU 1, Server uses both but with memory limits
+# Requires: 2+ NVIDIA GPUs with NVIDIA Container Toolkit
+# Note: Uses Docker Compose V2 syntax (no version: field)
+
+services:
+  mqtt-broker:
+    image: eclipse-mosquitto:latest
+    ports:
+      - "31883:1883"
+      - "39001:9001"
+    volumes:
+      - ../mqtt-config/mosquitto.conf:/mosquitto/config/mosquitto.conf
+    networks:
+      - temperature_network
+    container_name: mqtt-broker-temperature
+
+  # ============================================================================
+  # MQTT Protocol Services
+  # ============================================================================
+  
+  fl-server-mqtt-temperature:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=MQTT
+      - USE_CASE=temperature
+      - MQTT_BROKER=mqtt-broker:1883
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=0,1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.4
+    depends_on:
+      - mqtt-broker
+    networks:
+      - temperature_network
+    container_name: fl-server-mqtt-temperature
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0', '1']
+
+  fl-client-mqtt-temperature-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=MQTT
+      - USE_CASE=temperature
+      - MQTT_BROKER=mqtt-broker:1883
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - mqtt-broker
+      - fl-server-mqtt-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-mqtt-temperature-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-mqtt-temperature-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=MQTT
+      - USE_CASE=temperature
+      - MQTT_BROKER=mqtt-broker:1883
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - mqtt-broker
+      - fl-server-mqtt-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-mqtt-temperature-2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+  # ============================================================================
+  # AMQP Protocol Services
+  # ============================================================================
+  
+  amqp-broker:
+    image: rabbitmq:3.12-management
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    ports:
+      - "35672:5672"
+      - "35671:15672"
+    networks:
+      - temperature_network
+    container_name: amqp-broker-temperature
+
+  fl-server-amqp-temperature:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=AMQP
+      - USE_CASE=temperature
+      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=0,1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.4
+    depends_on:
+      - amqp-broker
+    networks:
+      - temperature_network
+    container_name: fl-server-amqp-temperature
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0', '1']
+
+  fl-client-amqp-temperature-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=AMQP
+      - USE_CASE=temperature
+      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - amqp-broker
+      - fl-server-amqp-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-amqp-temperature-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-amqp-temperature-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=AMQP
+      - USE_CASE=temperature
+      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - amqp-broker
+      - fl-server-amqp-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-amqp-temperature-2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+  # ============================================================================
+  # gRPC Protocol Services
+  # ============================================================================
+  
+  fl-server-grpc-temperature:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=gRPC
+      - USE_CASE=temperature
+      - GRPC_PORT=50051
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=0,1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.4
+    ports:
+      - "50051:50051"
+    networks:
+      - temperature_network
+    container_name: fl-server-grpc-temperature
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0', '1']
+
+  fl-client-grpc-temperature-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=gRPC
+      - USE_CASE=temperature
+      - GRPC_SERVER=fl-server-grpc-temperature:50051
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-grpc-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-grpc-temperature-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-grpc-temperature-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=gRPC
+      - USE_CASE=temperature
+      - GRPC_SERVER=fl-server-grpc-temperature:50051
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-grpc-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-grpc-temperature-2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+  # ============================================================================
+  # QUIC Protocol Services
+  # ============================================================================
+  
+  fl-server-quic-temperature:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=QUIC
+      - USE_CASE=temperature
+      - QUIC_PORT=4433
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=0,1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.4
+    ports:
+      - "4433:4433/udp"
+    networks:
+      - temperature_network
+    container_name: fl-server-quic-temperature
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0', '1']
+
+  fl-client-quic-temperature-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=QUIC
+      - USE_CASE=temperature
+      - QUIC_SERVER=fl-server-quic-temperature:4433
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-quic-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-quic-temperature-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-quic-temperature-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=QUIC
+      - USE_CASE=temperature
+      - QUIC_SERVER=fl-server-quic-temperature:4433
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-quic-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-quic-temperature-2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+  # ============================================================================
+  # DDS Protocol Services
+  # ============================================================================
+  
+  fl-server-dds-temperature:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=DDS
+      - USE_CASE=temperature
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=0,1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.4
+    networks:
+      - temperature_network
+    container_name: fl-server-dds-temperature
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0', '1']
+
+  fl-client-dds-temperature-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=DDS
+      - USE_CASE=temperature
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-dds-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-dds-temperature-1
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-dds-temperature-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=DDS
+      - USE_CASE=temperature
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-dds-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-dds-temperature-2
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+networks:
+  temperature_network:
+    driver: bridge

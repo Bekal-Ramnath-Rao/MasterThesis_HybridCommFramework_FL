@@ -1,0 +1,453 @@
+# Docker Compose for Emotion Recognition with GPU Support (Device-Isolated)
+# This version isolates GPU devices to prevent memory contention between clients
+# Client 1 uses GPU 0, Client 2 uses GPU 1, Server uses both but with memory limits
+# Requires: 2+ NVIDIA GPUs with NVIDIA Container Toolkit
+# Note: Uses Docker Compose V2 syntax (no version: field)
+
+services:
+  mqtt-broker:
+    image: eclipse-mosquitto:latest
+    ports:
+      - "31883:1883"
+      - "39001:9001"
+    volumes:
+      - ../mqtt-config/mosquitto.conf:/mosquitto/config/mosquitto.conf
+    networks:
+      - mentalstate_network
+    container_name: mqtt-broker-mentalstate
+
+  # ============================================================================
+  # MQTT Protocol Services
+  # ============================================================================
+  
+  fl-server-mqtt-mentalstate:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=MQTT
+      - USE_CASE=mentalstate
+      - MQTT_BROKER=mqtt-broker:1883
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=0,1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.4
+    depends_on:
+      - mqtt-broker
+    networks:
+      - mentalstate_network
+    container_name: fl-server-mqtt-mentalstate
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0', '1']
+
+  fl-client-mqtt-mentalstate-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=MQTT
+      - USE_CASE=mentalstate
+      - MQTT_BROKER=mqtt-broker:1883
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - mqtt-broker
+      - fl-server-mqtt-mentalstate
+    networks:
+      - mentalstate_network
+    container_name: fl-client-mqtt-mentalstate-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-mqtt-mentalstate-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=MQTT
+      - USE_CASE=mentalstate
+      - MQTT_BROKER=mqtt-broker:1883
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - mqtt-broker
+      - fl-server-mqtt-mentalstate
+    networks:
+      - mentalstate_network
+    container_name: fl-client-mqtt-mentalstate-2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+  # ============================================================================
+  # AMQP Protocol Services
+  # ============================================================================
+  
+  amqp-broker:
+    image: rabbitmq:3.12-management
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    ports:
+      - "35672:5672"
+      - "35671:15672"
+    networks:
+      - mentalstate_network
+    container_name: amqp-broker-mentalstate
+
+  fl-server-amqp-mentalstate:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=AMQP
+      - USE_CASE=mentalstate
+      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=0,1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.4
+    depends_on:
+      - amqp-broker
+    networks:
+      - mentalstate_network
+    container_name: fl-server-amqp-mentalstate
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0', '1']
+
+  fl-client-amqp-mentalstate-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=AMQP
+      - USE_CASE=mentalstate
+      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - amqp-broker
+      - fl-server-amqp-mentalstate
+    networks:
+      - mentalstate_network
+    container_name: fl-client-amqp-mentalstate-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-amqp-mentalstate-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=AMQP
+      - USE_CASE=mentalstate
+      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - amqp-broker
+      - fl-server-amqp-mentalstate
+    networks:
+      - mentalstate_network
+    container_name: fl-client-amqp-mentalstate-2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+  # ============================================================================
+  # gRPC Protocol Services
+  # ============================================================================
+  
+  fl-server-grpc-mentalstate:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=gRPC
+      - USE_CASE=mentalstate
+      - GRPC_PORT=50051
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=0,1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.4
+    ports:
+      - "50051:50051"
+    networks:
+      - mentalstate_network
+    container_name: fl-server-grpc-mentalstate
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0', '1']
+
+  fl-client-grpc-mentalstate-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=gRPC
+      - USE_CASE=mentalstate
+      - GRPC_SERVER=fl-server-grpc-mentalstate:50051
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-grpc-mentalstate
+    networks:
+      - mentalstate_network
+    container_name: fl-client-grpc-mentalstate-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-grpc-mentalstate-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=gRPC
+      - USE_CASE=mentalstate
+      - GRPC_SERVER=fl-server-grpc-mentalstate:50051
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-grpc-mentalstate
+    networks:
+      - mentalstate_network
+    container_name: fl-client-grpc-mentalstate-2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+  # ============================================================================
+  # QUIC Protocol Services
+  # ============================================================================
+  
+  fl-server-quic-mentalstate:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=QUIC
+      - USE_CASE=mentalstate
+      - QUIC_PORT=4433
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=0,1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.4
+    ports:
+      - "4433:4433/udp"
+    networks:
+      - mentalstate_network
+    container_name: fl-server-quic-mentalstate
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0', '1']
+
+  fl-client-quic-mentalstate-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=QUIC
+      - USE_CASE=mentalstate
+      - QUIC_SERVER=fl-server-quic-mentalstate:4433
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-quic-mentalstate
+    networks:
+      - mentalstate_network
+    container_name: fl-client-quic-mentalstate-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-quic-mentalstate-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=QUIC
+      - USE_CASE=mentalstate
+      - QUIC_SERVER=fl-server-quic-mentalstate:4433
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-quic-mentalstate
+    networks:
+      - mentalstate_network
+    container_name: fl-client-quic-mentalstate-2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+  # ============================================================================
+  # DDS Protocol Services
+  # ============================================================================
+  
+  fl-server-dds-mentalstate:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=DDS
+      - USE_CASE=mentalstate
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=0,1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.4
+    networks:
+      - mentalstate_network
+    container_name: fl-server-dds-mentalstate
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0', '1']
+
+  fl-client-dds-mentalstate-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=DDS
+      - USE_CASE=mentalstate
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-dds-mentalstate
+    networks:
+      - mentalstate_network
+    container_name: fl-client-dds-mentalstate-1
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-dds-mentalstate-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=DDS
+      - USE_CASE=mentalstate
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-dds-mentalstate
+    networks:
+      - mentalstate_network
+    container_name: fl-client-dds-mentalstate-2
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+networks:
+  mentalstate_network:
+    driver: bridge

@@ -70,7 +70,7 @@ class FederatedLearningServer:
         self.convergence_time = None
         
         # Initialize quantization handler
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        use_quantization = os.getenv("USE_QUANTIZATION", "false").lower() == "true"
         if use_quantization and QUANTIZATION_AVAILABLE:
             self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
             print("Server: Quantization enabled")
@@ -87,7 +87,7 @@ class FederatedLearningServer:
         # Training configuration
         self.training_config = {
             "batch_size": 32,
-            "local_epochs": 20
+            "local_epochs": 5
         }
         
         # Initialize MQTT client
@@ -181,9 +181,16 @@ class FederatedLearningServer:
         if round_num == self.current_round:
             # Check if update is compressed
             if 'compressed_data' in data and self.quantization_handler is not None:
+                compressed_update = data['compressed_data']
+                # If client sent serialized base64 string, decode and unpickle
+                if isinstance(compressed_update, str):
+                    try:
+                        compressed_update = pickle.loads(base64.b64decode(compressed_update.encode('utf-8')))
+                    except Exception as e:
+                        print(f"Server error decoding compressed_data from client {client_id}: {e}")
                 weights = self.quantization_handler.decompress_client_update(
                     client_id, 
-                    data['compressed_data']
+                    compressed_update
                 )
                 print(f"Received and decompressed update from client {client_id}")
             else:
@@ -240,9 +247,11 @@ class FederatedLearningServer:
             stats = self.quantization_handler.get_compression_stats(self.global_weights, compressed_data)
             print(f"Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
             
+            # Serialize compressed data to JSON-safe base64 string
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             initial_model_message = {
                 "round": 0,
-                "quantized_data": compressed_data,
+                "quantized_data": serialized,
                 "model_config": self.model_config
             }
         else:
@@ -318,9 +327,11 @@ class FederatedLearningServer:
         # Optionally compress before sending
         if self.quantization_handler is not None:
             compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            # Serialize compressed data to JSON-safe base64 string
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             global_model_message = {
                 "round": self.current_round,
-                "quantized_data": compressed_data
+                "quantized_data": serialized
             }
         else:
             global_model_message = {

@@ -1,0 +1,414 @@
+# Docker Compose for Emotion Recognition with GPU Support (Device-Isolated)
+# This version isolates GPU devices to prevent memory contention between clients
+# Client 1 uses GPU 0, Client 2 uses GPU 1, Server uses both but with memory limits
+# Requires: 2+ NVIDIA GPUs with NVIDIA Container Toolkit
+# Note: Uses Docker Compose V2 syntax (no version: field)
+
+services:
+  mqtt-broker:
+    image: eclipse-mosquitto:latest
+    ports:
+      - "31883:1883"
+      - "39001:9001"
+    volumes:
+      - ../mqtt-config/mosquitto.conf:/mosquitto/config/mosquitto.conf
+    networks:
+      - emotion_network
+    container_name: mqtt-broker-emotion
+
+  # ============================================================================
+  # MQTT Protocol Services
+  # ============================================================================
+  
+  fl-server-mqtt-emotion:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=MQTT
+      - USE_CASE=emotion
+      - MQTT_BROKER=mqtt-broker:1883
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
+    depends_on:
+      - mqtt-broker
+    networks:
+      - emotion_network
+    container_name: fl-server-mqtt-emotion
+    # Server does not need GPU resources - only aggregates models
+
+  fl-client-mqtt-emotion-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=MQTT
+      - USE_CASE=emotion
+      - MQTT_BROKER=mqtt-broker:1883
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - mqtt-broker
+      - fl-server-mqtt-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-mqtt-emotion-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-mqtt-emotion-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=MQTT
+      - USE_CASE=emotion
+      - MQTT_BROKER=mqtt-broker:1883
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - mqtt-broker
+      - fl-server-mqtt-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-mqtt-emotion-2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+  # ============================================================================
+  # AMQP Protocol Services
+  # ============================================================================
+  
+  amqp-broker:
+    image: rabbitmq:3.12-management
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    ports:
+      - "35672:5672"
+      - "35671:15672"
+    networks:
+      - emotion_network
+    container_name: amqp-broker-emotion
+
+  fl-server-amqp-emotion:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=AMQP
+      - USE_CASE=emotion
+      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
+    depends_on:
+      - amqp-broker
+    networks:
+      - emotion_network
+    container_name: fl-server-amqp-emotion
+    # Server does not need GPU resources - only aggregates models
+
+  fl-client-amqp-emotion-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=AMQP
+      - USE_CASE=emotion
+      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - amqp-broker
+      - fl-server-amqp-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-amqp-emotion-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-amqp-emotion-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=AMQP
+      - USE_CASE=emotion
+      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - amqp-broker
+      - fl-server-amqp-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-amqp-emotion-2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+  # ============================================================================
+  # gRPC Protocol Services
+  # ============================================================================
+  
+  fl-server-grpc-emotion:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=gRPC
+      - USE_CASE=emotion
+      - GRPC_PORT=50051
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
+    ports:
+      - "50051:50051"
+    networks:
+      - emotion_network
+    container_name: fl-server-grpc-emotion
+    # Server does not need GPU resources - only aggregates models
+
+  fl-client-grpc-emotion-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=gRPC
+      - USE_CASE=emotion
+      - GRPC_SERVER=fl-server-grpc-emotion:50051
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-grpc-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-grpc-emotion-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-grpc-emotion-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=gRPC
+      - USE_CASE=emotion
+      - GRPC_SERVER=fl-server-grpc-emotion:50051
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-grpc-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-grpc-emotion-2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+  # ============================================================================
+  # QUIC Protocol Services
+  # ============================================================================
+  
+  fl-server-quic-emotion:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=QUIC
+      - USE_CASE=emotion
+      - QUIC_PORT=4433
+      - NUM_ROUNDS=1000
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+    ports:
+      - "4433:4433/udp"
+    networks:
+      - emotion_network
+    container_name: fl-server-quic-emotion
+    # Server runs on CPU to avoid competing for GPU memory with clients
+
+  fl-client-quic-emotion-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=QUIC
+      - USE_CASE=emotion
+      - QUIC_SERVER=fl-server-quic-emotion:4433
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-quic-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-quic-emotion-1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-quic-emotion-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=QUIC
+      - USE_CASE=emotion
+      - QUIC_SERVER=fl-server-quic-emotion:4433
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-quic-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-quic-emotion-2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+  # ============================================================================
+  # DDS Protocol Services
+  # ============================================================================
+  
+  fl-server-dds-emotion:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=DDS
+      - USE_CASE=emotion
+      - NUM_ROUNDS=1000
+      - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
+      - LOCAL_EPOCHS=5
+    networks:
+      - emotion_network
+    container_name: fl-server-dds-emotion
+    cap_add:
+      - NET_ADMIN
+    # Server does not need GPU resources - only aggregates models
+
+  fl-client-dds-emotion-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=DDS
+      - USE_CASE=emotion
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-dds-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-dds-emotion-1
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-dds-emotion-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=DDS
+      - USE_CASE=emotion
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-dds-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-dds-emotion-2
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+networks:
+  emotion_network:
+    driver: bridge

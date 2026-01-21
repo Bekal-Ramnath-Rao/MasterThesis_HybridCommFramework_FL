@@ -47,8 +47,9 @@ class FederatedLearningClient:
         self.num_clients = num_clients
         self.model = None
         
-        # Initialize quantization compression
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization compression (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization:
             self.quantizer = Quantization(QuantizationConfig())
             print(f"Client {self.client_id}: Quantization enabled")
@@ -60,7 +61,7 @@ class FederatedLearningClient:
         self.x_test = None
         self.y_test = None
         self.current_round = 0
-        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        self.training_config = {"batch_size": 16, "local_epochs": 20}
         
         # AMQP connection
         self.connection = None
@@ -238,6 +239,12 @@ class FederatedLearningClient:
             # Check if weights are quantized
             if 'quantized_data' in data and self.quantizer is not None:
                 compressed_data = data['quantized_data']
+                # If server sent serialized base64 string, decode and unpickle
+                if isinstance(compressed_data, str):
+                    try:
+                        compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
+                    except Exception as e:
+                        print(f"Client {self.client_id} error decoding quantized_data: {e}")
                 weights = self.quantizer.decompress(compressed_data)
                 if round_num > 0:
                     print(f"Client {self.client_id}: Received and decompressed quantized global model")
@@ -392,10 +399,12 @@ class FederatedLearningClient:
                   f"Ratio: {stats['compression_ratio']:.2f}x, "
                   f"Size: {stats['compressed_size_mb']:.2f}MB")
             
+            # Serialize compressed data to JSON-safe base64 string
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             update_message = {
                 "client_id": self.client_id,
                 "round": self.current_round,
-                "compressed_data": compressed_data,
+                "compressed_data": serialized,
                 "num_samples": num_samples,
                 "metrics": metrics
             }
@@ -429,7 +438,7 @@ class FederatedLearningClient:
         """Evaluate model on test data and send metrics to server"""
         loss, mse, mae, mape = self.model.evaluate(
             self.x_test, self.y_test, 
-            batch_size=32, 
+            batch_size=16, 
             verbose=0
         )
         
@@ -479,7 +488,17 @@ class FederatedLearningClient:
 if __name__ == "__main__":
     # Load data
     print(f"Loading dataset for client {CLIENT_ID}...")
-    dataframe = pd.read_csv("Client/Temperature_Regulation/Dataset/base_data_baseline_unique.csv")
+    
+    # Detect environment and construct dataset path
+    if os.path.exists('/app'):
+        dataset_path = '/app/Client/Temperature_Regulation/Dataset/base_data_baseline_unique.csv'
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(os.path.dirname(script_dir))
+        dataset_path = os.path.join(project_root, 'Client', 'Temperature_Regulation', 'Dataset', 'base_data_baseline_unique.csv')
+    
+    print(f"Dataset path: {dataset_path}")
+    dataframe = pd.read_csv(dataset_path)
     print(f"Dataset loaded: {dataframe.shape}")
     
     # Create and start client

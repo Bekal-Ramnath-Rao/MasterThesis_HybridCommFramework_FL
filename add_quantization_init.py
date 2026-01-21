@@ -24,7 +24,7 @@ def add_client_quantization_init(filepath):
     replacement = """self.model = None
         
         # Initialize quantization compression
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        use_quantization = os.getenv("USE_QUANTIZATION", "false").lower() == "true"
         if use_quantization:
             self.quantizer = Quantization(QuantizationConfig())
             print(f"Client {self.client_id}: Quantization enabled")
@@ -57,7 +57,7 @@ def add_server_quantization_init(filepath):
     replacement = """
         
         # Initialize quantization handler
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        use_quantization = os.getenv("USE_QUANTIZATION", "false").lower() == "true"
         if use_quantization and QUANTIZATION_AVAILABLE:
             self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
             print("Server: Quantization enabled")

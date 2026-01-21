@@ -33,8 +33,20 @@ logging.getLogger("tensorflow").setLevel(logging.ERROR)
 # GPU Configuration
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
-    for g in gpus:
-        tf.config.experimental.set_memory_growth(g, True)
+    try:
+        # Set memory growth to avoid allocating all GPU memory at once
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        
+        # Set memory limit to prevent OOM with large CNN+BiLSTM+MHA model
+        # Allow ~7GB per GPU (conservative for 10GB cards with overhead)
+        tf.config.set_logical_device_configuration(
+            gpus[0],
+            [tf.config.LogicalDeviceConfiguration(memory_limit=7168)]
+        )
+        print(f"[GPU] Configured with memory growth and 7GB limit")
+    except RuntimeError as e:
+        print(f"[GPU] Configuration error: {e}")
 
 # MQTT Configuration
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
@@ -63,8 +75,9 @@ class FederatedLearningClient:
         self.num_clients = num_clients
         self.model = None
         
-        # Initialize quantization compression
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization compression (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization:
             self.quantizer = Quantization(QuantizationConfig())
             print(f"Client {self.client_id}: Quantization enabled")
@@ -75,7 +88,7 @@ class FederatedLearningClient:
         self.y_train = None
         self.current_round = 0
         self.training_config = {
-            "batch_size": 256,
+            "batch_size": 16,
             "local_epochs": 5,
             "val_split": 0.10
         }
@@ -94,9 +107,14 @@ class FederatedLearningClient:
         """Load and partition EEG data for this client using data_partitioner"""
         print(f"\n[Client {self.client_id}] Preparing data...")
         
-        # Get data directory
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        data_dir = os.path.join(script_dir, "Dataset")
+        # Get data directory - detect environment
+        if os.path.exists('/app'):
+            data_dir = '/app/Client/MentalState_Recognition/Dataset'
+        else:
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            project_root = os.path.dirname(os.path.dirname(script_dir))
+            data_dir = os.path.join(project_root, 'Client', 'MentalState_Recognition', 'Dataset')
+        print(f"Dataset path: {data_dir}")
         
         # Use data partitioner to get non-IID data
         self.x_train, self.y_train = get_client_data(
@@ -266,14 +284,20 @@ class FederatedLearningClient:
         data = json.loads(payload.decode())
         round_num = data['round']
         # Check if weights are quantized
-            if 'quantized_data' in data and self.quantizer is not None:
-                compressed_data = data['quantized_data']
-                weights = self.quantizer.decompress(compressed_data)
-                if round_num > 0:
-                    print(f"Client {self.client_id}: Received and decompressed quantized global model")
-            else:
-                encoded_weights = data['weights']
-                weights = self.deserialize_weights(encoded_weights)
+        if 'quantized_data' in data and self.quantizer is not None:
+            compressed_data = data['quantized_data']
+            # If server sent serialized base64 string, decode and unpickle
+            if isinstance(compressed_data, str):
+                try:
+                    compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
+                except Exception as e:
+                    print(f"Client {self.client_id} error decoding quantized_data: {e}")
+            weights = self.quantizer.decompress(compressed_data)
+            if round_num > 0:
+                print(f"Client {self.client_id}: Received and decompressed quantized global model")
+        else:
+            encoded_weights = data['weights']
+            weights = self.deserialize_weights(encoded_weights)
         
         if round_num == 0:
             print(f"\n[Client {self.client_id}] Received initial global model")
@@ -451,16 +475,28 @@ class FederatedLearningClient:
         """Send model update and metrics to server"""
         # Get updated weights
         weights = self.model.get_weights()
-        encoded_weights = self.serialize_weights(weights)
         
-        # Prepare update message
-        update_msg = {
-            "client_id": self.client_id,
-            "round": round_num,
-            "weights": encoded_weights,
-            "num_samples": int(len(self.y_train)),
-            "train_time": float(train_time)
-        }
+        # Prepare update message (use compression if enabled)
+        if self.quantizer is not None:
+            compressed_data = self.quantizer.compress(weights, data_type="weights")
+            # Serialize compressed data to JSON-safe base64 string
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
+            update_msg = {
+                "client_id": self.client_id,
+                "round": round_num,
+                "compressed_data": serialized,
+                "num_samples": int(len(self.y_train)),
+                "train_time": float(train_time)
+            }
+        else:
+            encoded_weights = self.serialize_weights(weights)
+            update_msg = {
+                "client_id": self.client_id,
+                "round": round_num,
+                "weights": encoded_weights,
+                "num_samples": int(len(self.y_train)),
+                "train_time": float(train_time)
+            }
         
         # Send update
         print(f"[Client {self.client_id}] Sending update to server...")

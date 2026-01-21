@@ -125,8 +125,9 @@ class FederatedLearningServer:
         self.start_time = None
         self.convergence_time = None
         
-        # Initialize quantization handler
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization handler (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization and QUANTIZATION_AVAILABLE:
             self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
             print("Server: Quantization enabled")
@@ -141,10 +142,16 @@ class FederatedLearningServer:
         self.initialize_global_model()
         
         # Training configuration
+        # Training configuration broadcast to DDS clients
+        # Reduced batch size to 16 to prevent GPU OOM
+        batch_size_env = int(os.getenv("BATCH_SIZE", "32"))
+        # Default to 5 for faster smoke tests if LOCAL_EPOCHS not set
+        local_epochs_env = int(os.getenv("LOCAL_EPOCHS", "20"))
         self.training_config = {
-            "batch_size": 32,
-            "local_epochs": 20
+            "batch_size": batch_size_env,
+            "local_epochs": local_epochs_env
         }
+        print(f"Server DDS training config: batch_size={batch_size_env}, local_epochs={local_epochs_env}")
         
         # Status flags
         self.training_started = False
@@ -275,23 +282,65 @@ class FederatedLearningServer:
         )
         self.writers['config'].write(config)
         
+        loop_count = 0
         try:
             while not self.training_complete:
-                # Publish current status
-                self.publish_status()
-                
-                # Check for client registrations
-                self.check_registrations()
-                
-                # Check for model updates
-                self.check_model_updates()
-                
-                time.sleep(0.5)
+                try:
+                    loop_count += 1
+                    # Print heartbeat every 10 iterations (5 seconds)
+                    if loop_count % 10 == 0:
+                        print(f"[ServerLoop] Iteration {loop_count}, round={self.current_round}, updates={len(self.client_updates)}/{self.num_clients}, metrics={len(self.client_metrics)}/{self.num_clients}")
+                        sys.stdout.flush()
+                    
+                    # Publish current status
+                    try:
+                        self.publish_status()
+                    except Exception as e:
+                        print(f"[ERROR] publish_status failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        sys.stdout.flush()
+                    
+                    # Check for client registrations
+                    try:
+                        self.check_registrations()
+                    except Exception as e:
+                        print(f"[ERROR] check_registrations failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        sys.stdout.flush()
+                    
+                    # Check for model updates
+                    try:
+                        self.check_model_updates()
+                    except Exception as e:
+                        print(f"[ERROR] check_model_updates failed: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        sys.stdout.flush()
+                    
+                    time.sleep(0.5)
+                    
+                except Exception as loop_error:
+                    print(f"[FATAL] Unhandled exception in server main loop iteration {loop_count}: {loop_error}")
+                    import traceback
+                    traceback.print_exc()
+                    sys.stdout.flush()
+                    # Continue loop despite error
+                    time.sleep(1)
             
+            print(f"\n[ServerLoop] Loop exited normally: training_complete={self.training_complete}")
+            sys.stdout.flush()
             print("\nServer shutting down...")
             
         except KeyboardInterrupt:
             print("\n\nServer interrupted by user")
+            sys.stdout.flush()
+        except Exception as fatal_error:
+            print(f"\n[FATAL] Server crashed with exception: {fatal_error}")
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
         finally:
             self.cleanup()
     
@@ -300,19 +349,23 @@ class FederatedLearningServer:
         samples = self.readers['registration'].take()
         
         for sample in samples:
-            if sample:
-                client_id = sample.client_id
-                if client_id not in self.registered_clients:
-                    self.registered_clients.add(client_id)
-                    print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
-                    
-                    # If all clients registered, distribute initial global model and start training
-                    if len(self.registered_clients) == self.num_clients and not self.training_started:
-                        print("\nAll clients registered. Distributing initial global model...\n")
-                        self.distribute_initial_model()
-                        # Record training start time
-                        self.start_time = time.time()
-                        print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            # Some DDS implementations may emit InvalidSample entries; guard against those
+            if not sample or not hasattr(sample, 'client_id'):
+                # Optional: uncomment for verbose diagnostics
+                # print(f"[DEBUG] Skipping non-data or invalid registration sample: {type(sample).__name__}")
+                continue
+            client_id = sample.client_id
+            if client_id not in self.registered_clients:
+                self.registered_clients.add(client_id)
+                print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
+                
+                # If all clients registered, distribute initial global model and start training
+                if len(self.registered_clients) == self.num_clients and not self.training_started:
+                    print("\nAll clients registered. Distributing initial global model...\n")
+                    self.distribute_initial_model()
+                    # Record training start time
+                    self.start_time = time.time()
+                    print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     
     def distribute_initial_model(self):
         """Distribute initial global model to all clients"""
@@ -353,24 +406,31 @@ class FederatedLearningServer:
         else:
             serialized_weights = self.serialize_weights(self.global_weights)
         
-        # Send initial global model to all clients
+        # Send initial global model to all clients (publish multiple times for reliability)
         initial_model = GlobalModel(
             round=0,  # Round 0 = initial model distribution
             weights=serialized_weights,
             model_config_json=json.dumps(model_config)
         )
-        self.writers['global_model'].write(initial_model)
+        
+        print("Publishing initial model to clients (sending multiple times for reliability)...")
+        for i in range(3):
+            self.writers['global_model'].write(initial_model)
+            print(f"  Attempt {i+1}/3: Initial model published via DDS")
+            time.sleep(0.5)
         
         print("Initial global model (architecture + weights) sent to all clients")
         
         # Wait for clients to receive and set the initial model
-        time.sleep(2)
+        print("Waiting for clients to receive and build the model...")
+        time.sleep(3)
         
         print(f"\n{'='*70}")
         print(f"Starting Round {self.current_round}/{self.num_rounds}")
         print(f"{'='*70}\n")
         
         # Send training command to start first round
+        print("Signaling clients to start training...")
         command = TrainingCommand(
             round=self.current_round,
             start_training=True,
@@ -378,13 +438,24 @@ class FederatedLearningServer:
             training_complete=False
         )
         self.writers['command'].write(command)
+        print("Start training signal sent successfully\n")
     
     def check_model_updates(self):
         """Check for model updates from clients"""
         samples = self.readers['model_update'].take()
         
+        # Debug: log how many samples we got
+        if len(samples) > 0:
+            #print(f"[DEBUG] check_model_updates: received {len(samples)} samples")
+            sys.stdout.flush()
+        
         for sample in samples:
-            if sample and sample.round == self.current_round:
+            if not sample or not hasattr(sample, 'round'):
+                #print(f"[DEBUG] Skipping invalid model_update sample: {type(sample).__name__}")
+                continue
+            print(f"[DEBUG] Processing model_update sample: client_id={sample.client_id if hasattr(sample, 'client_id') else 'N/A'}, round={sample.round}, current_round={self.current_round}")
+            sys.stdout.flush()
+            if sample.round == self.current_round and hasattr(sample, 'client_id'):
                 client_id = sample.client_id
                 
                 if client_id not in self.client_updates:
@@ -420,7 +491,7 @@ class FederatedLearningServer:
         samples = self.readers['metrics'].take()
         
         for sample in samples:
-            if sample:
+            if sample and hasattr(sample, 'client_id') and hasattr(sample, 'round'):
                 print(f"Server received metrics sample: client {sample.client_id}, round {sample.round} (current: {self.current_round})")
                 
                 if sample.round == self.current_round:

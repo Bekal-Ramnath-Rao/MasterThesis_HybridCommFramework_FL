@@ -11,6 +11,7 @@ from typing import List, Dict
 import matplotlib.pyplot as plt
 from pathlib import Path
 
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
@@ -65,8 +66,13 @@ class FederatedLearningServer:
         self.start_time = None
         self.convergence_time = None
         
-        # Initialize quantization handler
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Training timeout tracking (prevent waiting forever for stuck clients)
+        self.round_start_time = None
+        self.training_timeout = int(os.getenv("TRAINING_TIMEOUT", "600"))  # 10 minutes default
+        
+        # Initialize quantization handler (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization and QUANTIZATION_AVAILABLE:
             self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
             print("Server: Quantization enabled")
@@ -81,9 +87,10 @@ class FederatedLearningServer:
         self.initialize_global_model()
         
         # Training configuration
+        # Training configuration broadcast to MQTT clients
         self.training_config = {
             "batch_size": 32,
-            "local_epochs": 20
+            "local_epochs": 20  # Reduced from 20 for faster experiments (configurable via env)
         }
         
         # Initialize MQTT client
@@ -162,17 +169,15 @@ class FederatedLearningServer:
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
         if rc == 0:
-            print("Server connected to MQTT broker")
+            # Only log first connection, not reconnections
+            if not hasattr(self, '_connected_once'):
+                print("Server connected to MQTT broker")
+                self._connected_once = True
+            
             # Subscribe to client topics
-            result1, mid1 = self.mqtt_client.subscribe(TOPIC_CLIENT_REGISTER)
-            print(f"Subscribed to {TOPIC_CLIENT_REGISTER} - Result: {result1}")
-            
-            # Use QoS 0 for large model update messages
-            result2, mid2 = self.mqtt_client.subscribe("fl/client/+/update", qos=0)
-            print(f"Subscribed to fl/client/+/update (QoS 0) - Result: {result2}")
-            
-            result3, mid3 = self.mqtt_client.subscribe("fl/client/+/metrics")
-            print(f"Subscribed to fl/client/+/metrics - Result: {result3}")
+            self.mqtt_client.subscribe(TOPIC_CLIENT_REGISTER)
+            self.mqtt_client.subscribe("fl/client/+/update", qos=0)
+            self.mqtt_client.subscribe("fl/client/+/metrics")
         else:
             print(f"Server failed to connect, return code {rc}")
     
@@ -213,10 +218,16 @@ class FederatedLearningServer:
         if round_num == self.current_round:
             # Check if update is compressed
             if 'compressed_data' in data and self.quantization_handler is not None:
-                # Decompress quantized weights
+                # Decompress quantized weights (handle base64-serialized payloads)
+                compressed_update = data['compressed_data']
+                if isinstance(compressed_update, str):
+                    try:
+                        compressed_update = pickle.loads(base64.b64decode(compressed_update.encode('utf-8')))
+                    except Exception as e:
+                        print(f"Server error decoding compressed_data from client {client_id}: {e}")
                 weights = self.quantization_handler.decompress_client_update(
                     client_id, 
-                    data['compressed_data']
+                    compressed_update
                 )
                 print(f"Received and decompressed update from client {client_id}")
             else:
@@ -275,9 +286,11 @@ class FederatedLearningServer:
             stats = self.quantization_handler.get_compression_stats(self.global_weights, compressed_data)
             print(f"Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
             
+            # Serialize compressed data to JSON-safe base64 string
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             initial_model_message = {
                 "round": 0,
-                "quantized_data": compressed_data,
+                "quantized_data": serialized,
                 "model_config": self.model_config
             }
         else:
@@ -292,31 +305,39 @@ class FederatedLearningServer:
         message_size = len(message_json.encode('utf-8'))
         
         print(f"Initial model message size: {message_size / 1024:.2f} KB ({message_size} bytes)")
-        
-        # Publish with QoS 0 (no retain) for large messages - more reliable for big payloads
-        result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, 
-                                         message_json,
-                                         qos=0)
-        
-        if result.rc == mqtt.MQTT_ERR_SUCCESS:
-            print("Initial global model (architecture + weights) sent to all clients successfully")
-        else:
-            print(f"ERROR: Failed to publish initial model, return code: {result.rc}")
-        
         print(f"Model config: {len(self.model_config['layers'])} layers, {self.model_config['num_classes']} classes")
         
+        # Publish multiple times to ensure delivery (QoS 0 can lose messages)
+        print("\nPublishing initial model to clients...")
+        for i in range(3):  # Send 3 times for reliability
+            result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, 
+                                             message_json,
+                                             qos=0)
+            
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                print(f"  Attempt {i+1}/3: Initial model sent successfully")
+            else:
+                print(f"  Attempt {i+1}/3: FAILED (return code: {result.rc})")
+            
+            time.sleep(0.5)  # Small delay between sends
+        
         # Wait for clients to receive and build the model
-        print("Waiting for clients to receive and build the model...")
-        time.sleep(5)
+        print("\nWaiting for clients to receive and build the model...")
+        time.sleep(3)
         
         print(f"\n{'='*70}")
         print(f"Starting Round {self.current_round}/{self.num_rounds}")
         print(f"{'='*70}\n")
         
         # Signal clients to start training with the global model
-        self.mqtt_client.publish(TOPIC_START_TRAINING,
+        print("Signaling clients to start training...")
+        result = self.mqtt_client.publish(TOPIC_START_TRAINING,
                                 json.dumps({"round": self.current_round}),
                                 qos=1)
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            print("Start training signal sent successfully\n")
+        else:
+            print(f"ERROR: Failed to send start training signal (return code: {result.rc})\n")
     
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
@@ -348,9 +369,11 @@ class FederatedLearningServer:
         # Optionally compress before sending
         if self.quantization_handler is not None:
             compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            # Serialize compressed data to JSON-safe base64 string
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             global_model_message = {
                 "round": self.current_round,
-                "quantized_data": compressed_data
+                "quantized_data": serialized
             }
         else:
             # Send global model to all clients
@@ -359,15 +382,25 @@ class FederatedLearningServer:
                 "weights": self.serialize_weights(self.global_weights)
             }
         
-        self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, 
-                                json.dumps(global_model_message))
+        # Publish aggregated model (QoS 1 for at-least-once) and avoid duplicates
+        print(f"Publishing aggregated model for round {self.current_round}...")
+        message_json = json.dumps(global_model_message)
+        for i in range(3):
+            result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, message_json, qos=1)
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                print(f"  Attempt {i+1}/3: Aggregated model sent")
+                break
+            else:
+                print(f"  Attempt {i+1}/3: FAILED (rc={result.rc})")
+                time.sleep(0.5)
         
         print(f"Aggregated global model from round {self.current_round} sent to all clients")
         
         # Request evaluation from clients
-        time.sleep(1)
+        time.sleep(2)
+        print("Requesting client evaluation...")
         self.mqtt_client.publish(TOPIC_START_EVALUATION,
-                                json.dumps({"round": self.current_round}))
+                                json.dumps({"round": self.current_round}), qos=1)
     
     def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
@@ -437,9 +470,18 @@ class FederatedLearningServer:
             
             time.sleep(2)
             
-            # Signal clients to start next training round
-            self.mqtt_client.publish(TOPIC_START_TRAINING,
-                                    json.dumps({"round": self.current_round}))
+            # Signal clients to start next training round (with retry, no duplicates)
+            print(f"Signaling clients to start round {self.current_round}...")
+            for i in range(3):
+                result = self.mqtt_client.publish(TOPIC_START_TRAINING,
+                                        json.dumps({"round": self.current_round}), qos=1)
+                if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                    print(f"  Attempt {i+1}/3: Start training signal sent")
+                    break
+                else:
+                    print(f"  Attempt {i+1}/3: FAILED (rc={result.rc})")
+                    time.sleep(0.5)
+            print(f"Round {self.current_round} start signal sent\n")
         else:
             self.convergence_time = time.time() - self.start_time if self.start_time else 0
             print("\n" + "="*70)
@@ -556,9 +598,14 @@ class FederatedLearningServer:
         
         for attempt in range(max_retries):
             try:
-                print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
+                # Resolve broker host based on environment (Docker vs local)
+                broker_host = MQTT_BROKER.strip() if isinstance(MQTT_BROKER, str) else str(MQTT_BROKER)
+                if not broker_host:
+                    broker_host = 'mqtt-broker' if os.path.exists('/app') else 'localhost'
+                
+                print(f"Attempting to connect to MQTT broker at {broker_host}:{MQTT_PORT}...")
                 # Use 1 hour keepalive (3600 seconds) to prevent timeout during long training
-                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 3600)
+                self.mqtt_client.connect(broker_host, MQTT_PORT, keepalive=3600)
                 print(f"Successfully connected to MQTT broker!\n")
                 self.mqtt_client.loop_forever()
                 break
@@ -570,8 +617,8 @@ class FederatedLearningServer:
                 else:
                     print(f"\nFailed to connect to MQTT broker after {max_retries} attempts.")
                     print(f"\nPlease ensure:")
-                    print(f"  1. Mosquitto broker is running: net start mosquitto")
-                    print(f"  2. Broker address is correct: {MQTT_BROKER}:{MQTT_PORT}")
+                    print(f"  1. Mosquitto broker is running (service or container)")
+                    print(f"  2. Broker address is correct: {broker_host}:{MQTT_PORT}")
                     print(f"  3. Firewall allows connection on port {MQTT_PORT}")
                     raise
 

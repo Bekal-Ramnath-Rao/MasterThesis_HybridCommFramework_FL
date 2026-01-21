@@ -1,9 +1,7 @@
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D, MaxPooling2D, Dense, Dropout, Flatten, Input
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import os
+import sys
+import logging
 import json
 import pickle
 import base64
@@ -11,19 +9,61 @@ import time
 import random
 import pika
 
+# GPU Configuration - Must be done BEFORE TensorFlow import
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+# Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
+gpu_device = os.environ.get("GPU_DEVICE_ID", "0")
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
+os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
+
+# Disable Grappler layout optimizer to avoid NCHW transpose errors in logs
+os.environ["TF_ENABLE_LAYOUT_OPTIMIZER"] = "0"
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Dense, Dropout, Flatten, Input
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+# Make TensorFlow logs less verbose
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
+# Ensure Keras uses channels_last image data format
+tf.keras.backend.set_image_data_format('channels_last')
+
+# Verify GPU availability
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    print(f"GPUs available: {len(gpus)}")
+    for i, gpu in enumerate(gpus):
+        print(f"  GPU {i}: {gpu}")
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print("GPU memory growth enabled")
+        
+        # Set GPU memory limit to avoid OOM (RTX 3080 has 10GB, reserve 7GB per process)
+        # This prevents one process from consuming all GPU memory
+        for gpu in gpus:
+            try:
+                tf.config.set_logical_device_configuration(
+                    gpu,
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=7000)]  # 7GB per GPU
+                )
+            except RuntimeError:
+                pass  # GPU already configured
+    except RuntimeError as e:
+        print(f"Error setting GPU memory growth: {e}")
+else:
+    print("No GPUs found. Running on CPU.")
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
     sys.path.insert(0, compression_path)
 
 from quantization_client import Quantization, QuantizationConfig
-
-import os
-import logging
-
-# Make TensorFlow logs less verbose
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # AMQP Configuration
 AMQP_HOST = os.getenv("AMQP_HOST", "localhost")
@@ -44,8 +84,9 @@ class FederatedLearningClient:
         self.num_clients = num_clients
         self.model = None
         
-        # Initialize quantization compression
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization compression (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization:
             self.quantizer = Quantization(QuantizationConfig())
             print(f"Client {self.client_id}: Quantization enabled")
@@ -261,6 +302,12 @@ class FederatedLearningClient:
             # Check if weights are quantized
             if 'quantized_data' in data and self.quantizer is not None:
                 compressed_data = data['quantized_data']
+                # If server sent serialized base64 string, decode and unpickle
+                if isinstance(compressed_data, str):
+                    try:
+                        compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
+                    except Exception as e:
+                        print(f"Client {self.client_id} error decoding quantized_data: {e}")
                 weights = self.quantizer.decompress(compressed_data)
                 if round_num > 0:
                     print(f"Client {self.client_id}: Received and decompressed quantized global model")
@@ -351,11 +398,17 @@ class FederatedLearningClient:
             
             # Check if we're ready for this round (should have received global model first)
             if self.current_round == 0 and round_num == 1:
+                if self.model is None:
+                    print(f"Client {self.client_id} received start_training but model not initialized yet; waiting for global model.")
+                    return
                 # First training round with initial global model
                 self.current_round = round_num
                 print(f"\nClient {self.client_id} starting training for round {round_num} with initial global model...")
                 self.train_local_model()
             elif round_num == self.current_round:
+                if self.model is None:
+                    print(f"Client {self.client_id} received start_training for round {round_num} but model not initialized; ignoring signal.")
+                    return
                 # Subsequent rounds
                 print(f"\nClient {self.client_id} starting training for round {round_num}...")
                 self.train_local_model()
@@ -389,17 +442,19 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} error starting evaluation: {e}")
     
     def train_local_model(self):
-        """Train model on local data and send updates to server"""
+        """Train model on local data with GPU optimization and send updates to server"""
         batch_size = self.training_config['batch_size']
         epochs = self.training_config['local_epochs']
         
-        # Train the model
-        history = self.model.fit(
-            self.train_generator,
-            epochs=epochs,
-            validation_data=self.validation_generator,
-            verbose=2
-        )
+        # Use GPU device context for training
+        with tf.device('/GPU:0'):
+            # Train the model with GPU acceleration
+            history = self.model.fit(
+                self.train_generator,
+                epochs=epochs,
+                validation_data=self.validation_generator,
+                verbose=2
+            )
         
         # Get updated weights
         updated_weights = self.model.get_weights()
@@ -421,10 +476,12 @@ class FederatedLearningClient:
                   f"Ratio: {stats['compression_ratio']:.2f}x, "
                   f"Size: {stats['compressed_size_mb']:.2f}MB")
             
+            # Serialize compressed data to JSON-safe base64 string
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             update_message = {
                 "client_id": self.client_id,
                 "round": self.current_round,
-                "compressed_data": compressed_data,
+                "compressed_data": serialized,
                 "num_samples": num_samples,
                 "metrics": metrics
             }
@@ -457,11 +514,13 @@ class FederatedLearningClient:
         print(f"Training metrics - Loss: {metrics['loss']:.4f}, Accuracy: {metrics['accuracy']:.4f}")
     
     def evaluate_model(self):
-        """Evaluate model on validation data and send metrics to server"""
-        loss, accuracy = self.model.evaluate(
-            self.validation_generator, 
-            verbose=0
-        )
+        """Evaluate model on validation data with GPU acceleration and send metrics to server"""
+        # Use GPU device context for evaluation
+        with tf.device('/GPU:0'):
+            loss, accuracy = self.model.evaluate(
+                self.validation_generator, 
+                verbose=0
+            )
         
         num_samples = self.validation_generator.n
         
@@ -506,25 +565,39 @@ class FederatedLearningClient:
 
 def load_data(client_id):
     """Load emotion recognition data for this client"""
+    # Detect environment: Docker uses /app prefix, local uses relative path
+    if os.path.exists('/app'):
+        base_path = '/app/Client/Emotion_Recognition/Dataset'
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(os.path.dirname(script_dir))
+        base_path = os.path.join(project_root, 'Client', 'Emotion_Recognition', 'Dataset')
+    
+    train_path = os.path.join(base_path, f'client_{client_id}', 'train')
+    validation_path = os.path.join(base_path, f'client_{client_id}', 'validation')
+    print(f"Dataset base path: {base_path}")
+    
     # Initialize image data generator with rescaling
     train_data_gen = ImageDataGenerator(rescale=1./255)
     validation_data_gen = ImageDataGenerator(rescale=1./255)
 
     # Load training and validation data
     train_generator = train_data_gen.flow_from_directory(
-        f'Client/Emotion_Recognition/Dataset/client_{client_id}/train/',
+        train_path,
         target_size=(48, 48),
-        batch_size=64,
+        batch_size=32,
         color_mode="grayscale",
-        class_mode='categorical'
+        class_mode='categorical',
+        shuffle=True
     )
 
     validation_generator = validation_data_gen.flow_from_directory(
-        f'Client/Emotion_Recognition/Dataset/client_{client_id}/validation/',
+        validation_path,
         target_size=(48, 48),
-        batch_size=64,
+        batch_size=32,
         color_mode="grayscale",
-        class_mode='categorical'
+        class_mode='categorical',
+        shuffle=False
     )
 
     return train_generator, validation_generator

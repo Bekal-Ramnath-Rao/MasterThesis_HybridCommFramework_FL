@@ -231,8 +231,9 @@ class FederatedLearningServer:
         self.convergence_time = None
         self.converged = False
         
-        # Initialize quantization handler
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization handler (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization and QUANTIZATION_AVAILABLE:
             self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
             print("Server: Quantization enabled")
@@ -356,9 +357,16 @@ class FederatedLearningServer:
             if round_num == self.current_round:
                 # Check if update is compressed
                 if 'compressed_data' in data and self.quantization_handler is not None:
+                    compressed_update = data['compressed_data']
+                    # If client sent serialized base64 string, decode and unpickle
+                    if isinstance(compressed_update, str):
+                        try:
+                            compressed_update = pickle.loads(base64.b64decode(compressed_update.encode('utf-8')))
+                        except Exception as e:
+                            print(f"Server error decoding compressed_data from client {client_id}: {e}")
                     weights = self.quantization_handler.decompress_client_update(
                         client_id, 
-                        data['compressed_data']
+                        compressed_update
                     )
                     print(f"Received and decompressed update from client {client_id}")
                 else:

@@ -17,7 +17,7 @@ services:
       - ../mqtt-config:/mosquitto/config
     networks:
       - fl-network
-    command: mosquitto -c /mosquitto-no-auth.conf
+    command: mosquitto -c /mosquitto/config/mosquitto.conf
 
   fl-server-mqtt:
     build:

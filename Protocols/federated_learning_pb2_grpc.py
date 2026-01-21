@@ -5,24 +5,27 @@ import warnings
 
 import federated_learning_pb2 as federated__learning__pb2
 
-GRPC_GENERATED_VERSION = '1.76.0'
+# Relax gRPC runtime requirement to match Python 3.8-compatible grpcio
+GRPC_GENERATED_VERSION = '1.59.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
 try:
-    from grpc._utilities import first_version_is_lower
-    _version_not_supported = first_version_is_lower(GRPC_VERSION, GRPC_GENERATED_VERSION)
-except ImportError:
-    _version_not_supported = True
+        from grpc._utilities import first_version_is_lower
+        _version_not_supported = first_version_is_lower(GRPC_VERSION, GRPC_GENERATED_VERSION)
+except Exception:
+        # Older grpc releases may not expose _utilities; assume compatible
+        _version_not_supported = False
 
-if _version_not_supported:
-    raise RuntimeError(
-        f'The grpc package installed is at version {GRPC_VERSION},'
-        + ' but the generated code in federated_learning_pb2_grpc.py depends on'
-        + f' grpcio>={GRPC_GENERATED_VERSION}.'
-        + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
-        + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
-    )
+# Disable strict runtime version gate to support Python 3.8-compatible grpcio
+if False:
+        raise RuntimeError(
+                f'The grpc package installed is at version {GRPC_VERSION},'
+                + ' but the generated code in federated_learning_pb2_grpc.py depends on'
+                + f' grpcio>={GRPC_GENERATED_VERSION}.'
+                + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
+                + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
+        )
 
 
 class FederatedLearningStub(object):
@@ -38,33 +41,27 @@ class FederatedLearningStub(object):
         self.RegisterClient = channel.unary_unary(
                 '/federated_learning.FederatedLearning/RegisterClient',
                 request_serializer=federated__learning__pb2.ClientRegistration.SerializeToString,
-                response_deserializer=federated__learning__pb2.RegistrationResponse.FromString,
-                _registered_method=True)
+                response_deserializer=federated__learning__pb2.RegistrationResponse.FromString)
         self.GetGlobalModel = channel.unary_unary(
                 '/federated_learning.FederatedLearning/GetGlobalModel',
                 request_serializer=federated__learning__pb2.ModelRequest.SerializeToString,
-                response_deserializer=federated__learning__pb2.GlobalModel.FromString,
-                _registered_method=True)
+                response_deserializer=federated__learning__pb2.GlobalModel.FromString)
         self.SendModelUpdate = channel.unary_unary(
                 '/federated_learning.FederatedLearning/SendModelUpdate',
                 request_serializer=federated__learning__pb2.ModelUpdate.SerializeToString,
-                response_deserializer=federated__learning__pb2.UpdateResponse.FromString,
-                _registered_method=True)
+                response_deserializer=federated__learning__pb2.UpdateResponse.FromString)
         self.SendMetrics = channel.unary_unary(
                 '/federated_learning.FederatedLearning/SendMetrics',
                 request_serializer=federated__learning__pb2.EvaluationMetrics.SerializeToString,
-                response_deserializer=federated__learning__pb2.MetricsResponse.FromString,
-                _registered_method=True)
+                response_deserializer=federated__learning__pb2.MetricsResponse.FromString)
         self.GetTrainingConfig = channel.unary_unary(
                 '/federated_learning.FederatedLearning/GetTrainingConfig',
                 request_serializer=federated__learning__pb2.ConfigRequest.SerializeToString,
-                response_deserializer=federated__learning__pb2.TrainingConfig.FromString,
-                _registered_method=True)
+                response_deserializer=federated__learning__pb2.TrainingConfig.FromString)
         self.CheckTrainingStatus = channel.unary_unary(
                 '/federated_learning.FederatedLearning/CheckTrainingStatus',
                 request_serializer=federated__learning__pb2.StatusRequest.SerializeToString,
-                response_deserializer=federated__learning__pb2.TrainingStatus.FromString,
-                _registered_method=True)
+                response_deserializer=federated__learning__pb2.TrainingStatus.FromString)
 
 
 class FederatedLearningServicer(object):
@@ -150,7 +147,13 @@ def add_FederatedLearningServicer_to_server(servicer, server):
     generic_handler = grpc.method_handlers_generic_handler(
             'federated_learning.FederatedLearning', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('federated_learning.FederatedLearning', rpc_method_handlers)
+    # Older grpcio versions (e.g., 1.59.x for Python 3.8) do not expose
+    # server.add_registered_method_handlers. It's safe to skip this call
+    # and rely on the generic handler registration above.
+    try:
+            server.add_registered_method_handlers('federated_learning.FederatedLearning', rpc_method_handlers)
+    except AttributeError:
+            pass
 
 
  # This class is part of an EXPERIMENTAL API.
@@ -169,7 +172,7 @@ class FederatedLearning(object):
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.unary_unary(
+                return grpc.experimental.unary_unary(
             request,
             target,
             '/federated_learning.FederatedLearning/RegisterClient',
@@ -182,8 +185,7 @@ class FederatedLearning(object):
             compression,
             wait_for_ready,
             timeout,
-            metadata,
-            _registered_method=True)
+                        metadata)
 
     @staticmethod
     def GetGlobalModel(request,
@@ -196,7 +198,7 @@ class FederatedLearning(object):
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.unary_unary(
+                return grpc.experimental.unary_unary(
             request,
             target,
             '/federated_learning.FederatedLearning/GetGlobalModel',
@@ -209,8 +211,7 @@ class FederatedLearning(object):
             compression,
             wait_for_ready,
             timeout,
-            metadata,
-            _registered_method=True)
+                        metadata)
 
     @staticmethod
     def SendModelUpdate(request,
@@ -223,7 +224,7 @@ class FederatedLearning(object):
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.unary_unary(
+                return grpc.experimental.unary_unary(
             request,
             target,
             '/federated_learning.FederatedLearning/SendModelUpdate',
@@ -236,8 +237,7 @@ class FederatedLearning(object):
             compression,
             wait_for_ready,
             timeout,
-            metadata,
-            _registered_method=True)
+                        metadata)
 
     @staticmethod
     def SendMetrics(request,
@@ -250,7 +250,7 @@ class FederatedLearning(object):
             wait_for_ready=None,
             timeout=None,
             metadata=None):
-        return grpc.experimental.unary_unary(
+                return grpc.experimental.unary_unary(
             request,
             target,
             '/federated_learning.FederatedLearning/SendMetrics',
@@ -263,8 +263,7 @@ class FederatedLearning(object):
             compression,
             wait_for_ready,
             timeout,
-            metadata,
-            _registered_method=True)
+                        metadata)
 
     @staticmethod
     def GetTrainingConfig(request,

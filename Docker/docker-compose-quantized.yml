@@ -17,7 +17,7 @@ services:
       - ../mqtt-config:/mosquitto/config
     networks:
       - fl-quantized-network
-    command: mosquitto -c /mosquitto-no-auth.conf
+    command: mosquitto -c /mosquitto/config/mosquitto.conf
 
   # ============================================================================
   # FL Server with 8-bit Quantization (4x compression)

@@ -17,6 +17,18 @@ from aioquic.quic.events import QuicEvent, StreamDataReceived
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
+# Add Compression_Technique to path for optional quantization support
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in sys.path:
+    sys.path.insert(0, compression_path)
+
+try:
+    from quantization_server import ServerQuantizationHandler, QuantizationConfig
+    QUANTIZATION_AVAILABLE = True
+except ImportError:
+    print("Warning: Quantization module not available")
+    QUANTIZATION_AVAILABLE = False
+
 # Server Configuration
 QUIC_HOST = os.getenv("QUIC_HOST", "localhost")
 QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
@@ -248,6 +260,19 @@ class FederatedLearningServer:
 
         # Protocol reference
         self.protocol: Optional[FederatedLearningServerProtocol] = None
+
+        # Initialize quantization handler (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
+        if use_quantization and QUANTIZATION_AVAILABLE:
+            self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
+            print("Server: Quantization enabled")
+        else:
+            self.quantization_handler = None
+            if use_quantization and not QUANTIZATION_AVAILABLE:
+                print("Server: Quantization requested but not available")
+            else:
+                print("Server: Quantization disabled")
 
         # Initialize global model and test data
         self.initialize_global_model()

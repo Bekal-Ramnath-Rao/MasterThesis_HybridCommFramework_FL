@@ -65,8 +65,9 @@ class FederatedLearningClient:
         self.num_clients = num_clients
         self.model = None
         
-        # Initialize quantization compression
-        use_quantization = os.getenv("USE_QUANTIZATION", "true").lower() == "true"
+        # Initialize quantization compression (default: disabled unless explicitly enabled)
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
         if use_quantization:
             self.quantizer = Quantization(QuantizationConfig())
             print(f"Client {self.client_id}: Quantization enabled")
@@ -78,7 +79,7 @@ class FederatedLearningClient:
         self.x_test = None
         self.y_test = None
         self.current_round = 0
-        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        self.training_config = {"batch_size": 16, "local_epochs": 20}
         self.protocol = None
         self.stream_id = 0
         
@@ -322,7 +323,7 @@ class FederatedLearningClient:
             None,
             lambda: self.model.evaluate(
                 self.x_test, self.y_test, 
-                batch_size=32, 
+                batch_size=16, 
                 verbose=0
             )
         )
@@ -383,7 +384,15 @@ class FederatedLearningClient:
 
 async def main():
     print(f"Loading dataset for client {CLIENT_ID}...")
-    dataframe = pd.read_csv("Client/Temperature_Regulation/Dataset/base_data_baseline_unique.csv")
+    # Detect environment and construct dataset path
+    if os.path.exists('/app'):
+        dataset_path = '/app/Client/Temperature_Regulation/Dataset/base_data_baseline_unique.csv'
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(os.path.dirname(script_dir))
+        dataset_path = os.path.join(project_root, 'Client', 'Temperature_Regulation', 'Dataset', 'base_data_baseline_unique.csv')
+    print(f"Dataset path: {dataset_path}")
+    dataframe = pd.read_csv(dataset_path)
     print(f"Dataset loaded: {dataframe.shape}")
     
     client = FederatedLearningClient(CLIENT_ID, NUM_CLIENTS, dataframe)
