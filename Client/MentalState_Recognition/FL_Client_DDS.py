@@ -19,6 +19,22 @@ from data_partitioner import get_client_data, NUM_CLASSES, ID2LBL, LBL2ID
 
 # Suppress TensorFlow warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+# GPU Configuration - Must be done BEFORE TensorFlow import
+# Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
+os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
+
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # GPU Configuration
@@ -361,8 +377,9 @@ class FederatedLearningClient:
         self.participant = DomainParticipant(DDS_DOMAIN_ID)
         
         # Create QoS policy for reliable communication
+        # Infinite max_blocking_time for large model transfers (no timeout)
         reliable_qos = Qos(
-            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=3600)),  # 1 hour timeout
             Policy.History.KeepAll,
             Policy.Durability.TransientLocal
         )
@@ -431,11 +448,9 @@ class FederatedLearningClient:
             self.cleanup()
     
     def get_training_config(self):
-        """Get training configuration from server"""
-        timeout = 10
-        start_time = time.time()
+        """Get training configuration from server (no timeout)"""
         
-        while time.time() - start_time < timeout:
+        while True:  # Wait indefinitely for config
             samples = self.readers['config'].take()
             for sample in samples:
                 if sample:

@@ -613,7 +613,8 @@ async def main():
     )
     
     # Load certificates from certs directory
-    cert_dir = Path(__file__).parent.parent.parent / "certs"
+    # In Docker, certs are mounted at /app/certs/
+    cert_dir = Path("/app/certs") if Path("/app/certs").exists() else Path(__file__).parent.parent.parent / "certs"
     cert_file = cert_dir / "server-cert.pem"
     key_file = cert_dir / "server-key.pem"
     

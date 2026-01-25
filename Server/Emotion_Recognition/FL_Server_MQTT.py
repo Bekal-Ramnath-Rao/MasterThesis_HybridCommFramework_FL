@@ -25,7 +25,8 @@ except ImportError:
     QUANTIZATION_AVAILABLE = False
 
 # Server Configuration
-MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")  # MQTT broker address
+# Auto-detect environment: Docker (/app exists) or local
+MQTT_BROKER = os.getenv("MQTT_BROKER", 'mqtt-broker' if os.path.exists('/app') else 'localhost')
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))  # MQTT broker port
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
@@ -93,10 +94,13 @@ class FederatedLearningServer:
             "local_epochs": 20  # Reduced from 20 for faster experiments (configurable via env)
         }
         
-        # Initialize MQTT client
-        self.mqtt_client = mqtt.Client(client_id="fl_server", protocol=mqtt.MQTTv311)
-        # Set max packet size to 20MB for large model weights
-        self.mqtt_client._max_packet_size = 20 * 1024 * 1024
+        # Initialize MQTT client with fair comparison settings
+        # clean_session=True for stateless operation (like other protocols)
+        self.mqtt_client = mqtt.Client(client_id="fl_server", protocol=mqtt.MQTTv311, clean_session=True)
+        # Set max packet size to 12MB+ for FL model weights
+        self.mqtt_client._max_packet_size = 15 * 1024 * 1024  # 15MB with overhead
+        # Set keepalive to 60s (aligned with AMQP/gRPC/QUIC/DDS)
+        self.mqtt_client.keepalive = 60
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
 
@@ -174,10 +178,10 @@ class FederatedLearningServer:
                 print("Server connected to MQTT broker")
                 self._connected_once = True
             
-            # Subscribe to client topics
-            self.mqtt_client.subscribe(TOPIC_CLIENT_REGISTER)
-            self.mqtt_client.subscribe("fl/client/+/update", qos=0)
-            self.mqtt_client.subscribe("fl/client/+/metrics")
+            # Subscribe to client topics with QoS 1 for reliable delivery
+            self.mqtt_client.subscribe(TOPIC_CLIENT_REGISTER, qos=1)
+            self.mqtt_client.subscribe("fl/client/+/update", qos=1)
+            self.mqtt_client.subscribe("fl/client/+/metrics", qos=1)
         else:
             print(f"Server failed to connect, return code {rc}")
     
@@ -598,14 +602,9 @@ class FederatedLearningServer:
         
         for attempt in range(max_retries):
             try:
-                # Resolve broker host based on environment (Docker vs local)
-                broker_host = MQTT_BROKER.strip() if isinstance(MQTT_BROKER, str) else str(MQTT_BROKER)
-                if not broker_host:
-                    broker_host = 'mqtt-broker' if os.path.exists('/app') else 'localhost'
-                
-                print(f"Attempting to connect to MQTT broker at {broker_host}:{MQTT_PORT}...")
+                print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
                 # Use 1 hour keepalive (3600 seconds) to prevent timeout during long training
-                self.mqtt_client.connect(broker_host, MQTT_PORT, keepalive=3600)
+                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=3600)
                 print(f"Successfully connected to MQTT broker!\n")
                 self.mqtt_client.loop_forever()
                 break
@@ -618,7 +617,7 @@ class FederatedLearningServer:
                     print(f"\nFailed to connect to MQTT broker after {max_retries} attempts.")
                     print(f"\nPlease ensure:")
                     print(f"  1. Mosquitto broker is running (service or container)")
-                    print(f"  2. Broker address is correct: {broker_host}:{MQTT_PORT}")
+                    print(f"  2. Broker address is correct: {MQTT_BROKER}:{MQTT_PORT}")
                     print(f"  3. Firewall allows connection on port {MQTT_PORT}")
                     raise
 

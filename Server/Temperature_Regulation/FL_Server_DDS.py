@@ -205,8 +205,9 @@ class FederatedLearningServer:
         self.participant = DomainParticipant(DDS_DOMAIN_ID)
         
         # Create QoS policy for reliable communication
+        # Infinite max_blocking_time for large model transfers (no timeout)
         reliable_qos = Qos(
-            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=3600)),  # 1 hour timeout
             Policy.History.KeepAll,
             Policy.Durability.TransientLocal
         )
@@ -275,6 +276,9 @@ class FederatedLearningServer:
                 
                 # Check for model updates
                 self.check_model_updates()
+                
+                # Check for evaluation metrics
+                self.check_evaluation_metrics()
                 
                 time.sleep(0.5)
             
@@ -504,32 +508,16 @@ class FederatedLearningServer:
         
         self.evaluation_phase = True
         
-        # Wait for all evaluation metrics
-        self.wait_for_evaluation_metrics()
-        
-        # After receiving metrics (even if timeout), aggregate and continue
-        # This ensures training doesn't stall under poor network conditions
-        if len(self.client_metrics) > 0:
-            if len(self.client_metrics) < self.num_clients:
-                print(f"⚠ Proceeding with partial metrics ({len(self.client_metrics)}/{self.num_clients}) due to network conditions")
-            self.aggregate_metrics()
-            self.continue_training()
-        else:
-            print(f"⚠ WARNING: No metrics received. Skipping round {self.current_round}")
-            self.continue_training()
+        # Note: Evaluation metrics will be collected via check_evaluation_metrics() in main loop
+        # No blocking wait here to allow server loop to continue polling
     
     def wait_for_evaluation_metrics(self):
-        """Actively wait for evaluation metrics from all clients"""
+        """Actively wait for evaluation metrics from all clients (no timeout)"""
         print(f"\nWaiting for evaluation metrics from {self.num_clients} clients...")
-        timeout = 300  # 300 seconds (5 minutes) timeout for poor network conditions
-        start_time = time.time()
         check_count = 0
+        start_time = time.time()  # Track elapsed time for progress logging
         
         while len(self.client_metrics) < self.num_clients:
-            if time.time() - start_time > timeout:
-                print(f"Timeout waiting for metrics. Received {len(self.client_metrics)}/{self.num_clients}")
-                break
-            
             samples = self.readers['metrics'].take()
             for sample in samples:
                 if sample.round == self.current_round:

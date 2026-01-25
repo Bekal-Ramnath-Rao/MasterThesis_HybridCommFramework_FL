@@ -10,8 +10,16 @@ import random
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
-gpu_device = os.environ.get("GPU_DEVICE_ID", "0")
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
 os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
 
@@ -191,11 +199,12 @@ class FederatedLearningClient:
         # Create domain participant
         self.participant = DomainParticipant(DDS_DOMAIN_ID)
         
-        # Create QoS policy for reliable communication
+        # Create QoS policy for reliable communication - MUST match server QoS
+        # Using same settings as server for compatibility
         reliable_qos = Qos(
-            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
-            Policy.History.KeepAll,
-            Policy.Durability.TransientLocal
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),  # 10 minutes (match server)
+            Policy.History.KeepLast(1),  # Only keep latest (match server)
+            Policy.Durability.TransientLocal  # Survive late joiners (match server)
         )
         
         # Create topics
@@ -218,15 +227,17 @@ class FederatedLearningClient:
         self.writers['model_update'] = DataWriter(self.participant, topic_model_update, qos=reliable_qos)
         self.writers['metrics'] = DataWriter(self.participant, topic_metrics, qos=reliable_qos)
         
-        print(f"Client {self.client_id} DDS setup complete with RELIABLE QoS")
-        time.sleep(2)  # Allow time for discovery
+        time.sleep(3)  # Allow time for discovery
         
-        # Register with server
+        # Register with server - send multiple times for reliability
         registration = ClientRegistration(
             client_id=self.client_id,
             message=f"Client {self.client_id} ready"
         )
-        self.writers['registration'].write(registration)
+        # Send registration 3 times with delay to ensure delivery
+        for i in range(3):
+            self.writers['registration'].write(registration)
+            time.sleep(0.5)
         print(f"Client {self.client_id} registration sent\n")
     
     def run(self):
@@ -242,8 +253,6 @@ class FederatedLearningClient:
         
         # Get training configuration
         self.get_training_config()
-        
-        print(f"Client {self.client_id} waiting for training to start...\n")
         
         try:
             while self.running:
@@ -261,11 +270,9 @@ class FederatedLearningClient:
             self.cleanup()
     
     def get_training_config(self):
-        """Get training configuration from server"""
-        timeout = 10
-        start_time = time.time()
+        """Get training configuration from server (no timeout)"""
         
-        while time.time() - start_time < timeout:
+        while True:  # Wait indefinitely for config
             samples = self.readers['config'].take()
             for sample in samples:
                 if sample:
@@ -285,7 +292,6 @@ class FederatedLearningClient:
         
         for sample in samples:
             if sample:
-                print(f"Client {self.client_id} received command: round={sample.round}, start_training={sample.start_training}, start_evaluation={sample.start_evaluation}, training_complete={sample.training_complete}")
                 if sample.training_complete:
                     print(f"\nClient {self.client_id} - Training completed!")
                     self.running = False
@@ -296,7 +302,6 @@ class FederatedLearningClient:
                     if self.current_round == 0 and sample.round == 1:
                         # First training round with initial global model
                         if self.model is None:
-                            print(f"Client {self.client_id} waiting for initial model before training...")
                             return
                         self.current_round = sample.round
                         print(f"\nClient {self.client_id} starting training for round {self.current_round} with initial global model...")
@@ -317,10 +322,8 @@ class FederatedLearningClient:
             if status and not self.current_round and status.training_started and not status.training_complete:
                 if self.model is not None:
                     self.current_round = max(1, status.current_round)
-                    print(f"\n[Fallback] Client {self.client_id} starting training for round {self.current_round} based on server status...")
                     self.train_local_model()
-                else:
-                    print(f"[Fallback] Client {self.client_id} awaiting model before starting training...")
+
     
     def check_global_model(self):
         """Check for global model updates from server"""
@@ -475,21 +478,18 @@ class FederatedLearningClient:
         time.sleep(0.5)
         
         # Wait for global model after training
-        print(f"Client {self.client_id} waiting for global model for round {self.current_round}...")
         self.wait_for_global_model()
     
     def wait_for_global_model(self):
-        """Actively wait for global model after training"""
-        timeout = 30
-        start_time = time.time()
+        """Actively wait for global model after training (no timeout)"""
         check_count = 0
         
-        while time.time() - start_time < timeout:
+        while True:  # Wait indefinitely for global model
             samples = self.readers['global_model'].take()
             check_count += 1
             
-            if check_count % 50 == 0:  # Log every 5 seconds
-                print(f"Client {self.client_id} still waiting... (checked {check_count} times)")
+            #if check_count % 50 == 0:  # Log every 5 seconds
+                #print(f"Client {self.client_id} still waiting... (checked {check_count} times)")
             
             for sample in samples:
                 if sample:
@@ -505,8 +505,6 @@ class FederatedLearningClient:
                         self.evaluate_model()
                         return
             time.sleep(0.1)
-        
-        print(f"Client {self.client_id} WARNING: Timeout waiting for global model round {self.current_round}")
     
     def evaluate_model(self):
         """Evaluate model on validation data and send metrics to server"""

@@ -12,8 +12,16 @@ import pika
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
-gpu_device = os.environ.get("GPU_DEVICE_ID", "0")
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
 os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
 
@@ -82,6 +90,19 @@ class FederatedLearningClient:
     def __init__(self, client_id, num_clients, train_generator=None, validation_generator=None):
         self.client_id = client_id
         self.num_clients = num_clients
+        self.current_round = 0
+        # Default batch size adjusted for separate GPUs
+        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        # Deduplication tracking
+        self.last_global_round = -1
+        self.last_training_round = -1
+        self.evaluated_rounds = set()
+        
+        # Store data generators
+        self.train_generator = train_generator
+        self.validation_generator = validation_generator
+        
+        # Model will be initialized from server config
         self.model = None
         
         # Initialize quantization compression (default: disabled unless explicitly enabled)
@@ -93,10 +114,6 @@ class FederatedLearningClient:
         else:
             self.quantizer = None
             print(f"Client {self.client_id}: Quantization disabled")
-        self.train_generator = train_generator
-        self.validation_generator = validation_generator
-        self.current_round = 0
-        self.training_config = {"batch_size": 32, "local_epochs": 20}
         
         # AMQP connection
         self.connection = None

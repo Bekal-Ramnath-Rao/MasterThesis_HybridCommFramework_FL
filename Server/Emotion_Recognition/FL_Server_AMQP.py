@@ -180,7 +180,7 @@ class FederatedLearningServer:
                     host=AMQP_HOST,
                     port=AMQP_PORT,
                     credentials=credentials,
-                    heartbeat=600,
+                    heartbeat=60,  # Aligned with MQTT/gRPC/QUIC/DDS (60s)
                     blocked_connection_timeout=300
                 )
                 self.connection = pika.BlockingConnection(parameters)

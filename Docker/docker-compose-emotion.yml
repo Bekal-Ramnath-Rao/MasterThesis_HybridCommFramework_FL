@@ -54,6 +54,7 @@ services:
     cap_add:
       - NET_ADMIN
     depends_on:
+      - mqtt-broker
       - fl-server-mqtt-emotion
     environment:
       - MQTT_BROKER=mqtt-broker
@@ -81,6 +82,7 @@ services:
     cap_add:
       - NET_ADMIN
     depends_on:
+      - mqtt-broker
       - fl-server-mqtt-emotion
     environment:
       - MQTT_BROKER=mqtt-broker
@@ -348,11 +350,13 @@ services:
       - DDS_DOMAIN_ID=0
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
     command: python -u Server/Emotion_Recognition/FL_Server_DDS.py
     networks:
       - fl-dds-network
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+      - ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # DDS FL Client 1 (Emotion Recognition)
@@ -369,9 +373,11 @@ services:
       - DDS_DOMAIN_ID=0
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     networks:
       - fl-dds-network
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
@@ -390,9 +396,11 @@ services:
       - DDS_DOMAIN_ID=0
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     networks:
       - fl-dds-network
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml

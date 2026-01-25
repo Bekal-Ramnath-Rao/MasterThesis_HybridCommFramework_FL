@@ -503,10 +503,18 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
 def serve():
     """Start the gRPC server"""
-    # Set max message size to 100MB for large model weights
+    # Fair comparison settings aligned with MQTT/AMQP/QUIC/DDS
     options = [
-        ('grpc.max_send_message_length', 100 * 1024 * 1024),
-        ('grpc.max_receive_message_length', 100 * 1024 * 1024),
+        # Message size limits: 50MB for 12MB models + overhead
+        ('grpc.max_send_message_length', 50 * 1024 * 1024),
+        ('grpc.max_receive_message_length', 50 * 1024 * 1024),
+        # Keepalive settings: 60s aligned with other protocols
+        ('grpc.keepalive_time_ms', 60000),  # 60 seconds
+        ('grpc.keepalive_timeout_ms', 20000),  # 20 seconds
+        ('grpc.keepalive_permit_without_calls', 1),
+        ('grpc.http2.max_pings_without_data', 0),
+        ('grpc.http2.min_time_between_pings_ms', 10000),  # 10s
+        ('grpc.http2.max_ping_strikes', 2),
     ]
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10), options=options)
     servicer = FederatedLearningServicer(NUM_CLIENTS, NUM_ROUNDS)

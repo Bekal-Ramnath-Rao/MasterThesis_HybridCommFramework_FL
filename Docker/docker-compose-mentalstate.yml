@@ -52,6 +52,7 @@ services:
     cap_add:
       - NET_ADMIN
     depends_on:
+      - mqtt-broker-mental
       - fl-server-mqtt-mental
     environment:
       - MQTT_BROKER=mqtt-broker-mental
@@ -78,6 +79,7 @@ services:
     cap_add:
       - NET_ADMIN
     depends_on:
+      - mqtt-broker-mental
       - fl-server-mqtt-mental
     environment:
       - MQTT_BROKER=mqtt-broker-mental
@@ -333,11 +335,13 @@ services:
       - DDS_DOMAIN_ID=0
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - CYCLONEDDS_URI=file:///app/cyclonedds-mentalstate.xml
     command: python -u Server/MentalState_Recognition/FL_Server_DDS.py
     networks:
       - fl-dds-network
     volumes:
       - ../Server/MentalState_Recognition/results:/app/Server/MentalState_Recognition/results
+      - ../cyclonedds-mentalstate.xml:/app/cyclonedds-mentalstate.xml:ro
 
   # DDS FL Client 1 (Mental State Recognition)
   fl-client-dds-mental-1:
@@ -353,9 +357,11 @@ services:
       - DDS_DOMAIN_ID=0
       - CLIENT_ID=0
       - NUM_CLIENTS=2
+      - CYCLONEDDS_URI=file:///app/cyclonedds-mentalstate.xml
     command: python -u Client/MentalState_Recognition/FL_Client_DDS.py
     volumes:
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
+      - ../cyclonedds-mentalstate.xml:/app/cyclonedds-mentalstate.xml:ro
     networks:
       - fl-dds-network
 
@@ -373,9 +379,11 @@ services:
       - DDS_DOMAIN_ID=0
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - CYCLONEDDS_URI=file:///app/cyclonedds-mentalstate.xml
     command: python -u Client/MentalState_Recognition/FL_Client_DDS.py
     volumes:
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
+      - ../cyclonedds-mentalstate.xml:/app/cyclonedds-mentalstate.xml:ro
     networks:
       - fl-dds-network
 

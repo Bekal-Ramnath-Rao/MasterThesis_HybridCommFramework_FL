@@ -1,6 +1,4 @@
 import numpy as np
-import pandas as pd
-import math
 import os
 import sys
 import logging
@@ -14,8 +12,16 @@ import paho.mqtt.client as mqtt
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
-gpu_device = os.environ.get("GPU_DEVICE_ID", "0")
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
 os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
 
@@ -26,9 +32,7 @@ import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, Dense, Dropout, Flatten, Input
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.optimizers.schedules import ExponentialDecay
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from sklearn.preprocessing import MinMaxScaler
 
 # Make TensorFlow logs less verbose
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
@@ -71,7 +75,8 @@ if compression_path not in sys.path:
 from quantization_client import Quantization, QuantizationConfig
 
 # MQTT Configuration
-MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")  # MQTT broker address
+# Auto-detect environment: Docker (/app exists) or local
+MQTT_BROKER = os.getenv("MQTT_BROKER", 'mqtt-broker' if os.path.exists('/app') else 'localhost')
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))  # MQTT broker port
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))  # Can be set via environment variable
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
@@ -378,39 +383,6 @@ class FederatedLearningClient:
             steps_per_epoch = 100
             val_steps = 25
         
-        # Add training progress callbacks
-        class BatchLogger(tf.keras.callbacks.Callback):
-            def __init__(self, client_id: int, frequency: int = 100):
-                super().__init__()
-                self.client_id = client_id
-                self.frequency = frequency
-            def on_train_batch_end(self, batch, logs=None):
-                if batch % self.frequency == 0:
-                    logs = logs or {}
-                    loss = logs.get('loss')
-                    acc = logs.get('accuracy')
-                    try:
-                        print(f"[BatchLogger] Client {self.client_id} batch {batch}: loss={loss:.4f}, acc={acc:.4f}")
-                    except Exception:
-                        print(f"[BatchLogger] Client {self.client_id} batch {batch}: logs={logs}")
-
-        class EpochLogger(tf.keras.callbacks.Callback):
-            def __init__(self, client_id: int, total_epochs: int):
-                super().__init__()
-                self.client_id = client_id
-                self.total_epochs = total_epochs
-            def on_epoch_end(self, epoch, logs=None):
-                logs = logs or {}
-                loss = logs.get('loss')
-                acc = logs.get('accuracy')
-                val_loss = logs.get('val_loss')
-                val_acc = logs.get('val_accuracy')
-                try:
-                    print(f"[EpochLogger] Client {self.client_id} epoch {epoch+1}/{self.total_epochs}: "
-                          f"loss={loss:.4f}, acc={acc:.4f}, val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
-                except Exception:
-                    print(f"[EpochLogger] Client {self.client_id} epoch {epoch+1}/{self.total_epochs}: logs={logs}")
-
         # Train the model using generator
         history = self.model.fit(
             self.train_generator,
@@ -418,8 +390,7 @@ class FederatedLearningClient:
             validation_data=self.validation_generator,
             steps_per_epoch=steps_per_epoch,
             validation_steps=val_steps,
-            verbose=2,
-            callbacks=[BatchLogger(self.client_id), EpochLogger(self.client_id, epochs)]
+            verbose=2
         )
         
         # Get updated weights

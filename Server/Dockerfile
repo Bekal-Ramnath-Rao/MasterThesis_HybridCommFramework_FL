@@ -62,4 +62,4 @@ ENV TF_CPP_MIN_LOG_LEVEL=3
 EXPOSE 1883 5672 50051 4433 7400
 
 # Default command - can be overridden in docker-compose
-CMD ["python", "-u", "../Server/Emotion_Recognition/FL_Server_MQTT.py"]
+CMD ["python", "-u", "Server/Emotion_Recognition/FL_Server_MQTT.py"]

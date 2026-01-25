@@ -27,7 +27,7 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import QuicEvent, StreamDataReceived
 
 # Server Configuration
-QUIC_HOST = os.getenv("QUIC_HOST", "localhost")
+QUIC_HOST = os.getenv("QUIC_HOST", "fl-server-quic-emotion")
 QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
@@ -589,17 +589,18 @@ async def main():
     
     server = FederatedLearningServer(NUM_CLIENTS, NUM_ROUNDS)
     
-    # Configure QUIC with large stream data limits for model weights
+    # Fair comparison settings aligned with MQTT/AMQP/gRPC/DDS
     configuration = QuicConfiguration(
         is_client=False,
-        max_datagram_frame_size=65536,
-        max_stream_data=20 * 1024 * 1024,  # 20 MB per stream
-        max_data=50 * 1024 * 1024,  # 50 MB total connection data
-        idle_timeout=3600.0,  # 1 hour idle timeout (training can take long)
+        max_datagram_frame_size=65536,  # 64KB
+        max_stream_data=50 * 1024 * 1024,  # 50MB per stream (aligned with gRPC)
+        max_data=100 * 1024 * 1024,  # 100MB total connection data
+        idle_timeout=60.0,  # 60 seconds (aligned with MQTT/AMQP/gRPC/DDS)
     )
     
     # Check if certificates exist in the certs directory
-    cert_dir = Path(__file__).parent.parent.parent / "certs"
+    # In Docker, certs are mounted at /app/certs/
+    cert_dir = Path("/app/certs") if Path("/app/certs").exists() else Path(__file__).parent.parent.parent / "certs"
     cert_file = cert_dir / "server-cert.pem"
     key_file = cert_dir / "server-key.pem"
     

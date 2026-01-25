@@ -54,4 +54,4 @@ ENV QUIC_HOST=fl-server
 ENV DDS_DOMAIN_ID=0
 
 # Default command - can be overridden in docker-compose
-CMD ["python", "-u", "../Client/Emotion_Recognition/FL_Client_MQTT.py"]
+CMD ["python", "-u", "Client/Emotion_Recognition/FL_Client_MQTT.py"]

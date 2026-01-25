@@ -64,6 +64,7 @@ services:
     cap_add:
       - NET_ADMIN
     depends_on:
+      - mqtt-broker-temp
       - fl-server-mqtt-temp
     environment:
       - MQTT_BROKER=mqtt-broker-temp
@@ -90,6 +91,7 @@ services:
     cap_add:
       - NET_ADMIN
     depends_on:
+      - mqtt-broker-temp
       - fl-server-mqtt-temp
     environment:
       - MQTT_BROKER=mqtt-broker-temp
@@ -399,11 +401,13 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - CYCLONEDDS_URI=file:///app/cyclonedds-temperature.xml
     command: python -u Server/Temperature_Regulation/FL_Server_DDS.py
     networks:
       - fl-dds-network-temp
     volumes:
       - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+      - ../cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
 
   # DDS FL Client 1 (Temperature Regulation)
   fl-client-dds-temp-1:
@@ -424,9 +428,11 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - CYCLONEDDS_URI=file:///app/cyclonedds-temperature.xml
     command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
     networks:
       - fl-dds-network-temp
 
@@ -449,9 +455,11 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - CYCLONEDDS_URI=file:///app/cyclonedds-temperature.xml
     command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
     networks:
       - fl-dds-network-temp
 

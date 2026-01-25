@@ -99,24 +99,38 @@ class ExperimentRunner:
         
         # Docker compose file mapping (relative to project root)
         docker_dir = project_root / "Docker"
-        self.compose_files = {
-            "emotion": str(docker_dir / "docker-compose-emotion.yml"),
-            "mentalstate": str(docker_dir / "docker-compose-mentalstate.yml"),
-            "temperature": str(docker_dir / "docker-compose-temperature.yml")
-        }
         
-        # GPU overlay files
-        self.gpu_overlay_files = {
-            "emotion": str(docker_dir / "docker-compose-emotion.gpu.yml"),
-            "mentalstate": str(docker_dir / "docker-compose-mentalstate.gpu.yml"),
-            "temperature": str(docker_dir / "docker-compose-temperature.gpu.yml")
-        }
+        # Use GPU-isolated files when GPU is enabled, otherwise use standard files
+        if enable_gpu:
+            self.compose_files = {
+                "emotion": str(docker_dir / "docker-compose-emotion.gpu-isolated.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-mentalstate.gpu-isolated.yml"),
+                "temperature": str(docker_dir / "docker-compose-temperature.gpu-isolated.yml")
+            }
+            # No overlay files needed with GPU-isolated (they are standalone)
+            self.gpu_overlay_files = {}
+        else:
+            self.compose_files = {
+                "emotion": str(docker_dir / "docker-compose-emotion.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-mentalstate.yml"),
+                "temperature": str(docker_dir / "docker-compose-temperature.yml")
+            }
+            # GPU overlay files (not used when enable_gpu=False)
+            self.gpu_overlay_files = {
+                "emotion": str(docker_dir / "docker-compose-emotion.gpu.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-mentalstate.gpu.yml"),
+                "temperature": str(docker_dir / "docker-compose-temperature.gpu.yml")
+            }
         
         # Service name patterns
+        # Note: Use different broker names for GPU-isolated vs standard compose files
+        broker_mqtt = "mqtt-broker" if enable_gpu else "mqtt-broker"
+        broker_amqp = "amqp-broker" if enable_gpu else "rabbitmq"
+        
         self.service_patterns = {
             "emotion": {
-                "mqtt": ["mqtt-broker", "fl-server-mqtt-emotion", "fl-client-mqtt-emotion-1", "fl-client-mqtt-emotion-2"],
-                "amqp": ["rabbitmq", "fl-server-amqp-emotion", "fl-client-amqp-emotion-1", "fl-client-amqp-emotion-2"],
+                "mqtt": [broker_mqtt, "fl-server-mqtt-emotion", "fl-client-mqtt-emotion-1", "fl-client-mqtt-emotion-2"],
+                "amqp": [broker_amqp, "fl-server-amqp-emotion", "fl-client-amqp-emotion-1", "fl-client-amqp-emotion-2"],
                 "grpc": ["fl-server-grpc-emotion", "fl-client-grpc-emotion-1", "fl-client-grpc-emotion-2"],
                 "quic": ["fl-server-quic-emotion", "fl-client-quic-emotion-1", "fl-client-quic-emotion-2"],
                 "dds": ["fl-server-dds-emotion", "fl-client-dds-emotion-1", "fl-client-dds-emotion-2"]
@@ -164,11 +178,9 @@ class ExperimentRunner:
         """Start Docker containers for a specific protocol with staged startup"""
         compose_file = self.compose_files[self.use_case]
         
-        # Build compose command with GPU overlay if enabled
+        # Build compose command (no overlay needed with GPU-isolated files)
         compose_cmd_base = ["docker", "compose", "-f", compose_file]
-        if self.enable_gpu:
-            gpu_overlay = self.gpu_overlay_files[self.use_case]
-            compose_cmd_base.extend(["-f", gpu_overlay])
+        # Note: GPU-isolated files are standalone, no overlay needed
         
         services = self.service_patterns[self.use_case][protocol]
         
@@ -258,12 +270,9 @@ class ExperimentRunner:
         
         print(f"\nStopping containers for {protocol.upper()} protocol...")
         
-        # Build compose command with GPU overlay if enabled
-        cmd = ["docker", "compose", "-f", compose_file]
-        if self.enable_gpu:
-            gpu_overlay = self.gpu_overlay_files[self.use_case]
-            cmd.extend(["-f", gpu_overlay])
-        cmd.append("down")
+        # Build compose command (no overlay needed with GPU-isolated files)
+        cmd = ["docker", "compose", "-f", compose_file, "down"]
+        # Note: GPU-isolated files are standalone, no overlay needed
         
         self.run_command(cmd, check=False)
         
@@ -412,6 +421,21 @@ class ExperimentRunner:
             f.write(logs.stdout or "")
             f.write("\n\n=== STDERR ===\n\n")
             f.write(logs.stderr or "")
+
+        # Save broker logs (if broker exists for this protocol)
+        broker_containers = [s for s in services if "broker" in s.lower() or "rabbitmq" in s.lower()]
+        if broker_containers:
+            print(f"Collecting logs for broker: {', '.join(broker_containers)}")
+            for broker in broker_containers:
+                try:
+                    b_logs = self.run_command(["docker", "logs", broker], check=False)
+                    out_path = os.path.join(exp_dir, "broker_logs.txt")
+                    with open(out_path, "w", encoding='utf-8', errors='replace') as bf:
+                        bf.write(b_logs.stdout or "")
+                        bf.write("\n\n=== STDERR ===\n\n")
+                        bf.write(b_logs.stderr or "")
+                except Exception as e:
+                    print(f"[WARNING] Failed to collect logs for {broker}: {e}")
 
         # Save client logs as well for debugging client-side behavior
         client_containers = [s for s in services if "client" in s]

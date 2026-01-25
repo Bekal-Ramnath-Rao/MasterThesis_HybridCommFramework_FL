@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+    <Domain id="any">
+        <General>
+            <!-- Enable multicast for better discovery in Docker -->
+            <AllowMulticast>true</AllowMulticast>
+            <!-- Max message size: 100MB to handle emotion recognition models -->
+            <MaxMessageSize>104857600 B</MaxMessageSize>
+            <!-- Fragment size: 32KB - larger fragments for efficiency -->
+            <FragmentSize>32768 B</FragmentSize>
+        </General>
+        <Discovery>
+            <ParticipantIndex>auto</ParticipantIndex>
+            <!-- SPDP interval for discovery heartbeats -->
+            <SPDPInterval>5s</SPDPInterval>
+            <!-- Multicast discovery enabled - no need for explicit peers -->
+        </Discovery>
+        <Internal>
+            <SquashParticipants>false</SquashParticipants>
+            
+            <!-- Retransmission tuning for poor networks - reduce congestion storms -->
+            <NackDelay>2s</NackDelay>
+            
+            <!-- Increase max sample size to handle large emotion models (100MB) -->
+            <MaxSampleSize>104857600 B</MaxSampleSize>
+            
+            <!-- Allow more pending fragments (100MB / 32KB = ~3200 fragments) -->
+            <DefragReliableMaxSamples>5000</DefragReliableMaxSamples>
+            <DefragUnreliableMaxSamples>5000</DefragUnreliableMaxSamples>
+        </Internal>
+        <Tracing>
+            <Verbosity>warning</Verbosity>
+            <OutputFile>stderr</OutputFile>
+        </Tracing>
+    </Domain>
+</CycloneDDS>

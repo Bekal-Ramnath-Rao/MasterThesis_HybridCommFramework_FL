@@ -14,7 +14,7 @@ services:
       - ../mqtt-config/mosquitto.conf:/mosquitto/config/mosquitto.conf
     networks:
       - emotion_network
-    container_name: mqtt-broker-emotion
+    container_name: mqtt-broker
 
   # ============================================================================
   # MQTT Protocol Services
@@ -27,14 +27,18 @@ services:
     environment:
       - PROTOCOL=MQTT
       - USE_CASE=emotion
-      - MQTT_BROKER=mqtt-broker:1883
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
       - NUM_ROUNDS=1000
       - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - mqtt-broker
     networks:
       - emotion_network
     container_name: fl-server-mqtt-emotion
+    command: python -u Server/Emotion_Recognition/FL_Server_MQTT.py
     # Server does not need GPU resources - only aggregates models
 
   fl-client-mqtt-emotion-1:
@@ -46,17 +50,21 @@ services:
       - NUM_CLIENTS=2
       - PROTOCOL=MQTT
       - USE_CASE=emotion
-      - MQTT_BROKER=mqtt-broker:1883
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
       - CUDA_VISIBLE_DEVICES=0
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - mqtt-broker
       - fl-server-mqtt-emotion
     networks:
       - emotion_network
     container_name: fl-client-mqtt-emotion-1
+    command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
     deploy:
       resources:
         reservations:
@@ -74,17 +82,21 @@ services:
       - NUM_CLIENTS=2
       - PROTOCOL=MQTT
       - USE_CASE=emotion
-      - MQTT_BROKER=mqtt-broker:1883
-      - CUDA_VISIBLE_DEVICES=1
-      - GPU_DEVICE_ID=1
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - mqtt-broker
       - fl-server-mqtt-emotion
     networks:
       - emotion_network
     container_name: fl-client-mqtt-emotion-2
+    command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
     deploy:
       resources:
         reservations:
@@ -107,7 +119,7 @@ services:
       - "35671:15672"
     networks:
       - emotion_network
-    container_name: amqp-broker-emotion
+    container_name: amqp-broker
 
   fl-server-amqp-emotion:
     build:
@@ -116,14 +128,20 @@ services:
     environment:
       - PROTOCOL=AMQP
       - USE_CASE=emotion
-      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - AMQP_HOST=amqp-broker
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
       - NUM_ROUNDS=1000
       - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - amqp-broker
     networks:
       - emotion_network
     container_name: fl-server-amqp-emotion
+    command: python -u Server/Emotion_Recognition/FL_Server_AMQP.py
     # Server does not need GPU resources - only aggregates models
 
   fl-client-amqp-emotion-1:
@@ -135,17 +153,23 @@ services:
       - NUM_CLIENTS=2
       - PROTOCOL=AMQP
       - USE_CASE=emotion
-      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - AMQP_HOST=amqp-broker
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
       - CUDA_VISIBLE_DEVICES=0
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - amqp-broker
       - fl-server-amqp-emotion
     networks:
       - emotion_network
     container_name: fl-client-amqp-emotion-1
+    command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
     deploy:
       resources:
         reservations:
@@ -163,17 +187,23 @@ services:
       - NUM_CLIENTS=2
       - PROTOCOL=AMQP
       - USE_CASE=emotion
-      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
-      - CUDA_VISIBLE_DEVICES=1
-      - GPU_DEVICE_ID=1
+      - AMQP_HOST=amqp-broker
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - amqp-broker
       - fl-server-amqp-emotion
     networks:
       - emotion_network
     container_name: fl-client-amqp-emotion-2
+    command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
     deploy:
       resources:
         reservations:
@@ -196,11 +226,14 @@ services:
       - GRPC_PORT=50051
       - NUM_ROUNDS=1000
       - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
+    cap_add:
+      - NET_ADMIN
     ports:
       - "50051:50051"
     networks:
       - emotion_network
     container_name: fl-server-grpc-emotion
+    command: python -u Server/Emotion_Recognition/FL_Server_gRPC.py
     # Server does not need GPU resources - only aggregates models
 
   fl-client-grpc-emotion-1:
@@ -212,16 +245,20 @@ services:
       - NUM_CLIENTS=2
       - PROTOCOL=gRPC
       - USE_CASE=emotion
-      - GRPC_SERVER=fl-server-grpc-emotion:50051
+      - GRPC_HOST=fl-server-grpc-emotion
+      - GRPC_PORT=50051
       - CUDA_VISIBLE_DEVICES=0
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - fl-server-grpc-emotion
     networks:
       - emotion_network
     container_name: fl-client-grpc-emotion-1
+    command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
     deploy:
       resources:
         reservations:
@@ -239,16 +276,20 @@ services:
       - NUM_CLIENTS=2
       - PROTOCOL=gRPC
       - USE_CASE=emotion
-      - GRPC_SERVER=fl-server-grpc-emotion:50051
-      - CUDA_VISIBLE_DEVICES=1
-      - GPU_DEVICE_ID=1
+      - GRPC_HOST=fl-server-grpc-emotion
+      - GRPC_PORT=50051
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - fl-server-grpc-emotion
     networks:
       - emotion_network
     container_name: fl-client-grpc-emotion-2
+    command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
     deploy:
       resources:
         reservations:
@@ -271,11 +312,16 @@ services:
       - QUIC_PORT=4433
       - NUM_ROUNDS=1000
       - TF_FORCE_GPU_ALLOW_GROWTH=true
+    cap_add:
+      - NET_ADMIN
     ports:
       - "4433:4433/udp"
+    volumes:
+      - ../certs:/app/certs:ro
     networks:
       - emotion_network
     container_name: fl-server-quic-emotion
+    command: python -u Server/Emotion_Recognition/FL_Server_QUIC.py
     # Server runs on CPU to avoid competing for GPU memory with clients
 
   fl-client-quic-emotion-1:
@@ -287,16 +333,20 @@ services:
       - NUM_CLIENTS=2
       - PROTOCOL=QUIC
       - USE_CASE=emotion
-      - QUIC_SERVER=fl-server-quic-emotion:4433
+      - QUIC_HOST=fl-server-quic-emotion
+      - QUIC_PORT=4433
       - CUDA_VISIBLE_DEVICES=0
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - fl-server-quic-emotion
     networks:
       - emotion_network
     container_name: fl-client-quic-emotion-1
+    command: python -u Client/Emotion_Recognition/FL_Client_QUIC.py
     deploy:
       resources:
         reservations:
@@ -314,23 +364,27 @@ services:
       - NUM_CLIENTS=2
       - PROTOCOL=QUIC
       - USE_CASE=emotion
-      - QUIC_SERVER=fl-server-quic-emotion:4433
-      - CUDA_VISIBLE_DEVICES=1
-      - GPU_DEVICE_ID=1
+      - QUIC_HOST=fl-server-quic-emotion
+      - QUIC_PORT=4433
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+    cap_add:
+      - NET_ADMIN
     depends_on:
       - fl-server-quic-emotion
     networks:
       - emotion_network
     container_name: fl-client-quic-emotion-2
+    command: python -u Client/Emotion_Recognition/FL_Client_QUIC.py
     deploy:
       resources:
         reservations:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['1']
+              device_ids: ['0']
 
   # ============================================================================
   # DDS Protocol Services
@@ -345,12 +399,18 @@ services:
       - USE_CASE=emotion
       - NUM_ROUNDS=1000
       - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
-      - LOCAL_EPOCHS=5
+      - LOCAL_EPOCHS=20
+      - DDS_DOMAIN_ID=0
+      #- CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
     networks:
       - emotion_network
     container_name: fl-server-dds-emotion
     cap_add:
       - NET_ADMIN
+    volumes:
+      - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+      #- ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+    command: bash -c "sleep 10 && python -u Server/Emotion_Recognition/FL_Server_DDS.py"
     # Server does not need GPU resources - only aggregates models
 
   fl-client-dds-emotion-1:
@@ -366,6 +426,8 @@ services:
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+      - DDS_DOMAIN_ID=0
+      #- CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
     depends_on:
       - fl-server-dds-emotion
     networks:
@@ -373,6 +435,10 @@ services:
     container_name: fl-client-dds-emotion-1
     cap_add:
       - NET_ADMIN
+    volumes:
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      #- ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+    command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     deploy:
       resources:
         reservations:
@@ -390,10 +456,12 @@ services:
       - NUM_CLIENTS=2
       - PROTOCOL=DDS
       - USE_CASE=emotion
-      - CUDA_VISIBLE_DEVICES=1
-      - GPU_DEVICE_ID=1
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+      - DDS_DOMAIN_ID=0
+      #- CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
     depends_on:
       - fl-server-dds-emotion
     networks:
@@ -401,13 +469,17 @@ services:
     container_name: fl-client-dds-emotion-2
     cap_add:
       - NET_ADMIN
+    volumes:
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      #- ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+    command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     deploy:
       resources:
         reservations:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['1']
+              device_ids: ['0']
 
 networks:
   emotion_network:

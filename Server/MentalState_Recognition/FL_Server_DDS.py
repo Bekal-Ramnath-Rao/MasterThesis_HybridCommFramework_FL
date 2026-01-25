@@ -358,8 +358,9 @@ class FederatedLearningServer:
 
         self.participant = DomainParticipant(DDS_DOMAIN_ID)
 
+        # Infinite max_blocking_time for large model transfers (no timeout)
         reliable_qos = Qos(
-            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=3600)),  # 1 hour timeout
             Policy.History.KeepAll,
             Policy.Durability.TransientLocal
         )
