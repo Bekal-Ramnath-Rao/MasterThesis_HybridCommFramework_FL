@@ -223,17 +223,22 @@ class FederatedLearningClient:
     async def handle_global_model(self, message):
         """Receive and set global model weights and architecture from server"""
         round_num = message['round']
-        encoded_weights = message['weights']
         
         # Decompress or deserialize weights
         if 'quantized_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['quantized_data'])
+            # Deserialize base64+pickle encoded quantized data
+            compressed_data = pickle.loads(base64.b64decode(message['quantized_data']))
+            weights = self.quantizer.decompress(compressed_data)
             print(f"Client {self.client_id}: Received and decompressed quantized global model")
         elif 'compressed_data' in message and self.quantizer is not None:
             weights = self.quantizer.decompress(message['compressed_data'])
             print(f"Client {self.client_id}: Received and decompressed quantized global model")
-        else:
+        elif 'weights' in message:
+            encoded_weights = message['weights']
             weights = self.deserialize_weights(encoded_weights)
+        else:
+            print(f"Client {self.client_id}: ERROR - No weights found in message!")
+            return
         
         if round_num == 0:
             # If we've already moved past initialization, ignore repeated initial models
@@ -394,7 +399,7 @@ class FederatedLearningClient:
             print(f"Client {self.client_id}: Compressed weights - "
                   f"Ratio: {stats['compression_ratio']:.2f}x, "
                   f"Size: {stats['compressed_size_mb']:.2f}MB")
-            weights_data = compressed_data
+            weights_data = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             weights_key = 'compressed_data'
         else:
             weights_data = self.serialize_weights(updated_weights)

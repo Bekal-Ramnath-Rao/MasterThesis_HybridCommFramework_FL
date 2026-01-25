@@ -255,7 +255,9 @@ class FederatedLearningServer:
             # Decompress or deserialize client weights
             if 'compressed_data' in message and self.quantization_handler is not None:
                 start_t = time.time()
-                weights = self.quantization_handler.decompress_client_update(message['client_id'], message['compressed_data'])
+                # Deserialize base64+pickle encoded compressed data
+                compressed_data = pickle.loads(base64.b64decode(message['compressed_data']))
+                weights = self.quantization_handler.decompress_client_update(message['client_id'], compressed_data)
                 dt = time.time() - start_t
                 print(f"Server: Received and decompressed update from client {message['client_id']} in {dt:.2f}s")
             else:
@@ -348,7 +350,8 @@ class FederatedLearningServer:
             compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
             stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
             print(f"Server: Compressed initial global model - Ratio: {stats['compression_ratio']:.2f}x")
-            weights_data = compressed_data
+            # Serialize compressed data to JSON-safe base64 string
+            weights_data = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             weights_key = 'quantized_data'
         else:
             weights_data = self.serialize_weights(self.global_weights)
@@ -406,7 +409,8 @@ class FederatedLearningServer:
             compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
             stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
             print(f"Server: Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
-            weights_data = compressed_data
+            # Serialize compressed data to JSON-safe base64 string
+            weights_data = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             weights_key = 'quantized_data'
         else:
             weights_data = self.serialize_weights(self.global_weights)

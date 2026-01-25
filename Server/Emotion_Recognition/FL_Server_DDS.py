@@ -170,7 +170,6 @@ class FederatedLearningServer:
         from tensorflow.keras.layers import Conv2D, MaxPooling2D, Dense, Dropout, Flatten, Input
         from tensorflow.keras.optimizers import Adam
         
-        # Server runs on CPU - no GPU configuration needed
         # Create CNN model for emotion recognition (7 classes, 48x48 grayscale images)
         model = Sequential()
         model.add(Input(shape=(48, 48, 1)))
@@ -222,12 +221,11 @@ class FederatedLearningServer:
         # Create domain participant
         self.participant = DomainParticipant(DDS_DOMAIN_ID)
         
-        # Fair comparison QoS settings aligned with MQTT/AMQP/gRPC/QUIC
-        # Increased blocking time for poor networks: 12MB @ 384 Kbps = ~400s with retransmissions
+        # Create QoS policy for reliable communication
         reliable_qos = Qos(
-            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),  # 10 minutes (600s)
-            Policy.History.KeepLast(1),  # Only keep latest model (memory efficient)
-            Policy.Durability.TransientLocal  # Survive late joiners
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.History.KeepAll,
+            Policy.Durability.TransientLocal
         )
         
         # Create topics
@@ -251,7 +249,7 @@ class FederatedLearningServer:
         self.writers['status'] = DataWriter(self.participant, topic_status, qos=reliable_qos)
         
         print("DDS setup complete with RELIABLE QoS\n")
-        time.sleep(3)  # Allow time for discovery and endpoint matching
+        time.sleep(2)  # Allow time for discovery
     
     def publish_status(self):
         """Publish current server status"""
@@ -291,7 +289,7 @@ class FederatedLearningServer:
                     loop_count += 1
                     # Print heartbeat every 10 iterations (5 seconds)
                     if loop_count % 10 == 0:
-                        #print(f"[ServerLoop] Iteration {loop_count}, round={self.current_round}, updates={len(self.client_updates)}/{self.num_clients}, metrics={len(self.client_metrics)}/{self.num_clients}")
+                        print(f"[ServerLoop] Iteration {loop_count}, round={self.current_round}, updates={len(self.client_updates)}/{self.num_clients}, metrics={len(self.client_metrics)}/{self.num_clients}")
                         sys.stdout.flush()
                     
                     # Publish current status
@@ -321,15 +319,6 @@ class FederatedLearningServer:
                         traceback.print_exc()
                         sys.stdout.flush()
                     
-                    # Check for evaluation metrics
-                    try:
-                        self.check_evaluation_metrics()
-                    except Exception as e:
-                        print(f"[ERROR] check_evaluation_metrics failed: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        sys.stdout.flush()
-                    
                     time.sleep(0.5)
                     
                 except Exception as loop_error:
@@ -340,7 +329,7 @@ class FederatedLearningServer:
                     # Continue loop despite error
                     time.sleep(1)
             
-            #print(f"\n[ServerLoop] Loop exited normally: training_complete={self.training_complete}")
+            print(f"\n[ServerLoop] Loop exited normally: training_complete={self.training_complete}")
             sys.stdout.flush()
             print("\nServer shutting down...")
             
@@ -413,7 +402,8 @@ class FederatedLearningServer:
             compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
             stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
             print(f"Server: Compressed initial global model - Ratio: {stats['compression_ratio']:.2f}x")
-            serialized_weights = compressed_data
+            # Serialize compressed data (pickle + convert to list of ints for DDS)
+            serialized_weights = list(pickle.dumps(compressed_data))
         else:
             serialized_weights = self.serialize_weights(self.global_weights)
         
@@ -424,11 +414,13 @@ class FederatedLearningServer:
             model_config_json=json.dumps(model_config)
         )
         
+        print("Publishing initial model to clients (sending multiple times for reliability)...")
         for i in range(3):
             self.writers['global_model'].write(initial_model)
+            print(f"  Attempt {i+1}/3: Initial model published via DDS")
             time.sleep(0.5)
         
-        print("Initial global model sent to all clients")
+        print("Initial global model (architecture + weights) sent to all clients")
         
         # Wait for clients to receive and set the initial model
         print("Waiting for clients to receive and build the model...")
@@ -447,6 +439,7 @@ class FederatedLearningServer:
             training_complete=False
         )
         self.writers['command'].write(command)
+        print("Start training signal sent successfully\n")
     
     def check_model_updates(self):
         """Check for model updates from clients"""
@@ -470,10 +463,13 @@ class FederatedLearningServer:
                     # Decompress or deserialize client weights
                     if self.quantization_handler is not None:
                         try:
-                            weights = self.quantization_handler.decompress_client_update(sample.client_id, bytes(sample.weights))
+                            # Deserialize pickled compressed data
+                            compressed_data = pickle.loads(bytes(sample.weights))
+                            weights = self.quantization_handler.decompress_client_update(sample.client_id, compressed_data)
                             print(f"Server: Received and decompressed update from client {sample.client_id}")
-                        except:
+                        except Exception as e:
                             # Fallback to regular deserialization
+                            print(f"Server: Failed to decompress from client {sample.client_id}, falling back to regular deserialization: {e}")
                             weights = self.deserialize_weights(sample.weights)
                     else:
                         weights = self.deserialize_weights(sample.weights)
@@ -516,11 +512,11 @@ class FederatedLearningServer:
                         
                         print(f"Received metrics from client {client_id} "
                               f"({len(self.client_metrics)}/{self.num_clients})")
-        
-        # Check if all metrics received (moved outside the loop to check after processing all samples)
-        if len(self.client_metrics) == self.num_clients and not self.training_complete:
-            self.aggregate_metrics()
-            self.continue_training()
+                        
+                        # If all clients sent metrics, aggregate and continue
+                    if len(self.client_metrics) == self.num_clients:
+                        self.aggregate_metrics()
+                        self.continue_training()
     
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
@@ -557,7 +553,8 @@ class FederatedLearningServer:
             compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
             stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
             print(f"Server: Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
-            serialized_weights = compressed_data
+            # Serialize compressed data (pickle + convert to list of ints for DDS)
+            serialized_weights = list(pickle.dumps(compressed_data))
         else:
             serialized_weights = self.serialize_weights(self.global_weights)
         
@@ -580,14 +577,25 @@ class FederatedLearningServer:
         
         self.evaluation_phase = True
         
-        # Note: Evaluation metrics will be collected via check_evaluation_metrics() in main loop
-        # No blocking wait here to allow server loop to continue polling
+        # Wait for all evaluation metrics
+        self.wait_for_evaluation_metrics()
+        
+        # After receiving all metrics, aggregate and continue
+        if len(self.client_metrics) == self.num_clients:
+            self.aggregate_metrics()
+            self.continue_training()
     
     def wait_for_evaluation_metrics(self):
-        """Actively wait for evaluation metrics from all clients (no timeout)"""
+        """Actively wait for evaluation metrics from all clients"""
         print(f"\nWaiting for evaluation metrics from {self.num_clients} clients...")
+        timeout = 60  # 60 seconds timeout
+        start_time = time.time()
         
         while len(self.client_metrics) < self.num_clients:
+            if time.time() - start_time > timeout:
+                print(f"Timeout waiting for metrics. Received {len(self.client_metrics)}/{self.num_clients}")
+                break
+            
             samples = self.readers['metrics'].take()
             for sample in samples:
                 if sample.round == self.current_round:

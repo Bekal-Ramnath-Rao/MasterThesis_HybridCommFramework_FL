@@ -199,12 +199,11 @@ class FederatedLearningClient:
         # Create domain participant
         self.participant = DomainParticipant(DDS_DOMAIN_ID)
         
-        # Create QoS policy for reliable communication - MUST match server QoS
-        # Using same settings as server for compatibility
+        # Create QoS policy for reliable communication
         reliable_qos = Qos(
-            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),  # 10 minutes (match server)
-            Policy.History.KeepLast(1),  # Only keep latest (match server)
-            Policy.Durability.TransientLocal  # Survive late joiners (match server)
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.History.KeepAll,
+            Policy.Durability.TransientLocal
         )
         
         # Create topics
@@ -227,17 +226,15 @@ class FederatedLearningClient:
         self.writers['model_update'] = DataWriter(self.participant, topic_model_update, qos=reliable_qos)
         self.writers['metrics'] = DataWriter(self.participant, topic_metrics, qos=reliable_qos)
         
-        time.sleep(3)  # Allow time for discovery
+        print(f"Client {self.client_id} DDS setup complete with RELIABLE QoS")
+        time.sleep(2)  # Allow time for discovery
         
-        # Register with server - send multiple times for reliability
+        # Register with server
         registration = ClientRegistration(
             client_id=self.client_id,
             message=f"Client {self.client_id} ready"
         )
-        # Send registration 3 times with delay to ensure delivery
-        for i in range(3):
-            self.writers['registration'].write(registration)
-            time.sleep(0.5)
+        self.writers['registration'].write(registration)
         print(f"Client {self.client_id} registration sent\n")
     
     def run(self):
@@ -253,6 +250,8 @@ class FederatedLearningClient:
         
         # Get training configuration
         self.get_training_config()
+        
+        print(f"Client {self.client_id} waiting for training to start...\n")
         
         try:
             while self.running:
@@ -270,9 +269,11 @@ class FederatedLearningClient:
             self.cleanup()
     
     def get_training_config(self):
-        """Get training configuration from server (no timeout)"""
+        """Get training configuration from server"""
+        timeout = 10
+        start_time = time.time()
         
-        while True:  # Wait indefinitely for config
+        while time.time() - start_time < timeout:
             samples = self.readers['config'].take()
             for sample in samples:
                 if sample:
@@ -292,6 +293,7 @@ class FederatedLearningClient:
         
         for sample in samples:
             if sample:
+                print(f"Client {self.client_id} received command: round={sample.round}, start_training={sample.start_training}, start_evaluation={sample.start_evaluation}, training_complete={sample.training_complete}")
                 if sample.training_complete:
                     print(f"\nClient {self.client_id} - Training completed!")
                     self.running = False
@@ -302,6 +304,7 @@ class FederatedLearningClient:
                     if self.current_round == 0 and sample.round == 1:
                         # First training round with initial global model
                         if self.model is None:
+                            print(f"Client {self.client_id} waiting for initial model before training...")
                             return
                         self.current_round = sample.round
                         print(f"\nClient {self.client_id} starting training for round {self.current_round} with initial global model...")
@@ -322,8 +325,10 @@ class FederatedLearningClient:
             if status and not self.current_round and status.training_started and not status.training_complete:
                 if self.model is not None:
                     self.current_round = max(1, status.current_round)
+                    print(f"\n[Fallback] Client {self.client_id} starting training for round {self.current_round} based on server status...")
                     self.train_local_model()
-
+                else:
+                    print(f"[Fallback] Client {self.client_id} awaiting model before starting training...")
     
     def check_global_model(self):
         """Check for global model updates from server"""
@@ -332,7 +337,19 @@ class FederatedLearningClient:
         for sample in samples:
             if sample:
                 round_num = sample.round
-                weights = self.deserialize_weights(sample.weights)
+                # Deserialize and potentially decompress weights
+                raw_weights = self.deserialize_weights(sample.weights)
+                
+                # Check if weights are compressed (quantized)
+                if isinstance(raw_weights, dict) and 'compressed_data' in raw_weights:
+                    if self.quantizer is not None:
+                        weights = self.quantizer.decompress(raw_weights)
+                        print(f"Client {self.client_id}: Received and decompressed quantized global model")
+                    else:
+                        print(f"Client {self.client_id}: ERROR - Received quantized data but quantizer not initialized!")
+                        continue
+                else:
+                    weights = raw_weights
                 
                 if round_num == 0:
                     # Initial model from server - avoid rebuilding if already initialized
@@ -451,7 +468,8 @@ class FederatedLearningClient:
             compressed_data = self.quantizer.compress(weights, data_type="weights")
             stats = self.quantizer.get_compression_stats(weights, compressed_data)
             print(f"Client {self.client_id}: Compressed weights - Ratio: {stats['compression_ratio']:.2f}x, Size: {stats['compressed_size_mb']:.2f}MB")
-            serialized_weights = compressed_data
+            # Serialize compressed data (pickle + convert to list of ints for DDS)
+            serialized_weights = list(pickle.dumps(compressed_data))
         else:
             serialized_weights = self.serialize_weights(weights)
         
@@ -478,25 +496,41 @@ class FederatedLearningClient:
         time.sleep(0.5)
         
         # Wait for global model after training
+        print(f"Client {self.client_id} waiting for global model for round {self.current_round}...")
         self.wait_for_global_model()
     
     def wait_for_global_model(self):
-        """Actively wait for global model after training (no timeout)"""
+        """Actively wait for global model after training"""
+        timeout = 30
+        start_time = time.time()
         check_count = 0
         
-        while True:  # Wait indefinitely for global model
+        while time.time() - start_time < timeout:
             samples = self.readers['global_model'].take()
             check_count += 1
             
-            #if check_count % 50 == 0:  # Log every 5 seconds
-                #print(f"Client {self.client_id} still waiting... (checked {check_count} times)")
+            if check_count % 50 == 0:  # Log every 5 seconds
+                print(f"Client {self.client_id} still waiting... (checked {check_count} times)")
             
             for sample in samples:
                 if sample:
                     print(f"Client {self.client_id} received sample for round {sample.round} (expecting {self.current_round})")
                     if sample.round == self.current_round:
                         # Update local model with global weights
-                        weights = self.deserialize_weights(sample.weights)
+                        # Deserialize and potentially decompress weights
+                        raw_weights = self.deserialize_weights(sample.weights)
+                        
+                        # Check if weights are compressed (quantized)
+                        if isinstance(raw_weights, dict) and 'compressed_data' in raw_weights:
+                            if self.quantizer is not None:
+                                weights = self.quantizer.decompress(raw_weights)
+                                print(f"Client {self.client_id}: Received and decompressed quantized global model")
+                            else:
+                                print(f"Client {self.client_id}: ERROR - Received quantized data but quantizer not initialized!")
+                                return
+                        else:
+                            weights = raw_weights
+                        
                         self.model.set_weights(weights)
                         print(f"Client {self.client_id} received global model for round {self.current_round}")
                         
@@ -505,6 +539,8 @@ class FederatedLearningClient:
                         self.evaluate_model()
                         return
             time.sleep(0.1)
+        
+        print(f"Client {self.client_id} WARNING: Timeout waiting for global model round {self.current_round}")
     
     def evaluate_model(self):
         """Evaluate model on validation data and send metrics to server"""
