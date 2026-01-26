@@ -309,8 +309,8 @@ class ExperimentRunner:
         success_count = 0
         for container in services:
             # Skip brokers - they represent reliable infrastructure
-            if 'broker' in container.lower() or 'rabbitmq' in container.lower():
-                print(f"[INFO] Skipping network conditions for broker: {container} (infrastructure)")
+            if 'broker' in container.lower() or 'rabbitmq' in container.lower() or 'server' in container.lower():
+                print(f"[INFO] Skipping network conditions for broker/server: {container} (infrastructure)")
                 continue
             
             try:

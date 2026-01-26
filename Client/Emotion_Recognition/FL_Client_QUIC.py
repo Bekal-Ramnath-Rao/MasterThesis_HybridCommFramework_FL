@@ -82,6 +82,10 @@ QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "1"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 
+# Model initialization timeout (seconds) - longer for poor network conditions
+# Default: 300s (5 minutes) for very poor network conditions with large models
+MODEL_INIT_TIMEOUT = float(os.getenv("MODEL_INIT_TIMEOUT", "300"))
+
 
 class FederatedLearningClientProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
@@ -98,6 +102,8 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             
             # Append new data to buffer
             self._stream_buffers[event.stream_id] += event.data
+            buffer_size = len(self._stream_buffers[event.stream_id])
+            print(f"[DEBUG] Client stream {event.stream_id}: received {len(event.data)} bytes, buffer now {buffer_size} bytes, end_stream={event.end_stream}")
             
             # Try to decode complete messages (delimited by newline)
             while b'\n' in self._stream_buffers[event.stream_id]:
@@ -106,6 +112,8 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
                     try:
                         data = message_data.decode('utf-8')
                         message = json.loads(data)
+                        msg_type = message.get('type', 'unknown')
+                        print(f"[DEBUG] Client decoded message from stream {event.stream_id}: type={msg_type}, size={len(message_data)} bytes")
                         if self.client:
                             asyncio.create_task(self.client.handle_message(message))
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -113,9 +121,12 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             
             # If stream ended and buffer has remaining data, try to process it
             if event.end_stream and self._stream_buffers[event.stream_id]:
+                print(f"[DEBUG] Client stream {event.stream_id} ended with {len(self._stream_buffers[event.stream_id])} bytes remaining")
                 try:
                     data = self._stream_buffers[event.stream_id].decode('utf-8')
                     message = json.loads(data)
+                    msg_type = message.get('type', 'unknown')
+                    print(f"[DEBUG] Client decoded end-of-stream message: type={msg_type}")
                     if self.client:
                         asyncio.create_task(self.client.handle_message(message))
                     self._stream_buffers[event.stream_id] = b''
@@ -223,6 +234,7 @@ class FederatedLearningClient:
     async def handle_global_model(self, message):
         """Receive and set global model weights and architecture from server"""
         round_num = message['round']
+        print(f"Client {self.client_id}: Received global_model message for round {round_num}")
         
         # Decompress or deserialize weights
         if 'quantized_data' in message and self.quantizer is not None:
@@ -236,6 +248,7 @@ class FederatedLearningClient:
         elif 'weights' in message:
             encoded_weights = message['weights']
             weights = self.deserialize_weights(encoded_weights)
+            print(f"Client {self.client_id}: Deserialized global model weights ({len(encoded_weights)} bytes)")
         else:
             print(f"Client {self.client_id}: ERROR - No weights found in message!")
             return
@@ -311,11 +324,13 @@ class FederatedLearningClient:
         # Wait for model to be initialized (with timeout)
         if not self.model_ready.is_set():
             print(f"Client {self.client_id} waiting for model initialization before training round {round_num}...")
+            print(f"Client {self.client_id} using timeout of {MODEL_INIT_TIMEOUT}s (configured via MODEL_INIT_TIMEOUT env var)")
             try:
-                await asyncio.wait_for(self.model_ready.wait(), timeout=30.0)
+                await asyncio.wait_for(self.model_ready.wait(), timeout=MODEL_INIT_TIMEOUT)
                 print(f"Client {self.client_id} model ready, proceeding with training")
             except asyncio.TimeoutError:
-                print(f"Client {self.client_id} ERROR: Timeout waiting for model initialization")
+                print(f"Client {self.client_id} ERROR: Timeout waiting for model initialization after {MODEL_INIT_TIMEOUT}s")
+                print(f"Client {self.client_id} TIP: Increase MODEL_INIT_TIMEOUT env var for very poor network conditions")
                 return
         
         if self.current_round == 0 and round_num == 1:
@@ -513,9 +528,13 @@ async def main():
     configuration = QuicConfiguration(
         is_client=True,
         alpn_protocols=["fl"],
-        max_stream_data=20 * 1024 * 1024,  # 20 MB per stream
-        max_data=50 * 1024 * 1024,  # 50 MB total connection data
-        idle_timeout=3600.0,  # 1 hour idle timeout (training can take long)
+        max_stream_data=50 * 1024 * 1024,  # 20 MB per stream
+        max_data=100 * 1024 * 1024,  # 50 MB total connection data
+        idle_timeout=3600.0,  # 60 minutes idle timeout (training can take long)
+
+        #poor network adjustments
+        initial_rtt=0.15, # 150ms (account for 100ms latency + jitter)
+        max_datagram_frame_size=1200, # typical MTU size
     )
     
     # Load CA certificate for verification (optional - set verify_mode to False for testing)

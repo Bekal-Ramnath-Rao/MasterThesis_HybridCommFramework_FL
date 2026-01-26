@@ -201,7 +201,7 @@ class FederatedLearningClient:
         
         # Create QoS policy for reliable communication
         reliable_qos = Qos(
-            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=30)),
             Policy.History.KeepAll,
             Policy.Durability.TransientLocal
         )

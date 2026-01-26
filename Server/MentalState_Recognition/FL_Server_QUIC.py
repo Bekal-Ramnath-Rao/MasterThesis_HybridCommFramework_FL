@@ -334,8 +334,19 @@ class FederatedLearningServer:
             protocol = self.registered_clients[client_id]
             stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
             data = (json.dumps(message) + '\n').encode('utf-8')
-            protocol._quic.send_stream_data(stream_id, data, end_stream=False)
+            # Set end_stream=True to ensure proper message delivery, especially for large messages
+            protocol._quic.send_stream_data(stream_id, data, end_stream=True)
             protocol.transmit()
+            
+            msg_type = message.get('type')
+            msg_size_mb = len(data) / (1024 * 1024)
+            print(f"Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(data)} bytes = {msg_size_mb:.2f} MB)")
+            
+            # Adaptive delay based on message size for poor network conditions
+            if len(data) > 1_000_000:  # > 1MB
+                await asyncio.sleep(1.0)  # 1 second for large messages
+            else:
+                await asyncio.sleep(0.1)  # 100ms for small messages
 
     async def broadcast_message(self, message):
         """Broadcast message to all registered clients"""
@@ -444,8 +455,9 @@ class FederatedLearningServer:
 
         print("Initial global model sent to all clients")
         # Give clients time to build and initialize model
+        # Increased wait time for very poor network conditions (was 5s, now 30s)
         print("Waiting for clients to initialize models...")
-        await asyncio.sleep(5)
+        await asyncio.sleep(30)
 
         print(f"\n{'=' * 70}")
         print(f"Starting Round {self.current_round}/{self.num_rounds}")

@@ -223,9 +223,9 @@ class FederatedLearningServer:
         
         # Create QoS policy for reliable communication
         reliable_qos = Qos(
-            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=300)),
             Policy.History.KeepAll,
-            Policy.Durability.TransientLocal
+            Policy.Durability.TransientLocal,
         )
         
         # Create topics
@@ -289,7 +289,7 @@ class FederatedLearningServer:
                     loop_count += 1
                     # Print heartbeat every 10 iterations (5 seconds)
                     if loop_count % 10 == 0:
-                        print(f"[ServerLoop] Iteration {loop_count}, round={self.current_round}, updates={len(self.client_updates)}/{self.num_clients}, metrics={len(self.client_metrics)}/{self.num_clients}")
+                        #print(f"[ServerLoop] Iteration {loop_count}, round={self.current_round}, updates={len(self.client_updates)}/{self.num_clients}, metrics={len(self.client_metrics)}/{self.num_clients}")
                         sys.stdout.flush()
                     
                     # Publish current status
@@ -329,7 +329,7 @@ class FederatedLearningServer:
                     # Continue loop despite error
                     time.sleep(1)
             
-            print(f"\n[ServerLoop] Loop exited normally: training_complete={self.training_complete}")
+            #print(f"\n[ServerLoop] Loop exited normally: training_complete={self.training_complete}")
             sys.stdout.flush()
             print("\nServer shutting down...")
             

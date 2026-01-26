@@ -199,14 +199,20 @@ class FederatedLearningServer:
             stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
             # Add newline delimiter for message framing
             data = (json.dumps(message) + '\n').encode('utf-8')
-            protocol._quic.send_stream_data(stream_id, data, end_stream=False)
+            # Set end_stream=True to ensure proper message delivery, especially for large messages
+            protocol._quic.send_stream_data(stream_id, data, end_stream=True)
             protocol.transmit()
             
             msg_type = message.get('type')
-            print(f"Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(data)} bytes)")
+            msg_size_mb = len(data) / (1024 * 1024)
+            print(f"Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(data)} bytes = {msg_size_mb:.2f} MB)")
             
-            # Give event loop time to transmit large messages
-            await asyncio.sleep(0.1)
+            # Adaptive delay based on message size for poor network conditions
+            # Large messages (>1MB) need more time to transmit
+            if len(data) > 1_000_000:  # > 1MB
+                await asyncio.sleep(1.0)  # 1 second for large messages
+            else:
+                await asyncio.sleep(0.1)  # 100ms for small messages
     
     async def broadcast_message(self, message):
         """Broadcast message to all registered clients"""
@@ -366,11 +372,14 @@ class FederatedLearningServer:
                 'model_config': model_config
             })
             print(f"  Attempt {i+1}/3: Initial model broadcast complete")
-            await asyncio.sleep(0.5)
+            # Longer delay for poor network conditions (was 0.5s, now 2s)
+            await asyncio.sleep(2.0)
         
         print("Initial global model (architecture + weights) sent to all clients")
         print("Waiting for clients to initialize their models (TensorFlow + CNN building)...")
-        await asyncio.sleep(8)
+        # Increased wait time for very poor network conditions (was 8s, now 30s)
+        # This allows time for large model transfer + TensorFlow initialization
+        await asyncio.sleep(30)
         
         print(f"\n{'='*70}")
         print(f"Starting Round {self.current_round}/{self.num_rounds}")
@@ -596,10 +605,18 @@ async def main():
     # Fair comparison settings aligned with MQTT/AMQP/gRPC/DDS
     configuration = QuicConfiguration(
         is_client=False,
-        max_datagram_frame_size=65536,  # 64KB
-        max_stream_data=50 * 1024 * 1024,  # 50MB per stream (aligned with gRPC)
-        max_data=100 * 1024 * 1024,  # 100MB total connection data
-        idle_timeout=60.0,  # 60 seconds (aligned with MQTT/AMQP/gRPC/DDS)
+        alpn_protocols=["fl"],  # Add this for consistency
+        
+        # Data limits - your values are good
+        max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
+        max_data=100 * 1024 * 1024,  # 100 MB total
+        
+        # Timeout - INCREASE to match FL workflow
+        idle_timeout=3600.0,  # 60 minutes (not 60 seconds!)
+        
+        # Poor network adjustments
+        initial_rtt=0.15,  # Account for network latency
+        max_datagram_frame_size=1200,  # Match client for lossy network
     )
     
     # Check if certificates exist in the certs directory
