@@ -26,12 +26,14 @@ class ExperimentRunner:
     """Automates running FL experiments across different network conditions"""
     
     def __init__(self, use_case: str = "emotion", num_rounds: int = 10, enable_congestion: bool = False,
-                 use_quantization: bool = False, quantization_params: Dict[str, str] = None, enable_gpu: bool = False):
+                 use_quantization: bool = False, quantization_params: Dict[str, str] = None, enable_gpu: bool = False,
+                 baseline_mode: bool = False):
         self.use_case = use_case
         self.num_rounds = num_rounds
         self.enable_congestion = enable_congestion
         self.use_quantization = use_quantization
         self.enable_gpu = enable_gpu
+        self.baseline_mode = baseline_mode
         # quantization_params expected to be a dict of simple string values
         self.quantization_params = quantization_params or {}
         
@@ -51,18 +53,23 @@ class ExperimentRunner:
         project_root = script_dir.parent
         
         # Build descriptive folder name
-        folder_parts = [use_case]
-        if use_quantization:
-            folder_parts.append("quantized")
-            if quantization_params.get('QUANTIZATION_BITS'):
-                folder_parts.append(f"{quantization_params['QUANTIZATION_BITS']}bit")
-        if enable_congestion:
-            folder_parts.append("congestion")
-        folder_parts.append(datetime.now().strftime('%Y%m%d_%H%M%S'))
-        folder_name = "_".join(folder_parts)
+        if baseline_mode:
+            # Baseline results go to dedicated baseline folder
+            folder_name = use_case
+            self.results_dir = project_root / "experiment_results_baseline" / folder_name
+        else:
+            # Regular experiments
+            folder_parts = [use_case]
+            if use_quantization:
+                folder_parts.append("quantized")
+                if quantization_params.get('QUANTIZATION_BITS'):
+                    folder_parts.append(f"{quantization_params['QUANTIZATION_BITS']}bit")
+            if enable_congestion:
+                folder_parts.append("congestion")
+            folder_parts.append(datetime.now().strftime('%Y%m%d_%H%M%S'))
+            folder_name = "_".join(folder_parts)
+            self.results_dir = project_root / "experiment_results" / folder_name
         
-        # Set paths relative to project root
-        self.results_dir = project_root / "experiment_results" / folder_name
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.results_dir = str(self.results_dir)
         
@@ -324,12 +331,17 @@ class ExperimentRunner:
         return success_count > 0  # At least one container should succeed
     
     def wait_for_completion(self, protocol: str, timeout: int = 3600):
-        """Wait for FL training to complete"""
+        """Wait for FL training to complete and track round trip times"""
         print(f"\nWaiting for {protocol.upper()} training to complete (timeout: {timeout}s)...")
         
         # Get server container name
         services = self.service_patterns[self.use_case][protocol]
         server_container = [s for s in services if "server" in s][0]
+        
+        # Track round trip times (time from global model sent to next round start)
+        round_trip_times = []
+        last_round_complete_time = None
+        current_round = 0
         
         # Common completion markers that servers print when training ends
         completion_markers = [
@@ -351,18 +363,46 @@ class ExperimentRunner:
             
             if server_container not in result.stdout:
                 print(f"Server container stopped. Training complete!")
-                return True
+                return True, round_trip_times
             
-            # Check logs for completion indicators
+            # Check logs for completion indicators and RTT tracking
             logs = self.run_command([
-                "docker", "logs", "--tail", "50", server_container
+                "docker", "logs", "--tail", "100", server_container
             ], check=False)
             
+            # Track round trip time by looking for round completion markers
+            log_content = logs.stdout or ""
+            
+            # Look for round completion patterns
+            import re
+            round_patterns = [
+                r'Round (\d+)/\d+ completed',
+                r'\[Round (\d+)\] completed',
+                r'Completed round (\d+)',
+                r'Round (\d+) finished',
+                r'Starting Round (\d+)/',  # QUIC format
+                r'Round (\d+) - Aggregated Metrics:',  # QUIC aggregation
+                r'Aggregated global model from round (\d+)'  # QUIC model distribution
+            ]
+            
+            for pattern in round_patterns:
+                matches = re.findall(pattern, log_content)
+                if matches:
+                    latest_round = max([int(m) for m in matches])
+                    if latest_round > current_round:
+                        current_time = time.time()
+                        if last_round_complete_time is not None:
+                            rtt = current_time - last_round_complete_time
+                            round_trip_times.append(rtt)
+                            print(f"  Round {latest_round} RTT: {rtt:.2f}s")
+                        last_round_complete_time = current_time
+                        current_round = latest_round
+            
             # If any known completion marker appears, treat as complete
-            if any(marker in (logs.stdout or "") for marker in completion_markers):
+            if any(marker in log_content for marker in completion_markers):
                 print(f"Training completed successfully (marker detected)!")
                 time.sleep(5)  # Give time for final results to be written
-                return True
+                return True, round_trip_times
 
             # Check if training has reached the target number of rounds
             # by examining the results file content (not just existence)
@@ -384,13 +424,13 @@ class ExperimentRunner:
                         if rounds_completed >= self.num_rounds:
                             print(f"Training completed successfully ({rounds_completed}/{self.num_rounds} rounds)!")
                             time.sleep(3)
-                            return True
+                            return True, round_trip_times
                         else:
                             print(f"Progress: {rounds_completed}/{self.num_rounds} rounds completed...")
                     elif isinstance(results_data, list) and len(results_data) >= self.num_rounds:
                         print(f"Training completed successfully ({len(results_data)}/{self.num_rounds} rounds)!")
                         time.sleep(3)
-                        return True
+                        return True, round_trip_times
                 except json.JSONDecodeError:
                     # File exists but not valid JSON yet (still being written)
                     pass
@@ -398,10 +438,10 @@ class ExperimentRunner:
             time.sleep(10)  # Check every 10 seconds
         
         print(f"[WARNING] Training timed out after {timeout}s")
-        return False
+        return False, round_trip_times
     
-    def collect_results(self, protocol: str, scenario: str):
-        """Collect and save experiment results"""
+    def collect_results(self, protocol: str, scenario: str, round_trip_times: List[float] = None):
+        """Collect and save experiment results including RTT data"""
         print(f"\nCollecting results for {protocol.upper()} - {scenario}...")
         
         # Create directory for this experiment
@@ -477,11 +517,36 @@ class ExperimentRunner:
             "scenario": scenario,
             "use_case": self.use_case,
             "num_rounds": self.num_rounds,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "baseline_mode": self.baseline_mode,
+            "network_conditions_applied": not self.baseline_mode
         }
         
         with open(os.path.join(exp_dir, "metadata.json"), "w") as f:
             json.dump(metadata, f, indent=2)
+        
+        # Save RTT data if available
+        if round_trip_times and len(round_trip_times) > 0:
+            avg_rtt = sum(round_trip_times) / len(round_trip_times)
+            rtt_data = {
+                "protocol": protocol,
+                "scenario": scenario,
+                "use_case": self.use_case,
+                "num_rounds": self.num_rounds,
+                "rtt_per_round": round_trip_times,
+                "avg_rtt_per_round": avg_rtt,
+                "min_rtt": min(round_trip_times),
+                "max_rtt": max(round_trip_times),
+                "total_rtt": sum(round_trip_times),
+                "timestamp": datetime.now().isoformat(),
+                "baseline_mode": self.baseline_mode
+            }
+            
+            rtt_filename = f"{protocol}_baseline_rtt.json" if self.baseline_mode else f"{protocol}_rtt.json"
+            with open(os.path.join(exp_dir, rtt_filename), "w") as f:
+                json.dump(rtt_data, f, indent=2)
+            
+            print(f"  RTT Stats: Avg={avg_rtt:.2f}s, Min={min(round_trip_times):.2f}s, Max={max(round_trip_times):.2f}s")
         
         print(f"Results saved to: {exp_dir}")
     
@@ -491,6 +556,8 @@ class ExperimentRunner:
         print(f"# EXPERIMENT: {protocol.upper()} - {scenario.upper()}")
         print(f"# Use Case: {self.use_case.title()}")
         print(f"# Rounds: {self.num_rounds}")
+        if self.baseline_mode:
+            print(f"# Mode: BASELINE (no network conditions)")
         if self.enable_congestion and congestion_level != "none":
             print(f"# Congestion Level: {congestion_level.upper()}")
         print(f"{'#'*70}\n")
@@ -516,18 +583,25 @@ class ExperimentRunner:
                 print(f"[ERROR] Failed to start containers for {protocol}")
                 return False
             
-            # 2. Apply network scenario
-            if not self.apply_network_scenario(scenario, protocol):
-                print(f"[WARNING] Failed to apply network scenario {scenario}, continuing anyway...")
+            # 2. Apply network scenario (skip if baseline mode)
+            if not self.baseline_mode:
+                if not self.apply_network_scenario(scenario, protocol):
+                    print(f"[WARNING] Failed to apply network scenario {scenario}, continuing anyway...")
+            else:
+                print(f"[BASELINE] Skipping network conditions - running with ideal network")
             
-            # 3. Wait for completion with adaptive timeout
+            # 3. Wait for completion with adaptive timeout and RTT tracking
             print(f"[INFO] Using timeout: {timeout}s ({timeout/3600:.1f} hours) for {scenario} network")
-            if not self.wait_for_completion(protocol, timeout=timeout):
+            success, round_trip_times = self.wait_for_completion(protocol, timeout=timeout)
+            
+            if not success:
                 print(f"[WARNING] Experiment may not have completed")
             
-            # 4. Collect results
+            # 4. Collect results including RTT data
             result_suffix = f"{scenario}_congestion_{congestion_level}" if congestion_level != "none" else scenario
-            self.collect_results(protocol, result_suffix)
+            if self.baseline_mode:
+                result_suffix = "baseline"
+            self.collect_results(protocol, result_suffix, round_trip_times)
             
             # 5. Stop traffic generators (if running)
             if self.enable_congestion and self.congestion_manager and congestion_level != "none":
@@ -665,6 +739,8 @@ def main():
                 help="Set QUANTIZATION_PER_CHANNEL=1 if per-channel quantization should be used")
     parser.add_argument("--enable-gpu", "-g", action="store_true",
                 help="Enable GPU acceleration using NVIDIA runtime (requires nvidia-docker)")
+    parser.add_argument("--baseline", "-b", action="store_true",
+                help="Baseline mode: Run without network conditions and save to baseline folder")
     
     args = parser.parse_args()
     
@@ -695,7 +771,18 @@ def main():
                             enable_congestion=args.enable_congestion,
                             use_quantization=args.use_quantization,
                             quantization_params=quant_params,
-                            enable_gpu=args.enable_gpu)
+                            enable_gpu=args.enable_gpu,
+                            baseline_mode=args.baseline)
+    
+    # In baseline mode, run all protocols with excellent scenario (no network conditions)
+    if args.baseline:
+        print("\n" + "="*70)
+        print("BASELINE MODE: Running all protocols without network conditions")
+        print("="*70 + "\n")
+        protocols = args.protocols or runner.protocols
+        for protocol in protocols:
+            runner.run_single_experiment(protocol, "excellent", "none")
+        return
     
     if args.single:
         if not args.protocol or not args.scenario:
