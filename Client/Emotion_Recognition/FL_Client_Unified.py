@@ -490,8 +490,8 @@ def load_emotion_data(client_id: int):
     validation_data_gen = ImageDataGenerator(rescale=1./255)
 
     # Load training and validation data from client-specific directories
-    train_path = f'Client/Emotion_Recognition/Dataset/client_{client_id}/train/'
-    val_path = f'Client/Emotion_Recognition/Dataset/client_{client_id}/validation/'
+    train_path = f'Dataset/client_{client_id}/train/'
+    val_path = f'Dataset/client_{client_id}/validation/'
     
     print(f"[Dataset] Loading from:")
     print(f"  Train: {train_path}")
@@ -534,8 +534,8 @@ def main():
     except Exception as e:
         print(f"[Error] Failed to load dataset: {e}")
         print(f"\nPlease ensure dataset exists at:")
-        print(f"  Client/Emotion_Recognition/Dataset/client_{CLIENT_ID}/train/")
-        print(f"  Client/Emotion_Recognition/Dataset/client_{CLIENT_ID}/validation/")
+        print(f"  Dataset/client_{CLIENT_ID}/train/")
+        print(f"  Dataset/client_{CLIENT_ID}/validation/")
         return
     
     # Create client

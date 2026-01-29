@@ -89,7 +89,7 @@ class ExperimentRunner:
                 self.enable_congestion = False
         
         # Define protocols to test
-        self.protocols = ["mqtt", "amqp", "grpc", "quic", "dds"]
+        self.protocols = ["mqtt", "amqp", "grpc", "quic", "dds", "rl_unified"]
         
         # Define network scenarios to test
         self.network_scenarios = [
@@ -114,6 +114,12 @@ class ExperimentRunner:
                 "mentalstate": str(docker_dir / "docker-compose-mentalstate.gpu-isolated.yml"),
                 "temperature": str(docker_dir / "docker-compose-temperature.gpu-isolated.yml")
             }
+            # Unified compose files for RL-based protocol selection
+            self.unified_compose_files = {
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.yml"),
+                "temperature": str(docker_dir / "docker-compose-unified-temperature.yml")
+            }
             # No overlay files needed with GPU-isolated (they are standalone)
             self.gpu_overlay_files = {}
         else:
@@ -121,6 +127,12 @@ class ExperimentRunner:
                 "emotion": str(docker_dir / "docker-compose-emotion.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-mentalstate.yml"),
                 "temperature": str(docker_dir / "docker-compose-temperature.yml")
+            }
+            # Unified compose files for RL-based protocol selection (non-GPU)
+            self.unified_compose_files = {
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.yml"),
+                "temperature": str(docker_dir / "docker-compose-unified-temperature.yml")
             }
             # GPU overlay files (not used when enable_gpu=False)
             self.gpu_overlay_files = {
@@ -140,21 +152,24 @@ class ExperimentRunner:
                 "amqp": [broker_amqp, "fl-server-amqp-emotion", "fl-client-amqp-emotion-1", "fl-client-amqp-emotion-2"],
                 "grpc": ["fl-server-grpc-emotion", "fl-client-grpc-emotion-1", "fl-client-grpc-emotion-2"],
                 "quic": ["fl-server-quic-emotion", "fl-client-quic-emotion-1", "fl-client-quic-emotion-2"],
-                "dds": ["fl-server-dds-emotion", "fl-client-dds-emotion-1", "fl-client-dds-emotion-2"]
+                "dds": ["fl-server-dds-emotion", "fl-client-dds-emotion-1", "fl-client-dds-emotion-2"],
+                "rl_unified": ["fl-server-unified-emotion", "fl-client-unified-emotion-1", "fl-client-unified-emotion-2"]
             },
             "mentalstate": {
                 "mqtt": ["mqtt-broker-mental", "fl-server-mqtt-mental", "fl-client-mqtt-mental-1", "fl-client-mqtt-mental-2"],
                 "amqp": ["rabbitmq-mental", "fl-server-amqp-mental", "fl-client-amqp-mental-1", "fl-client-amqp-mental-2"],
                 "grpc": ["fl-server-grpc-mental", "fl-client-grpc-mental-1", "fl-client-grpc-mental-2"],
                 "quic": ["fl-server-quic-mental", "fl-client-quic-mental-1", "fl-client-quic-mental-2"],
-                "dds": ["fl-server-dds-mental", "fl-client-dds-mental-1", "fl-client-dds-mental-2"]
+                "dds": ["fl-server-dds-mental", "fl-client-dds-mental-1", "fl-client-dds-mental-2"],
+                "rl_unified": ["fl-server-unified-mental", "fl-client-unified-mental-1", "fl-client-unified-mental-2"]
             },
             "temperature": {
                 "mqtt": ["mqtt-broker-temp", "fl-server-mqtt-temp", "fl-client-mqtt-temp-1", "fl-client-mqtt-temp-2"],
                 "amqp": ["rabbitmq-temp", "fl-server-amqp-temp", "fl-client-amqp-temp-1", "fl-client-amqp-temp-2"],
                 "grpc": ["fl-server-grpc-temp", "fl-client-grpc-temp-1", "fl-client-grpc-temp-2"],
                 "quic": ["fl-server-quic-temp", "fl-client-quic-temp-1", "fl-client-quic-temp-2"],
-                "dds": ["fl-server-dds-temp", "fl-client-dds-temp-1", "fl-client-dds-temp-2"]
+                "dds": ["fl-server-dds-temp", "fl-client-dds-temp-1", "fl-client-dds-temp-2"],
+                "rl_unified": ["fl-server-unified-temp", "fl-client-unified-temp-1", "fl-client-unified-temp-2"]
             }
         }
     
@@ -183,6 +198,43 @@ class ExperimentRunner:
     
     def start_containers(self, protocol: str, scenario: str = "excellent", congestion_level: str = "none"):
         """Start Docker containers for a specific protocol with staged startup"""
+        
+        # Check if rl_unified is selected - use unified compose file
+        if protocol == "rl_unified":
+            print("\n" + "="*70)
+            print("STARTING RL-UNIFIED MODE")
+            print("="*70)
+            print("Using unified docker-compose file with all protocol brokers")
+            print("Server will handle: MQTT, AMQP, gRPC, QUIC, DDS")
+            print("Clients will use RL-based Q-Learning to select protocol")
+            print("="*70 + "\n")
+            
+            compose_file = self.unified_compose_files[self.use_case]
+            
+            # For unified mode, start all services together
+            compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"]
+            
+            print(f"Starting unified FL system for {self.use_case}...")
+            result = self.run_command(compose_cmd)
+            
+            if result.returncode != 0:
+                print(f"[ERROR] Failed to start unified containers:")
+                print(result.stderr)
+                raise RuntimeError("Failed to start unified containers")
+            
+            print("[SUCCESS] All unified containers started")
+            print("  ✓ MQTT Broker")
+            print("  ✓ AMQP Broker")
+            print("  ✓ Unified FL Server")
+            print("  ✓ Unified FL Clients")
+            
+            # Wait for services to initialize
+            print("\nWaiting for services to initialize (15 seconds)...")
+            time.sleep(15)
+            
+            return
+        
+        # Regular protocol handling (existing code)
         compose_file = self.compose_files[self.use_case]
         
         # Build compose command (no overlay needed with GPU-isolated files)
@@ -272,7 +324,12 @@ class ExperimentRunner:
     
     def stop_containers(self, protocol: str):
         """Stop Docker containers for a specific protocol"""
-        compose_file = self.compose_files[self.use_case]
+        
+        # Use unified compose file for rl_unified
+        if protocol == "rl_unified":
+            compose_file = self.unified_compose_files[self.use_case]
+        else:
+            compose_file = self.compose_files[self.use_case]
         services = self.service_patterns[self.use_case][protocol]
         
         print(f"\nStopping containers for {protocol.upper()} protocol...")
@@ -694,10 +751,10 @@ def main():
                        choices=["emotion", "mentalstate", "temperature"],
                        default="emotion",
                        help="Use case to run experiments for")
-    parser.add_argument("--protocols", "-p", 
+    parser.add_argument("--protocols", "-p",
                        nargs="+",
-                       choices=["mqtt", "amqp", "grpc", "quic", "dds"],
-                       help="Specific protocols to test (default: all)")
+                       choices=["mqtt", "amqp", "grpc", "quic", "dds", "rl_unified"],
+                       help="Specific protocols to test (default: all). Use 'rl_unified' for RL-based dynamic protocol selection")
     parser.add_argument("--scenarios", "-s",
                        nargs="+",
                        choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
@@ -719,8 +776,8 @@ def main():
     parser.add_argument("--single", action="store_true",
                        help="Run single experiment (requires --protocol and --scenario)")
     parser.add_argument("--protocol",
-                       choices=["mqtt", "amqp", "grpc", "quic", "dds"],
-                       help="Protocol for single experiment")
+                       choices=["mqtt", "amqp", "grpc", "quic", "dds", "rl_unified"],
+                       help="Protocol for single experiment (use 'rl_unified' for RL-based selection)")
     parser.add_argument("--scenario",
                        choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
                                "congested_light", "congested_moderate", "congested_heavy"],

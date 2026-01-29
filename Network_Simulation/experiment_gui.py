@@ -325,7 +325,8 @@ class FLExperimentGUI(QMainWindow):
             ("AMQP", "amqp", False),
             ("gRPC", "grpc", False),
             ("QUIC", "quic", False),
-            ("DDS", "dds", False)
+            ("DDS", "dds", False),
+            ("🤖 RL-Unified (Dynamic Selection)", "rl_unified", False)
         ])
         layout.addWidget(protocol_group, row, 0, 1, 2)
         self.protocol_checkboxes = protocol_group.findChildren(QCheckBox)
