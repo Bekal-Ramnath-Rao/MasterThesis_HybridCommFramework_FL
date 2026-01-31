@@ -9,6 +9,8 @@ import time
 import random
 import pika
 
+from packet_logger import log_received_packet, log_sent_packet
+
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
@@ -244,6 +246,15 @@ class FederatedLearningClient:
                     body=body,
                     properties=properties
                 )
+
+                log_sent_packet(
+                    packet_size=len(body),
+                    peer=exchange,
+                    protocol="AMQP",
+                    round=None,
+                    extra_info=f"Published to {routing_key}"
+                )
+                
                 return True
                 
             except (pika.exceptions.StreamLostError, 
@@ -272,12 +283,26 @@ class FederatedLearningClient:
             body=json.dumps(registration),
             properties=pika.BasicProperties(delivery_mode=2)
         ):
+            log_sent_packet(
+                packet_size=len(json.dumps(registration)),
+                peer=EXCHANGE_CLIENT_UPDATES,
+                protocol="AMQP",
+                round=None,
+                extra_info="Client registration"
+            )
             print(f"Client {self.client_id} registration sent")
         else:
             print(f"Client {self.client_id} ERROR: Failed to send registration")
     
     def on_broadcast_message(self, ch, method, properties, body):
         """Unified handler for all broadcast messages - routes based on message_type"""
+        log_received_packet(
+            packet_size=len(body),
+            peer=EXCHANGE_BROADCAST,
+            protocol="AMQP",
+            round=None,
+            extra_info="Broadcast message"
+        )
         try:
             data = json.loads(body.decode())
             message_type = data.get('message_type')
@@ -533,6 +558,13 @@ class FederatedLearningClient:
             body=json.dumps(update_message),
             properties=pika.BasicProperties(delivery_mode=2)
         ):
+            log_sent_packet(
+                packet_size=len(json.dumps(update_message)),
+                peer=EXCHANGE_CLIENT_UPDATES,
+                protocol="AMQP",
+                round=self.current_round,
+                extra_info="Model update"
+            )
             print(f"Client {self.client_id} sent model update for round {self.current_round}")
         else:
             print(f"Client {self.client_id} ERROR: Failed to send model update for round {self.current_round}")
@@ -567,6 +599,13 @@ class FederatedLearningClient:
             properties=pika.BasicProperties(delivery_mode=2)
         ):
             print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
+            log_sent_packet(
+                packet_size=len(json.dumps(metrics_message)),
+                peer=EXCHANGE_CLIENT_UPDATES,
+                protocol="AMQP",
+                round=self.current_round,
+                extra_info="Evaluation metrics"
+            )
         else:
             print(f"Client {self.client_id} ERROR: Failed to send evaluation metrics")
     

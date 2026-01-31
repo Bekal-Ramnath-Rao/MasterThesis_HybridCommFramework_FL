@@ -34,6 +34,18 @@ from tensorflow.keras.layers import Conv2D, MaxPooling2D, Dense, Dropout, Flatte
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 
+# Detect Docker environment and set project root accordingly
+if os.path.exists('/app'):
+    # Likely running in Docker, code is under /app
+    project_root = '/app'
+else:
+    # Local development: go up two levels from this file
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+    
+from packet_logger import log_sent_packet, log_received_packet, init_db
 # Make TensorFlow logs less verbose
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
@@ -109,6 +121,9 @@ class FederatedLearningClient:
         
         # Model will be initialized from server config
         self.model = None
+
+        # Initialize packet logger database
+        init_db()
         
         # Initialize quantization compression (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
@@ -171,6 +186,14 @@ class FederatedLearningClient:
             # Send registration message
             self.mqtt_client.publish("fl/client_register", 
                                     json.dumps({"client_id": self.client_id}), qos=1)
+            log_sent_packet(
+                packet_size=len(json.dumps({"client_id": self.client_id})),
+                peer="fl/client_register",  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="any additional info"
+            )
+            
             print(f"  Registration message sent")
         else:
             print(f"Client {self.client_id} failed to connect, return code {rc}")
@@ -179,6 +202,13 @@ class FederatedLearningClient:
         """Callback when message received"""
         try:
             print(f"Client {self.client_id} received message on topic: {msg.topic}, size: {len(msg.payload)} bytes")
+            log_received_packet(
+                packet_size=len(msg.payload),
+                peer=msg.topic,  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="any additional info"
+            )
             
             if msg.topic == TOPIC_GLOBAL_MODEL:
                 self.handle_global_model(msg.payload)
@@ -448,6 +478,13 @@ class FederatedLearningClient:
             # Use QoS 1 for reliable delivery of large model update messages
             result = self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, payload, qos=1)
             
+            log_sent_packet(
+                packet_size=len(payload),
+                peer=TOPIC_CLIENT_UPDATE,  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="any additional info"
+            )
             # Wait for the message to be published
             result.wait_for_publish(timeout=30)
             
@@ -481,6 +518,13 @@ class FederatedLearningClient:
         }
         
         self.mqtt_client.publish(TOPIC_CLIENT_METRICS, json.dumps(metrics_message))
+        log_sent_packet(
+            packet_size=len(json.dumps(metrics_message)),
+            peer=TOPIC_CLIENT_METRICS,  # or client_id/server_id as appropriate
+            protocol="MQTT",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="any additional info"
+        )
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
     
     def start(self):

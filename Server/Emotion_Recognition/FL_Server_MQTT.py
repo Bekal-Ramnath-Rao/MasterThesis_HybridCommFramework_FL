@@ -12,10 +12,24 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 
+# Detect Docker environment and set project root accordingly
+if os.path.exists('/app'):
+    # Likely running in Docker, code is under /app
+    project_root = '/app'
+else:
+    # Local development: go up two levels from this file
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from packet_logger import init_db, log_sent_packet, log_received_packet
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
     sys.path.insert(0, compression_path)
+
 
 try:
     from quantization_server import ServerQuantizationHandler, QuantizationConfig
@@ -187,6 +201,13 @@ class FederatedLearningServer:
     
     def on_message(self, client, userdata, msg):
         """Callback when message received"""
+        log_received_packet(
+            packet_size=len(msg.payload),
+            peer=msg.topic,
+            protocol="MQTT",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="Received message"
+        )
         try:
             if msg.topic == TOPIC_CLIENT_REGISTER:
                 self.handle_client_registration(msg.payload)
@@ -277,6 +298,13 @@ class FederatedLearningServer:
         self.mqtt_client.publish(TOPIC_TRAINING_CONFIG, 
                             json.dumps(self.training_config),
                             qos=1)
+        log_sent_packet(
+            packet_size=len(json.dumps(self.training_config)),
+            peer=TOPIC_TRAINING_CONFIG,  # or client_id/server_id as appropriate
+            protocol="MQTT",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="any additional info"
+        )
         
         self.current_round = 1
         
@@ -317,6 +345,13 @@ class FederatedLearningServer:
             result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, 
                                              message_json,
                                              qos=0)
+            log_sent_packet(
+                packet_size=len(message_json),
+                peer=TOPIC_GLOBAL_MODEL,  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Initial global model distribution"
+            )
             
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
                 print(f"  Attempt {i+1}/3: Initial model sent successfully")
@@ -338,6 +373,13 @@ class FederatedLearningServer:
         result = self.mqtt_client.publish(TOPIC_START_TRAINING,
                                 json.dumps({"round": self.current_round}),
                                 qos=1)
+        log_sent_packet(
+            packet_size=len(json.dumps({"round": self.current_round})),
+            peer=TOPIC_START_TRAINING,  # or client_id/server_id as appropriate
+            protocol="MQTT",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="Start training signal"
+        )
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
             print("Start training signal sent successfully\n")
         else:
@@ -391,6 +433,13 @@ class FederatedLearningServer:
         message_json = json.dumps(global_model_message)
         for i in range(3):
             result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, message_json, qos=1)
+            log_sent_packet(
+                packet_size=len(message_json),
+                peer=TOPIC_GLOBAL_MODEL,  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Aggregated global model distribution"
+            )
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
                 print(f"  Attempt {i+1}/3: Aggregated model sent")
                 break
@@ -405,6 +454,13 @@ class FederatedLearningServer:
         print("Requesting client evaluation...")
         self.mqtt_client.publish(TOPIC_START_EVALUATION,
                                 json.dumps({"round": self.current_round}), qos=1)
+        log_sent_packet(
+            packet_size=len(json.dumps({"round": self.current_round})),
+            peer=TOPIC_START_EVALUATION,  # or client_id/server_id as appropriate
+            protocol="MQTT",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="Start evaluation signal"
+        )
     
     def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
@@ -453,6 +509,13 @@ class FederatedLearningServer:
             print("Sending training completion signal to all clients...")
             print(f"Publishing to topic: {TOPIC_TRAINING_COMPLETE}")
             result = self.mqtt_client.publish(TOPIC_TRAINING_COMPLETE, json.dumps({"message": "Training completed"}), qos=1)
+            log_sent_packet(
+                packet_size=len(json.dumps({"message": "Training completed"})),
+                peer=TOPIC_TRAINING_COMPLETE,  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Training completion signal"
+            )
             print(f"Publish result: rc={result.rc}, mid={result.mid}")
             if result.rc != mqtt.MQTT_ERR_SUCCESS:
                 print(f"ERROR: Failed to publish training completion message, rc={result.rc}")
@@ -498,6 +561,13 @@ class FederatedLearningServer:
             print("Sending training completion signal to all clients...")
             print(f"Publishing to topic: {TOPIC_TRAINING_COMPLETE}")
             result = self.mqtt_client.publish(TOPIC_TRAINING_COMPLETE, json.dumps({"message": "Training completed"}), qos=1)
+            log_sent_packet(
+                packet_size=len(json.dumps({"message": "Training completed"})),
+                peer=TOPIC_TRAINING_COMPLETE,  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Training completion signal"
+            )
             print(f"Publish result: rc={result.rc}, mid={result.mid}")
             if result.rc != mqtt.MQTT_ERR_SUCCESS:
                 print(f"ERROR: Failed to publish training completion message, rc={result.rc}")

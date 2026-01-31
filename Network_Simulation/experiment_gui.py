@@ -203,6 +203,34 @@ class ExperimentRunner(QThread):
             self.progress_update.emit("\n⚠️ Experiment stopped by user\n")
 
 
+class DockerBuildThread(QThread):
+    log_update = pyqtSignal(str)
+    build_finished = pyqtSignal(bool, int)
+
+    def __init__(self, cmd, cwd):
+        super().__init__()
+        self.cmd = cmd
+        self.cwd = cwd
+
+    def run(self):
+        import subprocess
+        try:
+            proc = subprocess.Popen(self.cmd, cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in iter(proc.stdout.readline, ''):
+                if line:
+                    self.log_update.emit(line.rstrip())
+                if proc.poll() is not None:
+                    break
+            remaining = proc.stdout.read()
+            if remaining:
+                self.log_update.emit(remaining)
+            proc.wait()
+            self.build_finished.emit(True, proc.returncode)
+        except Exception as e:
+            self.log_update.emit(f"\n❌ Docker build error: {e}")
+            self.build_finished.emit(False, -1)
+
+
 class FLExperimentGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -243,7 +271,7 @@ class FLExperimentGUI(QMainWindow):
         self.config_tabs.addTab(self.create_basic_config_tab(), "⚙️ Basic Configuration")
         self.config_tabs.addTab(self.create_network_config_tab(), "🌐 Network Control")
         self.config_tabs.addTab(self.create_advanced_config_tab(), "🔧 Advanced Options")
-        
+        self.config_tabs.addTab(self.create_docker_build_tab(), "🐳 Docker Build")
         config_layout.addWidget(self.config_tabs)
         splitter.addWidget(config_widget)
         
@@ -696,13 +724,134 @@ class FLExperimentGUI(QMainWindow):
         layout.addStretch()
         return widget
     
+    def create_docker_build_tab(self):
+        """Create Docker build tab with build button"""
+        import subprocess
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(15)
+
+        docker_group = QGroupBox("🐳 Docker Image Build Options")
+        docker_group.setStyleSheet(self.get_group_style())
+        docker_layout = QVBoxLayout()
+
+        self.rebuild_images = QCheckBox("Rebuild Docker Images Before Experiment")
+        self.rebuild_images.setStyleSheet("font-size: 13px; padding: 5px;")
+        docker_layout.addWidget(self.rebuild_images)
+
+        self.use_cache = QCheckBox("Use Cache When Building Docker Images")
+        self.use_cache.setChecked(True)
+        self.use_cache.setStyleSheet("font-size: 13px; padding: 5px;")
+        docker_layout.addWidget(self.use_cache)
+
+        # Add Build Docker Images button
+        self.build_btn_temp = QPushButton("🐳 Build Docker Images (Temperature Regulation)")
+        self.build_btn_temp.setStyleSheet("font-size: 15px; padding: 10px; background-color: #3498db; color: white; border-radius: 6px;")
+        self.build_btn_temp.clicked.connect(self.build_docker_images_temperature)
+        docker_layout.addWidget(self.build_btn_temp)
+
+        # Add Build Docker Images button
+        self.build_btn_mental = QPushButton("🐳 Build Docker Images (Mental State)")
+        self.build_btn_mental.setStyleSheet("font-size: 15px; padding: 10px; background-color: #3498db; color: white; border-radius: 6px;")
+        self.build_btn_mental.clicked.connect(self.build_docker_images_mentalstate)
+        docker_layout.addWidget(self.build_btn_mental)
+
+        # Add Build Docker Images button
+        self.build_btn_emotion = QPushButton("🐳 Build Docker Images (Emotion)")
+        self.build_btn_emotion.setStyleSheet("font-size: 15px; padding: 10px; background-color: #3498db; color: white; border-radius: 6px;")
+        self.build_btn_emotion.clicked.connect(self.build_docker_images_emotion)
+        docker_layout.addWidget(self.build_btn_emotion)
+
+        docker_group.setLayout(docker_layout)
+        layout.addWidget(docker_group)
+
+        layout.addStretch()
+        return widget
+
+    def build_docker_images_emotion(self):
+        """Build Docker images for the emotion use case and show output"""
+        use_cache = self.use_cache.isChecked()
+        compose_file = "Docker/docker-compose-emotion.gpu-isolated.yml"
+        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        full_compose_path = f"{base_dir}/{compose_file}"
+        cmd = ["docker", "compose", "-f", full_compose_path, "build"]
+        if not use_cache:
+            cmd.append("--no-cache")
+        self.statusBar().showMessage("🐳 Building Docker images for Emotion use case...")
+        # Disable the button directly
+        if hasattr(self, 'build_btn_emotion'):
+            self.build_btn_emotion.setEnabled(False)
+        self.docker_build_log_text.clear()
+        self.output_tabs.setCurrentWidget(self.docker_build_log_text)
+        # Start Docker build in a thread
+        self.docker_build_thread = DockerBuildThread(cmd, base_dir)
+        self.docker_build_thread.log_update.connect(self.docker_build_log_text.append)
+        def on_build_finished(success, returncode):
+            if hasattr(self, 'build_btn_emotion'):
+                self.build_btn_emotion.setEnabled(True)
+            if success and returncode == 0:
+                self.statusBar().showMessage("✅ Docker images built successfully (Emotion)")
+                self.docker_build_log_text.append("\n✅ Docker images built successfully (Emotion)")
+            else:
+                self.statusBar().showMessage("❌ Docker build failed (Emotion)")
+                self.docker_build_log_text.append(f"\n❌ Docker build failed (Emotion), code {returncode}")
+        self.docker_build_thread.build_finished.connect(on_build_finished)
+        self.docker_build_thread.start()
+    
+    def build_docker_images_mentalstate(self):
+        """Build Docker images for the mental state use case and show output"""
+        use_cache = self.use_cache.isChecked()
+        compose_file = "Docker/docker-compose-mentalstate.gpu-isolated.yml"
+        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        full_compose_path = f"{base_dir}/{compose_file}"
+        cmd = ["docker", "compose", "-f", full_compose_path, "build"]
+        if not use_cache:
+            cmd.append("--no-cache")
+        self.statusBar().showMessage("🐳 Building Docker images for Mental State use case...")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, cwd=base_dir, timeout=1800)
+            output = proc.stdout + "\n" + proc.stderr
+            if proc.returncode == 0:
+                self.statusBar().showMessage("✅ Docker images built successfully (Mental State)")
+                QMessageBox.information(self, "Docker Build Complete", "Docker images for Mental State use case built successfully!\n\nOutput:\n" + output[-2000:])
+            else:
+                self.statusBar().showMessage("❌ Docker build failed (Mental State)")
+                QMessageBox.critical(self, "Docker Build Failed", "Docker build failed!\n\nOutput:\n" + output[-2000:])
+        except Exception as e:
+            self.statusBar().showMessage("❌ Docker build error (Mental State)")
+            QMessageBox.critical(self, "Docker Build Error", f"Error running Docker build:\n{e}")
+
+    def build_docker_images_temperature(self):
+        """Build Docker images for the temperature regulation use case and show output"""
+        use_cache = self.use_cache.isChecked()
+        compose_file = "Docker/docker-compose-temperature.gpu-isolated.yml"
+        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        full_compose_path = f"{base_dir}/{compose_file}"
+        cmd = ["docker", "compose", "-f", full_compose_path, "build"]
+        if not use_cache:
+            cmd.append("--no-cache")
+        self.statusBar().showMessage("🐳 Building Docker images for Temperature Regulation use case...")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, cwd=base_dir, timeout=1800)
+            output = proc.stdout + "\n" + proc.stderr
+            if proc.returncode == 0:
+                self.statusBar().showMessage("✅ Docker images built successfully (Temperature Regulation)")
+                QMessageBox.information(self, "Docker Build Complete", "Docker images for Temperature Regulation use case built successfully!\n\nOutput:\n" + output[-2000:])
+            else:
+                self.statusBar().showMessage("❌ Docker build failed (Temperature Regulation)")
+                QMessageBox.critical(self, "Docker Build Failed", "Docker build failed!\n\nOutput:\n" + output[-2000:])
+        except Exception as e:
+            self.statusBar().showMessage("❌ Docker build error (Temperature Regulation)")
+            QMessageBox.critical(self, "Docker Build Error", f"Error running Docker build:\n{e}")
+
     def create_monitoring_output_section(self):
-        """Create comprehensive monitoring and output section"""
+        """Create comprehensive monitoring and output section, with Packet Logs tab"""
+        from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setSpacing(10)
-        
-        # Control buttons
+
+        # Control buttons (unchanged)
         control_layout = QHBoxLayout()
         
         self.start_button = QPushButton("▶️ Start Experiment")
@@ -775,8 +924,8 @@ class FLExperimentGUI(QMainWindow):
         control_layout.addStretch()
         
         layout.addLayout(control_layout)
-        
-        # Progress bar
+
+        # Progress bar (unchanged)
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setMaximum(0)
@@ -784,7 +933,7 @@ class FLExperimentGUI(QMainWindow):
         layout.addWidget(self.progress_bar)
         
         # Tabbed output section
-        output_tabs = QTabWidget()
+        self.output_tabs = QTabWidget()
         
         # Tab 1: Experiment Output
         self.output_text = QTextEdit()
@@ -800,7 +949,7 @@ class FLExperimentGUI(QMainWindow):
                 padding: 10px;
             }
         """)
-        output_tabs.addTab(self.output_text, "📊 Experiment Output")
+        self.output_tabs.addTab(self.output_text, "📊 Experiment Output")
         
         # Tab 2: Training Dashboard with Baseline Comparison
         self.dashboard_text = QTextEdit()
@@ -816,7 +965,7 @@ class FLExperimentGUI(QMainWindow):
                 padding: 10px;
             }
         """)
-        output_tabs.addTab(self.dashboard_text, "📈 FL Training Monitor (vs Baseline)")
+        self.output_tabs.addTab(self.dashboard_text, "📈 FL Training Monitor (vs Baseline)")
         
         # Tab 3: Server Logs
         self.server_log_text = QTextEdit()
@@ -832,23 +981,19 @@ class FLExperimentGUI(QMainWindow):
                 padding: 10px;
             }
         """)
-        output_tabs.addTab(self.server_log_text, "🖥️ Server Logs")
-        
-        # Tab 4: Client Logs (NEW - with client selector!)
+        self.output_tabs.addTab(self.server_log_text, "🖥️ Server Logs")
+
+        # Tab 4: Client Logs
         client_tab_widget = QWidget()
         client_tab_layout = QVBoxLayout(client_tab_widget)
         client_tab_layout.setSpacing(5)
-        
-        # Client selector toolbar
         client_toolbar = QHBoxLayout()
         client_toolbar.addWidget(QLabel("Select Client:"))
-        
         self.client_selector = QComboBox()
         self.client_selector.setStyleSheet("padding: 5px; font-size: 11px; min-width: 150px;")
         self.client_selector.addItem("Detecting clients...", None)
         self.client_selector.currentIndexChanged.connect(self.switch_client_log)
         client_toolbar.addWidget(self.client_selector)
-        
         self.refresh_clients_btn = QPushButton("🔄 Refresh")
         self.refresh_clients_btn.setStyleSheet("""
             QPushButton {
@@ -862,11 +1007,8 @@ class FLExperimentGUI(QMainWindow):
         """)
         self.refresh_clients_btn.clicked.connect(self.refresh_client_list)
         client_toolbar.addWidget(self.refresh_clients_btn)
-        
         client_toolbar.addStretch()
         client_tab_layout.addLayout(client_toolbar)
-        
-        # Client log text area
         self.client_log_text = QTextEdit()
         self.client_log_text.setReadOnly(True)
         self.client_log_text.setStyleSheet("""
@@ -881,12 +1023,75 @@ class FLExperimentGUI(QMainWindow):
             }
         """)
         client_tab_layout.addWidget(self.client_log_text)
-        
-        output_tabs.addTab(client_tab_widget, "💻 Client Logs")
-        
-        layout.addWidget(output_tabs)
-        
+        self.output_tabs.addTab(client_tab_widget, "💻 Client Logs")
+
+        # Tab 5: Packet Logs
+        packet_tab_widget = QWidget()
+        packet_tab_layout = QVBoxLayout(packet_tab_widget)
+        packet_tab_layout.setSpacing(5)
+        refresh_btn = QPushButton("🔄 Refresh Packet Logs")
+        refresh_btn.setStyleSheet("padding: 6px 12px; font-size: 12px;")
+        refresh_btn.clicked.connect(self.refresh_packet_log_table)
+        packet_tab_layout.addWidget(refresh_btn)
+        self.packet_log_table = QTableWidget()
+        self.packet_log_table.setColumnCount(7)
+        self.packet_log_table.setHorizontalHeaderLabels([
+            "Type", "Timestamp", "Size (B)", "Peer", "Protocol", "Round", "Extra Info"
+        ])
+        self.packet_log_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.packet_log_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.packet_log_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.packet_log_table.setStyleSheet("font-size: 11px;")
+        packet_tab_layout.addWidget(self.packet_log_table)
+        packet_tab_widget.setLayout(packet_tab_layout)
+        self.output_tabs.addTab(packet_tab_widget, "📦 Packet Logs")
+        QTimer.singleShot(100, self.refresh_packet_log_table)
+
+        # Add Docker Build Logs tab
+        self.docker_build_log_text = QTextEdit()
+        self.docker_build_log_text.setReadOnly(True)
+        self.docker_build_log_text.setStyleSheet("""
+            QTextEdit {
+                background-color: #222831;
+                color: #00adb5;
+                font-family: 'Courier New', monospace;
+                font-size: 11px;
+                border: 2px solid #444;
+                border-radius: 6px;
+                padding: 10px;
+            }
+        """)
+        self.output_tabs.addTab(self.docker_build_log_text, "🐳 Docker Build Logs")
+
+        layout.addWidget(self.output_tabs)
         return widget
+
+    def refresh_packet_log_table(self):
+        import sqlite3
+        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../packet_logs.db')
+        db_path = os.path.abspath(db_path)
+        self.packet_log_table.setRowCount(0)
+        try:
+            conn = sqlite3.connect(db_path)
+            c = conn.cursor()
+            c.execute('SELECT timestamp, packet_size, peer, protocol, round, extra_info FROM sent_packets ORDER BY timestamp DESC LIMIT 100')
+            sent_rows = c.fetchall()
+            c.execute('SELECT timestamp, packet_size, peer, protocol, round, extra_info FROM received_packets ORDER BY timestamp DESC LIMIT 100')
+            recv_rows = c.fetchall()
+            conn.close()
+            all_rows = [("Sent",) + row for row in sent_rows] + [("Received",) + row for row in recv_rows]
+            all_rows.sort(key=lambda r: r[1], reverse=True)
+            self.packet_log_table.setRowCount(len(all_rows))
+            for i, row in enumerate(all_rows):
+                for j, val in enumerate(row):
+                    from PyQt5.QtWidgets import QTableWidgetItem
+                    item = QTableWidgetItem(str(val) if val is not None else "")
+                    self.packet_log_table.setItem(i, j, item)
+        except Exception as e:
+            self.packet_log_table.setRowCount(1)
+            from PyQt5.QtWidgets import QTableWidgetItem
+            self.packet_log_table.setItem(0, 0, QTableWidgetItem("Error"))
+            self.packet_log_table.setItem(0, 1, QTableWidgetItem(str(e)))
     
     def create_group(self, title, options):
         """Create a radio button group"""
