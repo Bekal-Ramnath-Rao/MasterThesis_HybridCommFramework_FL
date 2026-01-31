@@ -23,6 +23,7 @@ else:
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+print(f"Project root set to: {project_root}")
 from packet_logger import init_db, log_sent_packet, log_received_packet
 
 # Add Compression_Technique to path
@@ -118,6 +119,9 @@ class FederatedLearningServer:
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
 
+        #initial dataabase setup
+        init_db()
+
     def initialize_global_model(self):
         """Initialize the global model structure (CNN for Emotion Recognition)"""
         import tensorflow as tf
@@ -201,13 +205,17 @@ class FederatedLearningServer:
     
     def on_message(self, client, userdata, msg):
         """Callback when message received"""
-        log_received_packet(
-            packet_size=len(msg.payload),
-            peer=msg.topic,
-            protocol="MQTT",
-            round=self.current_round if hasattr(self, 'current_round') else None,
-            extra_info="Received message"
-        )
+        try:
+            log_received_packet(
+                packet_size=len(msg.payload),
+                peer=msg.topic,
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Received message"
+            )
+        except Exception as e:
+            print(f"Server error logging received packet: {e}")
+
         try:
             if msg.topic == TOPIC_CLIENT_REGISTER:
                 self.handle_client_registration(msg.payload)
@@ -684,6 +692,7 @@ class FederatedLearningServer:
                     print(f"Retrying in {retry_delay} seconds...\n")
                     time.sleep(retry_delay)
                 else:
+                    print(f"Error: Could not connect to MQTT broker. {e}")
                     print(f"\nFailed to connect to MQTT broker after {max_retries} attempts.")
                     print(f"\nPlease ensure:")
                     print(f"  1. Mosquitto broker is running (service or container)")

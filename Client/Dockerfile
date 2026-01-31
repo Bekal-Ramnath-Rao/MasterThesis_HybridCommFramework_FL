@@ -37,6 +37,7 @@ RUN pip install --no-cache-dir aioquic
 # Copy the Protocols directory for gRPC and DDS
 COPY Protocols/ ./Protocols/
 
+COPY packet_logger.py ./
 # Copy the Client directory
 COPY Client/ ./Client/
 

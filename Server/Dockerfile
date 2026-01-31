@@ -38,6 +38,7 @@ RUN pip install --no-cache-dir aioquic
 COPY Protocols/ ./Protocols/
 
 # Copy the Server directory
+COPY packet_logger.py ./
 COPY Server/ ./Server/
 
 # Copy Client/Compression_Technique for quantization support (needed by Server)
