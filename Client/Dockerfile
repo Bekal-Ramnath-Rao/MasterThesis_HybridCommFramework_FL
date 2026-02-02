@@ -37,6 +37,11 @@ RUN pip install --no-cache-dir aioquic
 # Copy the Protocols directory for gRPC and DDS
 COPY Protocols/ ./Protocols/
 
+# Compile gRPC protobuf files
+RUN cd Protocols && \
+    python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. federated_learning.proto && \
+    cd ..
+
 COPY packet_logger.py ./
 # Copy the Client directory
 COPY Client/ ./Client/

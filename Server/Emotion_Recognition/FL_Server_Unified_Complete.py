@@ -6,42 +6,19 @@ The server listens on all protocol channels and responds to clients
 using whichever protocol they selected via RL.
 """
 
-import os
-import sys
-
-# Configure GPU before importing TensorFlow
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
 import numpy as np
 import pandas as pd
 import json
 import pickle
 import base64
 import time
+import os
+import sys
 import threading
 import asyncio
-from typing import List, Dict, Sequence, TYPE_CHECKING
+from typing import List, Dict
 from pathlib import Path
 from concurrent import futures
-
-import tensorflow as tf
-
-# Configure GPU 0 with memory growth
-try:
-    gpus = tf.config.list_physical_devices('GPU')
-    if gpus:
-        # Enable memory growth to prevent OOM errors
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        # Set GPU 0 as the only visible device
-        tf.config.set_visible_devices(gpus[0], 'GPU')
-        print(f"[GPU] Server configured to use GPU 0: {gpus[0]}")
-        print(f"[GPU] Memory growth enabled")
-    else:
-        print("[WARNING] No GPU devices found, using CPU")
-except Exception as e:
-    print(f"[WARNING] GPU configuration failed: {e}, using CPU")
 
 # Protocol-specific imports
 import paho.mqtt.client as mqtt
@@ -80,8 +57,6 @@ try:
     from cyclonedds.sub import DataReader
     from cyclonedds.util import duration
     from cyclonedds.core import Qos, Policy
-    from cyclonedds.idl import IdlStruct
-    from cyclonedds.idl.types import sequence
     DDS_AVAILABLE = True
 except ImportError:
     DDS_AVAILABLE = False
@@ -128,45 +103,6 @@ QUIC_HOST = os.getenv("QUIC_HOST", '0.0.0.0')
 QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
 
-# DDS Data Structures (must be defined at module level for Python 3.8)
-if DDS_AVAILABLE:
-    from dataclasses import dataclass, field
-    
-    @dataclass
-    class GlobalModel(IdlStruct):
-        round: int
-        weights: sequence[int]
-        model_config_json: str = ""
-    
-    @dataclass
-    class TrainingCommand(IdlStruct):
-        round: int
-        start_training: bool
-        start_evaluation: bool
-        training_complete: bool
-    
-    @dataclass
-    class ModelUpdate(IdlStruct):
-        client_id: int
-        round: int
-        weights: sequence[int]  # CycloneDDS sequence type for sequence<octet> in IDL
-        num_samples: int
-        loss: float
-        mse: float
-        mae: float
-        mape: float
-    
-    @dataclass
-    class EvaluationMetrics(IdlStruct):
-        client_id: int
-        round: int
-        num_samples: int
-        loss: float
-        accuracy: float
-        mse: float
-        mae: float
-        mape: float
-
 
 class UnifiedFederatedLearningServer:
     """
@@ -182,9 +118,6 @@ class UnifiedFederatedLearningServer:
         self.client_metrics = {}
         self.global_weights = None
         self.model_config = None
-        
-        # Server state
-        self.running = True
         
         # Metrics storage
         self.ACCURACY = []
@@ -205,13 +138,8 @@ class UnifiedFederatedLearningServer:
         self.mqtt_client = None
         self.amqp_connection = None
         self.amqp_channel = None
-        self.amqp_consumer_connection = None
-        self.amqp_consumer_channel = None
-        self.amqp_send_connection = None  # Separate connection for sending (thread-safe)
-        self.amqp_send_channel = None
         self.grpc_server = None
         self.quic_server = None
-        self.quic_clients = {}  # Maps client_id -> QuicConnectionProtocol for sending responses
         self.dds_participant = None
         self.dds_writers = {}
         self.dds_readers = {}
@@ -355,55 +283,7 @@ class UnifiedFederatedLearningServer:
             
             if msg.topic == "fl/client_register":
                 data = json.loads(msg.payload.decode())
-                client_id = data['client_id']
-                self.handle_client_registration(client_id, 'mqtt')
-                
-                # Set up AMQP queues for this client immediately (synchronous)
-                try:
-                    if AMQP_AVAILABLE:
-                        credentials = pika.PlainCredentials('guest', 'guest')
-                        parameters = pika.ConnectionParameters(
-                            host=AMQP_BROKER,
-                            port=AMQP_PORT,
-                            credentials=credentials,
-                            connection_attempts=5,
-                            retry_delay=1,
-                            heartbeat=600,
-                            blocked_connection_timeout=300
-                        )
-                        conn = pika.BlockingConnection(parameters)
-                        ch = conn.channel()
-                        
-                        # Declare exchange
-                        ch.exchange_declare(
-                            exchange='fl_client_updates',
-                            exchange_type='direct',
-                            durable=True
-                        )
-                        
-                        # Queue for this client's updates
-                        update_queue = f'client_{client_id}_updates'
-                        ch.queue_declare(queue=update_queue, durable=True)
-                        ch.queue_bind(
-                            exchange='fl_client_updates',
-                            queue=update_queue,
-                            routing_key=f'client_{client_id}_update'
-                        )
-                        print(f"[AMQP] Declared queue: {update_queue}")
-                        
-                        # Queue for this client's metrics
-                        metrics_queue = f'client_{client_id}_metrics'
-                        ch.queue_declare(queue=metrics_queue, durable=True)
-                        ch.queue_bind(
-                            exchange='fl_client_updates',
-                            queue=metrics_queue,
-                            routing_key=f'client_{client_id}_metrics'
-                        )
-                        print(f"[AMQP] Declared queue: {metrics_queue}")
-                        
-                        conn.close()
-                except Exception as e:
-                    print(f"[AMQP] Error setting up queues for client {client_id}: {e}")
+                self.handle_client_registration(data['client_id'], 'mqtt')
             elif "/update" in msg.topic:
                 data = json.loads(msg.payload.decode())
                 self.handle_client_update(data, 'mqtt')
@@ -446,18 +326,10 @@ class UnifiedFederatedLearningServer:
                 port=AMQP_PORT,
                 credentials=credentials,
                 heartbeat=600,
-                blocked_connection_timeout=300,
-                connection_attempts=5,
-                retry_delay=2
+                blocked_connection_timeout=300
             )
-            
-            # Connection 1: Consumer (owned by consumer thread)
             self.amqp_connection = pika.BlockingConnection(parameters)
             self.amqp_channel = self.amqp_connection.channel()
-            
-            # Connection 2: Sender (owned by main thread - thread-safe!)
-            self.amqp_send_connection = pika.BlockingConnection(parameters)
-            self.amqp_send_channel = self.amqp_send_connection.channel()
             
             # Declare exchanges and queues
             self.amqp_channel.exchange_declare(
@@ -469,7 +341,7 @@ class UnifiedFederatedLearningServer:
             # Queue for client registrations
             self.amqp_channel.queue_declare(queue='fl_client_register', durable=True)
             
-            # Set up registration consumer
+            # Set up consumers
             self.amqp_channel.basic_consume(
                 queue='fl_client_register',
                 on_message_callback=self.on_amqp_register,
@@ -486,9 +358,11 @@ class UnifiedFederatedLearningServer:
             amqp_thread = threading.Thread(target=consume, daemon=True)
             amqp_thread.start()
             
-            print("[AMQP] Server started with separate send/receive connections")
+            print("[AMQP] Server started")
         except Exception as e:
-            print(f"[AMQP] Failed to start (will retry on client registration): {e}")
+            print(f"[AMQP] Failed to start: {e}")
+            import traceback
+            traceback.print_exc()
     
     def on_amqp_register(self, ch, method, properties, body):
         """AMQP registration callback"""
@@ -505,102 +379,83 @@ class UnifiedFederatedLearningServer:
             client_id = data['client_id']
             self.handle_client_registration(client_id, 'amqp')
             
-            # Just declare the queues but don't set up separate consumers
-            # The messages will be processed via polling in the consumer thread
-            try:
-                # Queue for this client's updates
-                update_queue = f'client_{client_id}_updates'
-                ch.queue_declare(queue=update_queue, durable=True)
-                ch.queue_bind(
-                    exchange='fl_client_updates',
-                    queue=update_queue,
-                    routing_key=f'client_{client_id}_update'
-                )
-                print(f"[AMQP] Declared queue: {update_queue} with routing_key: client_{client_id}_update")
-                
-                # Queue for this client's metrics
-                metrics_queue = f'client_{client_id}_metrics'
-                ch.queue_declare(queue=metrics_queue, durable=True)
-                ch.queue_bind(
-                    exchange='fl_client_updates',
-                    queue=metrics_queue,
-                    routing_key=f'client_{client_id}_metrics'
-                )
-                print(f"[AMQP] Declared queue: {metrics_queue} with routing_key: client_{client_id}_metrics")
-                
-                print(f"[AMQP] Declared queues for client {client_id}")
-            except Exception as e:
-                print(f"[AMQP] Error declaring queues for client {client_id}: {e}")
+            # Set up queues for this client
+            self.amqp_channel.queue_declare(queue=f'client_{client_id}_updates', durable=True)
+            self.amqp_channel.queue_bind(
+                exchange='fl_client_updates',
+                queue=f'client_{client_id}_updates',
+                routing_key=f'client_{client_id}_update'
+            )
+            
+            self.amqp_channel.basic_consume(
+                queue=f'client_{client_id}_updates',
+                on_message_callback=lambda ch, method, props, body: self.on_amqp_update(ch, method, props, body, client_id),
+                auto_ack=True
+            )
+            
+            # Queue for metrics
+            self.amqp_channel.queue_declare(queue=f'client_{client_id}_metrics', durable=True)
+            self.amqp_channel.queue_bind(
+                exchange='fl_client_updates',
+                queue=f'client_{client_id}_metrics',
+                routing_key=f'client_{client_id}_metrics'
+            )
+            
+            self.amqp_channel.basic_consume(
+                queue=f'client_{client_id}_metrics',
+                on_message_callback=lambda ch, method, props, body: self.on_amqp_metrics(ch, method, props, body, client_id),
+                auto_ack=True
+            )
         except Exception as e:
             print(f"[AMQP] Error handling registration: {e}")
             import traceback
             traceback.print_exc()
     
-    # Note: AMQP update and metrics callbacks are now defined inline in on_amqp_register
-    # to handle separate connections per client
-    
-    def send_quic_message(self, client_id, message):
-        """Send message to client via QUIC stream (copied from working single-protocol server)"""
-        if client_id not in self.quic_clients:
-            print(f"[QUIC] Warning: No QUIC protocol reference for client {client_id}")
-            print(f"[QUIC] Available QUIC clients: {list(self.quic_clients.keys())}")
-            return
-        
+    def on_amqp_update(self, ch, method, properties, body, client_id):
+        """AMQP update callback"""
         try:
-            protocol = self.quic_clients[client_id]
-            stream_id = protocol._quic.get_next_available_stream_id()
-            # Add newline delimiter for message framing
-            data = (json.dumps(message) + '\n').encode('utf-8')
-            protocol._quic.send_stream_data(stream_id, data, end_stream=True)
-            protocol.transmit()
-            
-            msg_type = message.get('type')
-            print(f"[QUIC] Sent {msg_type} to client {client_id} on stream {stream_id} ({len(data)} bytes)")
-            
-            log_sent_packet(
-                packet_size=len(data),
-                peer=f"quic_client_{client_id}",
-                protocol="QUIC",
+            log_received_packet(
+                packet_size=len(body),
+                peer=f"client_{client_id}",
+                protocol="AMQP",
                 round=self.current_round,
-                extra_info=msg_type
+                extra_info="model_update"
             )
+            
+            data = json.loads(body.decode())
+            self.handle_client_update(data, 'amqp')
         except Exception as e:
-            print(f"[QUIC] Error sending message to client {client_id}: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[AMQP] Error handling update: {e}")
+    
+    def on_amqp_metrics(self, ch, method, properties, body, client_id):
+        """AMQP metrics callback"""
+        try:
+            log_received_packet(
+                packet_size=len(body),
+                peer=f"client_{client_id}",
+                protocol="AMQP",
+                round=self.current_round,
+                extra_info="metrics"
+            )
+            
+            data = json.loads(body.decode())
+            self.handle_client_metrics(data, 'amqp')
+        except Exception as e:
+            print(f"[AMQP] Error handling metrics: {e}")
     
     def send_via_amqp(self, client_id, message_type, message):
-        """Send message to client via AMQP using dedicated send connection"""
-        if not AMQP_AVAILABLE:
+        """Send message to client via AMQP"""
+        if not AMQP_AVAILABLE or not self.amqp_channel:
             return
         
         try:
-            # Use dedicated send connection (thread-safe, not shared with consumer)
-            if not self.amqp_send_channel or not self.amqp_send_channel.is_open:
-                print(f"[AMQP] Send channel closed, reopening...")
-                if self.amqp_send_connection and self.amqp_send_connection.is_open:
-                    self.amqp_send_channel = self.amqp_send_connection.channel()
-                else:
-                    # Recreate send connection
-                    print(f"[AMQP] Send connection closed, recreating...")
-                    credentials = pika.PlainCredentials('guest', 'guest')
-                    parameters = pika.ConnectionParameters(
-                        host=AMQP_BROKER,
-                        port=AMQP_PORT,
-                        credentials=credentials,
-                        heartbeat=600,
-                        blocked_connection_timeout=300
-                    )
-                    self.amqp_send_connection = pika.BlockingConnection(parameters)
-                    self.amqp_send_channel = self.amqp_send_connection.channel()
-            
             payload = json.dumps(message)
             queue_name = f'client_{client_id}_{message_type}'
             
-            # Declare queue if not exists (safe on send channel)
-            self.amqp_send_channel.queue_declare(queue=queue_name, durable=True)
+            # Declare queue if not exists
+            self.amqp_channel.queue_declare(queue=queue_name, durable=True)
             
-            self.amqp_send_channel.basic_publish(
+            self.amqp_channel.basic_publish(
                 exchange='',
                 routing_key=queue_name,
                 body=payload,
@@ -614,11 +469,8 @@ class UnifiedFederatedLearningServer:
                 round=self.current_round,
                 extra_info=message_type
             )
-            print(f"[AMQP] Sent {message_type} to client {client_id} (queue: {queue_name})")
         except Exception as e:
             print(f"[AMQP] Error sending to client {client_id}: {e}")
-            import traceback
-            traceback.print_exc()
     
     # =========================================================================
     # gRPC PROTOCOL HANDLERS
@@ -662,28 +514,15 @@ class UnifiedFederatedLearningServer:
         try:
             # Run QUIC server in asyncio event loop
             def run_quic():
-                try:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                    print(f"[QUIC] Starting server on {QUIC_HOST}:{QUIC_PORT}")
-                    loop.run_until_complete(self._run_quic_server())
-                    # Keep the loop running
-                    loop.run_forever()
-                except Exception as e:
-                    print(f"[QUIC] Thread error: {e}")
-                    import traceback
-                    traceback.print_exc()
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self._run_quic_server())
             
             quic_thread = threading.Thread(target=run_quic, daemon=True)
             quic_thread.start()
-            
-            # Wait a bit for server to actually start listening
-            time.sleep(3)
-            print(f"[QUIC] Server initialized on {QUIC_HOST}:{QUIC_PORT}")
+            print(f"[QUIC] Server started on {QUIC_HOST}:{QUIC_PORT}")
         except Exception as e:
             print(f"[QUIC] Failed to start: {e}")
-            import traceback
-            traceback.print_exc()
     
     async def _run_quic_server(self):
         """Async QUIC server"""
@@ -696,12 +535,11 @@ class UnifiedFederatedLearningServer:
             # Generate self-signed certificate for QUIC
             import ssl
             from cryptography import x509
-            from cryptography.x509.oid import NameOID, ExtensionOID
+            from cryptography.x509.oid import NameOID
             from cryptography.hazmat.primitives import hashes
             from cryptography.hazmat.primitives.asymmetric import rsa
             from cryptography.hazmat.primitives import serialization
             import datetime
-            import ipaddress
             
             # Generate private key
             private_key = rsa.generate_private_key(
@@ -716,14 +554,6 @@ class UnifiedFederatedLearningServer:
                 x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
             ])
             
-            # Build SubjectAltName extension with multiple addresses
-            san_list = [
-                x509.DNSName("localhost"),
-                x509.DNSName("fl-server-unified-emotion"),
-                x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
-                x509.IPAddress(ipaddress.IPv4Address("0.0.0.0")),
-            ]
-            
             cert = x509.CertificateBuilder().subject_name(
                 subject
             ).issuer_name(
@@ -736,9 +566,6 @@ class UnifiedFederatedLearningServer:
                 datetime.datetime.utcnow()
             ).not_valid_after(
                 datetime.datetime.utcnow() + datetime.timedelta(days=365)
-            ).add_extension(
-                x509.SubjectAlternativeName(san_list),
-                critical=False
             ).sign(private_key, hashes.SHA256())
             
             # Save to temp files
@@ -772,173 +599,6 @@ class UnifiedFederatedLearningServer:
     # DDS PROTOCOL HANDLERS
     # =========================================================================
     
-    def start_amqp_consumer(self):
-        """Polling-based AMQP consumer for all clients"""
-        try:
-            credentials = pika.PlainCredentials('guest', 'guest')
-            parameters = pika.ConnectionParameters(
-                host=AMQP_BROKER,
-                port=AMQP_PORT,
-                credentials=credentials,
-                heartbeat=600,
-                blocked_connection_timeout=300,
-                connection_attempts=5,
-                retry_delay=2
-            )
-            self.amqp_consumer_connection = pika.BlockingConnection(parameters)
-            self.amqp_consumer_channel = self.amqp_consumer_connection.channel()
-            
-            print("[AMQP] Consumer connection established")
-            
-            # Give time for initial setup
-            time.sleep(3)
-            
-            # Run polling loop
-            poll_count = 0
-            consecutive_empty_checks = 0
-            check_connection_health = 0
-            
-            while self.running:
-                try:
-                    # Periodically log polling status and check connection health
-                    poll_count += 1
-                    check_connection_health += 1
-                    
-                    if check_connection_health % 200 == 0:
-                        print(f"[AMQP] Polling... ({poll_count} iterations, {len(self.registered_clients)} clients: {list(self.registered_clients.keys())})")
-                        print(f"[AMQP] Connection status: open={self.amqp_consumer_connection.is_open}, channel open={self.amqp_consumer_channel.is_open}")
-                    
-                    # Poll each registered client's update queue
-                    found_messages = False
-                    for client_id in list(self.registered_clients.keys()):
-                        update_queue = f'client_{client_id}_updates'
-                        
-                        try:
-                            # Ensure queue exists and is bound to exchange
-                            # (in case it wasn't declared yet)
-                            try:
-                                self.amqp_consumer_channel.queue_declare(
-                                    queue=update_queue, 
-                                    durable=True,
-                                    passive=False  # Create if doesn't exist
-                                )
-                                self.amqp_consumer_channel.queue_bind(
-                                    exchange='fl_client_updates',
-                                    queue=update_queue,
-                                    routing_key=f'client_{client_id}_update'
-                                )
-                            except:
-                                # Queue already exists, that's fine
-                                pass
-                            
-                            # Use explicit no_ack=False and auto_ack handling
-                            method, properties, body = self.amqp_consumer_channel.basic_get(
-                                queue=update_queue, 
-                                auto_ack=False
-                            )
-                            
-                            # Debug log every 500 iterations
-                            if check_connection_health % 500 == 0:
-                                print(f"[AMQP-DEBUG] basic_get({update_queue}): method={method}, body={'<data>' if body else None}")
-                                
-                            if body is not None:  # Important: check "is not None" not just "if body"
-                                found_messages = True
-                                consecutive_empty_checks = 0
-                                try:
-                                    log_received_packet(
-                                        packet_size=len(body),
-                                        peer=f"client_{client_id}",
-                                        protocol="AMQP",
-                                        round=self.current_round,
-                                        extra_info="model_update"
-                                    )
-                                    data = json.loads(body.decode())
-                                    self.handle_client_update(data, 'amqp')
-                                    print(f"[AMQP] Received update from client {client_id}")
-                                    # Acknowledge the message
-                                    self.amqp_consumer_channel.basic_ack(delivery_tag=method.delivery_tag)
-                                except Exception as e:
-                                    print(f"[AMQP] Error processing update from client {client_id}: {e}")
-                                    # Negative acknowledge with requeue
-                                    try:
-                                        self.amqp_consumer_channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-                                    except:
-                                        pass
-                        except Exception as e:
-                            # Queue may not exist yet, skip but log less frequently
-                            if poll_count % 1000 == 0:
-                                import traceback
-                                print(f"[AMQP] Error polling {update_queue}: {e}")
-                                traceback.print_exc()
-                        
-                        # Poll metrics queue
-                        metrics_queue = f'client_{client_id}_metrics'
-                        try:
-                            # Ensure queue exists and is bound to exchange
-                            try:
-                                self.amqp_consumer_channel.queue_declare(
-                                    queue=metrics_queue, 
-                                    durable=True,
-                                    passive=False
-                                )
-                                self.amqp_consumer_channel.queue_bind(
-                                    exchange='fl_client_updates',
-                                    queue=metrics_queue,
-                                    routing_key=f'client_{client_id}_metrics'
-                                )
-                            except:
-                                # Queue already exists, that's fine
-                                pass
-                            
-                            method, properties, body = self.amqp_consumer_channel.basic_get(
-                                queue=metrics_queue, 
-                                auto_ack=False
-                            )
-                            
-                            if body:
-                                found_messages = True
-                                try:
-                                    log_received_packet(
-                                        packet_size=len(body),
-                                        peer=f"client_{client_id}",
-                                        protocol="AMQP",
-                                        round=self.current_round,
-                                        extra_info="metrics"
-                                    )
-                                    data = json.loads(body.decode())
-                                    self.handle_client_metrics(data, 'amqp')
-                                    print(f"[AMQP] Received metrics from client {client_id}")
-                                    # Acknowledge the message
-                                    self.amqp_consumer_channel.basic_ack(delivery_tag=method.delivery_tag)
-                                except Exception as e:
-                                    print(f"[AMQP] Error processing metrics from client {client_id}: {e}")
-                                    # Negative acknowledge with requeue
-                                    try:
-                                        self.amqp_consumer_channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-                                    except:
-                                        pass
-                        except Exception as e:
-                            pass
-                    
-                    # If we found messages, keep polling immediately; otherwise, wait slightly
-                    if not found_messages:
-                        consecutive_empty_checks += 1
-                        if consecutive_empty_checks > 100:
-                            # Reduce console spam after lots of empty checks
-                            time.sleep(0.2)
-                    else:
-                        time.sleep(0.01)  # Very short delay if we found messages
-                        
-                except Exception as e:
-                    print(f"[AMQP] Consumer polling error: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    time.sleep(1)
-        except Exception as e:
-            print(f"[AMQP] Consumer connection failed: {e}")
-            import traceback
-            traceback.print_exc()
-    
     def start_dds_server(self):
         """Start DDS protocol handler"""
         if not DDS_AVAILABLE:
@@ -951,140 +611,27 @@ class UnifiedFederatedLearningServer:
             # Define QoS for reliable communication
             qos = Qos(
                 Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
-                Policy.History.KeepLast(10),
-                Policy.Durability.TransientLocal
+                Policy.History.KeepAll,
+                Policy.Durability.Volatile
             )
             
-            # Create topics and readers for model updates
-            update_topic = Topic(self.dds_participant, "ModelUpdate", ModelUpdate)
-            update_reader = DataReader(self.dds_participant, update_topic, qos=qos)
-            
-            # Create topics and readers for metrics
-            metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
-            metrics_reader = DataReader(self.dds_participant, metrics_topic, qos=qos)
-            
-            # Create writers for sending global model and commands to clients
-            global_model_topic = Topic(self.dds_participant, "GlobalModel", GlobalModel)
-            self.dds_writers['global_model'] = DataWriter(self.dds_participant, global_model_topic, qos=qos)
-            
-            command_topic = Topic(self.dds_participant, "TrainingCommand", TrainingCommand)
-            self.dds_writers['command'] = DataWriter(self.dds_participant, command_topic, qos=qos)
-            
-            # Create DDS listener thread that polls for messages
+            # Start DDS listener thread
             def dds_listener():
-                while self.running:
+                while not self.converged:
                     try:
-                        # Read model updates
-                        for sample in update_reader.take(10):
-                            if sample:
-                                try:
-                                    # Convert List[int] back to bytes and deserialize weights
-                                    weights_bytes = bytes(sample.weights)
-                                    weights = pickle.loads(weights_bytes)
-                                    
-                                    # Convert to dict format expected by handler
-                                    data = {
-                                        'client_id': sample.client_id,
-                                        'round': sample.round,
-                                        'weights': weights,
-                                        'num_samples': sample.num_samples,
-                                        'loss': sample.loss,
-                                        'mse': sample.mse,
-                                        'mae': sample.mae,
-                                        'mape': sample.mape
-                                    }
-                                    
-                                    log_received_packet(
-                                        packet_size=len(sample.weights),
-                                        peer=f"client_{sample.client_id}",
-                                        protocol="DDS",
-                                        round=self.current_round,
-                                        extra_info="model_update"
-                                    )
-                                    
-                                    self.handle_client_update(data, 'dds')
-                                    print(f"[DDS] Received update from client {sample.client_id}")
-                                except Exception as e:
-                                    print(f"[DDS] Error processing update: {type(e).__name__}: {e}")
-                                    import traceback
-                                    traceback.print_exc()
-                        
-                        # Read metrics
-                        for sample in metrics_reader.take(10):
-                            if sample:
-                                try:
-                                    # Convert to dict format expected by handler
-                                    data = {
-                                        'client_id': sample.client_id,
-                                        'round': sample.round,
-                                        'num_samples': sample.num_samples,
-                                        'loss': sample.loss,
-                                        'accuracy': sample.accuracy,
-                                        'mse': sample.mse,
-                                        'mae': sample.mae,
-                                        'mape': sample.mape
-                                    }
-                                    
-                                    log_received_packet(
-                                        packet_size=len(str(sample)),
-                                        peer=f"client_{sample.client_id}",
-                                        protocol="DDS",
-                                        round=self.current_round,
-                                        extra_info="metrics"
-                                    )
-                                    
-                                    self.handle_client_metrics(data, 'dds')
-                                    print(f"[DDS] Received metrics from client {sample.client_id}")
-                                except Exception as e:
-                                    print(f"[DDS] Error processing metrics: {type(e).__name__}: {e}")
-                                    import traceback
-                                    traceback.print_exc()
-                        
-                        # Small delay to avoid busy-waiting
                         time.sleep(0.1)
+                        # DDS uses callbacks, so just keep thread alive
                     except Exception as e:
                         print(f"[DDS] Listener error: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        time.sleep(1)
             
             dds_thread = threading.Thread(target=dds_listener, daemon=True)
             dds_thread.start()
             
             print(f"[DDS] Server started on domain {DDS_DOMAIN_ID}")
-
         except Exception as e:
             print(f"[DDS] Failed to start: {e}")
             import traceback
             traceback.print_exc()
-    
-    def receive_dds_update(self, data):
-        """Handle DDS message received from client"""
-        try:
-            log_received_packet(
-                packet_size=len(str(data)),
-                peer="dds_client",
-                protocol="DDS",
-                round=self.current_round,
-                extra_info="model_update"
-            )
-            self.handle_client_update(data, 'dds')
-        except Exception as e:
-            print(f"[DDS] Error handling DDS update: {e}")
-    
-    def receive_dds_metrics(self, data):
-        """Handle DDS metrics received from client"""
-        try:
-            log_received_packet(
-                packet_size=len(str(data)),
-                peer="dds_client",
-                protocol="DDS",
-                round=self.current_round,
-                extra_info="metrics"
-            )
-            self.handle_client_metrics(data, 'dds')
-        except Exception as e:
-            print(f"[DDS] Error handling DDS metrics: {e}")
     
     # =========================================================================
     # COMMON HANDLERS (Protocol-agnostic)
@@ -1116,9 +663,6 @@ class UnifiedFederatedLearningServer:
                       f"(round {round_num} != current {self.current_round})")
                 return
             
-            # Update the protocol this client is using (RL agent may change protocol per round)
-            self.registered_clients[client_id] = protocol
-            
             # Deserialize weights
             if 'compressed_data' in data and self.quantization_handler is not None:
                 compressed_update = data['compressed_data']
@@ -1131,10 +675,11 @@ class UnifiedFederatedLearningServer:
             else:
                 weights = self.deserialize_weights(data['weights'])
             
-            # Store update (metrics are handled separately via handle_client_metrics)
+            # Store update
             self.client_updates[client_id] = {
                 'weights': weights,
                 'num_samples': data['num_samples'],
+                'metrics': data['metrics'],
                 'protocol': protocol
             }
             
@@ -1170,56 +715,28 @@ class UnifiedFederatedLearningServer:
     
     def distribute_initial_model(self):
         """Distribute initial global model and config to all clients"""
-        # Prepare weights (quantized or not)
-        if self.quantization_handler is not None:
-            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
-            weights_data = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
-            weights_key = 'quantized_data'
-        else:
-            weights_data = self.serialize_weights(self.global_weights)
-            weights_key = 'weights'
+        message = {
+            'round': 0,
+            'weights': self.serialize_weights(self.global_weights),
+            'model_config': self.model_config
+        }
         
         for client_id, protocol in self.registered_clients.items():
             try:
                 if protocol == 'mqtt':
-                    message = {
-                        'round': 0,
-                        weights_key: weights_data,
-                        'model_config': self.model_config
-                    }
                     self.send_via_mqtt(client_id, "fl/global_model", message)
-                    print(f"[MQTT] Sent initial model to client {client_id}")
-                    
                 elif protocol == 'amqp':
-                    message = {
-                        'round': 0,
-                        weights_key: weights_data,
-                        'model_config': self.model_config
-                    }
                     self.send_via_amqp(client_id, 'global_model', message)
-                    print(f"[AMQP] Sent initial model to client {client_id}")
-                    
-                elif protocol == 'quic':
-                    # Send via QUIC stream
-                    message = {
-                        'type': 'global_model',
-                        'round': 0,
-                        weights_key: weights_data,
-                        'model_config': self.model_config
-                    }
-                    self.send_quic_message(client_id, message)
-                    print(f"[QUIC] Sent initial model to client {client_id}")
-                    
                 elif protocol == 'grpc':
-                    print(f"[gRPC] Client {client_id} will pull initial model")
-                    
+                    pass  # gRPC uses pull model, clients will request
+                elif protocol == 'quic':
+                    pass  # QUIC handled separately
                 elif protocol == 'dds':
-                    print(f"[DDS] Client {client_id} will receive initial model via pub/sub")
-                    
+                    pass  # DDS uses pub/sub
+                
+                print(f"[{protocol.upper()}] Sent initial model to client {client_id}")
             except Exception as e:
                 print(f"[{protocol.upper()}] Error sending initial model to client {client_id}: {e}")
-                import traceback
-                traceback.print_exc()
         
         # Start first round
         time.sleep(2)
@@ -1228,120 +745,50 @@ class UnifiedFederatedLearningServer:
     
     def signal_start_training(self):
         """Signal all clients to start training for current round"""
+        message = {'round': self.current_round}
+        
         for client_id, protocol in self.registered_clients.items():
             try:
                 if protocol == 'mqtt':
-                    message = {'round': self.current_round}
                     self.send_via_mqtt(client_id, "fl/start_training", message)
                 elif protocol == 'amqp':
-                    message = {'round': self.current_round}
                     self.send_via_amqp(client_id, 'start_training', message)
-                elif protocol == 'quic':
-                    message = {
-                        'type': 'start_training',
-                        'round': self.current_round
-                    }
-                    self.send_quic_message(client_id, message)
-                # gRPC and DDS handled via their mechanisms
+                # Other protocols handled via their mechanisms
             except Exception as e:
                 print(f"[{protocol.upper()}] Error signaling training to client {client_id}: {e}")
     
     def signal_start_evaluation(self):
         """Signal all clients to start evaluation for current round"""
-        for client_id, protocol in self.registered_clients.items():
-            try:
-                if protocol == 'mqtt':
-                    message = {'round': self.current_round}
-                    self.send_via_mqtt(client_id, "fl/start_evaluation", message)
-                elif protocol == 'amqp':
-                    message = {'round': self.current_round}
-                    self.send_via_amqp(client_id, 'start_evaluation', message)
-                elif protocol == 'quic':
-                    message = {
-                        'type': 'start_evaluation',
-                        'round': self.current_round
-                    }
-                    self.send_quic_message(client_id, message)
-                elif protocol == 'dds':
-                    # Send evaluation command via DDS
-                    if DDS_AVAILABLE and 'command' in self.dds_writers:
-                        command = TrainingCommand(
-                            round=self.current_round,
-                            start_training=False,
-                            start_evaluation=True,
-                            training_complete=False
-                        )
-                        self.dds_writers['command'].write(command)
-                        print(f"[DDS] Sent evaluation command to client {client_id}")
-                # gRPC handled via pull model
-            except Exception as e:
-                print(f"[{protocol.upper()}] Error signaling evaluation to client {client_id}: {e}")
-    
-    def broadcast_global_model(self):
-        """Broadcast updated global model to all clients via their registered protocols"""
-        # Prepare message with weights
-        if self.quantization_handler is not None:
-            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
-            weights_data = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
-            weights_key = 'quantized_data'
-        else:
-            weights_data = self.serialize_weights(self.global_weights)
-            weights_key = 'weights'
+        message = {'round': self.current_round}
         
         for client_id, protocol in self.registered_clients.items():
             try:
                 if protocol == 'mqtt':
-                    message = {
-                        'round': self.current_round,
-                        weights_key: weights_data
-                    }
-                    self.send_via_mqtt(client_id, "fl/global_model", message)
-                    print(f"[MQTT] Sent global model to client {client_id}")
-                    
+                    self.send_via_mqtt(client_id, "fl/start_evaluation", message)
                 elif protocol == 'amqp':
-                    message = {
-                        'round': self.current_round,
-                        weights_key: weights_data
-                    }
+                    self.send_via_amqp(client_id, 'start_evaluation', message)
+                # Other protocols handled via their mechanisms
+            except Exception as e:
+                print(f"[{protocol.upper()}] Error signaling evaluation to client {client_id}: {e}")
+    
+    def broadcast_global_model(self):
+        """Broadcast updated global model to all clients"""
+        message = {
+            'round': self.current_round,
+            'weights': self.serialize_weights(self.global_weights)
+        }
+        
+        for client_id, protocol in self.registered_clients.items():
+            try:
+                if protocol == 'mqtt':
+                    self.send_via_mqtt(client_id, "fl/global_model", message)
+                elif protocol == 'amqp':
                     self.send_via_amqp(client_id, 'global_model', message)
-                    print(f"[AMQP] Sent global model to client {client_id}")
-                    
-                elif protocol == 'quic':
-                    # Send via QUIC stream (like single-protocol server does)
-                    message = {
-                        'type': 'global_model',
-                        'round': self.current_round,
-                        weights_key: weights_data
-                    }
-                    self.send_quic_message(client_id, message)
-                    print(f"[QUIC] Sent global model to client {client_id}")
-                    
-                elif protocol == 'grpc':
-                    # gRPC uses pull model - clients request global model
-                    print(f"[gRPC] Client {client_id} will pull global model")
-                    
-                elif protocol == 'dds':
-                    # DDS uses pub/sub - publish to DDS topic
-                    if DDS_AVAILABLE and 'global_model' in self.dds_writers:
-                        try:
-                            # Publish global model
-                            global_model = GlobalModel(
-                                round=self.current_round,
-                                weights=list(map(int, base64.b64decode(weights_data if weights_key == 'quantized_data' else weights_data)))
-                            )
-                            self.dds_writers['global_model'].write(global_model)
-                            print(f"[DDS] Published global model to DDS topic for client {client_id}")
-                        except Exception as dds_error:
-                            print(f"[DDS] Error publishing global model: {dds_error}")
-                            import traceback
-                            traceback.print_exc()
-                    else:
-                        print(f"[DDS] DDS writer not available for client {client_id}")
-                    
+                # Other protocols handled separately
+                
+                print(f"[{protocol.upper()}] Sent global model to client {client_id}")
             except Exception as e:
                 print(f"[{protocol.upper()}] Error broadcasting to client {client_id}: {e}")
-                import traceback
-                traceback.print_exc()
     
     def aggregate_models(self):
         """Aggregate client model updates using FedAvg"""
@@ -1477,11 +924,6 @@ class UnifiedFederatedLearningServer:
         
         self.start_mqtt_server()
         self.start_amqp_server()
-        
-        # Start AMQP consumer thread (polling-based)
-        amqp_consumer_thread = threading.Thread(target=self.start_amqp_consumer, daemon=True)
-        amqp_consumer_thread.start()
-        
         self.start_grpc_server()
         self.start_quic_server()
         self.start_dds_server()
@@ -1505,10 +947,6 @@ class UnifiedFederatedLearningServer:
             self.mqtt_client.disconnect()
         if self.amqp_connection:
             self.amqp_connection.close()
-        if self.amqp_send_connection:  # Close send connection too
-            self.amqp_send_connection.close()
-        if hasattr(self, 'amqp_consumer_connection') and self.amqp_consumer_connection:
-            self.amqp_consumer_connection.close()
         if self.grpc_server:
             self.grpc_server.stop(0)
 
@@ -1607,18 +1045,13 @@ if GRPC_AVAILABLE:
                     extra_info="model_update"
                 )
                 
-                # Decode the weights - they come as bytes or string
-                if isinstance(request.weights, bytes):
-                    weights_str = request.weights.decode('utf-8')
-                else:
-                    weights_str = request.weights
-                
+                weights = pickle.loads(request.weights)
                 metrics = dict(request.metrics)
                 
                 data = {
                     'client_id': request.client_id,
                     'round': request.round,
-                    'weights': weights_str,  # Already base64-encoded from client
+                    'weights': base64.b64encode(pickle.dumps(weights)).decode('utf-8'),
                     'num_samples': request.num_samples,
                     'metrics': metrics
                 }
@@ -1700,75 +1133,30 @@ if QUIC_AVAILABLE:
         def __init__(self, server, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.server = server
-            self.stream_buffers = {}  # Buffer data per stream ID
-            print(f"[QUIC] Protocol initialized")
         
         def quic_event_received(self, event):
             """Handle QUIC events"""
-            print(f"[QUIC] Event received: {type(event).__name__}")
-            
             if isinstance(event, StreamDataReceived):
                 try:
-                    # Buffer stream data
-                    stream_id = event.stream_id
-                    if stream_id not in self.stream_buffers:
-                        self.stream_buffers[stream_id] = b''
+                    data = event.data.decode().strip()
+                    message = json.loads(data)
                     
-                    self.stream_buffers[stream_id] += event.data
+                    log_received_packet(
+                        packet_size=len(data),
+                        peer=f"quic_client_{message.get('client_id', 'unknown')}",
+                        protocol="QUIC",
+                        round=message.get('round', 0),
+                        extra_info=message.get('type', 'unknown')
+                    )
                     
-                    # Try to parse complete JSON messages
-                    # Look for newline as message delimiter
-                    buffer = self.stream_buffers[stream_id]
-                    if b'\n' in buffer:
-                        messages = buffer.split(b'\n')
-                        # Last element might be incomplete, keep it in buffer
-                        self.stream_buffers[stream_id] = messages[-1]
-                        
-                        # Process complete messages
-                        for msg_data in messages[:-1]:
-                            if msg_data:
-                                try:
-                                    data_str = msg_data.decode().strip()
-                                    print(f"[QUIC] Processing message: {len(data_str)} bytes")
-                                    message = json.loads(data_str)
-                                    
-                                    log_received_packet(
-                                        packet_size=len(data_str),
-                                        peer=f"quic_client_{message.get('client_id', 'unknown')}",
-                                        protocol="QUIC",
-                                        round=message.get('round', 0),
-                                        extra_info=message.get('type', 'unknown')
-                                    )
-                                    
-                                    # Store QUIC protocol reference for ANY message (not just registration)
-                                    # This allows server to send responses back via QUIC even if client registered via different protocol
-                                    client_id = message.get('client_id')
-                                    if client_id:
-                                        self.server.quic_clients[client_id] = self
-                                        print(f"[QUIC] Stored protocol reference for client {client_id} (now have {list(self.server.quic_clients.keys())})")
-                                    
-                                    if message['type'] == 'register':
-                                        self.server.handle_client_registration(message['client_id'], 'quic')
-                                        print(f"[QUIC] Received registration from client {message['client_id']}")
-                                    elif message['type'] == 'update':
-                                        self.server.handle_client_update(message, 'quic')
-                                        print(f"[QUIC] Received update from client {message['client_id']}")
-                                    elif message['type'] == 'metrics':
-                                        self.server.handle_client_metrics(message, 'quic')
-                                        print(f"[QUIC] Received metrics from client {message['client_id']}")
-                                except json.JSONDecodeError as je:
-                                    print(f"[QUIC] JSON decode error: {je}")
-                                except Exception as e2:
-                                    print(f"[QUIC] Error processing message: {e2}")
-                                    import traceback
-                                    traceback.print_exc()
+                    if message['type'] == 'register':
+                        self.server.handle_client_registration(message['client_id'], 'quic')
+                    elif message['type'] == 'update':
+                        self.server.handle_client_update(message, 'quic')
+                    elif message['type'] == 'metrics':
+                        self.server.handle_client_metrics(message, 'quic')
                 except Exception as e:
                     print(f"[QUIC] Error handling event: {e}")
-                    import traceback
-                    traceback.print_exc()
-            else:
-                # Call parent handler for other events
-                super().quic_event_received(event)
 
 
 def main():

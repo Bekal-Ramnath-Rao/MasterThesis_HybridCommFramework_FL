@@ -232,7 +232,7 @@ class ExperimentRunner:
             print("\nWaiting for services to initialize (15 seconds)...")
             time.sleep(15)
             
-            return
+            return True
         
         # Regular protocol handling (existing code)
         compose_file = self.compose_files[self.use_case]

@@ -10,6 +10,10 @@ import json
 import subprocess
 import threading
 from datetime import datetime
+
+# Add GUI directory to path for packet_logs_tab import
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'GUI'))
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QPushButton, QComboBox, QCheckBox, QSpinBox, QSlider,
@@ -244,7 +248,14 @@ class FLExperimentGUI(QMainWindow):
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle("🚀 Federated Learning Network Experiment Dashboard")
-        self.setGeometry(100, 100, 1400, 900)
+        
+        # Set minimum size and allow window to be resizable/maximizable
+        self.setMinimumSize(1200, 800)
+        self.resize(1400, 900)
+        
+        # Enable window maximize button and resizing
+        self.setWindowFlags(Qt.Window | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint)
+        
         self.setStyleSheet(self.get_stylesheet())
         
         # Create central widget and main layout
@@ -272,6 +283,7 @@ class FLExperimentGUI(QMainWindow):
         self.config_tabs.addTab(self.create_network_config_tab(), "🌐 Network Control")
         self.config_tabs.addTab(self.create_advanced_config_tab(), "🔧 Advanced Options")
         self.config_tabs.addTab(self.create_docker_build_tab(), "🐳 Docker Build")
+        self.config_tabs.addTab(self.create_docker_cleanup_tab(), "🗑️ Docker Cleanup")
         config_layout.addWidget(self.config_tabs)
         splitter.addWidget(config_widget)
         
@@ -287,6 +299,40 @@ class FLExperimentGUI(QMainWindow):
         
         # Status bar
         self.statusBar().showMessage("Ready to run experiments")
+        
+        # Add keyboard shortcuts for window control
+        self.setup_shortcuts()
+    
+    def setup_shortcuts(self):
+        """Setup keyboard shortcuts for better UX"""
+        from PyQt5.QtWidgets import QShortcut
+        from PyQt5.QtGui import QKeySequence
+        
+        # F11 for fullscreen toggle
+        fullscreen_shortcut = QShortcut(QKeySequence(Qt.Key_F11), self)
+        fullscreen_shortcut.activated.connect(self.toggle_fullscreen)
+        
+        # Ctrl+M for maximize/restore
+        maximize_shortcut = QShortcut(QKeySequence("Ctrl+M"), self)
+        maximize_shortcut.activated.connect(self.toggle_maximize)
+    
+    def toggle_fullscreen(self):
+        """Toggle fullscreen mode"""
+        if self.isFullScreen():
+            self.showNormal()
+            self.statusBar().showMessage("Exited fullscreen mode (F11 to toggle)")
+        else:
+            self.showFullScreen()
+            self.statusBar().showMessage("Fullscreen mode active (F11 to exit)")
+    
+    def toggle_maximize(self):
+        """Toggle maximize/restore window"""
+        if self.isMaximized():
+            self.showNormal()
+            self.statusBar().showMessage("Window restored (Ctrl+M to maximize)")
+        else:
+            self.showMaximized()
+            self.statusBar().showMessage("Window maximized (Ctrl+M to restore)")
         
     def create_header(self):
         """Create header section"""
@@ -762,11 +808,308 @@ class FLExperimentGUI(QMainWindow):
         self.build_btn_emotion.clicked.connect(self.build_docker_images_emotion)
         docker_layout.addWidget(self.build_btn_emotion)
 
+        # Add separator
+        separator = QLabel("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        separator.setStyleSheet("color: #95a5a6; font-size: 10px; margin: 10px 0;")
+        docker_layout.addWidget(separator)
+        
+        unified_label = QLabel("🤖 RL-Unified Scenario (Dynamic Protocol Selection)")
+        unified_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #e74c3c; margin-top: 10px;")
+        docker_layout.addWidget(unified_label)
+
+        # Add Build Docker Images button for Unified scenarios
+        self.build_btn_unified_temp = QPushButton("🤖 Build Unified Images (Temperature Regulation)")
+        self.build_btn_unified_temp.setStyleSheet("font-size: 15px; padding: 10px; background-color: #e74c3c; color: white; border-radius: 6px;")
+        self.build_btn_unified_temp.clicked.connect(self.build_docker_images_unified_temperature)
+        docker_layout.addWidget(self.build_btn_unified_temp)
+
+        self.build_btn_unified_mental = QPushButton("🤖 Build Unified Images (Mental State)")
+        self.build_btn_unified_mental.setStyleSheet("font-size: 15px; padding: 10px; background-color: #e74c3c; color: white; border-radius: 6px;")
+        self.build_btn_unified_mental.clicked.connect(self.build_docker_images_unified_mentalstate)
+        docker_layout.addWidget(self.build_btn_unified_mental)
+
+        self.build_btn_unified_emotion = QPushButton("🤖 Build Unified Images (Emotion)")
+        self.build_btn_unified_emotion.setStyleSheet("font-size: 15px; padding: 10px; background-color: #e74c3c; color: white; border-radius: 6px;")
+        self.build_btn_unified_emotion.clicked.connect(self.build_docker_images_unified_emotion)
+        docker_layout.addWidget(self.build_btn_unified_emotion)
+
         docker_group.setLayout(docker_layout)
         layout.addWidget(docker_group)
 
         layout.addStretch()
         return widget
+    
+    def create_docker_cleanup_tab(self):
+        """Create Docker cleanup tab for removing images"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(15)
+        
+        # Single Protocol Images Cleanup
+        single_group = QGroupBox("🗑️ Delete Single Protocol Images")
+        single_group.setStyleSheet(self.get_group_style())
+        single_layout = QVBoxLayout()
+        
+        info_label = QLabel("Delete images for specific use case (all protocols)")
+        info_label.setStyleSheet("font-size: 12px; color: #666; padding: 5px;")
+        single_layout.addWidget(info_label)
+        
+        self.cleanup_btn_emotion = QPushButton("🗑️ Delete All Emotion Images (Single Protocol)")
+        self.cleanup_btn_emotion.setStyleSheet("font-size: 14px; padding: 10px; background-color: #e67e22; color: white; border-radius: 6px;")
+        self.cleanup_btn_emotion.clicked.connect(lambda: self.cleanup_docker_images("emotion", False))
+        single_layout.addWidget(self.cleanup_btn_emotion)
+        
+        self.cleanup_btn_mental = QPushButton("🗑️ Delete All Mental State Images (Single Protocol)")
+        self.cleanup_btn_mental.setStyleSheet("font-size: 14px; padding: 10px; background-color: #e67e22; color: white; border-radius: 6px;")
+        self.cleanup_btn_mental.clicked.connect(lambda: self.cleanup_docker_images("mentalstate", False))
+        single_layout.addWidget(self.cleanup_btn_mental)
+        
+        self.cleanup_btn_temp = QPushButton("🗑️ Delete All Temperature Images (Single Protocol)")
+        self.cleanup_btn_temp.setStyleSheet("font-size: 14px; padding: 10px; background-color: #e67e22; color: white; border-radius: 6px;")
+        self.cleanup_btn_temp.clicked.connect(lambda: self.cleanup_docker_images("temperature", False))
+        single_layout.addWidget(self.cleanup_btn_temp)
+        
+        single_group.setLayout(single_layout)
+        layout.addWidget(single_group)
+        
+        # Unified Images Cleanup
+        unified_group = QGroupBox("🤖 Delete Unified (RL) Images")
+        unified_group.setStyleSheet(self.get_group_style())
+        unified_layout = QVBoxLayout()
+        
+        info_label2 = QLabel("Delete unified scenario images for specific use case")
+        info_label2.setStyleSheet("font-size: 12px; color: #666; padding: 5px;")
+        unified_layout.addWidget(info_label2)
+        
+        self.cleanup_btn_unified_emotion = QPushButton("🤖 Delete Unified Emotion Images")
+        self.cleanup_btn_unified_emotion.setStyleSheet("font-size: 14px; padding: 10px; background-color: #c0392b; color: white; border-radius: 6px;")
+        self.cleanup_btn_unified_emotion.clicked.connect(lambda: self.cleanup_docker_images("emotion", True))
+        unified_layout.addWidget(self.cleanup_btn_unified_emotion)
+        
+        self.cleanup_btn_unified_mental = QPushButton("🤖 Delete Unified Mental State Images")
+        self.cleanup_btn_unified_mental.setStyleSheet("font-size: 14px; padding: 10px; background-color: #c0392b; color: white; border-radius: 6px;")
+        self.cleanup_btn_unified_mental.clicked.connect(lambda: self.cleanup_docker_images("mentalstate", True))
+        unified_layout.addWidget(self.cleanup_btn_unified_mental)
+        
+        self.cleanup_btn_unified_temp = QPushButton("🤖 Delete Unified Temperature Images")
+        self.cleanup_btn_unified_temp.setStyleSheet("font-size: 14px; padding: 10px; background-color: #c0392b; color: white; border-radius: 6px;")
+        self.cleanup_btn_unified_temp.clicked.connect(lambda: self.cleanup_docker_images("temperature", True))
+        unified_layout.addWidget(self.cleanup_btn_unified_temp)
+        
+        unified_group.setLayout(unified_layout)
+        layout.addWidget(unified_group)
+        
+        # All Images Cleanup
+        all_group = QGroupBox("💣 Delete ALL Docker Images")
+        all_group.setStyleSheet(self.get_group_style())
+        all_layout = QVBoxLayout()
+        
+        warning_label = QLabel("⚠️ WARNING: This will delete ALL FL Docker images!")
+        warning_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #c0392b; padding: 5px;")
+        all_layout.addWidget(warning_label)
+        
+        self.cleanup_btn_all = QPushButton("💣 Delete ALL FL Docker Images")
+        self.cleanup_btn_all.setStyleSheet("font-size: 14px; padding: 10px; background-color: #8b0000; color: white; border-radius: 6px;")
+        self.cleanup_btn_all.clicked.connect(self.cleanup_all_docker_images)
+        all_layout.addWidget(self.cleanup_btn_all)
+        
+        all_group.setLayout(all_layout)
+        layout.addWidget(all_group)
+        
+        layout.addStretch()
+        return widget
+    
+    def cleanup_docker_images(self, use_case, unified=False):
+        """Delete Docker images for specific use case"""
+        import subprocess
+        
+        # Build image name patterns
+        if unified:
+            pattern = f"docker-fl-.*-unified-{use_case}"
+            desc = f"unified {use_case}"
+        else:
+            # For single protocol, match all protocol-specific images
+            pattern = f"docker-fl-.*(mqtt|amqp|grpc|quic|dds)-{use_case}"
+            desc = f"single protocol {use_case}"
+        
+        # List matching images
+        try:
+            result = subprocess.run(
+                ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+                capture_output=True, text=True, timeout=10
+            )
+            
+            if result.returncode != 0:
+                QMessageBox.critical(self, "Error", "Failed to list Docker images")
+                return
+            
+            import re
+            images = [img for img in result.stdout.strip().split('\n') 
+                     if img and re.search(pattern, img)]
+            
+            if not images:
+                QMessageBox.information(self, "No Images Found", 
+                                       f"No {desc} images found to delete.")
+                return
+            
+            # Confirm deletion
+            image_list = '\n'.join(images)
+            reply = QMessageBox.question(
+                self, "Confirm Deletion",
+                f"Found {len(images)} image(s) to delete:\n\n{image_list}\n\n"
+                f"This will free up approximately {len(images) * 7.5:.1f} GB.\n\n"
+                "Are you sure you want to delete these images?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.No:
+                return
+            
+            # Disable appropriate button
+            if unified:
+                if use_case == "emotion":
+                    self.cleanup_btn_unified_emotion.setEnabled(False)
+                elif use_case == "mentalstate":
+                    self.cleanup_btn_unified_mental.setEnabled(False)
+                else:
+                    self.cleanup_btn_unified_temp.setEnabled(False)
+            else:
+                if use_case == "emotion":
+                    self.cleanup_btn_emotion.setEnabled(False)
+                elif use_case == "mentalstate":
+                    self.cleanup_btn_mental.setEnabled(False)
+                else:
+                    self.cleanup_btn_temp.setEnabled(False)
+            
+            # Delete images
+            self.docker_build_log_text.clear()
+            self.output_tabs.setCurrentWidget(self.docker_build_log_text)
+            self.docker_build_log_text.append(f"🗑️ Deleting {len(images)} {desc} images...\\n")
+            self.statusBar().showMessage(f"Deleting {len(images)} {desc} images...")
+            
+            deleted = 0
+            failed = 0
+            for img in images:
+                try:
+                    self.docker_build_log_text.append(f"Deleting: {img}")
+                    result = subprocess.run(
+                        ["docker", "rmi", "-f", img],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if result.returncode == 0:
+                        self.docker_build_log_text.append(f"  ✅ Deleted successfully")
+                        deleted += 1
+                    else:
+                        self.docker_build_log_text.append(f"  ❌ Failed: {result.stderr}")
+                        failed += 1
+                except Exception as e:
+                    self.docker_build_log_text.append(f"  ❌ Error: {str(e)}")
+                    failed += 1
+            
+            # Re-enable button
+            if unified:
+                if use_case == "emotion":
+                    self.cleanup_btn_unified_emotion.setEnabled(True)
+                elif use_case == "mentalstate":
+                    self.cleanup_btn_unified_mental.setEnabled(True)
+                else:
+                    self.cleanup_btn_unified_temp.setEnabled(True)
+            else:
+                if use_case == "emotion":
+                    self.cleanup_btn_emotion.setEnabled(True)
+                elif use_case == "mentalstate":
+                    self.cleanup_btn_mental.setEnabled(True)
+                else:
+                    self.cleanup_btn_temp.setEnabled(True)
+            
+            # Show summary
+            self.docker_build_log_text.append(f"\\n📊 Summary: {deleted} deleted, {failed} failed")
+            self.statusBar().showMessage(f"✅ Cleanup complete: {deleted} deleted, {failed} failed")
+            QMessageBox.information(self, "Cleanup Complete",
+                                   f"Deleted {deleted} images\\nFailed: {failed}")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error during cleanup: {str(e)}")
+            self.statusBar().showMessage("❌ Cleanup failed")
+    
+    def cleanup_all_docker_images(self):
+        """Delete ALL FL Docker images"""
+        import subprocess
+        
+        # List all FL images
+        try:
+            result = subprocess.run(
+                ["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"],
+                capture_output=True, text=True, timeout=10
+            )
+            
+            if result.returncode != 0:
+                QMessageBox.critical(self, "Error", "Failed to list Docker images")
+                return
+            
+            images = [img for img in result.stdout.strip().split('\\n') 
+                     if img and 'docker-fl-' in img]
+            
+            if not images:
+                QMessageBox.information(self, "No Images Found", 
+                                       "No FL Docker images found to delete.")
+                return
+            
+            # Strong confirmation
+            reply = QMessageBox.warning(
+                self, "⚠️ CONFIRM DELETION OF ALL IMAGES",
+                f"⚠️ WARNING: You are about to delete ALL {len(images)} FL Docker images!\\n\\n"
+                f"This will free up approximately {len(images) * 7.5:.1f} GB.\\n\\n"
+                "This action cannot be undone!\\n\\n"
+                "Are you ABSOLUTELY SURE?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.No:
+                return
+            
+            # Disable all cleanup buttons
+            self.cleanup_btn_all.setEnabled(False)
+            
+            # Delete images
+            self.docker_build_log_text.clear()
+            self.output_tabs.setCurrentWidget(self.docker_build_log_text)
+            self.docker_build_log_text.append(f"💣 Deleting ALL {len(images)} FL Docker images...\\n")
+            self.statusBar().showMessage(f"Deleting all {len(images)} FL images...")
+            
+            deleted = 0
+            failed = 0
+            for img in images:
+                try:
+                    self.docker_build_log_text.append(f"Deleting: {img}")
+                    result = subprocess.run(
+                        ["docker", "rmi", "-f", img],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if result.returncode == 0:
+                        self.docker_build_log_text.append(f"  ✅ Deleted")
+                        deleted += 1
+                    else:
+                        self.docker_build_log_text.append(f"  ❌ Failed")
+                        failed += 1
+                except Exception as e:
+                    self.docker_build_log_text.append(f"  ❌ Error: {str(e)}")
+                    failed += 1
+            
+            # Re-enable button
+            self.cleanup_btn_all.setEnabled(True)
+            
+            # Show summary
+            self.docker_build_log_text.append(f"\\n📊 Final Summary: {deleted} deleted, {failed} failed")
+            self.statusBar().showMessage(f"✅ Cleanup complete: {deleted} deleted, {failed} failed")
+            QMessageBox.information(self, "Cleanup Complete",
+                                   f"Deleted {deleted} images\\nFailed: {failed}\\n\\n"
+                                   f"Freed approximately {deleted * 7.5:.1f} GB")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Error during cleanup: {str(e)}")
+            self.statusBar().showMessage("❌ Cleanup failed")
+            self.cleanup_btn_all.setEnabled(True)
 
     def build_docker_images_emotion(self):
         """Build Docker images for the emotion use case and show output"""
@@ -778,17 +1121,19 @@ class FLExperimentGUI(QMainWindow):
         if not use_cache:
             cmd.append("--no-cache")
         self.statusBar().showMessage("🐳 Building Docker images for Emotion use case...")
-        # Disable the button directly
-        if hasattr(self, 'build_btn_emotion'):
-            self.build_btn_emotion.setEnabled(False)
+        
+        # Disable the button
+        self.build_btn_emotion.setEnabled(False)
         self.docker_build_log_text.clear()
         self.output_tabs.setCurrentWidget(self.docker_build_log_text)
+        self.docker_build_log_text.clear()
+        self.output_tabs.setCurrentWidget(self.docker_build_log_text)
+        
         # Start Docker build in a thread
         self.docker_build_thread = DockerBuildThread(cmd, base_dir)
         self.docker_build_thread.log_update.connect(self.docker_build_log_text.append)
         def on_build_finished(success, returncode):
-            if hasattr(self, 'build_btn_emotion'):
-                self.build_btn_emotion.setEnabled(True)
+            self.build_btn_emotion.setEnabled(True)
             if success and returncode == 0:
                 self.statusBar().showMessage("✅ Docker images built successfully (Emotion)")
                 self.docker_build_log_text.append("\n✅ Docker images built successfully (Emotion)")
@@ -808,18 +1153,25 @@ class FLExperimentGUI(QMainWindow):
         if not use_cache:
             cmd.append("--no-cache")
         self.statusBar().showMessage("🐳 Building Docker images for Mental State use case...")
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, cwd=base_dir, timeout=1800)
-            output = proc.stdout + "\n" + proc.stderr
-            if proc.returncode == 0:
+        
+        # Disable the button
+        self.build_btn_mental.setEnabled(False)
+        self.docker_build_log_text.clear()
+        self.output_tabs.setCurrentWidget(self.docker_build_log_text)
+        
+        # Start Docker build in a thread
+        self.docker_build_thread = DockerBuildThread(cmd, base_dir)
+        self.docker_build_thread.log_update.connect(self.docker_build_log_text.append)
+        def on_build_finished(success, returncode):
+            self.build_btn_mental.setEnabled(True)
+            if success and returncode == 0:
                 self.statusBar().showMessage("✅ Docker images built successfully (Mental State)")
-                QMessageBox.information(self, "Docker Build Complete", "Docker images for Mental State use case built successfully!\n\nOutput:\n" + output[-2000:])
+                self.docker_build_log_text.append("\n✅ Docker images built successfully (Mental State)")
             else:
                 self.statusBar().showMessage("❌ Docker build failed (Mental State)")
-                QMessageBox.critical(self, "Docker Build Failed", "Docker build failed!\n\nOutput:\n" + output[-2000:])
-        except Exception as e:
-            self.statusBar().showMessage("❌ Docker build error (Mental State)")
-            QMessageBox.critical(self, "Docker Build Error", f"Error running Docker build:\n{e}")
+                self.docker_build_log_text.append(f"\n❌ Docker build failed (Mental State), code {returncode}")
+        self.docker_build_thread.build_finished.connect(on_build_finished)
+        self.docker_build_thread.start()
 
     def build_docker_images_temperature(self):
         """Build Docker images for the temperature regulation use case and show output"""
@@ -831,18 +1183,109 @@ class FLExperimentGUI(QMainWindow):
         if not use_cache:
             cmd.append("--no-cache")
         self.statusBar().showMessage("🐳 Building Docker images for Temperature Regulation use case...")
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, cwd=base_dir, timeout=1800)
-            output = proc.stdout + "\n" + proc.stderr
-            if proc.returncode == 0:
+        
+        # Disable the button
+        self.build_btn_temp.setEnabled(False)
+        self.docker_build_log_text.clear()
+        self.output_tabs.setCurrentWidget(self.docker_build_log_text)
+        
+        # Start Docker build in a thread
+        self.docker_build_thread = DockerBuildThread(cmd, base_dir)
+        self.docker_build_thread.log_update.connect(self.docker_build_log_text.append)
+        def on_build_finished(success, returncode):
+            self.build_btn_temp.setEnabled(True)
+            if success and returncode == 0:
                 self.statusBar().showMessage("✅ Docker images built successfully (Temperature Regulation)")
-                QMessageBox.information(self, "Docker Build Complete", "Docker images for Temperature Regulation use case built successfully!\n\nOutput:\n" + output[-2000:])
+                self.docker_build_log_text.append("\n✅ Docker images built successfully (Temperature Regulation)")
             else:
                 self.statusBar().showMessage("❌ Docker build failed (Temperature Regulation)")
-                QMessageBox.critical(self, "Docker Build Failed", "Docker build failed!\n\nOutput:\n" + output[-2000:])
-        except Exception as e:
-            self.statusBar().showMessage("❌ Docker build error (Temperature Regulation)")
-            QMessageBox.critical(self, "Docker Build Error", f"Error running Docker build:\n{e}")
+                self.docker_build_log_text.append(f"\n❌ Docker build failed (Temperature Regulation), code {returncode}")
+        self.docker_build_thread.build_finished.connect(on_build_finished)
+        self.docker_build_thread.start()
+
+    def build_docker_images_unified_temperature(self):
+        """Build Docker images for unified RL scenario - temperature use case"""
+        use_cache = self.use_cache.isChecked()
+        compose_file = "Docker/docker-compose-unified-temperature.yml"
+        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        full_compose_path = f"{base_dir}/{compose_file}"
+        cmd = ["docker", "compose", "-f", full_compose_path, "build"]
+        if not use_cache:
+            cmd.append("--no-cache")
+        self.statusBar().showMessage("🤖 Building Unified Docker images for Temperature Regulation...")
+        if hasattr(self, 'build_btn_unified_temp'):
+            self.build_btn_unified_temp.setEnabled(False)
+        self.docker_build_log_text.clear()
+        self.output_tabs.setCurrentWidget(self.docker_build_log_text)
+        self.docker_build_thread = DockerBuildThread(cmd, base_dir)
+        self.docker_build_thread.log_update.connect(self.docker_build_log_text.append)
+        def on_build_finished(success, returncode):
+            if hasattr(self, 'build_btn_unified_temp'):
+                self.build_btn_unified_temp.setEnabled(True)
+            if success and returncode == 0:
+                self.statusBar().showMessage("✅ Unified images built successfully (Temperature)")
+                self.docker_build_log_text.append("\n✅ Unified Docker images built successfully (Temperature)")
+            else:
+                self.statusBar().showMessage("❌ Unified build failed (Temperature)")
+                self.docker_build_log_text.append(f"\n❌ Unified Docker build failed (Temperature), code {returncode}")
+        self.docker_build_thread.build_finished.connect(on_build_finished)
+        self.docker_build_thread.start()
+
+    def build_docker_images_unified_mentalstate(self):
+        """Build Docker images for unified RL scenario - mentalstate use case"""
+        use_cache = self.use_cache.isChecked()
+        compose_file = "Docker/docker-compose-unified-mentalstate.yml"
+        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        full_compose_path = f"{base_dir}/{compose_file}"
+        cmd = ["docker", "compose", "-f", full_compose_path, "build"]
+        if not use_cache:
+            cmd.append("--no-cache")
+        self.statusBar().showMessage("🤖 Building Unified Docker images for Mental State...")
+        if hasattr(self, 'build_btn_unified_mental'):
+            self.build_btn_unified_mental.setEnabled(False)
+        self.docker_build_log_text.clear()
+        self.output_tabs.setCurrentWidget(self.docker_build_log_text)
+        self.docker_build_thread = DockerBuildThread(cmd, base_dir)
+        self.docker_build_thread.log_update.connect(self.docker_build_log_text.append)
+        def on_build_finished(success, returncode):
+            if hasattr(self, 'build_btn_unified_mental'):
+                self.build_btn_unified_mental.setEnabled(True)
+            if success and returncode == 0:
+                self.statusBar().showMessage("✅ Unified images built successfully (Mental State)")
+                self.docker_build_log_text.append("\n✅ Unified Docker images built successfully (Mental State)")
+            else:
+                self.statusBar().showMessage("❌ Unified build failed (Mental State)")
+                self.docker_build_log_text.append(f"\n❌ Unified Docker build failed (Mental State), code {returncode}")
+        self.docker_build_thread.build_finished.connect(on_build_finished)
+        self.docker_build_thread.start()
+
+    def build_docker_images_unified_emotion(self):
+        """Build Docker images for unified RL scenario - emotion use case"""
+        use_cache = self.use_cache.isChecked()
+        compose_file = "Docker/docker-compose-unified-emotion.yml"
+        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        full_compose_path = f"{base_dir}/{compose_file}"
+        cmd = ["docker", "compose", "-f", full_compose_path, "build"]
+        if not use_cache:
+            cmd.append("--no-cache")
+        self.statusBar().showMessage("🤖 Building Unified Docker images for Emotion...")
+        if hasattr(self, 'build_btn_unified_emotion'):
+            self.build_btn_unified_emotion.setEnabled(False)
+        self.docker_build_log_text.clear()
+        self.output_tabs.setCurrentWidget(self.docker_build_log_text)
+        self.docker_build_thread = DockerBuildThread(cmd, base_dir)
+        self.docker_build_thread.log_update.connect(self.docker_build_log_text.append)
+        def on_build_finished(success, returncode):
+            if hasattr(self, 'build_btn_unified_emotion'):
+                self.build_btn_unified_emotion.setEnabled(True)
+            if success and returncode == 0:
+                self.statusBar().showMessage("✅ Unified images built successfully (Emotion)")
+                self.docker_build_log_text.append("\n✅ Unified Docker images built successfully (Emotion)")
+            else:
+                self.statusBar().showMessage("❌ Unified build failed (Emotion)")
+                self.docker_build_log_text.append(f"\n❌ Unified Docker build failed (Emotion), code {returncode}")
+        self.docker_build_thread.build_finished.connect(on_build_finished)
+        self.docker_build_thread.start()
 
     def create_monitoring_output_section(self):
         """Create comprehensive monitoring and output section, with Packet Logs tab"""
@@ -1025,27 +1468,37 @@ class FLExperimentGUI(QMainWindow):
         client_tab_layout.addWidget(self.client_log_text)
         self.output_tabs.addTab(client_tab_widget, "💻 Client Logs")
 
-        # Tab 5: Packet Logs
-        packet_tab_widget = QWidget()
-        packet_tab_layout = QVBoxLayout(packet_tab_widget)
-        packet_tab_layout.setSpacing(5)
-        refresh_btn = QPushButton("🔄 Refresh Packet Logs")
-        refresh_btn.setStyleSheet("padding: 6px 12px; font-size: 12px;")
-        refresh_btn.clicked.connect(self.refresh_packet_log_table)
-        packet_tab_layout.addWidget(refresh_btn)
-        self.packet_log_table = QTableWidget()
-        self.packet_log_table.setColumnCount(7)
-        self.packet_log_table.setHorizontalHeaderLabels([
-            "Type", "Timestamp", "Size (B)", "Peer", "Protocol", "Round", "Extra Info"
-        ])
-        self.packet_log_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.packet_log_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.packet_log_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.packet_log_table.setStyleSheet("font-size: 11px;")
-        packet_tab_layout.addWidget(self.packet_log_table)
-        packet_tab_widget.setLayout(packet_tab_layout)
-        self.output_tabs.addTab(packet_tab_widget, "📦 Packet Logs")
-        QTimer.singleShot(100, self.refresh_packet_log_table)
+        # Tab 5: Packet Logs (Full-Featured Component)
+        try:
+            from packet_logs_tab import PacketLogsTab
+            self.packet_logs_tab = PacketLogsTab()
+            self.output_tabs.addTab(self.packet_logs_tab, "📦 Packet Logs")
+        except ImportError as e:
+            # Fallback to simple table if PacketLogsTab not available
+            packet_tab_widget = QWidget()
+            packet_tab_layout = QVBoxLayout(packet_tab_widget)
+            packet_tab_layout.setSpacing(5)
+            error_label = QLabel(f"⚠️ Advanced Packet Logs unavailable: {e}")
+            error_label.setStyleSheet("color: orange; padding: 10px;")
+            packet_tab_layout.addWidget(error_label)
+            refresh_btn = QPushButton("🔄 Refresh Packet Logs")
+            refresh_btn.setStyleSheet("padding: 6px 12px; font-size: 12px;")
+            refresh_btn.clicked.connect(self.refresh_packet_log_table)
+            packet_tab_layout.addWidget(refresh_btn)
+            self.packet_log_table = QTableWidget()
+            self.packet_log_table.setColumnCount(7)
+            self.packet_log_table.setHorizontalHeaderLabels([
+                "Type", "Timestamp", "Size (B)", "Peer", "Protocol", "Round", "Extra Info"
+            ])
+            self.packet_log_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            self.packet_log_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self.packet_log_table.setSelectionBehavior(QTableWidget.SelectRows)
+            self.packet_log_table.setStyleSheet("font-size: 11px;")
+            packet_tab_layout.addWidget(self.packet_log_table)
+            packet_tab_widget.setLayout(packet_tab_layout)
+            self.output_tabs.addTab(packet_tab_widget, "📦 Packet Logs (Simple)")
+            QTimer.singleShot(100, self.refresh_packet_log_table)
+            self.packet_logs_tab = None
 
         # Add Docker Build Logs tab
         self.docker_build_log_text = QTextEdit()
@@ -1067,11 +1520,27 @@ class FLExperimentGUI(QMainWindow):
         return widget
 
     def refresh_packet_log_table(self):
+        """Refresh packet log table (fallback simple version)"""
         import sqlite3
-        db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../packet_logs.db')
-        db_path = os.path.abspath(db_path)
+        # Check shared_data directory first (for unified scenario)
+        shared_db_server = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'shared_data', 'packet_logs_server.db')
+        # Fallback to old location
+        old_db_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'packet_logs.db')
+        
+        db_path = shared_db_server if os.path.exists(shared_db_server) else old_db_path
+        
+        if not hasattr(self, 'packet_log_table'):
+            return  # Skip if using PacketLogsTab component
+        
         self.packet_log_table.setRowCount(0)
         try:
+            if not os.path.exists(db_path):
+                self.packet_log_table.setRowCount(1)
+                from PyQt5.QtWidgets import QTableWidgetItem
+                self.packet_log_table.setItem(0, 0, QTableWidgetItem("Info"))
+                self.packet_log_table.setItem(0, 1, QTableWidgetItem(f"No database found at {db_path}"))
+                return
+            
             conn = sqlite3.connect(db_path)
             c = conn.cursor()
             c.execute('SELECT timestamp, packet_size, peer, protocol, round, extra_info FROM sent_packets ORDER BY timestamp DESC LIMIT 100')
@@ -1115,21 +1584,53 @@ class FLExperimentGUI(QMainWindow):
         return group
     
     def create_checkbox_group(self, title, options):
-        """Create a checkbox group"""
+        """Create a checkbox group with optional scrolling for many options"""
         group = QGroupBox(title)
         group.setStyleSheet(self.get_group_style())
-        layout = QGridLayout()
         
-        for i, (label, value, checked) in enumerate(options):
-            checkbox = QCheckBox(label)
-            checkbox.setProperty("value", value)
-            checkbox.setChecked(checked)
-            checkbox.setStyleSheet("font-size: 13px; padding: 5px;")
-            row = i // 3
-            col = i % 3
-            layout.addWidget(checkbox, row, col)
+        # Determine if we need scroll area (more than 6 options)
+        if len(options) > 6:
+            # Create scroll area for many options
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setMaximumHeight(250)
+            scroll.setStyleSheet("QScrollArea { background: transparent; }")
+            
+            content = QWidget()
+            layout = QGridLayout(content)
+            layout.setSpacing(8)
+            
+            for i, (label, value, checked) in enumerate(options):
+                checkbox = QCheckBox(label)
+                checkbox.setProperty("value", value)
+                checkbox.setChecked(checked)
+                checkbox.setStyleSheet("font-size: 13px; padding: 5px;")
+                row = i // 3
+                col = i % 3
+                layout.addWidget(checkbox, row, col)
+            
+            scroll.setWidget(content)
+            
+            main_layout = QVBoxLayout()
+            main_layout.addWidget(scroll)
+            group.setLayout(main_layout)
+        else:
+            # Simple grid layout for few options
+            layout = QGridLayout()
+            layout.setSpacing(8)
+            
+            for i, (label, value, checked) in enumerate(options):
+                checkbox = QCheckBox(label)
+                checkbox.setProperty("value", value)
+                checkbox.setChecked(checked)
+                checkbox.setStyleSheet("font-size: 13px; padding: 5px;")
+                row = i // 3
+                col = i % 3
+                layout.addWidget(checkbox, row, col)
+            
+            group.setLayout(layout)
         
-        group.setLayout(layout)
         return group
     
     def toggle_quantization_options(self, enabled):
@@ -1182,22 +1683,30 @@ class FLExperimentGUI(QMainWindow):
             if result.returncode == 0:
                 clients = [c.strip() for c in result.stdout.strip().split('\n') if c.strip()]
                 
-                # Update network target dropdown
+                # Update network target dropdown - block signals to prevent recursion
                 current_value = self.network_target.currentData()
-                self.network_target.clear()
-                self.network_target.addItem("All Clients", "all")
-                self.network_target.addItem("Server", "server")
                 
-                for client in clients:
-                    # Extract client number from container name
-                    if 'client' in client.lower():
-                        client_label = client.replace('_', ' ').title()
-                        self.network_target.addItem(f"🖥️ {client_label}", client)
+                # Block signals temporarily to prevent infinite recursion
+                self.network_target.blockSignals(True)
                 
-                # Restore previous selection if still available
-                index = self.network_target.findData(current_value)
-                if index >= 0:
-                    self.network_target.setCurrentIndex(index)
+                try:
+                    self.network_target.clear()
+                    self.network_target.addItem("All Clients", "all")
+                    self.network_target.addItem("Server", "server")
+                    
+                    for client in clients:
+                        # Extract client number from container name
+                        if 'client' in client.lower():
+                            client_label = client.replace('_', ' ').title()
+                            self.network_target.addItem(f"🖥️ {client_label}", client)
+                    
+                    # Restore previous selection if still available
+                    index = self.network_target.findData(current_value)
+                    if index >= 0:
+                        self.network_target.setCurrentIndex(index)
+                finally:
+                    # Re-enable signals
+                    self.network_target.blockSignals(False)
                 
                 self.output_text.append(f"✅ Detected {len(clients)} client container(s)\n")
             

@@ -1,11 +1,9 @@
-version: '3.8'
-
 services:
   # ============================================================================
   # BROKERS - Required for MQTT and AMQP protocols
   # ============================================================================
   
-  mqtt-broker:
+  mqtt-broker-unified:
     image: eclipse-mosquitto:latest
     container_name: mqtt-broker-unified
     ports:
@@ -17,7 +15,7 @@ services:
       - fl-network
     command: mosquitto -c /mosquitto/config/mosquitto.conf
   
-  amqp-broker:
+  amqp-broker-unified:
     image: rabbitmq:3-management
     container_name: amqp-broker-unified
     ports:
@@ -36,9 +34,10 @@ services:
   fl-server-unified-mentalstate:
     build:
       context: ..
-      dockerfile: Server/MentalState_Recognition/Dockerfile
+      dockerfile: Server/Dockerfile
     container_name: fl-server-unified-mentalstate
     environment:
+      - NODE_TYPE=server
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
       - MQTT_BROKER=mqtt-broker-unified
@@ -51,14 +50,15 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
     volumes:
-      - ../Server/MentalState_Recognition:/app
+      - ../Server/MentalState_Recognition:/app/Server/MentalState_Recognition
       - ../experiment_results:/app/results
+      - ../shared_data:/shared_data
     networks:
       - fl-network
     depends_on:
-      - mqtt-broker
-      - amqp-broker
-    command: python3 FL_Server_Unified.py
+      - mqtt-broker-unified
+      - amqp-broker-unified
+    command: python3 Server/MentalState_Recognition/FL_Server_Unified.py
     deploy:
       resources:
         reservations:
@@ -74,9 +74,10 @@ services:
   fl-client-unified-mentalstate-1:
     build:
       context: ..
-      dockerfile: Client/MentalState_Recognition/Dockerfile
+      dockerfile: Client/Dockerfile
     container_name: fl-client-unified-mentalstate-1
     environment:
+      - NODE_TYPE=client
       - CLIENT_ID=1
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
@@ -90,15 +91,16 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
     volumes:
-      - ../Client/MentalState_Recognition:/app
+      - ../Client/MentalState_Recognition:/app/Client/MentalState_Recognition
       - ../experiment_results:/app/results
+      - ../shared_data:/shared_data
     networks:
       - fl-network
     depends_on:
       - fl-server-unified-mentalstate
-      - mqtt-broker
-      - amqp-broker
-    command: python3 FL_Client_Unified.py
+      - mqtt-broker-unified
+      - amqp-broker-unified
+    command: python3 Client/MentalState_Recognition/FL_Client_Unified.py
     deploy:
       resources:
         reservations:
@@ -110,9 +112,10 @@ services:
   fl-client-unified-mentalstate-2:
     build:
       context: ..
-      dockerfile: Client/MentalState_Recognition/Dockerfile
+      dockerfile: Client/Dockerfile
     container_name: fl-client-unified-mentalstate-2
     environment:
+      - NODE_TYPE=client
       - CLIENT_ID=2
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
@@ -126,15 +129,16 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
     volumes:
-      - ../Client/MentalState_Recognition:/app
+      - ../Client/MentalState_Recognition:/app/Client/MentalState_Recognition
       - ../experiment_results:/app/results
+      - ../shared_data:/shared_data
     networks:
       - fl-network
     depends_on:
       - fl-server-unified-mentalstate
-      - mqtt-broker
-      - amqp-broker
-    command: python3 FL_Client_Unified.py
+      - mqtt-broker-unified
+      - amqp-broker-unified
+    command: python3 Client/MentalState_Recognition/FL_Client_Unified.py
     deploy:
       resources:
         reservations:

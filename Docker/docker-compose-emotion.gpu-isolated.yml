@@ -38,6 +38,8 @@ services:
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     cap_add:
       - NET_ADMIN
+    volumes:
+      - ../Server/Emotion_Recognition/packet_logger.db:/app/Server/Emotion_Recognition/packet_logger.db
     depends_on:
       - mqtt-broker
     networks:
@@ -82,6 +84,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../Client/Emotion_Recognition/packet_logger.db:/app/Client/Emotion_Recognition/packet_logger.db
 
   fl-client-mqtt-emotion-2:
     build:
@@ -119,6 +123,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../Client/Emotion_Recognition/packet_logger.db:/app/Client/Emotion_Recognition/packet_logger.db
 
   # ============================================================================
   # AMQP Protocol Services

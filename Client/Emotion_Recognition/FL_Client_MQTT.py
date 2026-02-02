@@ -207,7 +207,7 @@ class FederatedLearningClient:
                 peer=msg.topic,  # or client_id/server_id as appropriate
                 protocol="MQTT",
                 round=self.current_round if hasattr(self, 'current_round') else None,
-                extra_info="any additional info"
+                extra_info=msg.topic
             )
             
             if msg.topic == TOPIC_GLOBAL_MODEL:

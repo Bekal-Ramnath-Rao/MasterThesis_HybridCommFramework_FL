@@ -17,7 +17,7 @@ import pickle
 import base64
 import logging
 import threading
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List, Sequence
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
@@ -52,6 +52,73 @@ except ImportError:
     StreamDataReceived = None
     QuicConnectionProtocol = None
 
+try:
+    from cyclonedds.domain import DomainParticipant
+    from cyclonedds.topic import Topic
+    from cyclonedds.pub import DataWriter
+    from cyclonedds.sub import DataReader
+    from cyclonedds.util import duration
+    from cyclonedds.core import Qos, Policy
+    from cyclonedds.idl import IdlStruct
+    from cyclonedds.idl.types import sequence
+    from dataclasses import dataclass
+    DDS_AVAILABLE = True
+except ImportError:
+    DDS_AVAILABLE = False
+    dataclass = lambda x: x
+    IdlStruct = object
+
+# Define QUIC protocol handler if available
+if QuicConnectionProtocol is not None:
+    class UnifiedClientQUICProtocol(QuicConnectionProtocol):
+        """QUIC protocol handler for receiving server messages"""
+        def __init__(self, client, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.client = client
+            self.stream_buffers = {}
+        
+        def quic_event_received(self, event):
+            if isinstance(event, StreamDataReceived):
+                # Buffer stream data
+                stream_id = event.stream_id
+                if stream_id not in self.stream_buffers:
+                    self.stream_buffers[stream_id] = b''
+                
+                self.stream_buffers[stream_id] += event.data
+                
+                # Process complete messages (newline-delimited)
+                while b'\n' in self.stream_buffers[stream_id]:
+                    msg_data, self.stream_buffers[stream_id] = self.stream_buffers[stream_id].split(b'\n', 1)
+                    if msg_data:
+                        try:
+                            message = json.loads(msg_data.decode().strip())
+                            # Handle message in sync context
+                            self.client._handle_quic_message(message)
+                        except Exception as e:
+                            print(f"[QUIC] Client {self.client.client_id} error decoding message: {e}")
+                
+                # Process remaining buffer if stream ended
+                if event.end_stream and self.stream_buffers[stream_id]:
+                    try:
+                        message = json.loads(self.stream_buffers[stream_id].decode().strip())
+                        self.client._handle_quic_message(message)
+                        self.stream_buffers[stream_id] = b''
+                    except Exception as e:
+                        print(f"[QUIC] Client {self.client.client_id} error decoding end-stream: {e}")
+else:
+    UnifiedClientQUICProtocol = None
+
+# Detect Docker environment and set project root
+if os.path.exists('/app'):
+    project_root = '/app'
+else:
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from packet_logger import init_db, log_sent_packet, log_received_packet
+
 # Import custom modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
@@ -63,6 +130,23 @@ except ImportError:
 # Suppress TensorFlow warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
+
+# Configure GPU - Force GPU 0 usage with memory growth
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+try:
+    gpus = tf.config.list_physical_devices('GPU')
+    if gpus:
+        # Enable memory growth to prevent OOM errors
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        # Set GPU 0 as the only visible device
+        tf.config.set_visible_devices(gpus[0], 'GPU')
+        print(f"[GPU] Configured to use GPU 0: {gpus[0]}")
+        print(f"[GPU] Memory growth enabled")
+    else:
+        print("[WARNING] No GPU devices found, using CPU")
+except Exception as e:
+    print(f"[WARNING] GPU configuration failed: {e}, using CPU")
 
 # Environment variables
 CLIENT_ID = int(os.getenv("CLIENT_ID", "1"))
@@ -81,6 +165,47 @@ TOPIC_TRAINING_CONFIG = "fl/training_config"
 TOPIC_START_TRAINING = "fl/start_training"
 TOPIC_START_EVALUATION = "fl/start_evaluation"
 TOPIC_TRAINING_COMPLETE = "fl/training_complete"
+
+# DDS Configuration
+DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
+
+# DDS Data Structures (must be defined at module level for Python 3.8)
+if DDS_AVAILABLE:
+    from dataclasses import dataclass, field
+    
+    @dataclass
+    class GlobalModel(IdlStruct):
+        round: int
+        weights: sequence[int]  # CycloneDDS sequence type for sequence<octet> in IDL
+    
+    @dataclass
+    class TrainingCommand(IdlStruct):
+        round: int
+        start_training: bool
+        start_evaluation: bool
+        training_complete: bool
+    
+    @dataclass
+    class ModelUpdate(IdlStruct):
+        client_id: int
+        round: int
+        weights: sequence[int]  # CycloneDDS sequence type for sequence<octet> in IDL
+        num_samples: int
+        loss: float
+        mse: float
+        mae: float
+        mape: float
+    
+    @dataclass
+    class EvaluationMetrics(IdlStruct):
+        client_id: int
+        round: int
+        num_samples: int
+        loss: float
+        accuracy: float
+        mse: float
+        mae: float
+        mape: float
 
 
 class UnifiedFLClient_Emotion:
@@ -136,6 +261,60 @@ class UnifiedFLClient_Emotion:
             'success': False
         }
         
+        # DDS Components
+        if DDS_AVAILABLE:
+            try:
+                # Create DDS participant
+                self.dds_participant = DomainParticipant(DDS_DOMAIN_ID)
+                
+                # Create QoS for reliable communication
+                qos = Qos(
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+                    Policy.History.KeepLast(10),
+                    Policy.Durability.TransientLocal
+                )
+                
+                # Create topics and writers
+                self.dds_update_topic = Topic(self.dds_participant, "ModelUpdate", ModelUpdate)
+                self.dds_update_writer = DataWriter(self.dds_participant, self.dds_update_topic, qos=qos)
+                
+                self.dds_metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
+                self.dds_metrics_writer = DataWriter(self.dds_participant, self.dds_metrics_topic, qos=qos)
+                
+                print(f"[DDS] Client {client_id} initialized on domain {DDS_DOMAIN_ID}")
+            except Exception as e:
+                print(f"[DDS] Initialization failed: {e}")
+                self.dds_participant = None
+                self.dds_update_writer = None
+                self.dds_metrics_writer = None
+        else:
+            self.dds_participant = None
+            self.dds_update_writer = None
+            self.dds_metrics_writer = None
+        
+        # Initialize packet logger
+        init_db()
+        
+        # QUIC persistent connection components
+        self.quic_protocol = None
+        self.quic_connection_task = None
+        self.quic_loop = None
+        self.quic_thread = None
+        
+        # AMQP listener components
+        self.amqp_listener_connection = None
+        self.amqp_listener_channel = None
+        self.amqp_listener_thread = None
+        
+        # DDS listener components
+        self.dds_listener_thread = None
+        self.dds_global_model_reader = None
+        self.dds_command_reader = None
+        
+        # gRPC listener components
+        self.grpc_listener_thread = None
+        self.grpc_stub = None
+        
         # Initialize MQTT client for listening (always used for signal/sync)
         self.mqtt_client = mqtt.Client(client_id=f"fl_client_{client_id}", protocol=mqtt.MQTTv311)
         self.mqtt_client.max_inflight_messages_set(20)
@@ -151,6 +330,9 @@ class UnifiedFLClient_Emotion:
         print(f"Client ID: {self.client_id}/{self.num_clients}")
         print(f"RL Protocol Selection: {'ENABLED' if USE_RL_SELECTION else 'DISABLED'}")
         print(f"{'='*70}\n")
+        
+        # Start protocol listeners in background threads
+        self.start_all_protocol_listeners()
     
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
@@ -166,8 +348,15 @@ class UnifiedFLClient_Emotion:
             time.sleep(2)
             
             # Send registration message
-            self.mqtt_client.publish("fl/client_register", 
-                                    json.dumps({"client_id": self.client_id}), qos=1)
+            registration_msg = json.dumps({"client_id": self.client_id})
+            self.mqtt_client.publish("fl/client_register", registration_msg, qos=1)
+            log_sent_packet(
+                packet_size=len(registration_msg),
+                peer="server",
+                protocol="MQTT",
+                round=0,
+                extra_info="registration"
+            )
             print(f"  Registration message sent\n")
         else:
             print(f"Client {self.client_id} failed to connect, return code {rc}")
@@ -175,6 +364,14 @@ class UnifiedFLClient_Emotion:
     def on_message(self, client, userdata, msg):
         """Callback when message received"""
         try:
+            log_received_packet(
+                packet_size=len(msg.payload),
+                peer="server",
+                protocol="MQTT",
+                round=self.current_round,
+                extra_info=msg.topic
+            )
+            
             if msg.topic == TOPIC_GLOBAL_MODEL:
                 self.handle_global_model(msg.payload)
             elif msg.topic == TOPIC_TRAINING_CONFIG:
@@ -192,6 +389,9 @@ class UnifiedFLClient_Emotion:
     
     def on_disconnect(self, client, userdata, rc):
         """Callback when disconnected from MQTT broker"""
+        # Cleanup QUIC connection
+        self.cleanup()
+        
         if rc == 0:
             print(f"\nClient {self.client_id} clean disconnect from broker")
             print(f"Client {self.client_id} exiting...")
@@ -200,6 +400,366 @@ class UnifiedFLClient_Emotion:
             sys.exit(0)
         else:
             print(f"Client {self.client_id} unexpected disconnect, return code {rc}")
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        if self.quic_connection_task and self.quic_loop:
+            try:
+                # Cancel the QUIC connection task
+                self.quic_loop.call_soon_threadsafe(self.quic_connection_task.cancel)
+            except:
+                pass
+        
+        # Cleanup AMQP listener
+        if self.amqp_listener_connection and not self.amqp_listener_connection.is_closed:
+            try:
+                self.amqp_listener_connection.close()
+            except:
+                pass
+    
+    # =========================================================================
+    # PROTOCOL LISTENERS - Start all protocol listeners for receiving responses
+    # =========================================================================
+    
+    def start_all_protocol_listeners(self):
+        """Start listeners for all protocols (mirroring single-protocol implementations)"""
+        print("[Client] Starting protocol listeners...")
+        
+        # MQTT already started in __init__
+        
+        # Start AMQP listener
+        if pika is not None:
+            self.start_amqp_listener()
+        
+        # Start DDS listener
+        if DDS_AVAILABLE:
+            self.start_dds_listener()
+        
+        # Start gRPC listener
+        if grpc is not None:
+            self.start_grpc_listener()
+        
+        # Start QUIC persistent connection listener
+        if asyncio is not None and connect is not None:
+            self.start_quic_listener()
+        
+        print("[Client] All protocol listeners started\n")
+    
+    # -------------------------------------------------------------------------
+    # AMQP LISTENER
+    # -------------------------------------------------------------------------
+    
+    def start_amqp_listener(self):
+        """Start AMQP consumer thread (mirrors FL_Client_AMQP.py)"""
+        def amqp_consumer_loop():
+            # Retry with exponential backoff for startup race condition
+            max_retries = 5
+            retry_delay = 2
+            
+            for attempt in range(max_retries):
+                try:
+                    if attempt > 0:
+                        print(f"[AMQP] Retry {attempt}/{max_retries} after {retry_delay}s...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    
+                    credentials = pika.PlainCredentials('guest', 'guest')
+                    parameters = pika.ConnectionParameters(
+                        host=os.getenv("AMQP_HOST", "rabbitmq-broker-unified"),
+                        port=int(os.getenv("AMQP_PORT", "5672")),
+                        credentials=credentials,
+                        heartbeat=600,
+                        blocked_connection_timeout=300
+                    )
+                    
+                    self.amqp_listener_connection = pika.BlockingConnection(parameters)
+                    self.amqp_listener_channel = self.amqp_listener_connection.channel()
+                    
+                    # Declare client-specific queues (server creates these)
+                    queue_global_model = f'client_{self.client_id}_global_model'
+                    queue_start_evaluation = f'client_{self.client_id}_start_evaluation'
+                    
+                    self.amqp_listener_channel.queue_declare(queue=queue_global_model, durable=True)
+                    self.amqp_listener_channel.queue_declare(queue=queue_start_evaluation, durable=True)
+                    
+                    # Set up consumers
+                    self.amqp_listener_channel.basic_consume(
+                        queue=queue_global_model,
+                        on_message_callback=self.on_amqp_global_model,
+                        auto_ack=True
+                    )
+                    self.amqp_listener_channel.basic_consume(
+                        queue=queue_start_evaluation,
+                        on_message_callback=self.on_amqp_start_evaluation,
+                        auto_ack=True
+                    )
+                    
+                    print(f"[AMQP] Listener started for client {self.client_id}")
+                    
+                    # Start consuming (blocks in this thread)
+                    self.amqp_listener_channel.start_consuming()
+                    break  # Success - exit retry loop
+                    
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        print(f"[AMQP] Listener failed after {max_retries} attempts: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    else:
+                        print(f"[AMQP] Connection attempt {attempt + 1} failed: {e}")
+        
+        self.amqp_listener_thread = threading.Thread(target=amqp_consumer_loop, daemon=True, name=f"AMQP-Listener-{self.client_id}")
+        self.amqp_listener_thread.start()
+    
+    def on_amqp_global_model(self, ch, method, properties, body):
+        """AMQP callback: received global model"""
+        try:
+            log_received_packet(
+                packet_size=len(body),
+                peer="server",
+                protocol="AMQP",
+                round=self.current_round,
+                extra_info="global_model"
+            )
+            
+            data = json.loads(body.decode())
+            round_num = data['round']
+            print(f"[AMQP] Client {self.client_id} received global model for round {round_num}")
+            
+            # Deserialize weights
+            if 'quantized_data' in data:
+                compressed_data = pickle.loads(base64.b64decode(data['quantized_data']))
+                weights = self.quantizer.decompress_global_model(compressed_data) if self.quantizer else None
+            else:
+                weights = self.deserialize_weights(data['weights'])
+            
+            # Update model
+            if self.model and round_num > self.last_global_round:
+                self.model.set_weights(weights)
+                self.last_global_round = round_num
+                print(f"[AMQP] Client {self.client_id} updated model weights for round {round_num}")
+                
+        except Exception as e:
+            print(f"[AMQP] Client {self.client_id} error handling global model: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def on_amqp_start_evaluation(self, ch, method, properties, body):
+        """AMQP callback: received start evaluation signal"""
+        try:
+            log_received_packet(
+                packet_size=len(body),
+                peer="server",
+                protocol="AMQP",
+                round=self.current_round,
+                extra_info="start_evaluation"
+            )
+            
+            data = json.loads(body.decode())
+            round_num = data['round']
+            
+            if round_num == self.current_round and round_num not in self.evaluated_rounds:
+                print(f"[AMQP] Client {self.client_id} starting evaluation for round {round_num}")
+                self.evaluate_model()
+                
+        except Exception as e:
+            print(f"[AMQP] Client {self.client_id} error handling evaluation signal: {e}")
+    
+    # -------------------------------------------------------------------------
+    # DDS LISTENER
+    # -------------------------------------------------------------------------
+    
+    def start_dds_listener(self):
+        """Start DDS reader polling thread (mirrors FL_Client_DDS.py)"""
+        def dds_listener_loop():
+            try:
+                # Create readers for GlobalModel and TrainingCommand
+                from cyclonedds.core import Qos, Policy
+                from cyclonedds.util import duration
+                from cyclonedds.topic import Topic
+                
+                reliable_qos = Qos(
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+                    Policy.History.KeepLast(10),
+                    Policy.Durability.TransientLocal
+                )
+                
+                topic_global_model = Topic(self.dds_participant, "GlobalModel", GlobalModel)
+                topic_command = Topic(self.dds_participant, "TrainingCommand", TrainingCommand)
+                
+                self.dds_global_model_reader = DataReader(self.dds_participant, topic_global_model, qos=reliable_qos)
+                self.dds_command_reader = DataReader(self.dds_participant, topic_command, qos=reliable_qos)
+                
+                print(f"[DDS] Listener started for client {self.client_id}")
+                
+                # Polling loop
+                while True:
+                    # Check for global model
+                    for sample in self.dds_global_model_reader.take():
+                        if sample:
+                            self.on_dds_global_model(sample)
+                    
+                    # Check for commands
+                    for sample in self.dds_command_reader.take():
+                        if sample:
+                            self.on_dds_command(sample)
+                    
+                    time.sleep(0.1)  # Poll every 100ms
+                    
+            except Exception as e:
+                print(f"[DDS] Listener error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        self.dds_listener_thread = threading.Thread(target=dds_listener_loop, daemon=True, name=f"DDS-Listener-{self.client_id}")
+        self.dds_listener_thread.start()
+    
+    def on_dds_global_model(self, sample):
+        """DDS callback: received global model"""
+        try:
+            round_num = sample.round
+            print(f"[DDS] Client {self.client_id} received global model for round {round_num}")
+            
+            log_received_packet(
+                packet_size=len(sample.weights),
+                peer="server",
+                protocol="DDS",
+                round=self.current_round,
+                extra_info="global_model"
+            )
+            
+            # Deserialize weights (DDS uses sequence[int])
+            weights_bytes = bytes(sample.weights)
+            weights = pickle.loads(weights_bytes)
+            
+            # Update model
+            if self.model and round_num > self.last_global_round:
+                self.model.set_weights(weights)
+                self.last_global_round = round_num
+                print(f"[DDS] Client {self.client_id} updated model weights for round {round_num}")
+                
+        except Exception as e:
+            print(f"[DDS] Client {self.client_id} error handling global model: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def on_dds_command(self, sample):
+        """DDS callback: received training command"""
+        try:
+            log_received_packet(
+                packet_size=32,  # Approximate size
+                peer="server",
+                protocol="DDS",
+                round=self.current_round,
+                extra_info="command"
+            )
+            
+            if sample.start_evaluation and sample.round == self.current_round:
+                if sample.round not in self.evaluated_rounds:
+                    print(f"[DDS] Client {self.client_id} starting evaluation for round {sample.round}")
+                    self.evaluate_model()
+                    
+        except Exception as e:
+            print(f"[DDS] Client {self.client_id} error handling command: {e}")
+    
+    # -------------------------------------------------------------------------
+    # gRPC LISTENER
+    # -------------------------------------------------------------------------
+    
+    def start_grpc_listener(self):
+        """Start gRPC polling thread (mirrors FL_Client_gRPC.py)"""
+        def grpc_listener_loop():
+            try:
+                # Create gRPC channel and stub
+                grpc_host = os.getenv("GRPC_HOST", "fl-server-unified-emotion")
+                grpc_port = os.getenv("GRPC_PORT", "50051")
+                channel = grpc.insecure_channel(f"{grpc_host}:{grpc_port}")
+                self.grpc_stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
+                
+                print(f"[gRPC] Listener started for client {self.client_id}")
+                
+                # Polling loop
+                while True:
+                    try:
+                        # Poll for global model
+                        request = federated_learning_pb2.ModelRequest(
+                            client_id=self.client_id,
+                            round=self.current_round
+                        )
+                        response = self.grpc_stub.GetGlobalModel(request)
+                        
+                        if response.available and response.round > self.last_global_round:
+                            self.on_grpc_global_model(response)
+                            
+                    except grpc.RpcError:
+                        pass  # Expected when no new model
+                    except Exception as e:
+                        print(f"[gRPC] Listener poll error: {e}")
+                    
+                    time.sleep(1)  # Poll every second
+                    
+            except Exception as e:
+                print(f"[gRPC] Listener error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        self.grpc_listener_thread = threading.Thread(target=grpc_listener_loop, daemon=True, name=f"gRPC-Listener-{self.client_id}")
+        self.grpc_listener_thread.start()
+    
+    def on_grpc_global_model(self, response):
+        """gRPC callback: received global model"""
+        try:
+            round_num = response.round
+            print(f"[gRPC] Client {self.client_id} received global model for round {round_num}")
+            
+            log_received_packet(
+                packet_size=len(response.weights),
+                peer="server",
+                protocol="gRPC",
+                round=self.current_round,
+                extra_info="global_model"
+            )
+            
+            # Deserialize weights
+            weights = pickle.loads(response.weights)
+            
+            # Update model
+            if self.model and round_num > self.last_global_round:
+                self.model.set_weights(weights)
+                self.last_global_round = round_num
+                print(f"[gRPC] Client {self.client_id} updated model weights for round {round_num}")
+                
+                # Check if should evaluate
+                status_request = federated_learning_pb2.StatusRequest(client_id=self.client_id)
+                status = self.grpc_stub.CheckTrainingStatus(status_request)
+                
+                if status.should_evaluate and round_num == self.current_round:
+                    if round_num not in self.evaluated_rounds:
+                        print(f"[gRPC] Client {self.client_id} starting evaluation for round {round_num}")
+                        self.evaluate_model()
+                        
+        except Exception as e:
+            print(f"[gRPC] Client {self.client_id} error handling global model: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # =========================================================================
+    # QUIC LISTENER
+    # =========================================================================
+    
+    def start_quic_listener(self):
+        """Start QUIC persistent connection in background thread"""
+        if self.quic_thread is None or not self.quic_thread.is_alive():
+            self.quic_thread = threading.Thread(
+                target=self._run_quic_loop,
+                daemon=True,
+                name=f"QUIC-Client-{self.client_id}"
+            )
+            self.quic_thread.start()
+            
+            # Wait briefly for connection to establish
+            time.sleep(2)
+            print(f"[QUIC] Listener started for client {self.client_id}")
     
     def handle_global_model(self, payload):
         """Receive and set global model weights from server"""
@@ -444,27 +1004,38 @@ class UnifiedFLClient_Emotion:
         }
         
         comm_start = time.time()
-        try:
-            if protocol == 'mqtt':
-                self._send_via_mqtt(update_message)
-            elif protocol == 'amqp':
-                self._send_via_amqp(update_message)
-            elif protocol == 'grpc':
-                self._send_via_grpc(update_message)
-            elif protocol == 'quic':
-                self._send_via_quic(update_message)
-            elif protocol == 'dds':
-                self._send_via_dds(update_message)
-            else:
-                print(f"Client {self.client_id} ERROR: Unknown protocol {protocol}, falling back to MQTT")
-                self._send_via_mqtt(update_message)
-            
+        success = False
+        protocols_to_try = [protocol, 'amqp', 'mqtt', 'grpc', 'quic', 'dds']  # AMQP second in fallback for testing
+        
+        for attempt_protocol in protocols_to_try:
+            if success:
+                break
+            try:
+                if attempt_protocol == 'mqtt':
+                    self._send_via_mqtt(update_message)
+                    success = True
+                elif attempt_protocol == 'amqp' and pika is not None:
+                    self._send_via_amqp(update_message)
+                    success = True
+                elif attempt_protocol == 'grpc' and grpc is not None:
+                    self._send_via_grpc(update_message)
+                    success = True
+                elif attempt_protocol == 'quic' and asyncio is not None:
+                    self._send_via_quic(update_message)
+                    success = True
+                elif attempt_protocol == 'dds' and DDS_AVAILABLE:
+                    self._send_via_dds(update_message)
+                    success = True
+            except Exception as e:
+                if attempt_protocol == protocol:
+                    print(f"Client {self.client_id} WARNING: {protocol} failed ({e}), trying fallback...")
+                continue
+        
+        if success:
             self.round_metrics['communication_time'] = time.time() - comm_start
             self.round_metrics['success'] = True
-        except Exception as e:
-            print(f"Client {self.client_id} ERROR sending update via {protocol}: {e}")
-            import traceback
-            traceback.print_exc()
+        else:
+            print(f"Client {self.client_id} ERROR: All protocols failed!")
             self.round_metrics['success'] = False
     
     def evaluate_model(self):
@@ -526,6 +1097,14 @@ class UnifiedFLClient_Emotion:
             result = self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, payload, qos=1)
             result.wait_for_publish(timeout=30)
             
+            log_sent_packet(
+                packet_size=len(payload),
+                peer="server",
+                protocol="MQTT",
+                round=self.current_round,
+                extra_info="model_update"
+            )
+            
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
                 print(f"Client {self.client_id} sent model update for round {self.current_round} via MQTT")
                 print(f"Training metrics - Loss: {message['metrics']['loss']:.4f}, Accuracy: {message['metrics']['accuracy']:.4f}")
@@ -541,6 +1120,14 @@ class UnifiedFLClient_Emotion:
             payload = json.dumps(message)
             result = self.mqtt_client.publish(TOPIC_CLIENT_METRICS, payload, qos=1)
             result.wait_for_publish(timeout=30)
+            
+            log_sent_packet(
+                packet_size=len(payload),
+                peer="server",
+                protocol="MQTT",
+                round=self.current_round,
+                extra_info="metrics"
+            )
             
             if result.rc != mqtt.MQTT_ERR_SUCCESS:
                 raise Exception(f"MQTT publish failed with rc={result.rc}")
@@ -586,6 +1173,14 @@ class UnifiedFLClient_Emotion:
                 properties=pika.BasicProperties(delivery_mode=2)
             )
             
+            log_sent_packet(
+                packet_size=len(payload),
+                peer="server",
+                protocol="AMQP",
+                round=self.current_round,
+                extra_info="model_update"
+            )
+            
             print(f"Client {self.client_id} sent model update for round {self.current_round} via AMQP")
             connection.close()
         except Exception as e:
@@ -624,6 +1219,14 @@ class UnifiedFLClient_Emotion:
                 properties=pika.BasicProperties(delivery_mode=2)
             )
             
+            log_sent_packet(
+                packet_size=len(payload),
+                peer="server",
+                protocol="AMQP",
+                round=self.current_round,
+                extra_info="metrics"
+            )
+            
             connection.close()
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending metrics via AMQP: {e}")
@@ -654,10 +1257,18 @@ class UnifiedFLClient_Emotion:
                 federated_learning_pb2.ModelUpdate(
                     client_id=message['client_id'],
                     round=message['round'],
-                    weights=weights_str,
+                    weights=weights_str.encode() if isinstance(weights_str, str) else weights_str,
                     num_samples=message['num_samples'],
-                    metrics=json.dumps(message['metrics'])
+                    metrics={k: float(v) for k, v in message['metrics'].items()}
                 )
+            )
+            
+            log_sent_packet(
+                packet_size=len(weights_str),
+                peer="server",
+                protocol="gRPC",
+                round=self.current_round,
+                extra_info="model_update"
             )
             
             if response.success:
@@ -696,6 +1307,15 @@ class UnifiedFLClient_Emotion:
                 )
             )
             
+            payload_size = len(json.dumps(message))
+            log_sent_packet(
+                packet_size=payload_size,
+                peer="server",
+                protocol="gRPC",
+                round=self.current_round,
+                extra_info="metrics"
+            )
+            
             if not response.success:
                 raise Exception(f"gRPC send failed: {response.message}")
             
@@ -704,21 +1324,192 @@ class UnifiedFLClient_Emotion:
             print(f"Client {self.client_id} ERROR sending metrics via gRPC: {e}")
             raise
     
+    async def _ensure_quic_connection(self):
+        """Establish persistent QUIC connection if not already connected"""
+        if self.quic_protocol is not None:
+            return  # Already connected
+        
+        # Start QUIC connection thread if not running
+        if self.quic_thread is None or not self.quic_thread.is_alive():
+            self.quic_thread = threading.Thread(
+                target=self._run_quic_loop,
+                daemon=True,
+                name=f"QUIC-Client-{self.client_id}"
+            )
+            self.quic_thread.start()
+            
+            # Wait for connection to establish
+            max_wait = 10  # seconds
+            waited = 0
+            while self.quic_protocol is None and waited < max_wait:
+                await asyncio.sleep(0.1)
+                waited += 0.1
+            
+            if self.quic_protocol is None:
+                raise ConnectionError(f"QUIC connection not established after {max_wait}s")
+            
+            print(f"[QUIC] Client {self.client_id} connection ready")
+    
+    def _run_quic_loop(self):
+        """Run QUIC event loop in a separate thread"""
+        self.quic_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.quic_loop)
+        try:
+            self.quic_loop.run_until_complete(self._quic_connection_loop())
+        except Exception as e:
+            print(f"[QUIC] Event loop error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.quic_loop.close()
+    
+    async def _quic_connection_loop(self):
+        """Maintain persistent QUIC connection (runs in background)"""
+        import ssl
+        quic_host = os.getenv("QUIC_HOST", "localhost")
+        quic_port = int(os.getenv("QUIC_PORT", "4433"))
+        
+        config = QuicConfiguration(
+            is_client=True, 
+            verify_mode=ssl.CERT_NONE,
+            max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
+            max_data=100 * 1024 * 1024,  # 100 MB total
+            idle_timeout=3600.0  # 1 hour
+        )
+        
+        print(f"[QUIC] Client {self.client_id} connecting to {quic_host}:{quic_port}...")
+        
+        try:
+            async with connect(
+                quic_host,
+                quic_port,
+                configuration=config,
+                create_protocol=lambda *args, **kwargs: UnifiedClientQUICProtocol(self, *args, **kwargs)
+            ) as protocol:
+                self.quic_protocol = protocol
+                print(f"[QUIC] Client {self.client_id} established persistent connection")
+                
+                # Keep connection alive indefinitely
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    print(f"[QUIC] Client {self.client_id} connection cancelled")
+        except Exception as e:
+            print(f"[QUIC] Client {self.client_id} connection error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.quic_protocol = None
+    
+    def _handle_quic_message(self, message: dict):
+        """Handle QUIC message received from server (called from QUIC protocol)"""
+        msg_type = message.get('type')
+        print(f"[QUIC] Client {self.client_id} received message type: {msg_type}")
+        
+        if msg_type == 'global_model':
+            self.on_global_model_received_quic(message)
+        elif msg_type == 'start_training':
+            self.on_start_training_quic(message)
+        elif msg_type == 'start_evaluation':
+            self.on_start_evaluation_quic(message)
+    
+    def on_global_model_received_quic(self, message):
+        """Handle global model received via QUIC"""
+        try:
+            round_num = message['round']
+            print(f"[QUIC] Client {self.client_id} received global model for round {round_num}")
+            
+            # Deserialize weights
+            if 'quantized_data' in message:
+                compressed_data = pickle.loads(base64.b64decode(message['quantized_data']))
+                weights = self.quantizer.decompress_global_model(compressed_data) if self.quantizer else None
+            else:
+                weights = self.deserialize_weights(message['weights'])
+            
+            # Update model
+            if self.model:
+                self.model.set_weights(weights)
+                print(f"[QUIC] Client {self.client_id} updated model weights for round {round_num}")
+            
+            # Set event to signal model is ready
+            if hasattr(self, 'model_received'):
+                self.model_received.set()
+        except Exception as e:
+            print(f"[QUIC] Client {self.client_id} error handling global model: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def on_start_training_quic(self, message):
+        """Handle start training signal via QUIC"""
+        try:
+            print(f"[QUIC] Client {self.client_id} starting training for round {message.get('round', self.current_round + 1)}")
+            
+            log_received_packet(
+                packet_size=len(json.dumps(message)),
+                peer="server",
+                protocol="QUIC",
+                round=self.current_round,
+                extra_info="start_training"
+            )
+            
+            # Call the standard training handler
+            self.handle_start_training(json.dumps(message).encode())
+        except Exception as e:
+            print(f"[QUIC] Client {self.client_id} error handling start_training: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def on_start_evaluation_quic(self, message):
+        """Handle start evaluation signal via QUIC"""
+        try:
+            round_num = message.get('round', self.current_round)
+            print(f"[QUIC] Client {self.client_id} starting evaluation for round {round_num}")
+            
+            log_received_packet(
+                packet_size=len(json.dumps(message)),
+                peer="server",
+                protocol="QUIC",
+                round=self.current_round,
+                extra_info="start_evaluation"
+            )
+            
+            # Call the standard evaluation handler
+            self.handle_start_evaluation(json.dumps(message).encode())
+        except Exception as e:
+            print(f"[QUIC] Client {self.client_id} error handling evaluation signal: {e}")
+            import traceback
+            traceback.print_exc()
+    
     def _send_via_quic(self, message: dict):
-        """Send model update via QUIC"""
+        """Send model update via QUIC using persistent connection"""
         if asyncio is None or connect is None:
             raise ImportError("aioquic module not available for QUIC")
         
         try:
-            quic_host = os.getenv("QUIC_HOST", "localhost")
-            quic_port = int(os.getenv("QUIC_PORT", "4433"))
+            # Add 'type' field for server to identify message type
+            quic_message = {**message, 'type': 'update'}
             
-            payload = json.dumps(message)
+            payload = json.dumps(quic_message)
             payload_size_mb = len(payload) / (1024 * 1024)
             print(f"Client {self.client_id} sending via QUIC - size: {payload_size_mb:.2f} MB")
             
-            # Run async QUIC send
-            asyncio.run(self._quic_send_data(quic_host, quic_port, payload, 'model_update'))
+            # Use persistent connection directly via run_coroutine_threadsafe
+            if self.quic_loop is None:
+                raise ConnectionError("QUIC connection not established - loop not available")
+            
+            future = asyncio.run_coroutine_threadsafe(
+                self._do_quic_send(payload),
+                self.quic_loop
+            )
+            future.result(timeout=15)  # Wait for send to complete
+            
+            log_sent_packet(
+                packet_size=len(payload),
+                peer="server",
+                protocol="QUIC",
+                round=self.current_round,
+                extra_info="model_update"
+            )
             
             print(f"Client {self.client_id} sent model update for round {self.current_round} via QUIC")
         except Exception as e:
@@ -726,67 +1517,215 @@ class UnifiedFLClient_Emotion:
             raise
     
     def _send_metrics_via_quic(self, message: dict):
-        """Send metrics via QUIC"""
+        """Send metrics via QUIC using persistent connection"""
         if asyncio is None or connect is None:
             raise ImportError("aioquic module not available for QUIC")
         
         try:
-            quic_host = os.getenv("QUIC_HOST", "localhost")
-            quic_port = int(os.getenv("QUIC_PORT", "4433"))
+            # Add 'type' field for server to identify message type
+            quic_message = {**message, 'type': 'metrics'}
             
-            payload = json.dumps(message)
-            asyncio.run(self._quic_send_data(quic_host, quic_port, payload, 'metrics'))
+            payload = json.dumps(quic_message)
+            
+            # Use persistent connection directly via run_coroutine_threadsafe
+            if self.quic_loop is None:
+                raise ConnectionError("QUIC connection not established - loop not available")
+            
+            future = asyncio.run_coroutine_threadsafe(
+                self._do_quic_send(payload),
+                self.quic_loop
+            )
+            future.result(timeout=15)  # Wait for send to complete
+            
+            log_sent_packet(
+                packet_size=len(payload),
+                peer="server",
+                protocol="QUIC",
+                round=self.current_round,
+                extra_info="metrics"
+            )
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending metrics via QUIC: {e}")
             raise
     
+    async def _send_quic_persistent(self, payload: str):
+        """Send data via persistent QUIC connection"""
+        # Ensure connection exists
+        await self._ensure_quic_connection()
+        
+        if self.quic_protocol is None:
+            raise ConnectionError("QUIC connection not established")
+        
+        # Schedule send on QUIC thread's event loop
+        future = asyncio.run_coroutine_threadsafe(
+            self._do_quic_send(payload),
+            self.quic_loop
+        )
+        # Wait for completion
+        future.result(timeout=10)
+    
+    async def _do_quic_send(self, payload: str):
+        """Actually send data via QUIC (runs in QUIC thread's event loop)"""
+        # Ensure connection is ready
+        if self.quic_protocol is None or self.quic_protocol._quic is None:
+            raise ConnectionError("QUIC protocol not available")
+        
+        print(f"[QUIC] Client {self.client_id} preparing to send {len(payload)} bytes")
+        
+        # Send data via QUIC stream
+        stream_id = self.quic_protocol._quic.get_next_available_stream_id()
+        data = (payload + '\n').encode('utf-8')
+        self.quic_protocol._quic.send_stream_data(stream_id, data, end_stream=True)
+        self.quic_protocol.transmit()
+        
+        print(f"[QUIC] Client {self.client_id} sent on stream {stream_id}, transmitting...")
+        
+        # For large messages, give time for transmission
+        if len(data) > 1000000:  # > 1MB
+            for _ in range(3):
+                await asyncio.sleep(0.5)
+                self.quic_protocol.transmit()
+    
     async def _quic_send_data(self, host: str, port: int, payload: str, msg_type: str):
-        """Async QUIC data send"""
-        try:
-            config = QuicConfiguration(is_client=True, verify_mode='unverified')
-            
-            async with await connect(
-                host, port, configuration=config, local_host='0.0.0.0'
-            ) as protocol:
-                stream_id = protocol._quic_connection.get_next_available_stream_id()
-                protocol._quic_connection.send_stream_data(stream_id, (payload + '\n').encode())
+        """Async QUIC data send with timeout and retry (legacy method for registration)"""
+        import ssl
+        
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                # Use ssl.CERT_NONE for self-signed certificate verification
+                config = QuicConfiguration(is_client=True, verify_mode=ssl.CERT_NONE)
                 
-                # Wait for response
-                time.sleep(0.5)
-        except Exception as e:
-            print(f"QUIC send error: {e}")
-            raise
+                # connect() returns a QuicConnectionProtocol
+                # We use create_stream() to get reader/writer
+                try:
+                    # Try Python 3.11+ asyncio.timeout
+                    async with asyncio.timeout(5):
+                        async with connect(host, port, configuration=config) as protocol:
+                            # Create a stream for sending data
+                            reader, writer = await protocol.create_stream()
+                            writer.write((payload + '\n').encode())
+                            await writer.drain()
+                            # Give time for data to be transmitted before closing
+                            await asyncio.sleep(0.5)
+                            writer.close()
+                            # Wait for close to complete
+                            try:
+                                await writer.wait_closed()
+                            except:
+                                pass
+                            return  # Success
+                except AttributeError as e:
+                    # Python 3.8 doesn't have asyncio.timeout
+                    if "has no attribute 'timeout'" in str(e):
+                        # Use manual context manager handling for Python 3.8
+                        connection = connect(host, port, configuration=config)
+                        protocol = await asyncio.wait_for(connection.__aenter__(), timeout=5)
+                        try:
+                            reader, writer = await protocol.create_stream()
+                            writer.write((payload + '\n').encode())
+                            await writer.drain()
+                            # Give time for data to be transmitted
+                            await asyncio.sleep(0.5)
+                            writer.close()
+                            try:
+                                await writer.wait_closed()
+                            except:
+                                pass
+                            return  # Success
+                        finally:
+                            await connection.__aexit__(None, None, None)
+                    else:
+                        raise
+            except asyncio.TimeoutError:
+                print(f"QUIC send timeout (attempt {attempt + 1}/{max_retries}): Connection took too long")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5)
+                else:
+                    raise
+            except (ConnectionError, OSError) as e:
+                print(f"QUIC send connection error (attempt {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                else:
+                    raise
+            except Exception as e:
+                print(f"QUIC send error (attempt {attempt + 1}/{max_retries}): {type(e).__name__}: {e}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                else:
+                    raise
     
     def _send_via_dds(self, message: dict):
         """Send model update via DDS"""
+        if not DDS_AVAILABLE or not self.dds_update_writer:
+            raise NotImplementedError("DDS not available - triggering fallback")
+        
         try:
-            # DDS implementation - simplified for now
-            # In real implementation, would use cyclonedds or opensplice
-            import ddspython
+            # Serialize weights and convert to list of integers
+            weights_bytes = pickle.dumps(message['weights'])
+            weights_list = list(weights_bytes)  # Convert bytes to List[int]
             
-            payload = json.dumps(message)
-            payload_size_mb = len(payload) / (1024 * 1024)
-            print(f"Client {self.client_id} sending via DDS - size: {payload_size_mb:.2f} MB")
+            # Create DDS message
+            dds_msg = ModelUpdate(
+                client_id=self.client_id,
+                round=message['round'],
+                weights=weights_list,
+                num_samples=message.get('num_samples', 0),
+                loss=message.get('loss', 0.0),
+                mse=message.get('mse', 0.0),
+                mae=message.get('mae', 0.0),
+                mape=message.get('mape', 0.0)
+            )
             
-            # TODO: Implement actual DDS send
+            # Write to DDS
+            self.dds_update_writer.write(dds_msg)
+            
+            # Log the packet
+            log_sent_packet(
+                packet_size=len(weights_bytes),
+                peer="server",
+                protocol="DDS",
+                round=self.current_round,
+                extra_info="model_update"
+            )
+            
             print(f"Client {self.client_id} sent model update for round {self.current_round} via DDS")
-        except ImportError:
-            print(f"Client {self.client_id} WARNING: DDS not available, falling back to MQTT")
-            self._send_via_mqtt(message)
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending via DDS: {e}")
             raise
     
     def _send_metrics_via_dds(self, message: dict):
         """Send metrics via DDS"""
+        if not DDS_AVAILABLE or not self.dds_metrics_writer:
+            raise NotImplementedError("DDS not available - triggering fallback")
+        
         try:
-            import ddspython
+            # Create DDS metrics message
+            dds_msg = EvaluationMetrics(
+                client_id=self.client_id,
+                round=message['round'],
+                num_samples=message.get('num_samples', 0),
+                loss=message.get('loss', 0.0),
+                accuracy=message.get('accuracy', 0.0),
+                mse=message.get('mse', 0.0),
+                mae=message.get('mae', 0.0),
+                mape=message.get('mape', 0.0)
+            )
             
-            payload = json.dumps(message)
-            # TODO: Implement actual DDS send
-        except ImportError:
-            print(f"Client {self.client_id} WARNING: DDS not available, falling back to MQTT")
-            self._send_metrics_via_mqtt(message)
+            # Write to DDS
+            self.dds_metrics_writer.write(dds_msg)
+            
+            # Log the packet
+            log_sent_packet(
+                packet_size=len(str(dds_msg)),
+                peer="server",
+                protocol="DDS",
+                round=self.current_round,
+                extra_info="metrics"
+            )
+            
+            print(f"Client {self.client_id} sent metrics for round {self.current_round} via DDS")
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending metrics via DDS: {e}")
             raise

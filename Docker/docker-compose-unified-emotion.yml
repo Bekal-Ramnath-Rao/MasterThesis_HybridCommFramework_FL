@@ -1,11 +1,9 @@
-version: '3.8'
-
 services:
   # ============================================================================
   # BROKERS - Required for MQTT and AMQP protocols
   # ============================================================================
   
-  mqtt-broker:
+  mqtt-broker-unified:
     image: eclipse-mosquitto:latest
     container_name: mqtt-broker-unified
     ports:
@@ -17,7 +15,7 @@ services:
       - fl-network
     command: mosquitto -c /mosquitto/config/mosquitto.conf
   
-  amqp-broker:
+  amqp-broker-unified:
     image: rabbitmq:3-management
     container_name: amqp-broker-unified
     ports:
@@ -36,13 +34,16 @@ services:
   fl-server-unified-emotion:
     build:
       context: ..
-      dockerfile: Server/Emotion_Recognition/Dockerfile
+      dockerfile: Server/Dockerfile
     container_name: fl-server-unified-emotion
     environment:
+      - NODE_TYPE=server
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
       - MQTT_BROKER=mqtt-broker-unified
       - AMQP_BROKER=amqp-broker-unified
+      - AMQP_HOST=amqp-broker-unified
+      - GRPC_HOST=fl-server-unified-emotion
       - GRPC_PORT=50051
       - QUIC_HOST=0.0.0.0
       - QUIC_PORT=4433
@@ -53,23 +54,25 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
     volumes:
-      - ../Server/Emotion_Recognition:/app
+      - ../Server/Emotion_Recognition:/app/Server/Emotion_Recognition
       - ../experiment_results:/app/results
       - ../certs:/app/certs:ro
+      - ../shared_data:/shared_data
     networks:
       - fl-network
     ports:
       - "4433:4433/udp"
+      - "50051:50051"
     depends_on:
-      - mqtt-broker
-      - amqp-broker
-    command: python3 FL_Server_Unified.py
+      - mqtt-broker-unified
+      - amqp-broker-unified
+    command: python3 Server/Emotion_Recognition/FL_Server_Unified.py
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              device_ids: ['0']
               capabilities: [gpu]
   
   # ============================================================================
@@ -79,9 +82,10 @@ services:
   fl-client-unified-emotion-1:
     build:
       context: ..
-      dockerfile: Client/Emotion_Recognition/Dockerfile
+      dockerfile: Client/Dockerfile
     container_name: fl-client-unified-emotion-1
     environment:
+      - NODE_TYPE=client
       - CLIENT_ID=1
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
@@ -89,7 +93,8 @@ services:
       - DEFAULT_PROTOCOL=mqtt
       - MQTT_BROKER=mqtt-broker-unified
       - AMQP_BROKER=amqp-broker-unified
-      - GRPC_SERVER=fl-server-unified-emotion
+      - AMQP_HOST=amqp-broker-unified
+      - GRPC_HOST=fl-server-unified-emotion
       - GRPC_PORT=50051
       - QUIC_HOST=fl-server-unified-emotion
       - QUIC_PORT=4433
@@ -97,30 +102,32 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
     volumes:
-      - ../Client/Emotion_Recognition:/app
+      - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
+      - ../shared_data:/shared_data
       - ../experiment_results:/app/results
       - ../certs:/app/certs:ro
     networks:
       - fl-network
     depends_on:
       - fl-server-unified-emotion
-      - mqtt-broker
-      - amqp-broker
-    command: python3 FL_Client_Unified.py
+      - mqtt-broker-unified
+      - amqp-broker-unified
+    command: python3 Client/Emotion_Recognition/FL_Client_Unified.py
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              device_ids: ['0']
               capabilities: [gpu]
   
   fl-client-unified-emotion-2:
     build:
       context: ..
-      dockerfile: Client/Emotion_Recognition/Dockerfile
+      dockerfile: Client/Dockerfile
     container_name: fl-client-unified-emotion-2
     environment:
+      - NODE_TYPE=client
       - CLIENT_ID=2
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
@@ -128,7 +135,8 @@ services:
       - DEFAULT_PROTOCOL=mqtt
       - MQTT_BROKER=mqtt-broker-unified
       - AMQP_BROKER=amqp-broker-unified
-      - GRPC_SERVER=fl-server-unified-emotion
+      - AMQP_HOST=amqp-broker-unified
+      - GRPC_HOST=fl-server-unified-emotion
       - GRPC_PORT=50051
       - QUIC_HOST=fl-server-unified-emotion
       - QUIC_PORT=4433
@@ -136,22 +144,23 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
     volumes:
-      - ../Client/Emotion_Recognition:/app
+      - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
+      - ../shared_data:/shared_data
       - ../experiment_results:/app/results
       - ../certs:/app/certs:ro
     networks:
       - fl-network
     depends_on:
       - fl-server-unified-emotion
-      - mqtt-broker
-      - amqp-broker
-    command: python3 FL_Client_Unified.py
+      - mqtt-broker-unified
+      - amqp-broker-unified
+    command: python3 Client/Emotion_Recognition/FL_Client_Unified.py
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              device_ids: ['0']
               capabilities: [gpu]
 
 networks:
