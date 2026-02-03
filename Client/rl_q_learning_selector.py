@@ -25,7 +25,7 @@ class QLearningProtocolSelector:
     """
     
     # Protocol actions
-    PROTOCOLS = ['mqtt', 'amqp', 'grpc', 'quic', 'dds']
+    PROTOCOLS = ['mqtt', 'amqp', 'dds', 'grpc']
     
     # Environment state dimensions
     NETWORK_CONDITIONS = ['excellent', 'good', 'moderate', 'poor', 'very_poor']
@@ -70,15 +70,15 @@ class QLearningProtocolSelector:
         )
         self.q_table = np.zeros(state_space_size + (len(self.PROTOCOLS),))
         
-        # Load existing Q-table if available
-        self.load_q_table()
-        
         # Statistics tracking
         self.episode_count = 0
         self.total_rewards = []
         self.protocol_usage = {p: 0 for p in self.PROTOCOLS}
         self.protocol_success = {p: 0 for p in self.PROTOCOLS}
         self.protocol_failures = {p: 0 for p in self.PROTOCOLS}
+
+        # Load existing Q-table if available (will reset if dimensions don't match)
+        self.load_q_table()
         
         # History for learning
         self.state_history = []
@@ -280,18 +280,35 @@ class QLearningProtocolSelector:
                 with open(self.save_path, 'rb') as f:
                     data = pickle.load(f)
                 
-                self.q_table = data.get('q_table', self.q_table)
-                self.epsilon = data.get('epsilon', self.epsilon)
-                self.episode_count = data.get('episode_count', 0)
-                self.total_rewards = data.get('total_rewards', [])
-                self.protocol_usage = data.get('protocol_usage', self.protocol_usage)
-                self.protocol_success = data.get('protocol_success', self.protocol_success)
-                self.protocol_failures = data.get('protocol_failures', self.protocol_failures)
+                loaded_q_table = data.get('q_table')
                 
-                print(f"[Q-Learning] Loaded Q-table from {self.save_path}")
-                print(f"[Q-Learning] Episodes: {self.episode_count}, Epsilon: {self.epsilon:.4f}")
+                # Check if dimensions match current protocol list
+                expected_shape = (
+                    len(self.NETWORK_CONDITIONS),
+                    len(self.RESOURCE_LEVELS),
+                    len(self.MODEL_SIZES),
+                    len(self.MOBILITY_LEVELS),
+                    len(self.PROTOCOLS)
+                )
+                
+                if loaded_q_table is not None and loaded_q_table.shape == expected_shape:
+                    self.q_table = loaded_q_table
+                    self.epsilon = data.get('epsilon', self.epsilon)
+                    self.episode_count = data.get('episode_count', 0)
+                    self.total_rewards = data.get('total_rewards', [])
+                    self.protocol_usage = data.get('protocol_usage', self.protocol_usage)
+                    self.protocol_success = data.get('protocol_success', self.protocol_success)
+                    self.protocol_failures = data.get('protocol_failures', self.protocol_failures)
+                    
+                    print(f"[Q-Learning] Loaded Q-table from {self.save_path}")
+                    print(f"[Q-Learning] Episodes: {self.episode_count}, Epsilon: {self.epsilon:.4f}")
+                else:
+                    if loaded_q_table is not None:
+                        print(f"[Q-Learning] Q-table shape mismatch: expected {expected_shape}, got {loaded_q_table.shape}")
+                    print(f"[Q-Learning] Starting with fresh Q-table for {len(self.PROTOCOLS)} protocols: {self.PROTOCOLS}")
             except Exception as e:
                 print(f"[Q-Learning] Error loading Q-table: {e}")
+                print(f"[Q-Learning] Starting with fresh Q-table")
     
     def get_statistics(self) -> Dict:
         """Get learning statistics"""

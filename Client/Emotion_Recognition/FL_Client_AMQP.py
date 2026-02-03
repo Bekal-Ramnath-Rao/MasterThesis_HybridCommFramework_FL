@@ -9,6 +9,15 @@ import time
 import random
 import pika
 
+# Detect Docker environment and set project root accordingly
+if os.path.exists('/app'):
+    project_root = '/app'
+else:
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from packet_logger import log_received_packet, log_sent_packet
 
 # GPU Configuration - Must be done BEFORE TensorFlow import

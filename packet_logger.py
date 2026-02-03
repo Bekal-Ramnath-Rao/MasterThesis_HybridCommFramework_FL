@@ -69,7 +69,7 @@ def init_db():
     conn.close()
 
 def log_sent_packet(packet_size, peer, protocol, round=None, extra_info=None):
-    print(f"[DEBUG] log_sent_packet: Logging to {DB_PATH}")
+    #print(f"[DEBUG] log_sent_packet: Logging to {DB_PATH}")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''
@@ -80,7 +80,7 @@ def log_sent_packet(packet_size, peer, protocol, round=None, extra_info=None):
     conn.close()
 
 def log_received_packet(packet_size, peer, protocol, round=None, extra_info=None):
-    print(f"[DEBUG] log_received_packet: Logging to {DB_PATH}")
+    #print(f"[DEBUG] log_received_packet: Logging to {DB_PATH}")
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute('''

@@ -72,39 +72,58 @@ except ImportError:
 if QuicConnectionProtocol is not None:
     class UnifiedClientQUICProtocol(QuicConnectionProtocol):
         """QUIC protocol handler for receiving server messages"""
-        def __init__(self, client, *args, **kwargs):
+        def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.client = client
-            self.stream_buffers = {}
+            self.client = None  # Set by factory function
+            self._stream_buffers = {}  # Instance-specific stream buffers
         
         def quic_event_received(self, event):
             if isinstance(event, StreamDataReceived):
-                # Buffer stream data
-                stream_id = event.stream_id
-                if stream_id not in self.stream_buffers:
-                    self.stream_buffers[stream_id] = b''
-                
-                self.stream_buffers[stream_id] += event.data
-                
-                # Process complete messages (newline-delimited)
-                while b'\n' in self.stream_buffers[stream_id]:
-                    msg_data, self.stream_buffers[stream_id] = self.stream_buffers[stream_id].split(b'\n', 1)
-                    if msg_data:
+                try:
+                    # Get or create buffer for this stream
+                    stream_id = event.stream_id
+                    if stream_id not in self._stream_buffers:
+                        self._stream_buffers[stream_id] = b''
+                    
+                    # Append new data to buffer
+                    self._stream_buffers[stream_id] += event.data
+                    print(f"[QUIC] Client stream {stream_id}: received {len(event.data)} bytes, buffer now {len(self._stream_buffers[stream_id])} bytes")
+                    
+                    # Send flow control updates
+                    self.transmit()
+                    
+                    # Try to decode complete messages (delimited by newline)
+                    while b'\n' in self._stream_buffers[stream_id]:
+                        message_data, self._stream_buffers[stream_id] = self._stream_buffers[stream_id].split(b'\n', 1)
+                        if message_data:
+                            try:
+                                data_str = message_data.decode('utf-8')
+                                message = json.loads(data_str)
+                                msg_type = message.get('type', 'unknown')
+                                print(f"[QUIC] Client decoded message type '{msg_type}' from stream {stream_id}")
+                                # Handle message asynchronously
+                                if self.client:
+                                    asyncio.create_task(self.client._handle_quic_message_async(message))
+                            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                                print(f"[QUIC] Client error decoding message: {e}")
+                    
+                    # If stream ended and buffer has remaining data, try to process it
+                    if event.end_stream and self._stream_buffers[stream_id]:
+                        print(f"[QUIC] Client stream {stream_id} ended with {len(self._stream_buffers[stream_id])} bytes remaining")
                         try:
-                            message = json.loads(msg_data.decode().strip())
-                            # Handle message in sync context
-                            self.client._handle_quic_message(message)
-                        except Exception as e:
-                            print(f"[QUIC] Client {self.client.client_id} error decoding message: {e}")
-                
-                # Process remaining buffer if stream ended
-                if event.end_stream and self.stream_buffers[stream_id]:
-                    try:
-                        message = json.loads(self.stream_buffers[stream_id].decode().strip())
-                        self.client._handle_quic_message(message)
-                        self.stream_buffers[stream_id] = b''
-                    except Exception as e:
-                        print(f"[QUIC] Client {self.client.client_id} error decoding end-stream: {e}")
+                            data_str = self._stream_buffers[stream_id].decode('utf-8')
+                            message = json.loads(data_str)
+                            msg_type = message.get('type', 'unknown')
+                            print(f"[QUIC] Client decoded end-of-stream message type '{msg_type}'")
+                            if self.client:
+                                asyncio.create_task(self.client._handle_quic_message_async(message))
+                            self._stream_buffers[stream_id] = b''
+                        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                            print(f"[QUIC] Client error decoding remaining buffer: {e}")
+                except Exception as e:
+                    print(f"[QUIC] Client error handling event: {e}")
+                    import traceback
+                    traceback.print_exc()
 else:
     UnifiedClientQUICProtocol = None
 
@@ -237,6 +256,7 @@ class UnifiedFLClient_Emotion:
         self.last_global_round = -1
         self.last_training_round = -1
         self.evaluated_rounds = set()
+        self.waiting_for_aggregated_model = False  # Track if we sent update and waiting for aggregated model
         
         # Training configuration
         self.training_config = {"batch_size": 32, "local_epochs": 20}
@@ -427,20 +447,26 @@ class UnifiedFLClient_Emotion:
         
         # MQTT already started in __init__
         
-        # Start AMQP listener
-        if pika is not None:
+        # Get list of protocols that RL selector can use
+        available_protocols = []
+        if self.rl_selector:
+            available_protocols = self.rl_selector.PROTOCOLS
+            print(f"[Client] RL Selector configured for protocols: {available_protocols}")
+        
+        # Start AMQP listener only if in available protocols
+        if pika is not None and (not available_protocols or 'amqp' in available_protocols):
             self.start_amqp_listener()
         
-        # Start DDS listener
-        if DDS_AVAILABLE:
+        # Start DDS listener only if in available protocols
+        if DDS_AVAILABLE and (not available_protocols or 'dds' in available_protocols):
             self.start_dds_listener()
         
-        # Start gRPC listener
-        if grpc is not None:
+        # Start gRPC listener only if in available protocols
+        if grpc is not None and (not available_protocols or 'grpc' in available_protocols):
             self.start_grpc_listener()
         
-        # Start QUIC persistent connection listener
-        if asyncio is not None and connect is not None:
+        # Start QUIC persistent connection listener only if in available protocols
+        if asyncio is not None and connect is not None and (not available_protocols or 'quic' in available_protocols):
             self.start_quic_listener()
         
         print("[Client] All protocol listeners started\n")
@@ -478,9 +504,11 @@ class UnifiedFLClient_Emotion:
                     # Declare client-specific queues (server creates these)
                     queue_global_model = f'client_{self.client_id}_global_model'
                     queue_start_evaluation = f'client_{self.client_id}_start_evaluation'
+                    queue_start_training = f'client_{self.client_id}_start_training'
                     
                     self.amqp_listener_channel.queue_declare(queue=queue_global_model, durable=True)
                     self.amqp_listener_channel.queue_declare(queue=queue_start_evaluation, durable=True)
+                    self.amqp_listener_channel.queue_declare(queue=queue_start_training, durable=True)
                     
                     # Set up consumers
                     self.amqp_listener_channel.basic_consume(
@@ -491,6 +519,11 @@ class UnifiedFLClient_Emotion:
                     self.amqp_listener_channel.basic_consume(
                         queue=queue_start_evaluation,
                         on_message_callback=self.on_amqp_start_evaluation,
+                        auto_ack=True
+                    )
+                    self.amqp_listener_channel.basic_consume(
+                        queue=queue_start_training,
+                        on_message_callback=self.on_amqp_start_training,
                         auto_ack=True
                     )
                     
@@ -559,11 +592,54 @@ class UnifiedFLClient_Emotion:
             round_num = data['round']
             
             if round_num == self.current_round and round_num not in self.evaluated_rounds:
+                self.evaluated_rounds.add(round_num)  # Add BEFORE evaluate to prevent race condition
                 print(f"[AMQP] Client {self.client_id} starting evaluation for round {round_num}")
                 self.evaluate_model()
+                print(f"[AMQP] Client {self.client_id} evaluation completed for round {round_num}.")
                 
         except Exception as e:
             print(f"[AMQP] Client {self.client_id} error handling evaluation signal: {e}")
+    
+    def on_amqp_start_training(self, ch, method, properties, body):
+        """AMQP callback: received start training signal"""
+        try:
+            log_received_packet(
+                packet_size=len(body),
+                peer="server",
+                protocol="AMQP",
+                round=self.current_round,
+                extra_info="start_training"
+            )
+            
+            data = json.loads(body.decode())
+            round_num = data['round']
+            
+            # Check if model is initialized
+            if self.model is None:
+                print(f"[AMQP] Client {self.client_id} ERROR: Model not initialized yet, cannot start training for round {round_num}")
+                return
+            
+            # Check for duplicate training signals
+            if self.last_training_round == round_num:
+                print(f"[AMQP] Client {self.client_id} ignoring duplicate start training for round {round_num}")
+                return
+            
+            # Check if we're ready for this round
+            if self.current_round == 0 and round_num == 1:
+                self.current_round = round_num
+                self.last_training_round = round_num
+                print(f"\n[AMQP] Client {self.client_id} starting training for round {round_num}...")
+                self.train_local_model()
+            elif round_num >= self.current_round and round_num <= self.current_round + 1:
+                self.current_round = round_num
+                self.last_training_round = round_num
+                print(f"\n[AMQP] Client {self.client_id} starting training for round {round_num}...")
+                self.train_local_model()
+            else:
+                print(f"[AMQP] Client {self.client_id} skipping training signal for round {round_num} (current: {self.current_round})")
+                
+        except Exception as e:
+            print(f"[AMQP] Client {self.client_id} error handling training signal: {e}")
     
     # -------------------------------------------------------------------------
     # DDS LISTENER
@@ -654,10 +730,41 @@ class UnifiedFLClient_Emotion:
                 extra_info="command"
             )
             
+            round_num = sample.round
+            
+            # Handle start_training command
+            if sample.start_training:
+                # Check if model is initialized
+                if self.model is None:
+                    print(f"[DDS] Client {self.client_id} ERROR: Model not initialized yet, cannot start training for round {round_num}")
+                    return
+                
+                # Check for duplicate training signals
+                if self.last_training_round == round_num:
+                    print(f"[DDS] Client {self.client_id} ignoring duplicate start training for round {round_num}")
+                    return
+                
+                # Check if we're ready for this round
+                if self.current_round == 0 and round_num == 1:
+                    self.current_round = round_num
+                    self.last_training_round = round_num
+                    print(f"\n[DDS] Client {self.client_id} starting training for round {round_num}...")
+                    self.train_local_model()
+                elif round_num >= self.current_round and round_num <= self.current_round + 1:
+                    self.current_round = round_num
+                    self.last_training_round = round_num
+                    print(f"\n[DDS] Client {self.client_id} starting training for round {round_num}...")
+                    self.train_local_model()
+                else:
+                    print(f"[DDS] Client {self.client_id} skipping training signal for round {round_num} (current: {self.current_round})")
+            
+            # Handle start_evaluation command
             if sample.start_evaluation and sample.round == self.current_round:
                 if sample.round not in self.evaluated_rounds:
+                    self.evaluated_rounds.add(sample.round)  # Add BEFORE evaluate to prevent race condition
                     print(f"[DDS] Client {self.client_id} starting evaluation for round {sample.round}")
                     self.evaluate_model()
+                    print(f"[DDS] Client {self.client_id} evaluation completed for round {sample.round}.")
                     
         except Exception as e:
             print(f"[DDS] Client {self.client_id} error handling command: {e}")
@@ -681,14 +788,19 @@ class UnifiedFLClient_Emotion:
                 # Polling loop
                 while True:
                     try:
-                        # Poll for global model
+                        # Poll for global model (request round 0 to get latest available)
+                        # This allows client to get new model even if current_round hasn't updated yet
                         request = federated_learning_pb2.ModelRequest(
                             client_id=self.client_id,
-                            round=self.current_round
+                            round=0  # 0 means "give me latest model"
                         )
                         response = self.grpc_stub.GetGlobalModel(request)
                         
-                        if response.available and response.round > self.last_global_round:
+                        # Accept model if:
+                        # 1. It's a newer round, OR
+                        # 2. Same round but we're waiting for aggregated model (after sending update)
+                        if response.available and (response.round > self.last_global_round or 
+                                                   (response.round == self.current_round and self.waiting_for_aggregated_model)):
                             self.on_grpc_global_model(response)
                             
                     except grpc.RpcError:
@@ -727,6 +839,7 @@ class UnifiedFLClient_Emotion:
             if self.model and round_num > self.last_global_round:
                 self.model.set_weights(weights)
                 self.last_global_round = round_num
+                self.waiting_for_aggregated_model = False  # Clear flag: received aggregated model
                 print(f"[gRPC] Client {self.client_id} updated model weights for round {round_num}")
                 
                 # Check if should evaluate
@@ -735,8 +848,10 @@ class UnifiedFLClient_Emotion:
                 
                 if status.should_evaluate and round_num == self.current_round:
                     if round_num not in self.evaluated_rounds:
+                        self.evaluated_rounds.add(round_num)  # Add BEFORE evaluate to prevent race condition
                         print(f"[gRPC] Client {self.client_id} starting evaluation for round {round_num}")
                         self.evaluate_model()
+                        print(f"[gRPC] Client {self.client_id} evaluation completed for round {round_num}.")
                         
         except Exception as e:
             print(f"[gRPC] Client {self.client_id} error handling global model: {e}")
@@ -798,6 +913,7 @@ class UnifiedFLClient_Emotion:
                 self.model.set_weights(weights)
                 self.current_round = round_num
                 self.last_global_round = round_num
+                self.waiting_for_aggregated_model = False  # Clear flag: received aggregated model
                 print(f"Client {self.client_id} received global model for round {round_num}")
         except Exception as e:
             print(f"Client {self.client_id} ERROR in handle_global_model: {e}")
@@ -852,9 +968,9 @@ class UnifiedFLClient_Emotion:
             if round_num in self.evaluated_rounds:
                 print(f"Client {self.client_id} ignoring duplicate evaluation for round {round_num}")
                 return
+            self.evaluated_rounds.add(round_num)  # Add BEFORE evaluate to prevent race condition
             print(f"Client {self.client_id} starting evaluation for round {round_num}...")
             self.evaluate_model()
-            self.evaluated_rounds.add(round_num)
             print(f"Client {self.client_id} evaluation completed for round {round_num}.")
         else:
             print(f"Client {self.client_id} skipping evaluation signal for round {round_num} (current: {self.current_round})")
@@ -1263,6 +1379,9 @@ class UnifiedFLClient_Emotion:
                 )
             )
             
+            # Set flag: we're now waiting for aggregated model
+            self.waiting_for_aggregated_model = True
+            
             log_sent_packet(
                 packet_size=len(weights_str),
                 peer="server",
@@ -1379,12 +1498,18 @@ class UnifiedFLClient_Emotion:
         
         print(f"[QUIC] Client {self.client_id} connecting to {quic_host}:{quic_port}...")
         
+        # Create protocol factory that sets client reference
+        def create_protocol(*args, **kwargs):
+            protocol = UnifiedClientQUICProtocol(*args, **kwargs)
+            protocol.client = self
+            return protocol
+        
         try:
             async with connect(
                 quic_host,
                 quic_port,
                 configuration=config,
-                create_protocol=lambda *args, **kwargs: UnifiedClientQUICProtocol(self, *args, **kwargs)
+                create_protocol=create_protocol
             ) as protocol:
                 self.quic_protocol = protocol
                 print(f"[QUIC] Client {self.client_id} established persistent connection")
@@ -1401,8 +1526,20 @@ class UnifiedFLClient_Emotion:
         finally:
             self.quic_protocol = None
     
+    async def _handle_quic_message_async(self, message: dict):
+        """Handle QUIC message received from server asynchronously"""
+        msg_type = message.get('type')
+        print(f"[QUIC] Client {self.client_id} received message type: {msg_type}")
+        
+        if msg_type == 'global_model':
+            self.on_global_model_received_quic(message)
+        elif msg_type == 'start_training':
+            self.on_start_training_quic(message)
+        elif msg_type == 'start_evaluation':
+            self.on_start_evaluation_quic(message)
+    
     def _handle_quic_message(self, message: dict):
-        """Handle QUIC message received from server (called from QUIC protocol)"""
+        """Handle QUIC message received from server (called from QUIC protocol)""" 
         msg_type = message.get('type')
         print(f"[QUIC] Client {self.client_id} received message type: {msg_type}")
         

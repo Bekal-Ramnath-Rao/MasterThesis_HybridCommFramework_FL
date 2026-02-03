@@ -380,7 +380,7 @@ class MultiArmedBanditSelector:
             c: Exploration parameter (higher = more exploration)
         """
         self.c = c
-        self.actions = ['mqtt', 'amqp', 'grpc', 'quic', 'dds']
+        self.actions = ['mqtt', 'amqp']
         
         # Statistics per action
         self.counts = {action: 0 for action in self.actions}

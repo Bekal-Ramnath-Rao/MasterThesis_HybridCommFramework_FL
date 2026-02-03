@@ -69,9 +69,12 @@ try:
     from aioquic.asyncio.protocol import QuicConnectionProtocol
     from aioquic.quic.events import StreamDataReceived
     QUIC_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     QUIC_AVAILABLE = False
-    print("Warning: aioquic not available, QUIC disabled")
+    print(f"Warning: aioquic not available, QUIC disabled (ImportError: {e})")
+except Exception as e:
+    QUIC_AVAILABLE = False
+    print(f"Warning: aioquic not available, QUIC disabled (Unexpected error: {type(e).__name__}: {e})")
 
 try:
     from cyclonedds.domain import DomainParticipant  # DDS
@@ -216,6 +219,11 @@ class UnifiedFederatedLearningServer:
         self.dds_writers = {}
         self.dds_readers = {}
         
+        # gRPC state tracking
+        self.grpc_should_train = {}  # Maps client_id -> should_train (bool)
+        self.grpc_should_evaluate = {}  # Maps client_id -> should_evaluate (bool)
+        self.grpc_model_ready = {}  # Maps client_id -> model_ready_for_round (int)
+        
         # Training configuration
         self.training_config = {"batch_size": 32, "local_epochs": 20}
         
@@ -316,6 +324,7 @@ class UnifiedFederatedLearningServer:
         """Start MQTT protocol handler"""
         try:
             self.mqtt_client = mqtt.Client(
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
                 client_id="fl_unified_server_mqtt", 
                 protocol=mqtt.MQTTv311, 
                 clean_session=True
@@ -332,15 +341,15 @@ class UnifiedFederatedLearningServer:
         except Exception as e:
             print(f"[MQTT] Failed to start: {e}")
     
-    def on_mqtt_connect(self, client, userdata, flags, rc):
+    def on_mqtt_connect(self, client, userdata, connect_flags, reason_code, properties):
         """MQTT connection callback"""
-        if rc == 0:
+        if reason_code == 0:
             print(f"[MQTT] Connected to broker")
             client.subscribe("fl/client_register", qos=1)
             client.subscribe("fl/client/+/update", qos=1)
             client.subscribe("fl/client/+/metrics", qos=1)
         else:
-            print(f"[MQTT] Connection failed with code {rc}")
+            print(f"[MQTT] Connection failed with code {reason_code}")
     
     def on_mqtt_message(self, client, userdata, msg):
         """MQTT message callback"""
@@ -539,8 +548,37 @@ class UnifiedFederatedLearningServer:
     # Note: AMQP update and metrics callbacks are now defined inline in on_amqp_register
     # to handle separate connections per client
     
+    async def handle_quic_message(self, message, protocol):
+        """Handle incoming QUIC messages asynchronously"""
+        try:
+            msg_type = message.get('type')
+            client_id = message.get('client_id', 'unknown')
+            
+            # Store QUIC protocol reference for ANY message (not just registration)
+            if client_id and client_id != 'unknown':
+                self.quic_clients[client_id] = protocol
+                print(f"[QUIC] Stored protocol reference for client {client_id}")
+            
+            # Use asyncio.to_thread to call synchronous methods from async context
+            # This ensures thread-safe execution of methods with locks
+            loop = asyncio.get_event_loop()
+            
+            if msg_type == 'register':
+                await loop.run_in_executor(None, self.handle_client_registration, client_id, 'quic')
+                print(f"[QUIC] Received registration from client {client_id}")
+            elif msg_type == 'update':
+                await loop.run_in_executor(None, self.handle_client_update, message, 'quic')
+                print(f"[QUIC] Received update from client {client_id}")
+            elif msg_type == 'metrics':
+                await loop.run_in_executor(None, self.handle_client_metrics, message, 'quic')
+                print(f"[QUIC] Received metrics from client {client_id}")
+        except Exception as e:
+            print(f"[QUIC] Error handling message: {e}")
+            import traceback
+            traceback.print_exc()
+    
     def send_quic_message(self, client_id, message):
-        """Send message to client via QUIC stream (copied from working single-protocol server)"""
+        """Send message to client via QUIC stream"""
         if client_id not in self.quic_clients:
             print(f"[QUIC] Warning: No QUIC protocol reference for client {client_id}")
             print(f"[QUIC] Available QUIC clients: {list(self.quic_clients.keys())}")
@@ -548,7 +586,7 @@ class UnifiedFederatedLearningServer:
         
         try:
             protocol = self.quic_clients[client_id]
-            stream_id = protocol._quic.get_next_available_stream_id()
+            stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
             # Add newline delimiter for message framing
             data = (json.dumps(message) + '\n').encode('utf-8')
             protocol._quic.send_stream_data(stream_id, data, end_stream=True)
@@ -591,8 +629,10 @@ class UnifiedFederatedLearningServer:
                         heartbeat=600,
                         blocked_connection_timeout=300
                     )
+                    print("Before sending message type:", message_type)
                     self.amqp_send_connection = pika.BlockingConnection(parameters)
                     self.amqp_send_channel = self.amqp_send_connection.channel()
+                    print("After sending message type:", message_type)
             
             payload = json.dumps(message)
             queue_name = f'client_{client_id}_{message_type}'
@@ -690,6 +730,12 @@ class UnifiedFederatedLearningServer:
         try:
             configuration = QuicConfiguration(
                 is_client=False,
+                alpn_protocols=["fl"],
+                # Data limits for large model updates (12+ MB)
+                max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
+                max_data=100 * 1024 * 1024,  # 100 MB total connection
+                # Long timeout for FL training cycles
+                idle_timeout=3600.0,  # 1 hour
                 max_datagram_frame_size=65536,
             )
             
@@ -733,9 +779,9 @@ class UnifiedFederatedLearningServer:
             ).serial_number(
                 x509.random_serial_number()
             ).not_valid_before(
-                datetime.datetime.utcnow()
+                datetime.datetime.now(datetime.UTC)
             ).not_valid_after(
-                datetime.datetime.utcnow() + datetime.timedelta(days=365)
+                datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=365)
             ).add_extension(
                 x509.SubjectAlternativeName(san_list),
                 critical=False
@@ -757,11 +803,17 @@ class UnifiedFederatedLearningServer:
             
             configuration.load_cert_chain(cert_path, key_path)
             
+            # Create protocol factory that sets server reference
+            def create_protocol(*args, **kwargs):
+                protocol = QUICServerProtocol(*args, **kwargs)
+                protocol.server = self
+                return protocol
+            
             await serve(
                 QUIC_HOST,
                 QUIC_PORT,
                 configuration=configuration,
-                create_protocol=lambda *args, **kwargs: QUICServerProtocol(self, *args, **kwargs),
+                create_protocol=create_protocol,
             )
         except Exception as e:
             print(f"[QUIC] Server error: {e}")
@@ -808,9 +860,10 @@ class UnifiedFederatedLearningServer:
                         print(f"[AMQP] Polling... ({poll_count} iterations, {len(self.registered_clients)} clients: {list(self.registered_clients.keys())})")
                         print(f"[AMQP] Connection status: open={self.amqp_consumer_connection.is_open}, channel open={self.amqp_consumer_channel.is_open}")
                     
-                    # Poll each registered client's update queue
+                    # Poll ALL client queues (1 to num_clients), not just registered ones
+                    # This ensures we receive messages even before/during registration
                     found_messages = False
-                    for client_id in list(self.registered_clients.keys()):
+                    for client_id in range(1, self.num_clients + 1):
                         update_queue = f'client_{client_id}_updates'
                         
                         try:
@@ -975,7 +1028,10 @@ class UnifiedFederatedLearningServer:
                 while self.running:
                     try:
                         # Read model updates
-                        for sample in update_reader.take(10):
+                        samples_read = list(update_reader.take(10))
+                        if samples_read:
+                            print(f"[DDS] Read {len(samples_read)} update samples from DDS")
+                        for sample in samples_read:
                             if sample:
                                 try:
                                     # Convert List[int] back to bytes and deserialize weights
@@ -994,6 +1050,8 @@ class UnifiedFederatedLearningServer:
                                         'mape': sample.mape
                                     }
                                     
+                                    print(f"[DDS] Processing update from client {sample.client_id}, round {sample.round}")
+                                    
                                     log_received_packet(
                                         packet_size=len(sample.weights),
                                         peer=f"client_{sample.client_id}",
@@ -1010,7 +1068,10 @@ class UnifiedFederatedLearningServer:
                                     traceback.print_exc()
                         
                         # Read metrics
-                        for sample in metrics_reader.take(10):
+                        samples_read = list(metrics_reader.take(10))
+                        if samples_read:
+                            print(f"[DDS] Read {len(samples_read)} metric samples from DDS")
+                        for sample in samples_read:
                             if sample:
                                 try:
                                     # Convert to dict format expected by handler
@@ -1024,6 +1085,8 @@ class UnifiedFederatedLearningServer:
                                         'mae': sample.mae,
                                         'mape': sample.mape
                                     }
+                                    
+                                    print(f"[DDS] Processing metrics from client {sample.client_id}, round {sample.round}")
                                     
                                     log_received_packet(
                                         packet_size=len(str(sample)),
@@ -1107,13 +1170,22 @@ class UnifiedFederatedLearningServer:
     
     def handle_client_update(self, data, protocol):
         """Handle client model update (thread-safe)"""
+        print(f"[DEBUG] handle_client_update ENTRY - protocol={protocol}, client_id={data.get('client_id')}, round={data.get('round')}, current_round={self.current_round}")
         with self.lock:
             client_id = data['client_id']
             round_num = data['round']
             
-            if round_num != self.current_round:
-                print(f"[{protocol.upper()}] Ignoring update from client {client_id} "
-                      f"(round {round_num} != current {self.current_round})")
+            print(f"[DEBUG] handle_client_update LOCKED - checking round: {round_num} vs {self.current_round}")
+            
+            # Check if this update is for the current round
+            # Allow updates only for current round (not past or future)
+            if round_num < self.current_round:
+                print(f"[{protocol.upper()}] Ignoring old update from client {client_id} "
+                      f"(round {round_num} < current {self.current_round})")
+                return
+            elif round_num > self.current_round:
+                print(f"[{protocol.upper()}] WARNING: Received future update from client {client_id} "
+                      f"(round {round_num} > current {self.current_round})")
                 return
             
             # Update the protocol this client is using (RL agent may change protocol per round)
@@ -1150,12 +1222,32 @@ class UnifiedFederatedLearningServer:
             client_id = data['client_id']
             round_num = data['round']
             
-            if round_num != self.current_round:
-                print(f"[{protocol.upper()}] Ignoring metrics from client {client_id} "
-                      f"(round {round_num} != current {self.current_round})")
+            print(f"[{protocol.upper()}] handle_client_metrics ENTRY: client_id={client_id}, round={round_num}, current_round={self.current_round}")
+            print(f"[{protocol.upper()}] Current client_metrics keys: {list(self.client_metrics.keys())}")
+            
+            # Check if client already submitted metrics for this round
+            if client_id in self.client_metrics:
+                existing_round = self.client_metrics[client_id].get('round', -1)
+                if existing_round == round_num:
+                    print(f"[{protocol.upper()}] Ignoring duplicate metrics from client {client_id} "
+                          f"for round {round_num}")
+                    return
+            
+            # Accept metrics for current round only
+            if round_num < self.current_round:
+                print(f"[{protocol.upper()}] Ignoring old metrics from client {client_id} "
+                      f"(round {round_num} < current {self.current_round})")
+                return
+            elif round_num > self.current_round:
+                print(f"[{protocol.upper()}] WARNING: Received future metrics from client {client_id} "
+                      f"(round {round_num} > current {self.current_round})")
                 return
             
+            # Update the protocol this client is using (RL agent may change protocol per round)
+            self.registered_clients[client_id] = protocol
+            
             self.client_metrics[client_id] = {
+                'round': round_num,
                 'num_samples': data['num_samples'],
                 'loss': data['loss'],
                 'accuracy': data['accuracy'],
@@ -1166,6 +1258,7 @@ class UnifiedFederatedLearningServer:
                   f"({len(self.client_metrics)}/{self.num_clients})")
             
             if len(self.client_metrics) == self.num_clients:
+                print(f"[{protocol.upper()}] All {self.num_clients} metrics received! Triggering aggregate_metrics()")
                 self.aggregate_metrics()
     
     def distribute_initial_model(self):
@@ -1211,7 +1304,9 @@ class UnifiedFederatedLearningServer:
                     print(f"[QUIC] Sent initial model to client {client_id}")
                     
                 elif protocol == 'grpc':
-                    print(f"[gRPC] Client {client_id} will pull initial model")
+                    # Mark initial model as ready for gRPC client to pull
+                    self.grpc_model_ready[client_id] = 0
+                    print(f"[gRPC] Initial model ready for client {client_id} to pull")
                     
                 elif protocol == 'dds':
                     print(f"[DDS] Client {client_id} will receive initial model via pub/sub")
@@ -1228,54 +1323,79 @@ class UnifiedFederatedLearningServer:
     
     def signal_start_training(self):
         """Signal all clients to start training for current round"""
-        for client_id, protocol in self.registered_clients.items():
+        # Broadcast to ALL protocols (clients listen to multiple protocols simultaneously)
+        for client_id in self.registered_clients.keys():
+            message = {'round': self.current_round}
+            
+            # MQTT
             try:
-                if protocol == 'mqtt':
-                    message = {'round': self.current_round}
-                    self.send_via_mqtt(client_id, "fl/start_training", message)
-                elif protocol == 'amqp':
-                    message = {'round': self.current_round}
-                    self.send_via_amqp(client_id, 'start_training', message)
-                elif protocol == 'quic':
-                    message = {
-                        'type': 'start_training',
-                        'round': self.current_round
-                    }
-                    self.send_quic_message(client_id, message)
-                # gRPC and DDS handled via their mechanisms
+                self.send_via_mqtt(client_id, "fl/start_training", message)
             except Exception as e:
-                print(f"[{protocol.upper()}] Error signaling training to client {client_id}: {e}")
+                pass  # Client may not be listening to this protocol
+            
+            # AMQP
+            try:
+                self.send_via_amqp(client_id, 'start_training', message)
+            except Exception as e:
+                pass
+            
+            # gRPC - set flag for polling
+            try:
+                self.grpc_should_train[client_id] = True
+                self.grpc_should_evaluate[client_id] = False
+            except Exception as e:
+                pass
+            
+            # DDS
+            try:
+                if DDS_AVAILABLE and 'command' in self.dds_writers:
+                    command = TrainingCommand(
+                        round=self.current_round,
+                        start_training=True,
+                        start_evaluation=False,
+                        training_complete=False
+                    )
+                    self.dds_writers['command'].write(command)
+            except Exception as e:
+                pass
     
     def signal_start_evaluation(self):
         """Signal all clients to start evaluation for current round"""
-        for client_id, protocol in self.registered_clients.items():
+        # Broadcast to ALL protocols (clients listen to multiple protocols simultaneously)
+        for client_id in self.registered_clients.keys():
+            message = {'round': self.current_round}
+            
+            # MQTT
             try:
-                if protocol == 'mqtt':
-                    message = {'round': self.current_round}
-                    self.send_via_mqtt(client_id, "fl/start_evaluation", message)
-                elif protocol == 'amqp':
-                    message = {'round': self.current_round}
-                    self.send_via_amqp(client_id, 'start_evaluation', message)
-                elif protocol == 'quic':
-                    message = {
-                        'type': 'start_evaluation',
-                        'round': self.current_round
-                    }
-                    self.send_quic_message(client_id, message)
-                elif protocol == 'dds':
-                    # Send evaluation command via DDS
-                    if DDS_AVAILABLE and 'command' in self.dds_writers:
-                        command = TrainingCommand(
-                            round=self.current_round,
-                            start_training=False,
-                            start_evaluation=True,
-                            training_complete=False
-                        )
-                        self.dds_writers['command'].write(command)
-                        print(f"[DDS] Sent evaluation command to client {client_id}")
-                # gRPC handled via pull model
+                self.send_via_mqtt(client_id, "fl/start_evaluation", message)
             except Exception as e:
-                print(f"[{protocol.upper()}] Error signaling evaluation to client {client_id}: {e}")
+                pass  # Client may not be listening to this protocol
+            
+            # AMQP
+            try:
+                self.send_via_amqp(client_id, 'start_evaluation', message)
+            except Exception as e:
+                pass
+            
+            # gRPC - set flag for polling
+            try:
+                self.grpc_should_train[client_id] = False
+                self.grpc_should_evaluate[client_id] = True
+            except Exception as e:
+                pass
+            
+            # DDS
+            try:
+                if DDS_AVAILABLE and 'command' in self.dds_writers:
+                    command = TrainingCommand(
+                        round=self.current_round,
+                        start_training=False,
+                        start_evaluation=True,
+                        training_complete=False
+                    )
+                    self.dds_writers['command'].write(command)
+            except Exception as e:
+                pass
     
     def broadcast_global_model(self):
         """Broadcast updated global model to all clients via their registered protocols"""
@@ -1317,8 +1437,9 @@ class UnifiedFederatedLearningServer:
                     print(f"[QUIC] Sent global model to client {client_id}")
                     
                 elif protocol == 'grpc':
-                    # gRPC uses pull model - clients request global model
-                    print(f"[gRPC] Client {client_id} will pull global model")
+                    # gRPC uses pull model - mark model as ready for this client
+                    self.grpc_model_ready[client_id] = self.current_round
+                    print(f"[gRPC] Global model ready for client {client_id} to pull (round {self.current_round})")
                     
                 elif protocol == 'dds':
                     # DDS uses pub/sub - publish to DDS topic
@@ -1550,27 +1671,33 @@ if GRPC_AVAILABLE:
         def GetGlobalModel(self, request, context):
             """Send global model to client"""
             try:
-                if request.round == 0:
-                    # Initial model with config
-                    weights_bytes = pickle.dumps(self.server.global_weights)
-                    model_config_json = json.dumps(self.server.model_config)
-                    
-                    response = federated_learning_pb2.GlobalModel(
-                        round=0,
-                        weights=weights_bytes,
-                        available=True,
-                        model_config=model_config_json
-                    )
-                elif request.round == self.server.current_round:
-                    weights_bytes = pickle.dumps(self.server.global_weights)
-                    
-                    response = federated_learning_pb2.GlobalModel(
-                        round=self.server.current_round,
-                        weights=weights_bytes,
-                        available=True,
-                        model_config=""
-                    )
+                # Round 0 means "give me the latest model" (for polling)
+                if request.round == 0 or request.round == self.server.current_round or request.round == self.server.current_round - 1:
+                    # Send current global model
+                    if self.server.current_round == 0:
+                        # Initial model with config
+                        weights_bytes = pickle.dumps(self.server.global_weights)
+                        model_config_json = json.dumps(self.server.model_config)
+                        
+                        response = federated_learning_pb2.GlobalModel(
+                            round=0,
+                            weights=weights_bytes,
+                            available=True,
+                            model_config=model_config_json
+                        )
+                    else:
+                        # Updated model after aggregation
+                        weights_bytes = pickle.dumps(self.server.global_weights)
+                        
+                        response = federated_learning_pb2.GlobalModel(
+                            round=self.server.current_round,
+                            weights=weights_bytes,
+                            available=True,
+                            model_config=""
+                        )
+                        # Log removed to avoid spam - clients poll every second
                 else:
+                    # Client requesting old/future round - not available
                     response = federated_learning_pb2.GlobalModel(
                         round=request.round,
                         weights=b"",
@@ -1599,6 +1726,8 @@ if GRPC_AVAILABLE:
         def SendModelUpdate(self, request, context):
             """Receive model update from client"""
             try:
+                print(f"[gRPC] SendModelUpdate called - client_id={request.client_id}, round={request.round}, current_round={self.server.current_round}")
+                
                 log_received_packet(
                     packet_size=request.ByteSize(),
                     peer=f"client_{request.client_id}",
@@ -1623,7 +1752,9 @@ if GRPC_AVAILABLE:
                     'metrics': metrics
                 }
                 
+                print(f"[gRPC] Calling handle_client_update for client {request.client_id}, round {request.round}")
                 self.server.handle_client_update(data, 'grpc')
+                print(f"[gRPC] handle_client_update completed for client {request.client_id}")
                 
                 return federated_learning_pb2.UpdateResponse(
                     success=True,
@@ -1671,12 +1802,23 @@ if GRPC_AVAILABLE:
                 )
         
         def CheckTrainingStatus(self, request, context):
-            """Check if client should start training"""
+            """Check if client should start training or evaluation"""
             try:
-                should_train = (request.round == self.server.current_round)
+                client_id = request.client_id
+                
+                # Check if client should train
+                should_train = self.server.grpc_should_train.get(client_id, False)
+                should_evaluate = self.server.grpc_should_evaluate.get(client_id, False)
+                
+                # Clear flags after reading (one-time signals)
+                if should_train:
+                    self.server.grpc_should_train[client_id] = False
+                if should_evaluate:
+                    self.server.grpc_should_evaluate[client_id] = False
                 
                 return federated_learning_pb2.TrainingStatus(
                     should_train=should_train,
+                    should_evaluate=should_evaluate,
                     current_round=self.server.current_round,
                     is_complete=self.server.converged
                 )
@@ -1684,6 +1826,7 @@ if GRPC_AVAILABLE:
                 print(f"[gRPC] Error in CheckTrainingStatus: {e}")
                 return federated_learning_pb2.TrainingStatus(
                     should_train=False,
+                    should_evaluate=False,
                     current_round=0,
                     is_complete=True
                 )
@@ -1695,73 +1838,74 @@ if GRPC_AVAILABLE:
 
 if QUIC_AVAILABLE:
     class QUICServerProtocol(QuicConnectionProtocol):
-        """QUIC protocol handler"""
+        """QUIC protocol handler (supports multiple clients)"""
         
-        def __init__(self, server, *args, **kwargs):
+        def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.server = server
-            self.stream_buffers = {}  # Buffer data per stream ID
-            print(f"[QUIC] Protocol initialized")
+            self.server = None  # Set by factory function
+            self._stream_buffers = {}  # Buffer data per stream ID (instance-specific)
+            print(f"[QUIC] Protocol instance created")
         
         def quic_event_received(self, event):
             """Handle QUIC events"""
-            print(f"[QUIC] Event received: {type(event).__name__}")
-            
             if isinstance(event, StreamDataReceived):
                 try:
-                    # Buffer stream data
+                    # Get or create buffer for this stream
                     stream_id = event.stream_id
-                    if stream_id not in self.stream_buffers:
-                        self.stream_buffers[stream_id] = b''
+                    if stream_id not in self._stream_buffers:
+                        self._stream_buffers[stream_id] = b''
                     
-                    self.stream_buffers[stream_id] += event.data
+                    # Append new data to buffer
+                    self._stream_buffers[stream_id] += event.data
+                    print(f"[QUIC] Stream {stream_id}: received {len(event.data)} bytes, buffer now {len(self._stream_buffers[stream_id])} bytes")
                     
-                    # Try to parse complete JSON messages
-                    # Look for newline as message delimiter
-                    buffer = self.stream_buffers[stream_id]
-                    if b'\n' in buffer:
-                        messages = buffer.split(b'\n')
-                        # Last element might be incomplete, keep it in buffer
-                        self.stream_buffers[stream_id] = messages[-1]
-                        
-                        # Process complete messages
-                        for msg_data in messages[:-1]:
-                            if msg_data:
-                                try:
-                                    data_str = msg_data.decode().strip()
-                                    print(f"[QUIC] Processing message: {len(data_str)} bytes")
-                                    message = json.loads(data_str)
-                                    
-                                    log_received_packet(
-                                        packet_size=len(data_str),
-                                        peer=f"quic_client_{message.get('client_id', 'unknown')}",
-                                        protocol="QUIC",
-                                        round=message.get('round', 0),
-                                        extra_info=message.get('type', 'unknown')
-                                    )
-                                    
-                                    # Store QUIC protocol reference for ANY message (not just registration)
-                                    # This allows server to send responses back via QUIC even if client registered via different protocol
-                                    client_id = message.get('client_id')
-                                    if client_id:
-                                        self.server.quic_clients[client_id] = self
-                                        print(f"[QUIC] Stored protocol reference for client {client_id} (now have {list(self.server.quic_clients.keys())})")
-                                    
-                                    if message['type'] == 'register':
-                                        self.server.handle_client_registration(message['client_id'], 'quic')
-                                        print(f"[QUIC] Received registration from client {message['client_id']}")
-                                    elif message['type'] == 'update':
-                                        self.server.handle_client_update(message, 'quic')
-                                        print(f"[QUIC] Received update from client {message['client_id']}")
-                                    elif message['type'] == 'metrics':
-                                        self.server.handle_client_metrics(message, 'quic')
-                                        print(f"[QUIC] Received metrics from client {message['client_id']}")
-                                except json.JSONDecodeError as je:
-                                    print(f"[QUIC] JSON decode error: {je}")
-                                except Exception as e2:
-                                    print(f"[QUIC] Error processing message: {e2}")
-                                    import traceback
-                                    traceback.print_exc()
+                    # Send flow control updates to allow more data
+                    self.transmit()
+                    
+                    # Try to decode complete messages (delimited by newline)
+                    while b'\n' in self._stream_buffers[stream_id]:
+                        message_data, self._stream_buffers[stream_id] = self._stream_buffers[stream_id].split(b'\n', 1)
+                        if message_data:
+                            try:
+                                data_str = message_data.decode('utf-8')
+                                message = json.loads(data_str)
+                                print(f"[QUIC] Decoded message type '{message.get('type')}' from stream {stream_id}")
+                                
+                                log_received_packet(
+                                    packet_size=len(data_str),
+                                    peer=f"quic_client_{message.get('client_id', 'unknown')}",
+                                    protocol="QUIC",
+                                    round=message.get('round', 0),
+                                    extra_info=message.get('type', 'unknown')
+                                )
+                                
+                                # Handle message asynchronously
+                                if self.server:
+                                    asyncio.create_task(self.server.handle_quic_message(message, self))
+                            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                                print(f"[QUIC] Error decoding message: {e}")
+                    
+                    # If stream ended and buffer has remaining data, try to process it
+                    if event.end_stream and self._stream_buffers[stream_id]:
+                        print(f"[QUIC] Stream {stream_id} ended with {len(self._stream_buffers[stream_id])} bytes remaining")
+                        try:
+                            data_str = self._stream_buffers[stream_id].decode('utf-8')
+                            message = json.loads(data_str)
+                            print(f"[QUIC] Decoded end-of-stream message type '{message.get('type')}'")
+                            
+                            log_received_packet(
+                                packet_size=len(data_str),
+                                peer=f"quic_client_{message.get('client_id', 'unknown')}",
+                                protocol="QUIC",
+                                round=message.get('round', 0),
+                                extra_info=message.get('type', 'unknown')
+                            )
+                            
+                            if self.server:
+                                asyncio.create_task(self.server.handle_quic_message(message, self))
+                            self._stream_buffers[stream_id] = b''
+                        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                            print(f"[QUIC] Error decoding remaining buffer: {e}")
                 except Exception as e:
                     print(f"[QUIC] Error handling event: {e}")
                     import traceback
