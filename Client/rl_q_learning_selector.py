@@ -25,7 +25,7 @@ class QLearningProtocolSelector:
     """
     
     # Protocol actions
-    PROTOCOLS = ['mqtt', 'amqp', 'dds', 'grpc']
+    PROTOCOLS = ['mqtt', 'amqp', 'dds', 'grpc', 'quic']
     
     # Environment state dimensions
     NETWORK_CONDITIONS = ['excellent', 'good', 'moderate', 'poor', 'very_poor']

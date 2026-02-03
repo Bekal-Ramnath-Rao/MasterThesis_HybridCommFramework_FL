@@ -16,7 +16,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 # This ensures different clients use different GPUs in multi-GPU setups
 client_id_env = os.environ.get("CLIENT_ID", "0")
 try:
-    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+    default_gpu = str(0)  # Client 1->GPU 0, Client 2->GPU 1, etc.
 except (ValueError, TypeError):
     default_gpu = "0"
 gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)

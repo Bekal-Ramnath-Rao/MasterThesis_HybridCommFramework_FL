@@ -865,6 +865,7 @@ class UnifiedFLClient_Emotion:
     def start_quic_listener(self):
         """Start QUIC persistent connection in background thread"""
         if self.quic_thread is None or not self.quic_thread.is_alive():
+            # Start the event loop thread
             self.quic_thread = threading.Thread(
                 target=self._run_quic_loop,
                 daemon=True,
@@ -872,8 +873,21 @@ class UnifiedFLClient_Emotion:
             )
             self.quic_thread.start()
             
-            # Wait briefly for connection to establish
-            time.sleep(2)
+            # Wait for event loop to be ready
+            max_wait = 2
+            waited = 0
+            while self.quic_loop is None and waited < max_wait:
+                time.sleep(0.1)
+                waited += 0.1
+            
+            # Schedule the connection task in the event loop
+            if self.quic_loop:
+                asyncio.run_coroutine_threadsafe(
+                    self._quic_connection_loop(),
+                    self.quic_loop
+                )
+                time.sleep(2)  # Wait for connection attempt
+            
             print(f"[QUIC] Listener started for client {self.client_id}")
     
     def handle_global_model(self, payload):
@@ -1136,7 +1150,8 @@ class UnifiedFLClient_Emotion:
                 elif attempt_protocol == 'grpc' and grpc is not None:
                     self._send_via_grpc(update_message)
                     success = True
-                elif attempt_protocol == 'quic' and asyncio is not None:
+                elif attempt_protocol == 'quic' and asyncio is not None and self.quic_protocol is not None:
+                    # Only try QUIC if connection is established
                     self._send_via_quic(update_message)
                     success = True
                 elif attempt_protocol == 'dds' and DDS_AVAILABLE:
@@ -1183,8 +1198,13 @@ class UnifiedFLClient_Emotion:
                 self._send_metrics_via_amqp(metrics_message)
             elif protocol == 'grpc':
                 self._send_metrics_via_grpc(metrics_message)
-            elif protocol == 'quic':
+            elif protocol == 'quic' and self.quic_protocol is not None:
+                # Only try QUIC if connection is established
                 self._send_metrics_via_quic(metrics_message)
+            elif protocol == 'quic':
+                # QUIC not connected, fallback to MQTT
+                print(f"Client {self.client_id} WARNING: QUIC not connected, falling back to MQTT for metrics")
+                self._send_metrics_via_mqtt(metrics_message)
             elif protocol == 'dds':
                 self._send_metrics_via_dds(metrics_message)
             else:
@@ -1474,13 +1494,15 @@ class UnifiedFLClient_Emotion:
         self.quic_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.quic_loop)
         try:
-            self.quic_loop.run_until_complete(self._quic_connection_loop())
+            # Keep loop running indefinitely
+            self.quic_loop.run_forever()
         except Exception as e:
             print(f"[QUIC] Event loop error: {e}")
             import traceback
             traceback.print_exc()
         finally:
-            self.quic_loop.close()
+            # Don't close the loop here - it should stay open for sending
+            print(f"[QUIC] Event loop stopped for client {self.client_id}")
     
     async def _quic_connection_loop(self):
         """Maintain persistent QUIC connection (runs in background)"""
@@ -1490,6 +1512,7 @@ class UnifiedFLClient_Emotion:
         
         config = QuicConfiguration(
             is_client=True, 
+            alpn_protocols=["fl"],  # CRITICAL: Must match server's ALPN
             verify_mode=ssl.CERT_NONE,
             max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
             max_data=100 * 1024 * 1024,  # 100 MB total
@@ -1497,34 +1520,60 @@ class UnifiedFLClient_Emotion:
         )
         
         print(f"[QUIC] Client {self.client_id} connecting to {quic_host}:{quic_port}...")
+        print(f"[QUIC] Configuration: verify_mode=CERT_NONE, idle_timeout=3600s")
         
         # Create protocol factory that sets client reference
         def create_protocol(*args, **kwargs):
             protocol = UnifiedClientQUICProtocol(*args, **kwargs)
             protocol.client = self
+            print(f"[QUIC] Client {self.client_id} created protocol instance")
             return protocol
         
-        try:
-            async with connect(
-                quic_host,
-                quic_port,
-                configuration=config,
-                create_protocol=create_protocol
-            ) as protocol:
-                self.quic_protocol = protocol
-                print(f"[QUIC] Client {self.client_id} established persistent connection")
-                
-                # Keep connection alive indefinitely
-                try:
-                    await asyncio.Future()
-                except asyncio.CancelledError:
-                    print(f"[QUIC] Client {self.client_id} connection cancelled")
-        except Exception as e:
-            print(f"[QUIC] Client {self.client_id} connection error: {e}")
-            import traceback
-            traceback.print_exc()
-        finally:
-            self.quic_protocol = None
+        # Retry connection with exponential backoff, keep retrying indefinitely
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"[QUIC] Client {self.client_id} attempt {attempt + 1}/{max_retries} - calling connect()...")
+                async with connect(
+                    quic_host,
+                    quic_port,
+                    configuration=config,
+                    create_protocol=create_protocol
+                ) as protocol:
+                    self.quic_protocol = protocol
+                    print(f"[QUIC] ✓ Client {self.client_id} established persistent connection")
+                    print(f"[QUIC] Connection state: {protocol._quic.get_timer() if hasattr(protocol, '_quic') else 'unknown'}")
+                    
+                    # Keep connection alive indefinitely
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError:
+                        print(f"[QUIC] Client {self.client_id} connection cancelled")
+                    break  # Connection successful, exit retry loop
+                    
+            except (ConnectionError, OSError, TimeoutError) as e:
+                if attempt < max_retries - 1:
+                    print(f"[QUIC] ✗ Client {self.client_id} connection attempt {attempt + 1}/{max_retries} failed: {type(e).__name__}: {e}")
+                    print(f"[QUIC] Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    print(f"[QUIC] ✗✗✗ Client {self.client_id} connection FAILED after {max_retries} attempts: {type(e).__name__}: {e}")
+                    print(f"[QUIC] QUIC protocol will NOT be available for this client")
+                    print(f"[QUIC] Server status: listening on {quic_host}:{quic_port}")
+                    print(f"[QUIC] Possible causes:")
+                    print(f"[QUIC]   1. Server not responding to QUIC handshake")
+                    print(f"[QUIC]   2. Firewall blocking UDP port {quic_port}")
+                    print(f"[QUIC]   3. Server's asyncio loop not running properly")
+                    self.quic_protocol = None
+            except Exception as e:
+                print(f"[QUIC] ✗ Client {self.client_id} unexpected connection error: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+                self.quic_protocol = None
+                break
     
     async def _handle_quic_message_async(self, message: dict):
         """Handle QUIC message received from server asynchronously"""
@@ -1623,6 +1672,17 @@ class UnifiedFLClient_Emotion:
             raise ImportError("aioquic module not available for QUIC")
         
         try:
+            # Check if event loop is available and running
+            if self.quic_loop is None:
+                raise ConnectionError("QUIC event loop not available")
+            
+            if self.quic_loop.is_closed():
+                raise ConnectionError("QUIC event loop is closed")
+            
+            # Check if protocol is connected
+            if self.quic_protocol is None:
+                raise ConnectionError("QUIC protocol not connected")
+            
             # Add 'type' field for server to identify message type
             quic_message = {**message, 'type': 'update'}
             
@@ -1631,9 +1691,6 @@ class UnifiedFLClient_Emotion:
             print(f"Client {self.client_id} sending via QUIC - size: {payload_size_mb:.2f} MB")
             
             # Use persistent connection directly via run_coroutine_threadsafe
-            if self.quic_loop is None:
-                raise ConnectionError("QUIC connection not established - loop not available")
-            
             future = asyncio.run_coroutine_threadsafe(
                 self._do_quic_send(payload),
                 self.quic_loop
@@ -1659,15 +1716,23 @@ class UnifiedFLClient_Emotion:
             raise ImportError("aioquic module not available for QUIC")
         
         try:
+            # Check if event loop is available and running
+            if self.quic_loop is None:
+                raise ConnectionError("QUIC event loop not available")
+            
+            if self.quic_loop.is_closed():
+                raise ConnectionError("QUIC event loop is closed")
+            
+            # Check if protocol is connected
+            if self.quic_protocol is None:
+                raise ConnectionError("QUIC protocol not connected")
+            
             # Add 'type' field for server to identify message type
             quic_message = {**message, 'type': 'metrics'}
             
             payload = json.dumps(quic_message)
             
             # Use persistent connection directly via run_coroutine_threadsafe
-            if self.quic_loop is None:
-                raise ConnectionError("QUIC connection not established - loop not available")
-            
             future = asyncio.run_coroutine_threadsafe(
                 self._do_quic_send(payload),
                 self.quic_loop
@@ -1731,7 +1796,11 @@ class UnifiedFLClient_Emotion:
         for attempt in range(max_retries):
             try:
                 # Use ssl.CERT_NONE for self-signed certificate verification
-                config = QuicConfiguration(is_client=True, verify_mode=ssl.CERT_NONE)
+                config = QuicConfiguration(
+                    is_client=True,
+                    alpn_protocols=["fl"],  # CRITICAL: Must match server's ALPN
+                    verify_mode=ssl.CERT_NONE
+                )
                 
                 # connect() returns a QuicConnectionProtocol
                 # We use create_stream() to get reader/writer

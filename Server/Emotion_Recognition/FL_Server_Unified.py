@@ -706,8 +706,9 @@ class UnifiedFederatedLearningServer:
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
                     print(f"[QUIC] Starting server on {QUIC_HOST}:{QUIC_PORT}")
-                    loop.run_until_complete(self._run_quic_server())
-                    # Keep the loop running
+                    # Schedule the QUIC server as a task
+                    loop.create_task(self._run_quic_server())
+                    # Keep the loop running indefinitely
                     loop.run_forever()
                 except Exception as e:
                     print(f"[QUIC] Thread error: {e}")
@@ -803,18 +804,31 @@ class UnifiedFederatedLearningServer:
             
             configuration.load_cert_chain(cert_path, key_path)
             
+            print(f"[QUIC] Server configuration complete:")
+            print(f"[QUIC]   - Host: {QUIC_HOST}:{QUIC_PORT}")
+            print(f"[QUIC]   - Certificate: {cert_path}")
+            print(f"[QUIC]   - ALPN: fl")
+            print(f"[QUIC]   - Max stream data: 50 MB")
+            print(f"[QUIC]   - Idle timeout: 3600s")
+            
             # Create protocol factory that sets server reference
             def create_protocol(*args, **kwargs):
                 protocol = QUICServerProtocol(*args, **kwargs)
                 protocol.server = self
+                print(f"[QUIC] Server created protocol instance for new connection")
                 return protocol
             
+            print(f"[QUIC] Server starting serve() on {QUIC_HOST}:{QUIC_PORT}")
             await serve(
                 QUIC_HOST,
                 QUIC_PORT,
                 configuration=configuration,
                 create_protocol=create_protocol,
             )
+            print(f"[QUIC] ✓ Server serve() completed, now running indefinitely")
+            print(f"[QUIC] Server is ready to accept connections")
+            # Keep server running indefinitely
+            await asyncio.Future()  # Run forever
         except Exception as e:
             print(f"[QUIC] Server error: {e}")
             import traceback
