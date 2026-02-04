@@ -18,5 +18,6 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 python3 distributed_client_gui.py
 
+
 echo ""
 echo "👋 Distributed Client GUI closed"
