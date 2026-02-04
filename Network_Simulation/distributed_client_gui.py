@@ -502,6 +502,47 @@ class DistributedClientGUI(QMainWindow):
         
         self.log_text.append(f"Using image: {image_name}\n")
         
+        # Check if image exists locally
+        try:
+            check_result = subprocess.run(
+                ["docker", "image", "inspect", image_name],
+                capture_output=True,
+                timeout=10
+            )
+            
+            if check_result.returncode != 0:
+                # Image doesn't exist
+                self.log_text.append(f"⚠️ Image not found locally: {image_name}\n")
+                self.log_text.append(f"The image needs to be built on this machine.\n\n")
+                
+                reply = QMessageBox.question(
+                    self,
+                    "Image Not Found",
+                    f"Docker image not found on this machine:\n{image_name}\n\n"
+                    f"The image needs to be built before starting the client.\n\n"
+                    f"Would you like to build it now?\n"
+                    f"(This may take several minutes)",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                
+                if reply == QMessageBox.Yes:
+                    # Trigger rebuild
+                    self.rebuild_client_image()
+                    return
+                else:
+                    self.log_text.append(f"❌ Cannot start client without image. Use 'Rebuild Image' button to build it.\n")
+                    QMessageBox.information(
+                        self,
+                        "Image Required",
+                        "Please use the 'Rebuild Image' button to build the Docker image first."
+                    )
+                    return
+            else:
+                self.log_text.append(f"✅ Image found: {image_name}\n")
+                
+        except Exception as e:
+            self.log_text.append(f"⚠️ Could not check image: {str(e)}\n")
+        
         # Base command
         cmd = [
             "docker", "run", "-d",
