@@ -159,6 +159,51 @@ class FederatedLearningClient:
         weights = pickle.loads(serialized)
         return weights
     
+    def build_model_from_config(self, model_config):
+        """Build CNN model from server-provided configuration"""
+        input_shape = model_config.get('input_shape', (48, 48, 1))
+        num_classes = model_config.get('num_classes', 7)
+        layers = model_config.get('layers', [
+            {'type': 'conv', 'filters': 64, 'kernel': 3, 'activation': 'relu'},
+            {'type': 'maxpool', 'pool_size': 2},
+            {'type': 'conv', 'filters': 128, 'kernel': 3, 'activation': 'relu'},
+            {'type': 'maxpool', 'pool_size': 2},
+            {'type': 'conv', 'filters': 256, 'kernel': 3, 'activation': 'relu'},
+            {'type': 'maxpool', 'pool_size': 2},
+            {'type': 'flatten'},
+            {'type': 'dense', 'units': 256, 'activation': 'relu'},
+            {'type': 'dropout', 'rate': 0.5},
+            {'type': 'dense', 'units': num_classes, 'activation': 'softmax'}
+        ])
+        
+        model = tf.keras.Sequential()
+        model.add(tf.keras.layers.Input(shape=input_shape))
+        
+        for layer in layers:
+            if layer['type'] == 'conv':
+                model.add(tf.keras.layers.Conv2D(
+                    layer['filters'], 
+                    layer['kernel'], 
+                    activation=layer['activation'],
+                    padding='same'
+                ))
+            elif layer['type'] == 'maxpool':
+                model.add(tf.keras.layers.MaxPooling2D(layer['pool_size']))
+            elif layer['type'] == 'flatten':
+                model.add(tf.keras.layers.Flatten())
+            elif layer['type'] == 'dense':
+                model.add(tf.keras.layers.Dense(layer['units'], activation=layer['activation']))
+            elif layer['type'] == 'dropout':
+                model.add(tf.keras.layers.Dropout(layer['rate']))
+        
+        model.compile(
+            optimizer='adam',
+            loss='categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        return model
+    
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
         if rc == 0:
@@ -278,9 +323,9 @@ class FederatedLearningClient:
                 encoded_weights = data['weights']
                 weights = self.deserialize_weights(encoded_weights)
             
-            if round_num == 0:
-                # Initial model from server - create model from server's config
-                print(f"Client {self.client_id} received initial global model from server")
+            # Initialize model if not yet created (works for any round)
+            if self.model is None:
+                print(f"Client {self.client_id} initializing model from server (round {round_num})")
                 
                 model_config = data.get('model_config')
                 if model_config:
@@ -324,12 +369,9 @@ class FederatedLearningClient:
                 print(f"Client {self.client_id} model initialized with server weights")
                 self.current_round = 0
                 # Mark initial global model processed to ignore duplicates
-                self.last_global_round = 0
+                self.last_global_round = round_num
             else:
-                # Updated model after aggregation
-                if self.model is None:
-                    print(f"Client {self.client_id} ERROR: Received model for round {round_num} but local model not initialized!")
-                    return
+                # Updated model after aggregation (model already initialized)
                 self.model.set_weights(weights)
                 self.current_round = round_num
                 self.last_global_round = round_num
@@ -351,8 +393,7 @@ class FederatedLearningClient:
         
         # Check if model is initialized
         if self.model is None:
-            print(f"Client {self.client_id} ERROR: Model not initialized yet, cannot start training for round {round_num}")
-            print(f"Client {self.client_id} waiting for global model from server...")
+            print(f"Client {self.client_id} waiting for global model (not yet initialized)...")
             return
         
         # Check for duplicate training signals
@@ -360,22 +401,11 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} ignoring duplicate start training for round {round_num}")
             return
         
-        # Check if we're ready for this round
-        if self.current_round == 0 and round_num == 1:
-            # First training round with initial global model
-            self.current_round = round_num
-            self.last_training_round = round_num
-            print(f"\nClient {self.client_id} starting training for round {round_num} with initial global model...")
-            self.train_local_model()
-        elif round_num >= self.current_round and round_num <= self.current_round + 1:
-            # Next round - use model from current_round (might be round_num-1 if global model arrives late)
-            # This handles race condition where start_training arrives before global_model
-            self.current_round = round_num
-            self.last_training_round = round_num
-            print(f"\nClient {self.client_id} starting training for round {round_num}...")
-            self.train_local_model()
-        else:
-            print(f"Client {self.client_id} round mismatch - received signal for round {round_num}, currently at {self.current_round}")
+        # Start training regardless of round number (generic approach)
+        self.current_round = round_num
+        self.last_training_round = round_num
+        print(f"\nClient {self.client_id} starting training for round {round_num}...")
+        self.train_local_model()
     
     def handle_start_evaluation(self, payload):
         """Start evaluation when server signals"""
@@ -384,22 +414,20 @@ class FederatedLearningClient:
         
         # Check if model is initialized
         if self.model is None:
-            print(f"Client {self.client_id} ERROR: Model not initialized yet, cannot evaluate for round {round_num}")
+            print(f"Client {self.client_id} waiting for global model (not yet initialized)...")
             return
         
-        if round_num == self.current_round:
-            if round_num in self.evaluated_rounds:
-                print(f"Client {self.client_id} ignoring duplicate evaluation for round {round_num}")
-                return
-            print(f"Client {self.client_id} starting evaluation for round {round_num}...")
-            self.evaluate_model()
-            # After evaluation, prepare for next round
-            # Do NOT increment current_round here; wait for server's start_training signal
-            # to advance to the next round. This keeps round alignment consistent.
-            self.evaluated_rounds.add(round_num)
-            print(f"Client {self.client_id} evaluation completed for round {round_num}. Awaiting start_training for round {round_num + 1}.")
-        else:
-            print(f"Client {self.client_id} skipping evaluation signal for round {round_num} (current: {self.current_round})")
+        # Check for duplicate evaluation signals
+        if round_num in self.evaluated_rounds:
+            print(f"Client {self.client_id} ignoring duplicate evaluation for round {round_num}")
+            return
+        
+        # Evaluate regardless of round number (generic approach)
+        self.current_round = round_num
+        print(f"Client {self.client_id} starting evaluation for round {round_num}...")
+        self.evaluate_model()
+        self.evaluated_rounds.add(round_num)
+        print(f"Client {self.client_id} evaluation completed for round {round_num}")
     
     def train_local_model(self):
         """Train model on local data and send updates to server"""

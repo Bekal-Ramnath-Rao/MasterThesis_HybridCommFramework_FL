@@ -119,7 +119,7 @@ class QLearningProtocolSelector:
         self.q_table = defaultdict(lambda: defaultdict(float))
         
         # Actions (protocols)
-        self.actions = ['mqtt', 'amqp', 'grpc', 'quic', 'dds']
+        self.actions = ['mqtt', 'amqp', 'grpc', 'quic']
         
         # Statistics
         self.episodes = 0

@@ -484,11 +484,7 @@ class FederatedLearningClient:
                         self.current_round = sample.round
                         print(f"\nClient {self.client_id} starting training for round {self.current_round} with initial global model...")
                         self.train_local_model()
-                    elif sample.round > self.current_round:
-                        if self.model is None:
-                            print(f"Client {self.client_id} ERROR: Model not initialized!")
-                            return
-                        self.current_round = sample.round
+                    elif sample.round > self.current_round:                        self.current_round = sample.round
                         print(f"\nClient {self.client_id} starting training for round {self.current_round}...")
                         self.train_local_model()
     
@@ -501,9 +497,10 @@ class FederatedLearningClient:
                 round_num = sample.round
                 weights = self.deserialize_weights(sample.weights)
                 
-                if round_num == 0:
+                # Check if model needs initialization (works for late-joiners too)
+                if self.model is None:
                     print(f"[DEBUG] Client {self.client_id} received initial model - round={round_num}, has_config={hasattr(sample, 'model_config_json') and bool(sample.model_config_json)}")
-                    print(f"Client {self.client_id} received initial global model from server")
+                    print(f"Client {self.client_id} received initial global model from server (round {round_num})")
                     
                     if hasattr(sample, 'model_config_json') and sample.model_config_json:
                         model_config = json.loads(sample.model_config_json)

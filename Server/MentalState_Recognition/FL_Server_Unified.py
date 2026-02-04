@@ -41,7 +41,9 @@ except ImportError:
     QUANTIZATION_AVAILABLE = False
 
 # Server Configuration
-NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+# Dynamic client configuration
+MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
+MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
@@ -59,8 +61,10 @@ class UnifiedFederatedLearningServer:
     Unified FL Server that handles all 5 communication protocols
     """
     
-    def __init__(self, num_clients, num_rounds):
-        self.num_clients = num_clients
+    def __init__(self, min_clients, num_rounds, max_clients=100):
+        self.min_clients = min_clients
+        self.max_clients = max_clients
+        self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = {}  # Maps client_id -> protocol_used
@@ -210,7 +214,7 @@ class UnifiedFederatedLearningServer:
             self.registered_clients[client_id] = protocol
             print(f"[{protocol.upper()}] Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
             
-            if len(self.registered_clients) == self.num_clients:
+            if len(self.registered_clients) >= self.min_clients:
                 print(f"\n[Server] All {self.num_clients} clients registered!")
                 self.start_training()
     
@@ -234,7 +238,8 @@ class UnifiedFederatedLearningServer:
             print(f"[{protocol.upper()}] Received update from client {client_id} "
                   f"({len(self.client_updates)}/{self.num_clients})")
             
-            if len(self.client_updates) == self.num_clients:
+            # Wait for all registered clients (dynamic)
+            if len(self.client_updates) >= len(self.registered_clients):
                 self.aggregate_and_broadcast()
     
     def start_training(self):

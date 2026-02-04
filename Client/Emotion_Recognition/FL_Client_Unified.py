@@ -882,7 +882,7 @@ class UnifiedFLClient_Emotion:
             
             # Schedule the connection task in the event loop
             if self.quic_loop:
-                asyncio.run_coroutine_threadsafe(
+                self.quic_connection_task = asyncio.run_coroutine_threadsafe(
                     self._quic_connection_loop(),
                     self.quic_loop
                 )
@@ -891,44 +891,63 @@ class UnifiedFLClient_Emotion:
             print(f"[QUIC] Listener started for client {self.client_id}")
     
     def handle_global_model(self, payload):
-        """Receive and set global model weights from server"""
+        """Receive and apply global model from server"""
         try:
-            data = json.loads(payload.decode())
-            round_num = data['round']
+            data = json.loads(payload.decode()) if isinstance(payload, bytes) else payload
+            round_num = data.get('round', 0)
             
-            # Ignore duplicate global model for the same round
-            if round_num <= self.last_global_round:
+            # Check for duplicate (already processed this exact model)
+            if hasattr(self, 'last_global_round') and self.last_global_round == round_num and self.model is not None:
                 print(f"Client {self.client_id} ignoring duplicate global model for round {round_num}")
                 return
             
-            encoded_weights = data['weights']
-            weights = self.deserialize_weights(encoded_weights)
+            print(f"Client {self.client_id} received global model (round {round_num})")
             
-            if round_num == 0:
-                # Initial model from server
-                print(f"Client {self.client_id} received initial global model from server")
-                
+            # Decompress/deserialize weights
+            if 'quantized_data' in data:
+                # Handle quantized/compressed data
+                compressed_data = data['quantized_data']
+                if isinstance(compressed_data, str):
+                    import base64, pickle
+                    compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
+                if hasattr(self, 'quantization') and self.quantization is not None:
+                    weights = self.quantization.decompress(compressed_data)
+                elif hasattr(self, 'quantizer') and self.quantizer is not None:
+                    weights = self.quantizer.decompress(compressed_data)
+                else:
+                    weights = compressed_data
+                print(f"Client {self.client_id} decompressed quantized model")
+            else:
+                # Normal weights
+                if 'weights' in data:
+                    encoded_weights = data['weights']
+                    if isinstance(encoded_weights, str):
+                        import base64, pickle
+                        serialized = base64.b64decode(encoded_weights.encode('utf-8'))
+                        weights = pickle.loads(serialized)
+                    else:
+                        weights = encoded_weights
+                else:
+                    weights = data.get('parameters', [])
+            
+            # Initialize model if not already done (for late-joining or first-time clients)
+            if self.model is None:
                 model_config = data.get('model_config')
                 if model_config:
+                    print(f"Client {self.client_id} initializing model from received configuration...")
                     self.model = self.build_model_from_config(model_config)
-                    print(f"Client {self.client_id} built CNN model from server configuration")
+                    print(f"Client {self.client_id} model built successfully")
                 else:
-                    raise ValueError("No model configuration received from server!")
-                
-                self.model.set_weights(weights)
-                print(f"Client {self.client_id} model initialized with server weights")
-                self.current_round = 0
-                self.last_global_round = 0
-            else:
-                # Updated model after aggregation
-                if self.model is None:
-                    print(f"Client {self.client_id} ERROR: Received model for round {round_num} but local model not initialized!")
+                    print(f"Client {self.client_id} WARNING: No model_config in global model, cannot initialize!")
                     return
-                self.model.set_weights(weights)
-                self.current_round = round_num
+            
+            # Apply received weights
+            self.model.set_weights(weights)
+            self.current_round = round_num
+            if hasattr(self, 'last_global_round'):
                 self.last_global_round = round_num
-                self.waiting_for_aggregated_model = False  # Clear flag: received aggregated model
-                print(f"Client {self.client_id} received global model for round {round_num}")
+            print(f"Client {self.client_id} updated model weights (round {round_num})")
+            
         except Exception as e:
             print(f"Client {self.client_id} ERROR in handle_global_model: {e}")
             import traceback
@@ -972,13 +991,7 @@ class UnifiedFLClient_Emotion:
     def handle_start_evaluation(self, payload):
         """Start evaluation when server signals"""
         data = json.loads(payload.decode())
-        round_num = data['round']
-        
-        if self.model is None:
-            print(f"Client {self.client_id} ERROR: Model not initialized yet, cannot evaluate for round {round_num}")
-            return
-        
-        if round_num == self.current_round:
+        round_num = data['round']        if round_num == self.current_round:
             if round_num in self.evaluated_rounds:
                 print(f"Client {self.client_id} ignoring duplicate evaluation for round {round_num}")
                 return

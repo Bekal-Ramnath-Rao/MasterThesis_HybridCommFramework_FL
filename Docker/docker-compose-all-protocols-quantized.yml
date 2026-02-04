@@ -3,11 +3,9 @@ version: '3.8'
 # Multi-Protocol Federated Learning with Quantization
 # Demonstrates all 5 protocols with quantization enabled
 # Use Case: Emotion Recognition
-
 services:
   # ============================================================================
   # MQTT PROTOCOL with Quantization
-  # ============================================================================
   mqtt-broker:
     image: eclipse-mosquitto:2
     container_name: fl-mqtt-broker
@@ -18,7 +16,6 @@ services:
     networks:
       - fl-network
     command: mosquitto -c /mosquitto/config/mosquitto.conf
-
   fl-server-mqtt:
     build:
       context: ..
@@ -26,7 +23,6 @@ services:
     container_name: fl-server-mqtt-quantized
     depends_on:
       - mqtt-broker
-    ports:
       - "8081:8080"
     environment:
       - USE_QUANTIZATION=true
@@ -34,176 +30,57 @@ services:
       - MQTT_BROKER=mqtt-broker
       - NUM_CLIENTS=2
       - NUM_ROUNDS=3
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
     command: python -u Server/Emotion_Recognition/FL_Server_MQTT.py
-    networks:
-      - fl-network
-
   fl-client-mqtt-1:
-    build:
-      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-mqtt-1-quantized
-    depends_on:
       - fl-server-mqtt
-    environment:
-      - USE_QUANTIZATION=true
-      - QUANTIZATION_BITS=8
-      - MQTT_BROKER=mqtt-broker
       - CLIENT_ID=1
     command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
-    volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-    networks:
-      - fl-network
-
   fl-client-mqtt-2:
-    build:
-      context: ..
-      dockerfile: Client/Dockerfile
     container_name: fl-client-mqtt-2-quantized
-    depends_on:
-      - fl-server-mqtt
-    environment:
-      - USE_QUANTIZATION=true
-      - QUANTIZATION_BITS=8
-      - MQTT_BROKER=mqtt-broker
       - CLIENT_ID=2
-    command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
-    volumes:
-      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-    networks:
-      - fl-network
-
-  # ============================================================================
   # gRPC PROTOCOL with Quantization
-  # ============================================================================
   fl-server-grpc:
-    build:
-      context: ..
-      dockerfile: Server/Dockerfile
     container_name: fl-server-grpc-quantized
-    ports:
       - "50051:50051"
-    environment:
-      - USE_QUANTIZATION=true
       - QUANTIZATION_BITS=16              # 2x compression for gRPC
       - GRPC_PORT=50051
-      - NUM_CLIENTS=2
-      - NUM_ROUNDS=3
     command: python -u Server/Emotion_Recognition/FL_Server_gRPC.py
-    networks:
-      - fl-network
-
   fl-client-grpc-1:
-    build:
-      context: ..
-      dockerfile: Client/Dockerfile
     container_name: fl-client-grpc-1-quantized
-    depends_on:
       - fl-server-grpc
-    environment:
-      - USE_QUANTIZATION=true
-      - QUANTIZATION_BITS=16              # 2x compression for gRPC
       - GRPC_HOST=fl-server-grpc
-      - GRPC_PORT=50051
       - CLIENT_ID=0
     command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
-    volumes:
-      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-    networks:
-      - fl-network
-
   fl-client-grpc-2:
-    build:
-      context: ..
-      dockerfile: Client/Dockerfile
     container_name: fl-client-grpc-2-quantized
-    depends_on:
-      - fl-server-grpc
-    environment:
-      - USE_QUANTIZATION=true
       - QUANTIZATION_BITS=16
-      - GRPC_HOST=fl-server-grpc
-      - GRPC_PORT=50051
-      - CLIENT_ID=1
-    command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
-    volumes:
-      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-    networks:
-      - fl-network
-
-  # ============================================================================
   # AMQP PROTOCOL with Quantization
-  # ============================================================================
   rabbitmq:
     image: rabbitmq:3-management
     container_name: fl-rabbitmq
-    ports:
       - "5672:5672"
       - "15672:15672"
-    networks:
-      - fl-network
-
   fl-server-amqp:
-    build:
-      context: ..
-      dockerfile: Server/Dockerfile
     container_name: fl-server-amqp-quantized
-    depends_on:
       - rabbitmq
-    environment:
-      - USE_QUANTIZATION=true
-      - QUANTIZATION_BITS=8
       - AMQP_HOST=rabbitmq
-      - NUM_CLIENTS=2
-      - NUM_ROUNDS=3
     command: python -u Server/Emotion_Recognition/FL_Server_AMQP.py
-    networks:
-      - fl-network
-
   fl-client-amqp-1:
-    build:
-      context: ..
-      dockerfile: Client/Dockerfile
     container_name: fl-client-amqp-1-quantized
-    depends_on:
       - fl-server-amqp
-    environment:
-      - USE_QUANTIZATION=true
-      - QUANTIZATION_BITS=8
-      - AMQP_HOST=rabbitmq
-      - CLIENT_ID=1
     command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
-    volumes:
-      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-    networks:
-      - fl-network
-
   fl-client-amqp-2:
-    build:
-      context: ..
-      dockerfile: Client/Dockerfile
     container_name: fl-client-amqp-2-quantized
-    depends_on:
-      - fl-server-amqp
-    environment:
-      - USE_QUANTIZATION=true
-      - QUANTIZATION_BITS=8
-      - AMQP_HOST=rabbitmq
-      - CLIENT_ID=2
-    command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
-    volumes:
-      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-    networks:
-      - fl-network
-
 networks:
   fl-network:
     driver: bridge
-
 # ============================================================================
 # USAGE:
-# ============================================================================
 # Run specific protocol:
 #   docker-compose -f docker-compose-all-protocols-quantized.yml up mqtt-broker fl-server-mqtt fl-client-mqtt-1 fl-client-mqtt-2
 #   docker-compose -f docker-compose-all-protocols-quantized.yml up fl-server-grpc fl-client-grpc-1 fl-client-grpc-2
@@ -211,15 +88,12 @@ networks:
 #
 # Run all protocols (heavy resource usage):
 #   docker-compose -f docker-compose-all-protocols-quantized.yml up
-#
 # View logs for specific protocol:
 #   docker logs fl-server-mqtt-quantized
 #   docker logs fl-server-grpc-quantized
 #   docker logs fl-server-amqp-quantized
-#
 # Quantization verification - look for:
 #   "Server: Quantization enabled"
 #   "Client X: Quantization enabled"
 #   "Compressed weights - Ratio: 4.00x" (for 8-bit)
 #   "Compressed weights - Ratio: 2.00x" (for 16-bit)
-# ============================================================================

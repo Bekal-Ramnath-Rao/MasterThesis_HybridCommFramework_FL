@@ -74,6 +74,8 @@ services:
       - ./results:/app/results
     networks:
       - fl-network
+    cap_add:
+      - NET_ADMIN
     command: python Server/Emotion_Recognition/FL_Server_Unified.py
 
   # ============================================================================
@@ -124,6 +126,8 @@ services:
       - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-network
+    cap_add:
+      - NET_ADMIN
     deploy:
       resources:
         reservations:
@@ -181,6 +185,8 @@ services:
       - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-network
+    cap_add:
+      - NET_ADMIN
     deploy:
       resources:
         reservations:

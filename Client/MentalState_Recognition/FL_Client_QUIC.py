@@ -344,6 +344,45 @@ class FederatedLearningClient:
         weights = pickle.loads(serialized)
         return weights
     
+    def build_model_from_config(self, model_config):
+        """Build model from server-provided configuration"""
+        input_shape = model_config.get('input_shape')
+        num_classes = model_config.get('num_classes')
+        layers = model_config.get('layers', [])
+        
+        model = tf.keras.Sequential()
+        model.add(tf.keras.layers.Input(shape=input_shape))
+        
+        for layer in layers:
+            if layer['type'] == 'conv':
+                model.add(tf.keras.layers.Conv2D(
+                    layer['filters'], 
+                    layer['kernel'], 
+                    activation=layer['activation'],
+                    padding='same'
+                ))
+            elif layer['type'] == 'maxpool':
+                model.add(tf.keras.layers.MaxPooling2D(layer['pool_size']))
+            elif layer['type'] == 'flatten':
+                model.add(tf.keras.layers.Flatten())
+            elif layer['type'] == 'dense':
+                model.add(tf.keras.layers.Dense(layer['units'], activation=layer['activation']))
+            elif layer['type'] == 'dropout':
+                model.add(tf.keras.layers.Dropout(layer['rate']))
+            elif layer['type'] == 'lstm':
+                model.add(tf.keras.layers.LSTM(layer['units'], return_sequences=layer.get('return_sequences', False)))
+            elif layer['type'] == 'gru':
+                model.add(tf.keras.layers.GRU(layer['units'], return_sequences=layer.get('return_sequences', False)))
+        
+        model.compile(
+            optimizer='adam',
+            loss=model_config.get('loss', 'categorical_crossentropy'),
+            metrics=['accuracy']
+        )
+        
+        return model
+    
+    
     async def send_message(self, message):
         """Send message to server via QUIC stream"""
         if self.protocol:
@@ -408,8 +447,13 @@ class FederatedLearningClient:
         else:
             weights = self.deserialize_weights(encoded_weights)
         
-        if round_num == 0:
-            print(f"Client {self.client_id} received initial global model from server")
+        # Initialize model if not yet created (works for any round)
+
+        
+        if self.model is None:
+
+        
+            print(f"Client {self.client_id} initializing model from server (round {round_num})"
             
             model_config = message.get('model_config')
             if model_config:

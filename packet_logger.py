@@ -69,26 +69,46 @@ def init_db():
     conn.close()
 
 def log_sent_packet(packet_size, peer, protocol, round=None, extra_info=None):
-    #print(f"[DEBUG] log_sent_packet: Logging to {DB_PATH}")
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO sent_packets (timestamp, packet_size, peer, protocol, round, extra_info)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (datetime.now().isoformat(), packet_size, peer, protocol, round, extra_info))
-    conn.commit()
-    conn.close()
+    """Log a sent packet to the database. Auto-creates tables if needed."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO sent_packets (timestamp, packet_size, peer, protocol, round, extra_info)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (datetime.now().isoformat(), packet_size, peer, protocol, round, extra_info))
+        conn.commit()
+        conn.close()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            # Tables don't exist, initialize and retry
+            init_db()
+            log_sent_packet(packet_size, peer, protocol, round, extra_info)
+        else:
+            print(f"Server error logging sent packet: {e}")
+    except Exception as e:
+        print(f"Server error logging sent packet: {e}")
 
 def log_received_packet(packet_size, peer, protocol, round=None, extra_info=None):
-    #print(f"[DEBUG] log_received_packet: Logging to {DB_PATH}")
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        INSERT INTO received_packets (timestamp, packet_size, peer, protocol, round, extra_info)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (datetime.now().isoformat(), packet_size, peer, protocol, round, extra_info))
-    conn.commit()
-    conn.close()
+    """Log a received packet to the database. Auto-creates tables if needed."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('''
+            INSERT INTO received_packets (timestamp, packet_size, peer, protocol, round, extra_info)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (datetime.now().isoformat(), packet_size, peer, protocol, round, extra_info))
+        conn.commit()
+        conn.close()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            # Tables don't exist, initialize and retry
+            init_db()
+            log_received_packet(packet_size, peer, protocol, round, extra_info)
+        else:
+            print(f"Server error logging received packet: {e}")
+    except Exception as e:
+        print(f"Server error logging received packet: {e}")
 
 if __name__ == "__main__":
     init_db()

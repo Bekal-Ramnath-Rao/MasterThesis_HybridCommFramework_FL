@@ -40,6 +40,8 @@ services:
       - NODE_TYPE=server
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - MQTT_BROKER=mqtt-broker-unified
       - AMQP_BROKER=amqp-broker-unified
       - GRPC_PORT=50051
@@ -81,6 +83,8 @@ services:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - USE_RL_SELECTION=true
       - DEFAULT_PROTOCOL=mqtt
       - MQTT_BROKER=mqtt-broker-unified
@@ -119,6 +123,8 @@ services:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - USE_RL_SELECTION=true
       - DEFAULT_PROTOCOL=mqtt
       - MQTT_BROKER=mqtt-broker-unified

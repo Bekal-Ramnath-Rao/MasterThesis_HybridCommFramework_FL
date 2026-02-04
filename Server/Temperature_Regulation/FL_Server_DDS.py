@@ -40,7 +40,9 @@ from typing import List
 
 # Server Configuration
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
-NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+# Dynamic client configuration
+MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
+MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
 NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
 
@@ -111,8 +113,10 @@ class ServerStatus(IdlStruct):
 
 
 class FederatedLearningServer:
-    def __init__(self, num_clients, num_rounds):
-        self.num_clients = num_clients
+    def __init__(self, min_clients, num_rounds, max_clients=100):
+        self.min_clients = min_clients
+        self.max_clients = max_clients
+        self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
@@ -131,6 +135,8 @@ class FederatedLearningServer:
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.converged = False
+        self.training_started = False
+        self.training_started = False
         self.start_time = None
         self.convergence_time = None
         
@@ -298,7 +304,11 @@ class FederatedLearningServer:
                 client_id = sample.client_id
                 if client_id not in self.registered_clients:
                     self.registered_clients.add(client_id)
-                    print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
+                    print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
+        
+        # Update total client count if more clients join
+        if len(self.registered_clients) > self.num_clients:
+            self.update_client_count(len(self.registered_clients))
                     
                     # If all clients registered, distribute initial global model and start training
                     if len(self.registered_clients) == self.num_clients and not self.training_started:
@@ -306,7 +316,9 @@ class FederatedLearningServer:
                         self.distribute_initial_model()
                         # Record training start time
                         self.start_time = time.time()
-                        print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                                    self.training_started = True
+            self.training_started = True
+print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     
     def distribute_initial_model(self):
         """Distribute initial global model to all clients"""
@@ -413,7 +425,8 @@ class FederatedLearningServer:
                           f"({len(self.client_updates)}/{self.num_clients})")
                     
                     # If all clients sent updates, aggregate
-                    if len(self.client_updates) == self.num_clients:
+                    # Wait for all registered clients (dynamic)
+            if len(self.client_updates) >= len(self.registered_clients):
                         self.aggregate_models()
     
     def check_evaluation_metrics(self):
@@ -442,7 +455,8 @@ class FederatedLearningServer:
                               f"({len(self.client_metrics)}/{self.num_clients})")
                         
                         # If all clients sent metrics, aggregate and continue
-                    if len(self.client_metrics) == self.num_clients:
+                    # Wait for all registered clients (dynamic)
+            if len(self.client_metrics) >= len(self.registered_clients):
                         self.aggregate_metrics()
                         self.continue_training()
     
@@ -486,9 +500,19 @@ class FederatedLearningServer:
         else:
             serialized_weights = self.serialize_weights(self.global_weights)
         
+        # Always include model_config for late-joiners
+        model_config = {
+            "architecture": "LSTM",
+            "layers": [
+                {"type": "LSTM", "units": 50, "activation": "relu", "input_shape": [1, 4]},
+                {"type": "Dense", "units": 1}
+            ],
+            "compile_config": {"loss": "mse", "optimizer": "adam", "metrics": ["mae"]}
+        }
         global_model = GlobalModel(
             round=self.current_round,
-            weights=serialized_weights
+            weights=serialized_weights,
+            model_config_json=json.dumps(model_config)
         )
         self.writers['global_model'].write(global_model)
         
@@ -543,7 +567,8 @@ class FederatedLearningServer:
                     elapsed = time.time() - start_time
                     print(f"Still waiting for metrics ({len(self.client_metrics)}/{self.num_clients}) - {elapsed:.1f}s elapsed")
         
-        if len(self.client_metrics) == self.num_clients:
+        # Wait for all registered clients (dynamic)
+            if len(self.client_metrics) >= len(self.registered_clients):
             print(f"✓ All evaluation metrics received!")
     
     def aggregate_metrics(self):
@@ -769,5 +794,5 @@ class FederatedLearningServer:
 
 
 if __name__ == "__main__":
-    server = FederatedLearningServer(NUM_CLIENTS, NUM_ROUNDS)
+    server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     server.run()

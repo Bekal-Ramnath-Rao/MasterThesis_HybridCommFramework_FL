@@ -18,7 +18,7 @@ else:
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from packet_logger import log_received_packet, log_sent_packet
+from packet_logger import log_received_packet, log_sent_packet, init_db
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
@@ -126,6 +126,9 @@ class FederatedLearningClient:
             self.quantizer = None
             print(f"Client {self.client_id}: Quantization disabled")
         
+        # Initialize packet logging database
+        init_db()
+        
         # AMQP connection
         self.connection = None
         self.channel = None
@@ -147,6 +150,45 @@ class FederatedLearningClient:
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
+    
+    def build_model_from_config(self, model_config):
+        """Build model from server-provided configuration"""
+        input_shape = model_config.get('input_shape')
+        num_classes = model_config.get('num_classes')
+        layers = model_config.get('layers', [])
+        
+        model = tf.keras.Sequential()
+        model.add(tf.keras.layers.Input(shape=input_shape))
+        
+        for layer in layers:
+            if layer['type'] == 'conv':
+                model.add(tf.keras.layers.Conv2D(
+                    layer['filters'], 
+                    layer['kernel'], 
+                    activation=layer['activation'],
+                    padding='same'
+                ))
+            elif layer['type'] == 'maxpool':
+                model.add(tf.keras.layers.MaxPooling2D(layer['pool_size']))
+            elif layer['type'] == 'flatten':
+                model.add(tf.keras.layers.Flatten())
+            elif layer['type'] == 'dense':
+                model.add(tf.keras.layers.Dense(layer['units'], activation=layer['activation']))
+            elif layer['type'] == 'dropout':
+                model.add(tf.keras.layers.Dropout(layer['rate']))
+            elif layer['type'] == 'lstm':
+                model.add(tf.keras.layers.LSTM(layer['units'], return_sequences=layer.get('return_sequences', False)))
+            elif layer['type'] == 'gru':
+                model.add(tf.keras.layers.GRU(layer['units'], return_sequences=layer.get('return_sequences', False)))
+        
+        model.compile(
+            optimizer='adam',
+            loss=model_config.get('loss', 'categorical_crossentropy'),
+            metrics=['accuracy']
+        )
+        
+        return model
+    
     
     def connect(self):
         """Connect to RabbitMQ broker"""
@@ -366,9 +408,9 @@ class FederatedLearningClient:
                 encoded_weights = data['weights']
                 weights = self.deserialize_weights(encoded_weights)
             
-            if round_num == 0:
-                # Initial model from server - create model from server's config
-                print(f"Client {self.client_id} received initial global model from server")
+            # Initialize model if not yet created (works for any round)
+            if self.model is None:
+                print(f"Client {self.client_id} initializing model from server (round {round_num})")
                 
                 model_config = data.get('model_config')
                 if model_config:

@@ -235,9 +235,9 @@ class FederatedLearningClient:
             encoded_weights = data['weights']
             weights = self.deserialize_weights(encoded_weights)
         
-        if round_num == 0:
-            # Initial model from server - create model from server's config
-            print(f"Client {self.client_id} received initial global model from server")
+        # Initialize model if not yet created (works for any round)
+        if self.model is None:
+            print(f"Client {self.client_id} initializing model from server (round {round_num})")
             
             model_config = data.get('model_config')
             if model_config:

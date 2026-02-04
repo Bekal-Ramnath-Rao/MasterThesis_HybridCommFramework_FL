@@ -1959,10 +1959,46 @@ class FLExperimentGUI(QMainWindow):
             )
             
             if reply == QMessageBox.Yes:
+                self.output_text.append("\n🛑 Stopping experiment...\n")
+                self.statusBar().showMessage("Stopping experiment...")
+                
+                # Stop the experiment thread
                 self.experiment_thread.stop()
-                self.experiment_thread.wait()
+                self.experiment_thread.wait(5000)  # Wait up to 5 seconds
+                
+                # Stop monitors
                 self.stop_all_monitors()
+                
+                # Stop and remove all FL containers
+                self.output_text.append("🗑️ Cleaning up containers...\n")
+                try:
+                    subprocess.run(
+                        ["docker", "ps", "-a", "--filter", "name=fl-", "--format", "{{.Names}}"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    containers = [c.strip() for c in subprocess.run(
+                        ["docker", "ps", "-a", "--filter", "name=fl-", "--format", "{{.Names}}"],
+                        capture_output=True, text=True, timeout=10
+                    ).stdout.split('\n') if c.strip()]
+                    
+                    if containers:
+                        self.output_text.append(f"  Stopping {len(containers)} containers...\n")
+                        subprocess.run(["docker", "stop"] + containers, timeout=30)
+                        self.output_text.append(f"  Removing {len(containers)} containers...\n")
+                        subprocess.run(["docker", "rm"] + containers, timeout=30)
+                        self.output_text.append(f"✅ Cleaned up {len(containers)} containers\n")
+                    
+                except Exception as e:
+                    self.output_text.append(f"⚠️ Cleanup error: {e}\n")
+                
+                # Reset UI
                 self.reset_ui()
+                self.output_text.append("\n✅ Experiment stopped successfully\n")
+                self.statusBar().showMessage("Experiment stopped")
+        else:
+            QMessageBox.information(self, "No Experiment", "No experiment is currently running.")
     
     def start_dashboard_monitor(self):
         """Start FL training dashboard monitoring"""

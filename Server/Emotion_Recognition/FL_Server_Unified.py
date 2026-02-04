@@ -114,7 +114,9 @@ except ImportError:
     QUANTIZATION_AVAILABLE = False
 
 # Server Configuration
-NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+# Dynamic client configuration
+MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
+MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
@@ -176,8 +178,10 @@ class UnifiedFederatedLearningServer:
     Unified FL Server that handles all 5 communication protocols
     """
     
-    def __init__(self, num_clients, num_rounds):
-        self.num_clients = num_clients
+    def __init__(self, min_clients, num_rounds, max_clients=100):
+        self.min_clients = min_clients
+        self.max_clients = max_clients
+        self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = {}  # Maps client_id -> protocol_used
@@ -706,10 +710,8 @@ class UnifiedFederatedLearningServer:
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
                     print(f"[QUIC] Starting server on {QUIC_HOST}:{QUIC_PORT}")
-                    # Schedule the QUIC server as a task
-                    loop.create_task(self._run_quic_server())
-                    # Keep the loop running indefinitely
-                    loop.run_forever()
+                    # Run the QUIC server coroutine directly (not as a task)
+                    loop.run_until_complete(self._run_quic_server())
                 except Exception as e:
                     print(f"[QUIC] Thread error: {e}")
                     import traceback
@@ -780,9 +782,9 @@ class UnifiedFederatedLearningServer:
             ).serial_number(
                 x509.random_serial_number()
             ).not_valid_before(
-                datetime.datetime.now(datetime.UTC)
+                datetime.datetime.utcnow()
             ).not_valid_after(
-                datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=365)
+                datetime.datetime.utcnow() + datetime.timedelta(days=365)
             ).add_extension(
                 x509.SubjectAlternativeName(san_list),
                 critical=False
@@ -1174,7 +1176,7 @@ class UnifiedFederatedLearningServer:
             print(f"[{protocol.upper()}] Client {client_id} registered "
                   f"({len(self.registered_clients)}/{self.num_clients})")
             
-            if len(self.registered_clients) == self.num_clients:
+            if len(self.registered_clients) >= self.min_clients:
                 print(f"\n[Server] All {self.num_clients} clients registered!")
                 print("[Server] Distributing initial global model...\n")
                 time.sleep(2)
@@ -1227,7 +1229,8 @@ class UnifiedFederatedLearningServer:
             print(f"[{protocol.upper()}] Received update from client {client_id} "
                   f"({len(self.client_updates)}/{self.num_clients})")
             
-            if len(self.client_updates) == self.num_clients:
+            # Wait for all registered clients (dynamic)
+            if len(self.client_updates) >= len(self.registered_clients):
                 self.aggregate_models()
     
     def handle_client_metrics(self, data, protocol):
@@ -1271,7 +1274,8 @@ class UnifiedFederatedLearningServer:
             print(f"[{protocol.upper()}] Received metrics from client {client_id} "
                   f"({len(self.client_metrics)}/{self.num_clients})")
             
-            if len(self.client_metrics) == self.num_clients:
+            # Wait for all registered clients (dynamic)
+            if len(self.client_metrics) >= len(self.registered_clients):
                 print(f"[{protocol.upper()}] All {self.num_clients} metrics received! Triggering aggregate_metrics()")
                 self.aggregate_metrics()
     
@@ -1871,7 +1875,6 @@ if QUIC_AVAILABLE:
                     
                     # Append new data to buffer
                     self._stream_buffers[stream_id] += event.data
-                    print(f"[QUIC] Stream {stream_id}: received {len(event.data)} bytes, buffer now {len(self._stream_buffers[stream_id])} bytes")
                     
                     # Send flow control updates to allow more data
                     self.transmit()

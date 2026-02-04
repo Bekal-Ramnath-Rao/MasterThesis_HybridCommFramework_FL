@@ -487,13 +487,7 @@ class FederatedLearningClient:
                 
                 print(f"Client {self.client_id} built EEG model from server configuration")
                 print(f"  Input shape: {model_config['input_shape']}")
-                print(f"  Output classes: {model_config['num_classes']}")
-            
-            if self.model is None:
-                print(f"Client {self.client_id} ERROR: Model not initialized before setting weights!")
-                return
-            
-            self.model.set_weights(weights)
+                print(f"  Output classes: {model_config['num_classes']}")            self.model.set_weights(weights)
             
             if model_update.model_config:
                 # Verify model is ready (first initialization)

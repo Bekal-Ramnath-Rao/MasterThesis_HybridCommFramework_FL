@@ -33,7 +33,9 @@ import federated_learning_pb2_grpc
 # Server Configuration
 GRPC_HOST = os.getenv("GRPC_HOST", "0.0.0.0")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
-NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+# Dynamic client configuration
+MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
+MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "5"))
 
 # Convergence Settings
@@ -43,8 +45,10 @@ MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 
 class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningServicer):
-    def __init__(self, num_clients, num_rounds):
-        self.num_clients = num_clients
+    def __init__(self, min_clients, num_rounds, max_clients=100):
+        self.min_clients = min_clients
+        self.max_clients = max_clients
+        self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
@@ -211,7 +215,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 serialized_weights = pickle.dumps(compressed_data)
             else:
                 serialized_weights = self.serialize_weights(self.global_weights)
-            model_config_json = json.dumps(self.model_config) if self.current_round == 0 else ''
+            # Always include model_config for late-joining clients
+            model_config_json = json.dumps(self.model_config)
             
             print(f"Client {request.client_id}: Sending global model (round {self.current_round}, {len(serialized_weights)/1024:.2f} KB)")
             
@@ -268,7 +273,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             print(f"  Progress: {len(self.client_updates)}/{self.num_clients} clients")
             
             # Check if all clients have submitted
-            if len(self.client_updates) == self.num_clients:
+            # Wait for all registered clients (dynamic)
+            if len(self.client_updates) >= len(self.registered_clients):
                 print(f"\nAll clients submitted updates for round {self.current_round}")
                 # Aggregate in separate thread
                 threading.Thread(target=self.aggregate_updates).start()
