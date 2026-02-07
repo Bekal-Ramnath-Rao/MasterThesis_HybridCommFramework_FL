@@ -198,7 +198,7 @@ class FederatedLearningServer:
         return weights
     
     async def send_message(self, client_id, message):
-        """Send message to client via QUIC stream"""
+        """Send message to client via QUIC stream with improved transmission for poor networks"""
         if client_id in self.registered_clients:
             protocol = self.registered_clients[client_id]
             # Create a new stream for each message
@@ -213,12 +213,14 @@ class FederatedLearningServer:
             msg_size_mb = len(data) / (1024 * 1024)
             print(f"Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(data)} bytes = {msg_size_mb:.2f} MB)")
             
-            # Adaptive delay based on message size for poor network conditions
-            # Large messages (>1MB) need more time to transmit
+            # Multiple transmit calls for large messages (improved for poor networks)
             if len(data) > 1_000_000:  # > 1MB
-                await asyncio.sleep(1.0)  # 1 second for large messages
+                for _ in range(3):
+                    await asyncio.sleep(0.5)
+                    protocol.transmit()
             else:
-                await asyncio.sleep(0.1)  # 100ms for small messages
+                # Small delay for flow control
+                await asyncio.sleep(0.1)
     
     async def broadcast_message(self, message):
         """Broadcast message to all registered clients"""
@@ -646,10 +648,9 @@ async def main():
         
         # Timeout - INCREASE to match FL workflow
         idle_timeout=3600.0,  # 60 minutes (not 60 seconds!)
-        
+        max_datagram_frame_size=65536,  # Larger frame size for better throughput
         # Poor network adjustments
         initial_rtt=0.15,  # Account for network latency
-        max_datagram_frame_size=1200,  # Match client for lossy network
     )
     
     # Check if certificates exist in the certs directory

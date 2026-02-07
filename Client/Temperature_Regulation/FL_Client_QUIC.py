@@ -61,6 +61,9 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             # Append new data to buffer
             self._stream_buffers[event.stream_id] += event.data
             
+            # Send flow control updates to allow more data (critical for poor networks)
+            self.transmit()
+            
             # Try to decode complete messages (delimited by newline)
             while b'\n' in self._stream_buffers[event.stream_id]:
                 message_data, self._stream_buffers[event.stream_id] = self._stream_buffers[event.stream_id].split(b'\n', 1)
@@ -158,8 +161,16 @@ class FederatedLearningClient:
             # Add newline delimiter for message framing
             data = (json.dumps(message) + '\n').encode('utf-8')
             self.stream_id = self.protocol._quic.get_next_available_stream_id()
-            self.protocol._quic.send_stream_data(self.stream_id, data, end_stream=False)
+            self.protocol._quic.send_stream_data(self.stream_id, data, end_stream=True)
             self.protocol.transmit()
+            
+            # Multiple transmit calls for large messages (improved for poor networks)
+            if len(data) > 1000000:  # > 1MB
+                for _ in range(3):
+                    await asyncio.sleep(0.5)
+                    self.protocol.transmit()
+            else:
+                await asyncio.sleep(0.1)
     
     async def handle_message(self, message):
         """Handle incoming messages from server"""
@@ -205,7 +216,7 @@ class FederatedLearningClient:
         if self.model is None:
 
         
-            print(f"Client {self.client_id} initializing model from server (round {round_num})"
+            print(f"Client {self.client_id} initializing model from server (round {round_num})")
             
             model_config = message.get('model_config')
             if model_config:
@@ -368,7 +379,15 @@ class FederatedLearningClient:
     
     async def start(self):
         """Connect to QUIC server and start client"""
-        configuration = QuicConfiguration(is_client=True)
+        configuration = QuicConfiguration(
+            is_client=True,
+            alpn_protocols=["fl"],
+            max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
+            max_data=100 * 1024 * 1024,  # 100 MB total
+            idle_timeout=3600.0,  # 60 minutes idle timeout
+            max_datagram_frame_size=65536,  # Larger frame size for better throughput
+            initial_rtt=0.15,  # 150ms (account for 100ms latency + jitter)
+        )
         
         # Load CA certificate for verification (optional - set verify_mode to False for testing)
         # cert_dir = Path(__file__).parent.parent.parent / "certs"

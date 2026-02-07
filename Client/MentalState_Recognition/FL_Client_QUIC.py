@@ -92,6 +92,9 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             buffer_size = len(self._stream_buffers[event.stream_id])
             print(f"[DEBUG] Client stream {event.stream_id}: received {len(event.data)} bytes, buffer now {buffer_size} bytes, end_stream={event.end_stream}")
             
+            # Send flow control updates to allow more data (critical for poor networks)
+            self.transmit()
+            
             while b'\n' in self._stream_buffers[event.stream_id]:
                 message_data, self._stream_buffers[event.stream_id] = self._stream_buffers[event.stream_id].split(b'\n', 1)
                 if message_data:
@@ -397,11 +400,13 @@ class FederatedLearningClient:
             self.protocol._quic.send_stream_data(self.stream_id, data, end_stream=True)
             self.protocol.transmit()
             
-            # Wait longer for large messages to be transmitted
+            # Multiple transmit calls for large messages (improved for poor networks)
             if len(data) > 1000000:  # > 1MB
-                await asyncio.sleep(2)
+                for _ in range(3):
+                    await asyncio.sleep(0.5)
+                    self.protocol.transmit()
             else:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)
             print(f"[DEBUG] Client {self.client_id} sent {msg_type} on stream {self.stream_id}")
     
     async def handle_message(self, message):
@@ -453,7 +458,7 @@ class FederatedLearningClient:
         if self.model is None:
 
         
-            print(f"Client {self.client_id} initializing model from server (round {round_num})"
+            print(f"Client {self.client_id} initializing model from server (round {round_num})")
             
             model_config = message.get('model_config')
             if model_config:
@@ -610,9 +615,11 @@ async def main():
     configuration = QuicConfiguration(
         is_client=True,
         alpn_protocols=["fl"],
-        max_stream_data=20 * 1024 * 1024,
-        max_data=50 * 1024 * 1024,
-        idle_timeout=300.0,  # 5 minutes idle timeout
+        max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
+        max_data=100 * 1024 * 1024,  # 100 MB total
+        idle_timeout=3600.0,  # 60 minutes idle timeout
+        max_datagram_frame_size=65536,  # Larger frame size for better throughput
+        initial_rtt=0.15,  # 150ms (account for 100ms latency + jitter)
     )
     
     # Load CA certificate for verification (optional - set verify_mode to False for testing)

@@ -13,7 +13,12 @@
             <ParticipantIndex>auto</ParticipantIndex>
             <!-- SPDP interval for discovery heartbeats -->
             <SPDPInterval>60s</SPDPInterval>
-            <!-- Peers will be discovered automatically within Docker network -->
+            <!-- Explicit peer list for unicast discovery in Docker -->
+            <Peers>
+                <Peer address="fl-server-dds-temperature"/>
+                <Peer address="fl-client-dds-temperature-1"/>
+                <Peer address="fl-client-dds-temperature-2"/>
+            </Peers>
         </Discovery>
         <Internal>
             <SquashParticipants>false</SquashParticipants>

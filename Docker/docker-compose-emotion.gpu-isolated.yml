@@ -482,7 +482,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-      #- CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
+      - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
     networks:
       - emotion_network
     container_name: fl-server-dds-emotion
@@ -490,7 +490,7 @@ services:
       - NET_ADMIN
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
-      #- ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+      - ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     command: bash -c "sleep 10 && python -u Server/Emotion_Recognition/FL_Server_DDS.py"
     # Server does not need GPU resources - only aggregates models
 
@@ -513,7 +513,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-      #- CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
+      - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
     depends_on:
       - fl-server-dds-emotion
     networks:
@@ -523,7 +523,7 @@ services:
       - NET_ADMIN
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      #- ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+      - ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     deploy:
       resources:
@@ -552,7 +552,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-      #- CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
+      - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
     depends_on:
       - fl-server-dds-emotion
     networks:
@@ -562,7 +562,7 @@ services:
       - NET_ADMIN
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      #- ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+      - ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     deploy:
       resources:

@@ -43,6 +43,9 @@ MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start tra
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
 
+# Chunking configuration for large messages
+CHUNK_SIZE = 64 * 1024  # 64KB chunks for better DDS performance in poor networks
+
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
@@ -78,10 +81,31 @@ class GlobalModel(IdlStruct):
 
 
 @dataclass
+class GlobalModelChunk(IdlStruct):
+    round: int
+    chunk_id: int
+    total_chunks: int
+    payload: sequence[int]
+    model_config_json: str = ""  # JSON string for model configuration
+
+
+@dataclass
 class ModelUpdate(IdlStruct):
     client_id: int
     round: int
     weights: sequence[int]
+    num_samples: int
+    loss: float
+    accuracy: float
+
+
+@dataclass
+class ModelUpdateChunk(IdlStruct):
+    client_id: int
+    round: int
+    chunk_id: int
+    total_chunks: int
+    payload: sequence[int]
     num_samples: int
     loss: float
     accuracy: float
@@ -111,11 +135,16 @@ class FederatedLearningServer:
         self.max_clients = max_clients
         self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
+        self.num_classes = 7  # For emotion recognition
         self.current_round = 0
         self.registered_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
         self.global_weights = None
+        
+        # Chunk reassembly buffers
+        self.model_update_chunks = {}  # {client_id: {chunk_id: payload}}
+        self.model_update_metadata = {}  # {client_id: {total_chunks, num_samples, loss, accuracy}}
         
         # Metrics storage for classification
         self.ACCURACY = []
@@ -220,6 +249,32 @@ class FederatedLearningServer:
         # Convert list of ints back to bytes
         return pickle.loads(bytes(serialized_weights))
     
+    def split_into_chunks(self, data):
+        """Split serialized data into chunks of CHUNK_SIZE"""
+        chunks = []
+        for i in range(0, len(data), CHUNK_SIZE):
+            chunks.append(data[i:i + CHUNK_SIZE])
+        return chunks
+    
+    def send_global_model_chunked(self, round_num, serialized_weights, model_config):
+        """Send global model as chunks"""
+        chunks = self.split_into_chunks(serialized_weights)
+        total_chunks = len(chunks)
+        
+        print(f"Sending global model in {total_chunks} chunks ({len(serialized_weights)} bytes total)")
+        
+        for chunk_id, chunk_data in enumerate(chunks):
+            chunk = GlobalModelChunk(
+                round=round_num,
+                chunk_id=chunk_id,
+                total_chunks=total_chunks,
+                payload=chunk_data,
+                model_config_json=model_config if chunk_id == 0 else ""  # Only send config with first chunk
+            )
+            self.writers['global_model_chunk'].write(chunk)
+            print(f"  Sent chunk {chunk_id + 1}/{total_chunks} ({len(chunk_data)} bytes)")
+            time.sleep(0.05)  # Small delay between chunks
+    
     def setup_dds(self):
         """Initialize DDS participant, topics, readers, and writers"""
         print(f"Setting up DDS on domain {DDS_DOMAIN_ID}...")
@@ -227,35 +282,68 @@ class FederatedLearningServer:
         # Create domain participant
         self.participant = DomainParticipant(DDS_DOMAIN_ID)
         
-        # Create QoS policy for reliable communication
+        # Reliable QoS for critical control messages (registration, config, commands)
+        # TransientLocal durability ensures messages survive discovery delays
         reliable_qos = Qos(
-            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=300)),
-            Policy.History.KeepAll,
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.History.KeepLast(10),
             Policy.Durability.TransientLocal,
         )
-        
+
+        # Reliable QoS for chunks - need large history buffer for multiple clients × 144 chunks
+        chunk_qos = Qos(
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=5)),
+            Policy.History.KeepLast(500),  # Support multiple clients sending 144 chunks simultaneously
+            Policy.Durability.Volatile
+        )
+
+        # Best effort QoS for large data transfers (model chunks)
+        best_effort_qos = Qos(
+            Policy.Reliability.BestEffort,
+            Policy.History.KeepLast(1),
+        )
+
         # Create topics
         topic_registration = Topic(self.participant, "ClientRegistration", ClientRegistration)
         topic_config = Topic(self.participant, "TrainingConfig", TrainingConfig)
         topic_command = Topic(self.participant, "TrainingCommand", TrainingCommand)
         topic_global_model = Topic(self.participant, "GlobalModel", GlobalModel)
+        topic_global_model_chunk = Topic(self.participant, "GlobalModelChunk", GlobalModelChunk)
         topic_model_update = Topic(self.participant, "ModelUpdate", ModelUpdate)
+        topic_model_update_chunk = Topic(self.participant, "ModelUpdateChunk", ModelUpdateChunk)
         topic_metrics = Topic(self.participant, "EvaluationMetrics", EvaluationMetrics)
         topic_status = Topic(self.participant, "ServerStatus", ServerStatus)
         
-        # Create readers (for receiving from clients) with reliable QoS
+        # # Create readers (for receiving from clients) with reliable QoS
+        # self.readers['registration'] = DataReader(self.participant, topic_registration, qos=reliable_qos)
+        # self.readers['model_update'] = DataReader(self.participant, topic_model_update, qos=reliable_qos)
+        # self.readers['metrics'] = DataReader(self.participant, topic_metrics, qos=reliable_qos)
+        
+        # # Create writers (for sending to clients) with reliable QoS
+        # self.writers['config'] = DataWriter(self.participant, topic_config, qos=reliable_qos)
+        # self.writers['command'] = DataWriter(self.participant, topic_command, qos=reliable_qos)
+        # self.writers['global_model'] = DataWriter(self.participant, topic_global_model, qos=reliable_qos)
+        # self.writers['status'] = DataWriter(self.participant, topic_status, qos=reliable_qos)
+
+        # Create readers (for receiving from clients)
+        # Use Reliable QoS for registration to ensure delivery despite discovery delays
         self.readers['registration'] = DataReader(self.participant, topic_registration, qos=reliable_qos)
-        self.readers['model_update'] = DataReader(self.participant, topic_model_update, qos=reliable_qos)
+        # Use chunk_qos for chunks with large history buffer to prevent loss
+        self.readers['model_update'] = DataReader(self.participant, topic_model_update, qos=best_effort_qos)
+        self.readers['model_update_chunk'] = DataReader(self.participant, topic_model_update_chunk, qos=chunk_qos)
         self.readers['metrics'] = DataReader(self.participant, topic_metrics, qos=reliable_qos)
         
-        # Create writers (for sending to clients) with reliable QoS
+        # Create writers (for sending to clients)
+        # Use Reliable QoS for config and commands (critical control messages)
         self.writers['config'] = DataWriter(self.participant, topic_config, qos=reliable_qos)
         self.writers['command'] = DataWriter(self.participant, topic_command, qos=reliable_qos)
-        self.writers['global_model'] = DataWriter(self.participant, topic_global_model, qos=reliable_qos)
-        self.writers['status'] = DataWriter(self.participant, topic_status, qos=reliable_qos)
+        # Use BestEffort for legacy global_model, chunk_qos for chunks with large buffer
+        self.writers['global_model'] = DataWriter(self.participant, topic_global_model, qos=best_effort_qos)
+        self.writers['global_model_chunk'] = DataWriter(self.participant, topic_global_model_chunk, qos=chunk_qos)
+        self.writers['status'] = DataWriter(self.participant, topic_status, qos=best_effort_qos)
         
-        print("DDS setup complete with RELIABLE QoS\n")
-        time.sleep(2)  # Allow time for discovery
+        print("DDS setup complete (Reliable QoS for control and chunks with KeepLast(200), BestEffort for status)\n")
+        time.sleep(0.5)  # Allow time for discovery
     
     def publish_status(self):
         """Publish current server status"""
@@ -281,6 +369,12 @@ class FederatedLearningServer:
         # Setup DDS
         self.setup_dds()
         
+        # Wait for DDS endpoint discovery to complete
+        # This ensures readers/writers are matched before clients start sending
+        print("Waiting for DDS endpoint discovery...")
+        time.sleep(2.0)
+        print("DDS endpoints ready\n")
+        
         # Publish initial training config
         config = TrainingConfig(
             batch_size=self.training_config['batch_size'],
@@ -295,7 +389,7 @@ class FederatedLearningServer:
                     loop_count += 1
                     # Print heartbeat every 10 iterations (5 seconds)
                     if loop_count % 10 == 0:
-                        #print(f"[ServerLoop] Iteration {loop_count}, round={self.current_round}, updates={len(self.client_updates)}/{self.num_clients}, metrics={len(self.client_metrics)}/{self.num_clients}")
+                        print(f"[ServerLoop] Iteration {loop_count}, registered={len(self.registered_clients)}/{self.num_clients}, training_started={self.training_started}")
                         sys.stdout.flush()
                     
                     # Publish current status
@@ -325,7 +419,7 @@ class FederatedLearningServer:
                         traceback.print_exc()
                         sys.stdout.flush()
                     
-                    time.sleep(0.5)
+                    time.sleep(0.05)  # Fast polling for chunk reception
                     
                 except Exception as loop_error:
                     print(f"[FATAL] Unhandled exception in server main loop iteration {loop_count}: {loop_error}")
@@ -354,13 +448,26 @@ class FederatedLearningServer:
         """Check for new client registrations"""
         samples = self.readers['registration'].take()
         
+        # Debug: Always log to show we're checking (every 20th call to avoid spam)
+        if not hasattr(self, '_reg_check_count'):
+            self._reg_check_count = 0
+        self._reg_check_count += 1
+        
+        if self._reg_check_count % 20 == 1:
+            print(f"[DEBUG] check_registrations called (count={self._reg_check_count}), samples received: {len(samples)}")
+        
+        # Debug: log how many samples received
+        if len(samples) > 0:
+            print(f"[DEBUG] *** RECEIVED {len(samples)} REGISTRATION SAMPLES ***")
+        
         for sample in samples:
             # Some DDS implementations may emit InvalidSample entries; guard against those
             if not sample or not hasattr(sample, 'client_id'):
-                # Optional: uncomment for verbose diagnostics
-                # print(f"[DEBUG] Skipping non-data or invalid registration sample: {type(sample).__name__}")
+                # Debug: show what we're skipping
+                print(f"[DEBUG] Skipping invalid registration sample: {type(sample).__name__}")
                 continue
             client_id = sample.client_id
+            print(f"[DEBUG] Processing registration from client {client_id}")
             if client_id not in self.registered_clients:
                 self.registered_clients.add(client_id)
                 print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
@@ -369,15 +476,14 @@ class FederatedLearningServer:
         if len(self.registered_clients) > self.num_clients:
             self.update_client_count(len(self.registered_clients))
                 
-                # If all clients registered, distribute initial global model and start training
-                if len(self.registered_clients) == self.num_clients and not self.training_started:
-                    print("\nAll clients registered. Distributing initial global model...\n")
-                    self.distribute_initial_model()
-                    # Record training start time
-                    self.start_time = time.time()
-                                self.training_started = True
+        # If all clients registered, distribute initial global model and start training
+        if len(self.registered_clients) == self.num_clients and not self.training_started:
+            print("\nAll clients registered. Distributing initial global model...\n")
+            self.distribute_initial_model()
+            # Record training start time
+            self.start_time = time.time()
             self.training_started = True
-print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     
     def distribute_initial_model(self):
         """Distribute initial global model to all clients"""
@@ -419,20 +525,11 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         else:
             serialized_weights = self.serialize_weights(self.global_weights)
         
-        # Send initial global model to all clients (publish multiple times for reliability)
-        initial_model = GlobalModel(
-            round=0,  # Round 0 = initial model distribution
-            weights=serialized_weights,
-            model_config_json=json.dumps(model_config)
-        )
+        # Send initial global model to all clients using chunking
+        print("Publishing initial model to clients in chunks...")
+        self.send_global_model_chunked(0, serialized_weights, json.dumps(model_config))
         
-        print("Publishing initial model to clients (sending multiple times for reliability)...")
-        for i in range(3):
-            self.writers['global_model'].write(initial_model)
-            print(f"  Attempt {i+1}/3: Initial model published via DDS")
-            time.sleep(0.5)
-        
-        print("Initial global model (architecture + weights) sent to all clients")
+        print("Initial global model (architecture + weights) sent to all clients in chunks")
         
         # Wait for clients to receive and set the initial model
         print("Waiting for clients to receive and build the model...")
@@ -454,54 +551,86 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         print("Start training signal sent successfully\n")
     
     def check_model_updates(self):
-        """Check for model updates from clients"""
-        samples = self.readers['model_update'].take()
+        """Check for model updates from clients (chunked version)"""
+        # Drain all pending chunks in one call for faster processing
+        chunk_samples = self.readers['model_update_chunk'].take()
         
-        # Debug: log how many samples we got
-        if len(samples) > 0:
-            #print(f"[DEBUG] check_model_updates: received {len(samples)} samples")
-            sys.stdout.flush()
+        if not chunk_samples:
+            return  # No chunks to process
         
-        for sample in samples:
+        for sample in chunk_samples:
             if not sample or not hasattr(sample, 'round'):
-                #print(f"[DEBUG] Skipping invalid model_update sample: {type(sample).__name__}")
                 continue
-            #print(f"[DEBUG] Processing model_update sample: client_id={sample.client_id if hasattr(sample, 'client_id') else 'N/A'}, round={sample.round}, current_round={self.current_round}")
-            sys.stdout.flush()
+                
             if sample.round == self.current_round and hasattr(sample, 'client_id'):
                 client_id = sample.client_id
+                chunk_id = sample.chunk_id
+                total_chunks = sample.total_chunks
                 
-                if client_id not in self.client_updates:
-                    # Decompress or deserialize client weights
-                    if self.quantization_handler is not None:
-                        try:
-                            # Deserialize pickled compressed data
-                            compressed_data = pickle.loads(bytes(sample.weights))
-                            weights = self.quantization_handler.decompress_client_update(sample.client_id, compressed_data)
-                            print(f"Server: Received and decompressed update from client {sample.client_id}")
-                        except Exception as e:
-                            # Fallback to regular deserialization
-                            print(f"Server: Failed to decompress from client {sample.client_id}, falling back to regular deserialization: {e}")
-                            weights = self.deserialize_weights(sample.weights)
-                    else:
-                        weights = self.deserialize_weights(sample.weights)
-                    
-                    self.client_updates[client_id] = {
-                        'weights': weights,
+                # Initialize buffers for this client if needed
+                if client_id not in self.model_update_chunks:
+                    self.model_update_chunks[client_id] = {}
+                    self.model_update_metadata[client_id] = {
+                        'total_chunks': total_chunks,
                         'num_samples': sample.num_samples,
-                        'metrics': {
-                            'loss': sample.loss,
-                            'accuracy': sample.accuracy
-                        }
+                        'loss': sample.loss,
+                        'accuracy': sample.accuracy
                     }
+                
+                # Store chunk
+                self.model_update_chunks[client_id][chunk_id] = sample.payload
+                
+                # Progress update every 20 chunks to reduce console spam
+                if (chunk_id + 1) % 20 == 0 or (chunk_id + 1) == total_chunks:
+                    print(f"Received {chunk_id + 1}/{total_chunks} chunks from client {client_id}")
+                
+                # Check if all chunks received for this client
+                if len(self.model_update_chunks[client_id]) == total_chunks:
+                    print(f"All chunks received from client {client_id}, reassembling...")
                     
-                    print(f"Received update from client {client_id} "
-                          f"({len(self.client_updates)}/{self.num_clients})")
+                    # Reassemble chunks in order
+                    reassembled_data = []
+                    for i in range(total_chunks):
+                        if i in self.model_update_chunks[client_id]:
+                            reassembled_data.extend(self.model_update_chunks[client_id][i])
+                        else:
+                            print(f"ERROR: Missing chunk {i} from client {client_id}")
+                            break
                     
-                    # If all clients sent updates, aggregate
-                    # Wait for all registered clients (dynamic)
-            if len(self.client_updates) >= len(self.registered_clients):
-                        self.aggregate_models()
+                    # Only process if we have all chunks
+                    if len(reassembled_data) > 0 and client_id not in self.client_updates:
+                        # Decompress or deserialize client weights
+                        if self.quantization_handler is not None:
+                            try:
+                                compressed_data = pickle.loads(bytes(reassembled_data))
+                                weights = self.quantization_handler.decompress_client_update(client_id, compressed_data)
+                                print(f"Server: Received and decompressed update from client {client_id}")
+                            except Exception as e:
+                                print(f"Server: Failed to decompress from client {client_id}, falling back: {e}")
+                                weights = self.deserialize_weights(reassembled_data)
+                        else:
+                            weights = self.deserialize_weights(reassembled_data)
+                        
+                        metadata = self.model_update_metadata[client_id]
+                        self.client_updates[client_id] = {
+                            'weights': weights,
+                            'num_samples': metadata['num_samples'],
+                            'metrics': {
+                                'loss': metadata['loss'],
+                                'accuracy': metadata['accuracy']
+                            }
+                        }
+                        
+                        # Clear chunk buffers for this client
+                        del self.model_update_chunks[client_id]
+                        del self.model_update_metadata[client_id]
+                        
+                        print(f"Successfully reassembled update from client {client_id} "
+                              f"({len(self.client_updates)}/{len(self.registered_clients)})")
+        
+        # If all clients sent updates, aggregate (ensure we have at least one client)
+        if len(self.client_updates) > 0 and len(self.client_updates) >= len(self.registered_clients):
+            self.aggregate_models()
     
     def check_evaluation_metrics(self):
         """Check for evaluation metrics from clients"""
@@ -535,6 +664,11 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
+        
+        # Safety check: ensure we have at least one client update
+        if len(self.client_updates) == 0:
+            print("ERROR: aggregate_models called with 0 client updates. Skipping aggregation.")
+            return
         
         # Calculate total samples
         total_samples = sum(update['num_samples'] 
@@ -572,7 +706,7 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         else:
             serialized_weights = self.serialize_weights(self.global_weights)
         
-        # Publish global model (always include model_config for late-joiners)
+        # Publish global model using chunking (always include model_config for late-joiners)
         model_config = {
             'input_shape': [48, 48, 1],
             'num_classes': self.num_classes,
@@ -589,12 +723,7 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 {'type': 'Dense', 'units': self.num_classes, 'activation': 'softmax'}
             ]
         }
-        global_model = GlobalModel(
-            round=self.current_round,
-            weights=serialized_weights,
-            model_config_json=json.dumps(model_config)
-        )
-        self.writers['global_model'].write(global_model)
+        self.send_global_model_chunked(self.current_round, serialized_weights, json.dumps(model_config))
         
         # Send evaluation command
         time.sleep(1)
@@ -613,7 +742,7 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         
         # After receiving all metrics, aggregate and continue
         # Wait for all registered clients (dynamic)
-            if len(self.client_metrics) >= len(self.registered_clients):
+        if len(self.client_metrics) >= len(self.registered_clients):
             self.aggregate_metrics()
             self.continue_training()
     
@@ -648,7 +777,7 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 time.sleep(0.1)  # Short sleep before next check
         
         # Wait for all registered clients (dynamic)
-            if len(self.client_metrics) >= len(self.registered_clients):
+        if len(self.client_metrics) >= len(self.registered_clients):
             print(f"✓ All evaluation metrics received!")
     
     def aggregate_metrics(self):

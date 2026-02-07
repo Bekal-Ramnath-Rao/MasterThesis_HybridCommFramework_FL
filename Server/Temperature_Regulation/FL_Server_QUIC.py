@@ -57,6 +57,9 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
             # Append new data to buffer
             self._stream_buffers[event.stream_id] += event.data
             
+            # Send flow control updates to allow more data (critical for poor networks)
+            self.transmit()
+            
             # Try to decode complete messages (delimited by newline)
             while b'\n' in self._stream_buffers[event.stream_id]:
                 message_data, self._stream_buffers[event.stream_id] = self._stream_buffers[event.stream_id].split(b'\n', 1)
@@ -160,9 +163,17 @@ class FederatedLearningServer:
             stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
             # Add newline delimiter for message framing
             data = (json.dumps(message) + '\n').encode('utf-8')
-            protocol._quic.send_stream_data(stream_id, data, end_stream=False)
+            protocol._quic.send_stream_data(stream_id, data, end_stream=True)
             protocol.transmit()
             print(f"Sent message type '{message.get('type')}' to client {client_id} on stream {stream_id}")
+            
+            # Multiple transmit calls for large messages (improved for poor networks)
+            if len(data) > 1_000_000:  # > 1MB
+                for _ in range(3):
+                    await asyncio.sleep(0.5)
+                    protocol.transmit()
+            else:
+                await asyncio.sleep(0.1)
     
     async def broadcast_message(self, message):
         """Broadcast message to all registered clients"""

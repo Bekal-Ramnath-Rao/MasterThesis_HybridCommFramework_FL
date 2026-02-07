@@ -74,6 +74,9 @@ class FederatedLearningServer:
         self.client_metrics = {}
         self.global_weights = None
         
+        # Track which clients are expected to send updates for current round
+        self.round_participants = set()
+        
         # Metrics storage (for classification)
         self.ACCURACY = []
         self.LOSS = []
@@ -391,11 +394,11 @@ class FederatedLearningServer:
             }
             
             print(f"Received update from client {client_id} "
-                  f"({len(self.client_updates)}/{self.num_clients})")
+                  f"({len(self.client_updates)}/{len(self.round_participants)})")
             
-            # If all clients sent updates, aggregate
-            # Wait for all registered clients (dynamic)
-            if len(self.client_updates) >= len(self.registered_clients):
+            # If all PARTICIPATING clients sent updates, aggregate
+            # Only wait for clients that were present at round start
+            if len(self.client_updates) >= len(self.round_participants):
                 self.aggregate_models()
     
     def handle_client_metrics(self, payload):
@@ -487,9 +490,13 @@ class FederatedLearningServer:
             
             time.sleep(0.5)  # Small delay between sends
         
-        # Wait for clients to receive and build the model
+        # Wait for clients to receive and build the model...
         print("\nWaiting for clients to receive and build the model...")
         time.sleep(3)
+        
+        # Capture which clients will participate in this round
+        self.round_participants = self.registered_clients.copy()
+        print(f"Round {self.current_round} participants: {sorted(list(self.round_participants))}")
         
         print(f"\n{'='*70}")
         print(f"Starting Round {self.current_round}/{self.num_rounds}")
@@ -660,8 +667,12 @@ class FederatedLearningServer:
         if self.current_round < self.num_rounds:
             self.current_round += 1
             
+            # Capture participants for this new round (includes late-joiners)
+            self.round_participants = self.registered_clients.copy()
+            
             print(f"\n{'='*70}")
             print(f"Starting Round {self.current_round}/{self.num_rounds}")
+            print(f"Round {self.current_round} participants: {sorted(list(self.round_participants))}")
             print(f"{'='*70}\n")
             
             time.sleep(2)

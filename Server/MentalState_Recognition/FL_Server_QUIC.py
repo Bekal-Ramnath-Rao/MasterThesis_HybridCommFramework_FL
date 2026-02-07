@@ -86,6 +86,9 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
 
             self._stream_buffers[event.stream_id] += event.data
 
+            # Send flow control updates to allow more data (critical for poor networks)
+            self.transmit()
+
             # Process complete messages (delimited by newline)
             while b'\n' in self._stream_buffers[event.stream_id]:
                 message_data, self._stream_buffers[event.stream_id] = self._stream_buffers[event.stream_id].split(
@@ -346,11 +349,13 @@ class FederatedLearningServer:
             msg_size_mb = len(data) / (1024 * 1024)
             print(f"Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(data)} bytes = {msg_size_mb:.2f} MB)")
             
-            # Adaptive delay based on message size for poor network conditions
+            # Multiple transmit calls for large messages (improved for poor networks)
             if len(data) > 1_000_000:  # > 1MB
-                await asyncio.sleep(1.0)  # 1 second for large messages
+                for _ in range(3):
+                    await asyncio.sleep(0.5)
+                    protocol.transmit()
             else:
-                await asyncio.sleep(0.1)  # 100ms for small messages
+                await asyncio.sleep(0.1)
 
     async def broadcast_message(self, message):
         """Broadcast message to all registered clients"""

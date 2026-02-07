@@ -105,6 +105,9 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             buffer_size = len(self._stream_buffers[event.stream_id])
             print(f"[DEBUG] Client stream {event.stream_id}: received {len(event.data)} bytes, buffer now {buffer_size} bytes, end_stream={event.end_stream}")
             
+            # Send flow control updates to allow more data (critical for poor networks)
+            self.transmit()
+            
             # Try to decode complete messages (delimited by newline)
             while b'\n' in self._stream_buffers[event.stream_id]:
                 message_data, self._stream_buffers[event.stream_id] = self._stream_buffers[event.stream_id].split(b'\n', 1)
@@ -230,16 +233,17 @@ class FederatedLearningClient:
             # Transmit immediately
             self.protocol.transmit()
             
-            # For large messages, give more time for transmission
+            # For large messages, give more time for transmission with multiple transmit calls
             if len(data) > 1000000:  # > 1MB
                 #print(f"[DEBUG] Client {self.client_id} waiting for large message transmission...")
-                # Multiple transmit calls with delays for very large messages
-                for i in range(5):
-                    await asyncio.sleep(1)
+                # Multiple transmit calls with shorter delays for very large messages
+                for i in range(3):
+                    await asyncio.sleep(0.5)
                     self.protocol.transmit()
-                    #print(f"[DEBUG] Client {self.client_id} transmit call {i+1}/5")
+                    #print(f"[DEBUG] Client {self.client_id} transmit call {i+1}/3")
             else:
-                await asyncio.sleep(0.5)
+                # Single small delay for flow control
+                await asyncio.sleep(0.1)
             
             #print(f"[DEBUG] Client {self.client_id} sent {msg_type} on stream {self.stream_id}")
     
@@ -564,13 +568,12 @@ async def main():
     configuration = QuicConfiguration(
         is_client=True,
         alpn_protocols=["fl"],
-        max_stream_data=50 * 1024 * 1024,  # 20 MB per stream
-        max_data=100 * 1024 * 1024,  # 50 MB total connection data
+        max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
+        max_data=100 * 1024 * 1024,  # 100 MB total connection data
         idle_timeout=3600.0,  # 60 minutes idle timeout (training can take long)
-
-        #poor network adjustments
-        initial_rtt=0.15, # 150ms (account for 100ms latency + jitter)
-        max_datagram_frame_size=1200, # typical MTU size
+        max_datagram_frame_size=65536,  # Larger frame size for better throughput
+        # Poor network adjustments
+        initial_rtt=0.15,  # 150ms (account for 100ms latency + jitter)
     )
     
     # Load CA certificate for verification (optional - set verify_mode to False for testing)
