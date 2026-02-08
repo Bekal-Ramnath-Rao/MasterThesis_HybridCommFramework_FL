@@ -103,7 +103,9 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             # Append new data to buffer
             self._stream_buffers[event.stream_id] += event.data
             buffer_size = len(self._stream_buffers[event.stream_id])
-            print(f"[DEBUG] Client stream {event.stream_id}: received {len(event.data)} bytes, buffer now {buffer_size} bytes, end_stream={event.end_stream}")
+            # Reduced logging - only show progress for large messages (every 100KB)
+            if buffer_size % (100 * 1024) < len(event.data):
+                print(f"[DEBUG] Client stream {event.stream_id}: ~{buffer_size // 1024}KB received")
             
             # Send flow control updates to allow more data (critical for poor networks)
             self.transmit()

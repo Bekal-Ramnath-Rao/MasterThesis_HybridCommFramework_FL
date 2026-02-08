@@ -118,6 +118,7 @@ class FederatedLearningServer:
         self.training_started = False
         self.start_time = None
         self.convergence_time = None
+        self.model_config_json = None  # Will be set during distribute_initial_model
         
         # Protocol reference
         self.protocol: Optional[FederatedLearningServerProtocol] = None
@@ -280,9 +281,8 @@ class FederatedLearningServer:
             await asyncio.sleep(2)
             await self.distribute_initial_model()
             self.start_time = time.time()
-                        self.training_started = True
             self.training_started = True
-print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     
     async def handle_client_update(self, message):
         """Handle model update from client"""
@@ -385,6 +385,9 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             ]
         }
         
+        # Store model config for late-joiners and aggregation
+        self.model_config_json = model_config
+        
         # Prepare global model (compress if quantization enabled)
         if self.quantization_handler is not None:
             compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
@@ -463,7 +466,7 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             'type': 'global_model',
             'round': self.current_round,
             weights_key: weights_data,
-            'model_config': model_config  # Always include for late-joiners
+            'model_config': self.model_config_json  # Always include for late-joiners
         })
         
         print(f"Aggregated global model from round {self.current_round} sent to all clients")
