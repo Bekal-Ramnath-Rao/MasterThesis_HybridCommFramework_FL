@@ -105,6 +105,13 @@ class ClientRegistration(IdlStruct):
 
 
 @dataclass
+class ClientReady(IdlStruct):
+    """Signal from client that it's ready to receive chunks"""
+    client_id: int
+    ready_for_chunks: bool
+
+
+@dataclass
 class TrainingConfig(IdlStruct):
     batch_size: int
     local_epochs: int
@@ -246,9 +253,13 @@ class FederatedLearningClient:
                 accuracy=accuracy
             )
             self.writers['model_update_chunk'].write(chunk)
-            # Removed time.sleep - Reliable QoS handles delivery, no need for artificial delay
+            
+            # CRITICAL: Pacing for BestEffort QoS to prevent UDP buffer overflow
+            time.sleep(0.01)  # 10ms between chunks
+            
             if (chunk_id + 1) % 20 == 0:  # Progress update every 20 chunks
                 print(f"  Sent {chunk_id + 1}/{total_chunks} chunks")
+                time.sleep(0.1)  # Extra pause for buffer drain
     
     def setup_dds(self):
         """Initialize DDS participant, topics, readers, and writers"""
@@ -266,13 +277,15 @@ class FederatedLearningClient:
         )
 
         # Best effort QoS for large data transfers (model chunks)
+        # Increased history buffer to handle burst packet loss
         best_effort_qos = Qos(
-            Policy.Reliability.BestEffort(),
-            Policy.History.KeepLast(1),
+            Policy.Reliability.BestEffort,
+            Policy.History.KeepLast(50),  # Buffer up to 50 chunks to handle burst losses
         )
         
         # Create topics
         topic_registration = Topic(self.participant, "ClientRegistration", ClientRegistration)
+        topic_ready = Topic(self.participant, "ClientReady", ClientReady)
         topic_config = Topic(self.participant, "TrainingConfig", TrainingConfig)
         topic_command = Topic(self.participant, "TrainingCommand", TrainingCommand)
         topic_global_model = Topic(self.participant, "GlobalModel", GlobalModel)
@@ -303,15 +316,20 @@ class FederatedLearningClient:
         self.readers['status'] = DataReader(self.participant, topic_status, qos=best_effort_qos)
         
         # Create writers (for sending to server)
-        # Use Reliable QoS for registration (critical to ensure server receives it)
+        # Use Reliable QoS for registration and ready signals (critical to ensure server receives them)
         self.writers['registration'] = DataWriter(self.participant, topic_registration, qos=reliable_qos)
+        self.writers['ready'] = DataWriter(self.participant, topic_ready, qos=reliable_qos)
         # Use BestEffort for chunked data and metrics
         self.writers['model_update'] = DataWriter(self.participant, topic_model_update, qos=best_effort_qos)
         self.writers['model_update_chunk'] = DataWriter(self.participant, topic_model_update_chunk, qos=best_effort_qos)
         self.writers['metrics'] = DataWriter(self.participant, topic_metrics, qos=best_effort_qos)
 
         print(f"Client {self.client_id} DDS setup complete (Reliable QoS for control, BestEffort for data)")
-        time.sleep(2.0)  # Wait for DDS endpoint discovery
+        
+        # Wait for DDS endpoint discovery (critical for BestEffort QoS!)
+        # BestEffort chunks are lost if sent before DataReader/DataWriter are matched
+        print(f"Client {self.client_id} waiting for endpoint discovery...")
+        time.sleep(3.0)  # Increased for BestEffort chunk endpoints
         
         # Register with server (send multiple times for reliability)
         registration = ClientRegistration(
@@ -323,7 +341,19 @@ class FederatedLearningClient:
             self.writers['registration'].write(registration)
             print(f"  Registration attempt {i+1}/3")
             time.sleep(0.3)
-        print(f"Client {self.client_id} registration sent\n")
+        print(f"Client {self.client_id} registration sent")
+        
+        # Signal that we're ready to receive chunks (AFTER registration)
+        time.sleep(2.0)  # Extra wait to ensure chunk endpoints are discovered
+        ready_signal = ClientReady(
+            client_id=self.client_id,
+            ready_for_chunks=True
+        )
+        print(f"Client {self.client_id} signaling ready for chunk reception...")
+        for i in range(3):
+            self.writers['ready'].write(ready_signal)
+            time.sleep(0.2)
+        print(f"Client {self.client_id} ready signal sent\n")
     
     def run(self):
         """Main client loop"""
@@ -341,8 +371,15 @@ class FederatedLearningClient:
         
         print(f"Client {self.client_id} waiting for training to start...\n")
         
+        loop_count = 0
         try:
             while self.running:
+                loop_count += 1
+                
+                # Heartbeat every 5 seconds (50 iterations * 0.1s)
+                if loop_count % 50 == 0:
+                    print(f"[ClientLoop] Client {self.client_id} iteration {loop_count}, model={'received' if self.model else 'waiting'}, round={self.current_round}")
+                
                 # Check for global model updates
                 self.check_global_model()
                 
@@ -419,6 +456,10 @@ class FederatedLearningClient:
         """Check for global model updates from server (chunked version)"""
         # Check for chunked global model
         chunk_samples = self.readers['global_model_chunk'].take()
+        
+        # DEBUG: Log if we're receiving anything
+        if len(chunk_samples) > 0:
+            print(f"[DEBUG] Client {self.client_id} received {len(chunk_samples)} chunk samples from DataReader")
         
         for sample in chunk_samples:
             if not sample or not hasattr(sample, 'round'):

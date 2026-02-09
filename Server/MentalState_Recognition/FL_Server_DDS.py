@@ -575,6 +575,11 @@ class FederatedLearningServer:
         }
 
         serialized_weights = self.serialize_weights(self.global_weights)
+        
+        # Wait for DDS chunk endpoints to be fully discovered (BestEffort needs this!)
+        print("Waiting for chunk DataReader/DataWriter discovery...")
+        time.sleep(5)  # Extra time for BestEffort endpoints to discover each other
+        
         print("Publishing initial model to clients in chunks...")
         self.send_global_model_chunked(0, serialized_weights, json.dumps(model_config))
         

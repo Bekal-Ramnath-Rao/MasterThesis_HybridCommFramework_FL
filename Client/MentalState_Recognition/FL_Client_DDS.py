@@ -476,7 +476,11 @@ class FederatedLearningClient:
         self.writers['metrics'] = DataWriter(self.participant, topic_metrics, qos=best_effort_qos)
 
         print(f"Client {self.client_id} DDS setup complete (Reliable QoS for control, BestEffort for data)")
-        time.sleep(2.0)  # Wait for DDS endpoint discovery
+        
+        # Wait longer for DDS endpoint discovery (critical for BestEffort QoS!)
+        # BestEffort chunks are lost if sent before DataReader/DataWriter are matched
+        print(f"Client {self.client_id} waiting for endpoint discovery...")
+        time.sleep(3.0)  # Increased for BestEffort chunk endpoints
         
         # Register with server (send multiple times for reliability)
         registration = ClientRegistration(

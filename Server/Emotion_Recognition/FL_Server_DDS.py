@@ -60,6 +60,13 @@ class ClientRegistration(IdlStruct):
 
 
 @dataclass
+class ClientReady(IdlStruct):
+    """Signal from client that it's ready to receive chunks"""
+    client_id: int
+    ready_for_chunks: bool
+
+
+@dataclass
 class TrainingConfig(IdlStruct):
     batch_size: int
     local_epochs: int
@@ -138,6 +145,7 @@ class FederatedLearningServer:
         self.num_classes = 7  # For emotion recognition
         self.current_round = 0
         self.registered_clients = set()
+        self.ready_clients = set()  # Track clients ready for chunk reception
         self.client_updates = {}
         self.client_metrics = {}
         self.global_weights = None
@@ -272,9 +280,14 @@ class FederatedLearningServer:
                 model_config_json=model_config if chunk_id == 0 else ""  # Only send config with first chunk
             )
             self.writers['global_model_chunk'].write(chunk)
-            # Removed time.sleep - Reliable QoS handles delivery, no artificial delay needed
+            
+            # CRITICAL: Pacing for BestEffort QoS to prevent UDP buffer overflow
+            # Without this, chunks are sent faster than the network can deliver them
+            time.sleep(0.01)  # 10ms between chunks = ~100 chunks/sec max throughput
+            
             if (chunk_id + 1) % 20 == 0:  # Progress update every 20 chunks
                 print(f"  Sent {chunk_id + 1}/{total_chunks} chunks")
+                time.sleep(0.1)  # Extra pause every 20 chunks for buffer drain
     
     def setup_dds(self):
         """Initialize DDS participant, topics, readers, and writers"""
@@ -292,13 +305,15 @@ class FederatedLearningServer:
         )
 
         # Best effort QoS for large data transfers (model chunks)
+        # Increased history buffer to handle burst packet loss
         best_effort_qos = Qos(
-            Policy.Reliability.BestEffort(),
-            Policy.History.KeepLast(1),
+            Policy.Reliability.BestEffort,
+            Policy.History.KeepLast(50),  # Buffer up to 50 chunks to handle burst losses
         )
 
         # Create topics
         topic_registration = Topic(self.participant, "ClientRegistration", ClientRegistration)
+        topic_ready = Topic(self.participant, "ClientReady", ClientReady)
         topic_config = Topic(self.participant, "TrainingConfig", TrainingConfig)
         topic_command = Topic(self.participant, "TrainingCommand", TrainingCommand)
         topic_global_model = Topic(self.participant, "GlobalModel", GlobalModel)
@@ -320,8 +335,9 @@ class FederatedLearningServer:
         # self.writers['status'] = DataWriter(self.participant, topic_status, qos=reliable_qos)
 
         # Create readers (for receiving from clients)
-        # Use Reliable QoS for registration to ensure delivery despite discovery delays
+        # Use Reliable QoS for registration and ready signals to ensure delivery
         self.readers['registration'] = DataReader(self.participant, topic_registration, qos=reliable_qos)
+        self.readers['ready'] = DataReader(self.participant, topic_ready, qos=reliable_qos)
         # Use BestEffort for chunked data (many small messages, retransmission handled by chunking)
         self.readers['model_update'] = DataReader(self.participant, topic_model_update, qos=best_effort_qos)
         self.readers['model_update_chunk'] = DataReader(self.participant, topic_model_update_chunk, qos=best_effort_qos)
@@ -518,6 +534,33 @@ class FederatedLearningServer:
             serialized_weights = list(pickle.dumps(compressed_data))
         else:
             serialized_weights = self.serialize_weights(self.global_weights)
+        
+        # Wait for all clients to explicitly signal they're ready to receive chunks
+        print("Waiting for all clients to signal ready for chunk reception...")
+        max_wait = 30  # Maximum 30 seconds to wait
+        start_time = time.time()
+        
+        while time.time() - start_time < max_wait:
+            # Check for ready signals
+            ready_samples = self.readers['ready'].take()
+            for sample in ready_samples:
+                if sample and sample.ready_for_chunks:
+                    self.ready_clients.add(sample.client_id)
+                    print(f"[READY] Client {sample.client_id} ready for chunks ({len(self.ready_clients)}/{self.num_clients})")
+            
+            # Check if all clients are ready
+            if len(self.ready_clients) >= self.num_clients:
+                print(f"[SUCCESS] All {self.num_clients} clients ready for chunk reception!")
+                break
+            
+            time.sleep(0.5)
+        
+        # Final check
+        if len(self.ready_clients) < self.num_clients:
+            print(f"[WARNING] Only {len(self.ready_clients)}/{self.num_clients} clients signaled ready!")
+            print("[WARNING] Proceeding anyway, but some chunks may be lost...")
+        
+        time.sleep(1)  # Small buffer after ready signals
         
         # Send initial global model to all clients using chunking
         print("Publishing initial model to clients in chunks...")
