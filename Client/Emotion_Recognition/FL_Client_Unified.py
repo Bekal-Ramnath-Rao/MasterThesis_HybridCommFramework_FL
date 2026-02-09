@@ -17,6 +17,8 @@ import pickle
 import base64
 import logging
 import threading
+import subprocess
+import re
 from typing import Dict, Tuple, Optional, List, Sequence
 import numpy as np
 import tensorflow as tf
@@ -991,7 +993,8 @@ class UnifiedFLClient_Emotion:
     def handle_start_evaluation(self, payload):
         """Start evaluation when server signals"""
         data = json.loads(payload.decode())
-        round_num = data['round']        if round_num == self.current_round:
+        round_num = data['round']
+        if round_num == self.current_round:
             if round_num in self.evaluated_rounds:
                 print(f"Client {self.client_id} ignoring duplicate evaluation for round {round_num}")
                 return
@@ -1012,6 +1015,68 @@ class UnifiedFLClient_Emotion:
         self.mqtt_client.disconnect()
         print(f"Client {self.client_id} disconnected successfully.")
     
+    def measure_network_condition(self):
+        """
+        Measure current network condition (latency / bandwidth estimate)
+        and update the RL environment state manager.
+        """
+        if not self.env_manager:
+            return
+
+        try:
+            target_host = MQTT_BROKER
+
+            # Use ping to estimate latency (average RTT over a few packets)
+            completed = subprocess.run(
+                ["ping", "-c", "3", "-q", str(target_host)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+            )
+
+            # Default conservative latency if ping fails
+            latency_ms = 300.0
+
+            if completed.returncode == 0:
+                # Try to parse "rtt min/avg/max/mdev = x/x/x/x ms"
+                match = re.search(
+                    r"rtt [^=]*= ([0-9.]+)/([0-9.]+)/",
+                    completed.stdout,
+                )
+                if not match:
+                    # BSD/macOS style: "round-trip min/avg/max/stddev = x/x/x/x ms"
+                    match = re.search(
+                        r"round-trip [^=]*= ([0-9.]+)/([0-9.]+)/",
+                        completed.stdout,
+                    )
+                if match:
+                    latency_ms = float(match.group(2))
+
+            # Rough bandwidth estimate based on latency bucket
+            if latency_ms < 20:
+                bandwidth_mbps = 100.0
+            elif latency_ms < 50:
+                bandwidth_mbps = 20.0
+            elif latency_ms < 150:
+                bandwidth_mbps = 5.0
+            elif latency_ms < 400:
+                bandwidth_mbps = 1.0
+            else:
+                bandwidth_mbps = 0.5
+
+            condition = self.env_manager.detect_network_condition(
+                latency_ms, bandwidth_mbps
+            )
+            self.env_manager.update_network_condition(condition)
+
+            print(
+                f"[Network] latency={latency_ms:.1f} ms, "
+                f"est_bandwidth={bandwidth_mbps:.1f} Mbps -> condition={condition}"
+            )
+        except Exception as e:
+            print(f"[Network] Failed to measure network condition: {e}")
+
     def select_protocol(self) -> str:
         """
         Select protocol using RL based on current environment and network conditions
@@ -1027,7 +1092,11 @@ class UnifiedFLClient_Emotion:
                 
                 resource_level = self.env_manager.detect_resource_level(cpu, memory)
                 self.env_manager.update_resource_level(resource_level)
-                
+
+                # Update network condition in the RL environment based on
+                # current connectivity to the aggregation server / broker.
+                self.measure_network_condition()
+
                 state = self.env_manager.get_current_state()
                 protocol = self.rl_selector.select_protocol(state, training=True)
                 
