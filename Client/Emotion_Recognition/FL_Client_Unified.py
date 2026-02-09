@@ -17,7 +17,7 @@ import pickle
 import base64
 import logging
 import threading
-import subprocess
+import socket
 import re
 from typing import Dict, Tuple, Optional, List, Sequence
 import numpy as np
@@ -269,10 +269,12 @@ class UnifiedFLClient_Emotion:
                 save_path=f"q_table_emotion_client_{client_id}.pkl"
             )
             self.env_manager = EnvironmentStateManager()
-            self.env_manager.update_model_size('medium')  # Emotion recognition
         else:
             self.rl_selector = None
             self.env_manager = None
+
+        # Track recent network latency samples for mobility estimation
+        self.latency_history: List[float] = []
         
         # Track selected protocol and metrics
         self.selected_protocol = None
@@ -1026,32 +1028,28 @@ class UnifiedFLClient_Emotion:
         try:
             target_host = MQTT_BROKER
 
-            # Use ping to estimate latency (average RTT over a few packets)
-            completed = subprocess.run(
-                ["ping", "-c", "3", "-q", str(target_host)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=5,
-            )
+            # Estimate latency by timing TCP connection to MQTT broker.
+            # This avoids requiring external tools like `ping` inside the container.
+            latencies: List[float] = []
+            port = int(os.getenv("MQTT_PORT", "1883"))
+            for _ in range(3):
+                start = time.time()
+                try:
+                    with socket.create_connection(
+                        (target_host, port), timeout=2
+                    ):
+                        pass
+                    elapsed_ms = (time.time() - start) * 1000.0
+                    latencies.append(elapsed_ms)
+                except OSError:
+                    # Treat failures as high latency samples
+                    latencies.append(500.0)
 
-            # Default conservative latency if ping fails
-            latency_ms = 300.0
-
-            if completed.returncode == 0:
-                # Try to parse "rtt min/avg/max/mdev = x/x/x/x ms"
-                match = re.search(
-                    r"rtt [^=]*= ([0-9.]+)/([0-9.]+)/",
-                    completed.stdout,
-                )
-                if not match:
-                    # BSD/macOS style: "round-trip min/avg/max/stddev = x/x/x/x ms"
-                    match = re.search(
-                        r"round-trip [^=]*= ([0-9.]+)/([0-9.]+)/",
-                        completed.stdout,
-                    )
-                if match:
-                    latency_ms = float(match.group(2))
+            if latencies:
+                latency_ms = sum(latencies) / len(latencies)
+            else:
+                # Fallback conservative default
+                latency_ms = 300.0
 
             # Rough bandwidth estimate based on latency bucket
             if latency_ms < 20:
@@ -1070,9 +1068,40 @@ class UnifiedFLClient_Emotion:
             )
             self.env_manager.update_network_condition(condition)
 
+            # Update mobility based on variability of recent latency samples.
+            # Higher jitter -> higher inferred mobility level.
+            try:
+                self.latency_history.append(latency_ms)
+                # Keep a rolling window to bound memory and smooth behaviour
+                if len(self.latency_history) > 20:
+                    self.latency_history.pop(0)
+
+                mobility = "static"
+                if len(self.latency_history) >= 5:
+                    avg = sum(self.latency_history) / len(self.latency_history)
+                    variance = sum(
+                        (x - avg) ** 2 for x in self.latency_history
+                    ) / len(self.latency_history)
+                    stddev = variance ** 0.5
+
+                    # Simple buckets for mobility based on latency jitter
+                    if stddev < 5:
+                        mobility = "static"
+                    elif stddev < 20:
+                        mobility = "low"
+                    elif stddev < 50:
+                        mobility = "medium"
+                    else:
+                        mobility = "high"
+
+                    self.env_manager.update_mobility(mobility)
+            except Exception as e:
+                print(f"[Mobility] Failed to update mobility level: {e}")
+
             print(
                 f"[Network] latency={latency_ms:.1f} ms, "
-                f"est_bandwidth={bandwidth_mbps:.1f} Mbps -> condition={condition}"
+                f"est_bandwidth={bandwidth_mbps:.1f} Mbps -> "
+                f"condition={condition}"
             )
         except Exception as e:
             print(f"[Network] Failed to measure network condition: {e}")
@@ -1148,7 +1177,25 @@ class UnifiedFLClient_Emotion:
             optimizer=Adam(learning_rate=0.0001),
             metrics=['accuracy']
         )
-        
+
+        # Dynamically categorize model size for RL state based on parameter count
+        try:
+            if self.env_manager is not None:
+                total_params = model.count_params()
+                if total_params < 1e5:
+                    size_category = "small"
+                elif total_params < 1e7:
+                    size_category = "medium"
+                else:
+                    size_category = "large"
+                self.env_manager.update_model_size(size_category)
+                print(
+                    f"[RL] Model params={total_params} -> "
+                    f"size_category={size_category}"
+                )
+        except Exception as e:
+            print(f"[RL] Failed to update model size category: {e}")
+
         return model
     
     def serialize_weights(self, weights):

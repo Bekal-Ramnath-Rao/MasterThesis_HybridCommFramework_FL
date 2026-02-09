@@ -68,6 +68,8 @@ services:
     depends_on:
       - mqtt-broker-unified
       - amqp-broker-unified
+    cap_add:
+      - NET_ADMIN
     command: python3 Server/Emotion_Recognition/FL_Server_Unified.py
     deploy:
       resources:
@@ -114,6 +116,8 @@ services:
       - fl-server-unified-emotion
       - mqtt-broker-unified
       - amqp-broker-unified
+    cap_add:
+      - NET_ADMIN
     command: python3 Client/Emotion_Recognition/FL_Client_Unified.py
     deploy:
       resources:
@@ -156,6 +160,8 @@ services:
       - fl-server-unified-emotion
       - mqtt-broker-unified
       - amqp-broker-unified
+    cap_add:
+      - NET_ADMIN
     command: python3 Client/Emotion_Recognition/FL_Client_Unified.py
     deploy:
       resources:

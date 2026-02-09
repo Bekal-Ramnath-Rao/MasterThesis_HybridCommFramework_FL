@@ -1934,7 +1934,9 @@ if QUIC_AVAILABLE:
 
 def main():
     """Main function"""
-    server = UnifiedFederatedLearningServer(NUM_CLIENTS, NUM_ROUNDS)
+    # Use MIN_CLIENTS (dynamic clients) and configured NUM_ROUNDS.
+    # MAX_CLIENTS controls the upper bound of concurrently registered clients.
+    server = UnifiedFederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, max_clients=MAX_CLIENTS)
     server.run()
 
 
