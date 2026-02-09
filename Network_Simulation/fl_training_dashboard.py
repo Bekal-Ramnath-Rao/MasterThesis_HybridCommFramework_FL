@@ -211,13 +211,17 @@ class FLTrainingDashboard:
     
     def get_container_logs_tail(self, container: str, lines: int = 3) -> List[str]:
         """Get last few lines of container logs"""
-        cmd = ['docker', 'logs', '--tail', str(lines), container]
+        # Fetch more lines than needed to ensure we get the freshest logs
+        fetch_lines = max(lines * 2, 10)
+        cmd = ['docker', 'logs', '--tail', str(fetch_lines), container]
         success, stdout, _ = self.run_command(cmd)
         
-        if not success:
+        if not success or not stdout.strip():
             return []
         
-        return [line.strip() for line in stdout.split('\n') if line.strip()][-lines:]
+        # Filter out empty lines and get the last N lines
+        all_lines = [line.strip() for line in stdout.split('\n') if line.strip()]
+        return all_lines[-lines:] if all_lines else []
     
     def extract_round_info(self, logs: str, protocol: str) -> Optional[int]:
         """Extract current round number from server logs"""
@@ -388,19 +392,46 @@ class FLTrainingDashboard:
             
             print("-" * 140)
         
-        # Recent Activity
-        print("\n📝 RECENT ACTIVITY (Last 2 lines per container)")
-        print("-" * 140)
+        # Recent Activity - Server Logs
+        if self.server_containers:
+            print(f"\n📝 SERVER LOGS (Last 4 lines per server) - Showing all {len(self.server_containers)} server(s)")
+            print("-" * 140)
+            
+            for container in self.server_containers:
+                logs = self.get_container_logs_tail(container, 4)
+                protocol = self.get_protocol_from_container(container)
+                protocol_tag = f"[{protocol.upper()}] " if protocol else ""
+                print(f"\n{protocol_tag}{container}:")
+                if logs:
+                    for log in logs:
+                        # Truncate long logs
+                        log_display = log[:130] + "..." if len(log) > 130 else log
+                        print(f"  {log_display}")
+                else:
+                    print("  No recent logs available")
         
-        for container in (self.server_containers + self.client_containers)[:5]:  # Show first 5 containers
-            logs = self.get_container_logs_tail(container, 2)
-            protocol = self.get_protocol_from_container(container)
-            protocol_tag = f"[{protocol.upper()}] " if protocol else ""
-            print(f"\n{protocol_tag}{container}:")
-            for log in logs:
-                # Truncate long logs
-                log_display = log[:125] + "..." if len(log) > 125 else log
-                print(f"  {log_display}")
+        # Recent Activity - Client Logs
+        if self.client_containers:
+            print("\n📝 CLIENT LOGS (Last 3 lines per client)")
+            print("-" * 140)
+            
+            # Show all clients, or limit to first 8 if there are too many
+            display_clients = self.client_containers[:8] if len(self.client_containers) > 8 else self.client_containers
+            if len(self.client_containers) > 8:
+                print(f"(Showing first 8 of {len(self.client_containers)} clients)")
+            
+            for container in display_clients:
+                logs = self.get_container_logs_tail(container, 3)
+                protocol = self.get_protocol_from_container(container)
+                protocol_tag = f"[{protocol.upper()}] " if protocol else ""
+                print(f"\n{protocol_tag}{container}:")
+                if logs:
+                    for log in logs:
+                        # Truncate long logs
+                        log_display = log[:130] + "..." if len(log) > 130 else log
+                        print(f"  {log_display}")
+                else:
+                    print("  No recent logs available")
         
         print("\n" + "-" * 140)
         print("\n💡 TIPS:")
