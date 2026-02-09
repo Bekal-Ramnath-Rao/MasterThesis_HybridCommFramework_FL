@@ -318,23 +318,16 @@ class UnifiedFLClient_Emotion:
                 # Create DDS participant
                 self.dds_participant = DomainParticipant(DDS_DOMAIN_ID)
                 
-                # FAIR CONFIG: Control QoS for registration/commands (60s for responsiveness)
+                # Reliable QoS for critical control messages (registration, config, commands)
                 reliable_qos = Qos(
-                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=60)),
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
                     Policy.History.KeepLast(10),
                     Policy.Durability.TransientLocal
                 )
                 
-                # FAIR CONFIG: Chunk QoS for data (600s timeout, 2048 chunks = 128 MB buffer)
-                chunk_qos = Qos(
-                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),  # 10 min for very_poor network
-                    Policy.History.KeepLast(2048),  # 2048 × 64KB = 128 MB buffer (aligned with AMQP)
-                    Policy.Durability.Volatile
-                )
-                
-                # Best effort QoS for legacy non-chunked messages
+                # Best effort QoS for large data transfers (model chunks)
                 best_effort_qos = Qos(
-                    Policy.Reliability.BestEffort,
+                    Policy.Reliability.BestEffort(),
                     Policy.History.KeepLast(1),
                 )
                 
@@ -346,15 +339,15 @@ class UnifiedFLClient_Emotion:
                 self.dds_metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
                 
                 # Create readers (for receiving from server)
-                # Use BestEffort for legacy global_model, chunk_qos for chunks with large history buffer
+                # Use BestEffort for chunked model data
                 self.dds_global_model_reader = DataReader(self.dds_participant, global_model_topic, qos=best_effort_qos)
-                self.dds_global_model_chunk_reader = DataReader(self.dds_participant, global_model_chunk_topic, qos=chunk_qos)
+                self.dds_global_model_chunk_reader = DataReader(self.dds_participant, global_model_chunk_topic, qos=best_effort_qos)
                 
                 # Create writers (for sending to server)
-                # Use best_effort for legacy, chunk_qos for chunks, reliable for metrics
+                # Use BestEffort for chunked data and metrics
                 self.dds_update_writer = DataWriter(self.dds_participant, self.dds_update_topic, qos=best_effort_qos)
-                self.dds_update_chunk_writer = DataWriter(self.dds_participant, update_chunk_topic, qos=chunk_qos)
-                self.dds_metrics_writer = DataWriter(self.dds_participant, self.dds_metrics_topic, qos=reliable_qos)
+                self.dds_update_chunk_writer = DataWriter(self.dds_participant, update_chunk_topic, qos=best_effort_qos)
+                self.dds_metrics_writer = DataWriter(self.dds_participant, self.dds_metrics_topic, qos=best_effort_qos)
                 
                 print(f"[DDS] Client {client_id} initialized on domain {DDS_DOMAIN_ID} with chunking support")
             except Exception as e:

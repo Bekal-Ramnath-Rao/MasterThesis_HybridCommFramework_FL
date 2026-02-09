@@ -1087,23 +1087,16 @@ class UnifiedFederatedLearningServer:
             # Create DDS participant
             self.dds_participant = DomainParticipant(DDS_DOMAIN_ID)
             
-            # FAIR CONFIG: Control QoS for registration/commands (60s for responsiveness)
+            # Reliable QoS for critical control messages (registration, config, commands)
             reliable_qos = Qos(
-                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=60)),
+                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
                 Policy.History.KeepLast(10),
                 Policy.Durability.TransientLocal
             )
             
-            # FAIR CONFIG: Chunk QoS for data (600s timeout, 2048 chunks = 128 MB buffer)
-            chunk_qos = Qos(
-                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),  # 10 min for very_poor network
-                Policy.History.KeepLast(2048),  # 2048 × 64KB = 128 MB buffer (aligned with AMQP)
-                Policy.Durability.Volatile
-            )
-            
-            # Best effort QoS for legacy non-chunked messages
+            # Best effort QoS for large data transfers (model chunks)
             best_effort_qos = Qos(
-                Policy.Reliability.BestEffort,
+                Policy.Reliability.BestEffort(),
                 Policy.History.KeepLast(1),
             )
             
@@ -1111,17 +1104,17 @@ class UnifiedFederatedLearningServer:
             update_topic = Topic(self.dds_participant, "ModelUpdate", ModelUpdate)
             update_reader = DataReader(self.dds_participant, update_topic, qos=best_effort_qos)
             update_chunk_topic = Topic(self.dds_participant, "ModelUpdateChunk", ModelUpdateChunk)
-            update_chunk_reader = DataReader(self.dds_participant, update_chunk_topic, qos=chunk_qos)
+            update_chunk_reader = DataReader(self.dds_participant, update_chunk_topic, qos=best_effort_qos)
             
             # Create topics and readers for metrics
             metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
-            metrics_reader = DataReader(self.dds_participant, metrics_topic, qos=reliable_qos)
+            metrics_reader = DataReader(self.dds_participant, metrics_topic, qos=best_effort_qos)
             
             # Create writers for sending global model and commands to clients
             global_model_topic = Topic(self.dds_participant, "GlobalModel", GlobalModel)
             self.dds_writers['global_model'] = DataWriter(self.dds_participant, global_model_topic, qos=best_effort_qos)
             global_model_chunk_topic = Topic(self.dds_participant, "GlobalModelChunk", GlobalModelChunk)
-            self.dds_writers['global_model_chunk'] = DataWriter(self.dds_participant, global_model_chunk_topic, qos=chunk_qos)
+            self.dds_writers['global_model_chunk'] = DataWriter(self.dds_participant, global_model_chunk_topic, qos=best_effort_qos)
             
             command_topic = Topic(self.dds_participant, "TrainingCommand", TrainingCommand)
             self.dds_writers['command'] = DataWriter(self.dds_participant, command_topic, qos=reliable_qos)

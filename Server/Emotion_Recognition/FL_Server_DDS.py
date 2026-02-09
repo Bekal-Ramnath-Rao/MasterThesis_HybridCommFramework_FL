@@ -283,24 +283,17 @@ class FederatedLearningServer:
         # Create domain participant
         self.participant = DomainParticipant(DDS_DOMAIN_ID)
         
-        # FAIR CONFIG: Control QoS for registration/commands (60s for responsiveness)
+        # Reliable QoS for critical control messages (registration, config, commands)
         # TransientLocal durability ensures messages survive discovery delays
         reliable_qos = Qos(
-            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=60)),
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
             Policy.History.KeepLast(10),
             Policy.Durability.TransientLocal,
         )
 
-        # FAIR CONFIG: Chunk QoS for data (600s timeout, 2048 chunks = 128 MB buffer)
-        chunk_qos = Qos(
-            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),  # 10 min for very_poor network
-            Policy.History.KeepLast(2048),  # 2048 × 64KB = 128 MB buffer (aligned with AMQP)
-            Policy.Durability.Volatile
-        )
-
         # Best effort QoS for large data transfers (model chunks)
         best_effort_qos = Qos(
-            Policy.Reliability.BestEffort,
+            Policy.Reliability.BestEffort(),
             Policy.History.KeepLast(1),
         )
 
@@ -329,21 +322,21 @@ class FederatedLearningServer:
         # Create readers (for receiving from clients)
         # Use Reliable QoS for registration to ensure delivery despite discovery delays
         self.readers['registration'] = DataReader(self.participant, topic_registration, qos=reliable_qos)
-        # Use chunk_qos for chunks with large history buffer to prevent loss
+        # Use BestEffort for chunked data (many small messages, retransmission handled by chunking)
         self.readers['model_update'] = DataReader(self.participant, topic_model_update, qos=best_effort_qos)
-        self.readers['model_update_chunk'] = DataReader(self.participant, topic_model_update_chunk, qos=chunk_qos)
-        self.readers['metrics'] = DataReader(self.participant, topic_metrics, qos=reliable_qos)
+        self.readers['model_update_chunk'] = DataReader(self.participant, topic_model_update_chunk, qos=best_effort_qos)
+        self.readers['metrics'] = DataReader(self.participant, topic_metrics, qos=best_effort_qos)
         
         # Create writers (for sending to clients)
         # Use Reliable QoS for config and commands (critical control messages)
         self.writers['config'] = DataWriter(self.participant, topic_config, qos=reliable_qos)
         self.writers['command'] = DataWriter(self.participant, topic_command, qos=reliable_qos)
-        # Use BestEffort for legacy global_model, chunk_qos for chunks with large buffer
+        # Use BestEffort for large model data and chunked transfers
         self.writers['global_model'] = DataWriter(self.participant, topic_global_model, qos=best_effort_qos)
-        self.writers['global_model_chunk'] = DataWriter(self.participant, topic_global_model_chunk, qos=chunk_qos)
+        self.writers['global_model_chunk'] = DataWriter(self.participant, topic_global_model_chunk, qos=best_effort_qos)
         self.writers['status'] = DataWriter(self.participant, topic_status, qos=best_effort_qos)
         
-        print("DDS setup complete (Reliable QoS for control and chunks with KeepLast(2048), BestEffort for status)\n")
+        print("DDS setup complete (Reliable QoS for control, BestEffort for data chunks)\n")
         time.sleep(0.5)  # Allow time for discovery
     
     def publish_status(self):
