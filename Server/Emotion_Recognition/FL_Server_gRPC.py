@@ -509,14 +509,14 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
 def serve():
     """Start the gRPC server"""
-    # Fair comparison settings aligned with MQTT/AMQP/QUIC/DDS
+    # FAIR CONFIG: Aligned with MQTT/AMQP/QUIC/DDS for unbiased comparison
     options = [
-        # Message size limits: 50MB for 12MB models + overhead
-        ('grpc.max_send_message_length', 50 * 1024 * 1024),
-        ('grpc.max_receive_message_length', 50 * 1024 * 1024),
-        # Keepalive settings: 60s aligned with other protocols
-        ('grpc.keepalive_time_ms', 60000),  # 60 seconds
-        ('grpc.keepalive_timeout_ms', 20000),  # 20 seconds
+        # FAIR CONFIG: Message size limits 128MB (aligned with AMQP default)
+        ('grpc.max_send_message_length', 128 * 1024 * 1024),
+        ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+        # FAIR CONFIG: Keepalive settings 600s for very_poor network
+        ('grpc.keepalive_time_ms', 600000),  # 10 minutes
+        ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
         ('grpc.keepalive_permit_without_calls', 1),
         ('grpc.http2.max_pings_without_data', 0),
         ('grpc.http2.min_time_between_pings_ms', 10000),  # 10s

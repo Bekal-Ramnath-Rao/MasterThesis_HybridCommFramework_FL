@@ -132,6 +132,8 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
 QUIC_HOST = os.getenv("QUIC_HOST", '0.0.0.0')
 QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
+# FAIR CONFIG: 64 KB chunks for better DDS performance in poor networks
+CHUNK_SIZE = 64 * 1024  # 64KB chunks
 
 # DDS Data Structures (must be defined at module level for Python 3.8)
 if DDS_AVAILABLE:
@@ -142,6 +144,14 @@ if DDS_AVAILABLE:
         round: int
         weights: sequence[int]
         model_config_json: str = ""
+    
+    @dataclass
+    class GlobalModelChunk(IdlStruct):
+        round: int
+        chunk_id: int
+        total_chunks: int
+        payload: sequence[int]
+        model_config_json: str = ""  # JSON string containing model configuration
     
     @dataclass
     class TrainingCommand(IdlStruct):
@@ -155,6 +165,19 @@ if DDS_AVAILABLE:
         client_id: int
         round: int
         weights: sequence[int]  # CycloneDDS sequence type for sequence<octet> in IDL
+        num_samples: int
+        loss: float
+        mse: float
+        mae: float
+        mape: float
+    
+    @dataclass
+    class ModelUpdateChunk(IdlStruct):
+        client_id: int
+        round: int
+        chunk_id: int
+        total_chunks: int
+        payload: sequence[int]
         num_samples: int
         loss: float
         mse: float
@@ -204,6 +227,10 @@ class UnifiedFederatedLearningServer:
         self.converged = False
         self.start_time = None
         self.convergence_time = None
+        
+        # DDS chunk reassembly buffers (FAIR CONFIG: matching standalone)
+        self.model_update_chunks = {}  # {client_id: {chunk_id: payload}}
+        self.model_update_metadata = {}  # {client_id: {total_chunks, num_samples, loss, mse, mae, mape}}
         
         # Lock for thread-safe operations
         self.lock = threading.Lock()
@@ -314,6 +341,33 @@ class UnifiedFederatedLearningServer:
         encoded = base64.b64encode(serialized).decode('utf-8')
         return encoded
     
+    def split_into_chunks(self, data):
+        """Split serialized data into chunks of CHUNK_SIZE (for DDS)"""
+        chunks = []
+        for i in range(0, len(data), CHUNK_SIZE):
+            chunks.append(data[i:i + CHUNK_SIZE])
+        return chunks
+    
+    def send_global_model_chunked(self, round_num, serialized_weights, model_config):
+        """Send global model as chunks via DDS"""
+        chunks = self.split_into_chunks(serialized_weights)
+        total_chunks = len(chunks)
+        
+        print(f"Sending global model in {total_chunks} chunks ({len(serialized_weights)} bytes total)")
+        
+        for chunk_id, chunk_data in enumerate(chunks):
+            chunk = GlobalModelChunk(
+                round=round_num,
+                chunk_id=chunk_id,
+                total_chunks=total_chunks,
+                payload=chunk_data,
+                model_config_json=model_config if chunk_id == 0 else ""  # Only send config with first chunk
+            )
+            self.dds_writers['global_model_chunk'].write(chunk)
+            # Reliable QoS handles delivery, no artificial delay needed
+            if (chunk_id + 1) % 20 == 0:  # Progress update every 20 chunks
+                print(f"  Sent {chunk_id + 1}/{total_chunks} chunks")
+    
     def deserialize_weights(self, encoded_weights):
         """Deserialize model weights received from clients"""
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
@@ -333,10 +387,12 @@ class UnifiedFederatedLearningServer:
                 protocol=mqtt.MQTTv311, 
                 clean_session=True
             )
-            self.mqtt_client._max_packet_size = 20 * 1024 * 1024
+            # FAIR CONFIG: Set max packet size to 128MB (aligned with AMQP default)
+            self.mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
             self.mqtt_client.on_connect = self.on_mqtt_connect
             self.mqtt_client.on_message = self.on_mqtt_message
-            self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            # FAIR CONFIG: keepalive 600s for very_poor network
+            self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 600)
             
             # Start MQTT loop in separate thread
             mqtt_thread = threading.Thread(target=self.mqtt_client.loop_forever, daemon=True)
@@ -375,14 +431,15 @@ class UnifiedFederatedLearningServer:
                 try:
                     if AMQP_AVAILABLE:
                         credentials = pika.PlainCredentials('guest', 'guest')
+                        # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
                         parameters = pika.ConnectionParameters(
                             host=AMQP_BROKER,
                             port=AMQP_PORT,
                             credentials=credentials,
                             connection_attempts=5,
                             retry_delay=1,
-                            heartbeat=600,
-                            blocked_connection_timeout=300
+                            heartbeat=600,  # 10 minutes for very_poor network
+                            blocked_connection_timeout=600  # Aligned with heartbeat
                         )
                         conn = pika.BlockingConnection(parameters)
                         ch = conn.channel()
@@ -454,12 +511,13 @@ class UnifiedFederatedLearningServer:
         
         try:
             credentials = pika.PlainCredentials('guest', 'guest')
+            # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
             parameters = pika.ConnectionParameters(
                 host=AMQP_BROKER,
                 port=AMQP_PORT,
                 credentials=credentials,
-                heartbeat=600,
-                blocked_connection_timeout=300,
+                heartbeat=600,  # 10 minutes for very_poor network
+                blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=5,
                 retry_delay=2
             )
@@ -626,12 +684,13 @@ class UnifiedFederatedLearningServer:
                     # Recreate send connection
                     print(f"[AMQP] Send connection closed, recreating...")
                     credentials = pika.PlainCredentials('guest', 'guest')
+                    # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
                     parameters = pika.ConnectionParameters(
                         host=AMQP_BROKER,
                         port=AMQP_PORT,
                         credentials=credentials,
-                        heartbeat=600,
-                        blocked_connection_timeout=300
+                        heartbeat=600,  # 10 minutes for very_poor network
+                        blocked_connection_timeout=600  # Aligned with heartbeat
                     )
                     print("Before sending message type:", message_type)
                     self.amqp_send_connection = pika.BlockingConnection(parameters)
@@ -674,11 +733,20 @@ class UnifiedFederatedLearningServer:
             return
         
         try:
+            # FAIR CONFIG: Aligned with MQTT/AMQP/QUIC/DDS for unbiased comparison
             self.grpc_server = grpc.server(
                 futures.ThreadPoolExecutor(max_workers=10),
                 options=[
-                    ('grpc.max_send_message_length', 100 * 1024 * 1024),
-                    ('grpc.max_receive_message_length', 100 * 1024 * 1024),
+                    # FAIR CONFIG: Message size limits 128MB (aligned with AMQP default)
+                    ('grpc.max_send_message_length', 128 * 1024 * 1024),
+                    ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                    # FAIR CONFIG: Keepalive settings 600s for very_poor network
+                    ('grpc.keepalive_time_ms', 600000),  # 10 minutes
+                    ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
+                    ('grpc.keepalive_permit_without_calls', 1),
+                    ('grpc.http2.max_pings_without_data', 0),
+                    ('grpc.http2.min_time_between_pings_ms', 10000),  # 10s
+                    ('grpc.http2.max_ping_strikes', 2),
                 ]
             )
             
@@ -731,15 +799,16 @@ class UnifiedFederatedLearningServer:
     async def _run_quic_server(self):
         """Async QUIC server"""
         try:
+            # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/DDS for unbiased comparison
             configuration = QuicConfiguration(
                 is_client=False,
                 alpn_protocols=["fl"],
-                # Data limits for large model updates (12+ MB)
-                max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
-                max_data=100 * 1024 * 1024,  # 100 MB total connection
-                # Long timeout for FL training cycles
-                idle_timeout=3600.0,  # 1 hour
-                max_datagram_frame_size=65536,
+                # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
+                max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
+                max_data=256 * 1024 * 1024,  # 256 MB total connection
+                # FAIR CONFIG: Timeout 600s for very_poor network scenarios
+                idle_timeout=600.0,  # 10 minutes
+                max_datagram_frame_size=65536,  # 64 KB frames
             )
             
             # Generate self-signed certificate for QUIC
@@ -844,12 +913,13 @@ class UnifiedFederatedLearningServer:
         """Polling-based AMQP consumer for all clients"""
         try:
             credentials = pika.PlainCredentials('guest', 'guest')
+            # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
             parameters = pika.ConnectionParameters(
                 host=AMQP_BROKER,
                 port=AMQP_PORT,
                 credentials=credentials,
-                heartbeat=600,
-                blocked_connection_timeout=300,
+                heartbeat=600,  # 10 minutes for very_poor network
+                blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=5,
                 retry_delay=2
             )
@@ -1017,33 +1087,123 @@ class UnifiedFederatedLearningServer:
             # Create DDS participant
             self.dds_participant = DomainParticipant(DDS_DOMAIN_ID)
             
-            # Define QoS for reliable communication
-            qos = Qos(
-                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            # FAIR CONFIG: Control QoS for registration/commands (60s for responsiveness)
+            reliable_qos = Qos(
+                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=60)),
                 Policy.History.KeepLast(10),
                 Policy.Durability.TransientLocal
             )
             
+            # FAIR CONFIG: Chunk QoS for data (600s timeout, 2048 chunks = 128 MB buffer)
+            chunk_qos = Qos(
+                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),  # 10 min for very_poor network
+                Policy.History.KeepLast(2048),  # 2048 × 64KB = 128 MB buffer (aligned with AMQP)
+                Policy.Durability.Volatile
+            )
+            
+            # Best effort QoS for legacy non-chunked messages
+            best_effort_qos = Qos(
+                Policy.Reliability.BestEffort,
+                Policy.History.KeepLast(1),
+            )
+            
             # Create topics and readers for model updates
             update_topic = Topic(self.dds_participant, "ModelUpdate", ModelUpdate)
-            update_reader = DataReader(self.dds_participant, update_topic, qos=qos)
+            update_reader = DataReader(self.dds_participant, update_topic, qos=best_effort_qos)
+            update_chunk_topic = Topic(self.dds_participant, "ModelUpdateChunk", ModelUpdateChunk)
+            update_chunk_reader = DataReader(self.dds_participant, update_chunk_topic, qos=chunk_qos)
             
             # Create topics and readers for metrics
             metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
-            metrics_reader = DataReader(self.dds_participant, metrics_topic, qos=qos)
+            metrics_reader = DataReader(self.dds_participant, metrics_topic, qos=reliable_qos)
             
             # Create writers for sending global model and commands to clients
             global_model_topic = Topic(self.dds_participant, "GlobalModel", GlobalModel)
-            self.dds_writers['global_model'] = DataWriter(self.dds_participant, global_model_topic, qos=qos)
+            self.dds_writers['global_model'] = DataWriter(self.dds_participant, global_model_topic, qos=best_effort_qos)
+            global_model_chunk_topic = Topic(self.dds_participant, "GlobalModelChunk", GlobalModelChunk)
+            self.dds_writers['global_model_chunk'] = DataWriter(self.dds_participant, global_model_chunk_topic, qos=chunk_qos)
             
             command_topic = Topic(self.dds_participant, "TrainingCommand", TrainingCommand)
-            self.dds_writers['command'] = DataWriter(self.dds_participant, command_topic, qos=qos)
+            self.dds_writers['command'] = DataWriter(self.dds_participant, command_topic, qos=reliable_qos)
             
             # Create DDS listener thread that polls for messages
             def dds_listener():
                 while self.running:
                     try:
-                        # Read model updates
+                        # FAIR CONFIG: Read chunked model updates (matching standalone)
+                        chunk_samples = list(update_chunk_reader.take(50))  # Read more chunks at once
+                        for sample in chunk_samples:
+                            if sample and hasattr(sample, 'client_id'):
+                                client_id = sample.client_id
+                                chunk_id = sample.chunk_id
+                                total_chunks = sample.total_chunks
+                                
+                                # Initialize chunk buffers if needed
+                                if client_id not in self.model_update_chunks:
+                                    self.model_update_chunks[client_id] = {}
+                                    self.model_update_metadata[client_id] = {
+                                        'total_chunks': total_chunks,
+                                        'num_samples': sample.num_samples,
+                                        'loss': sample.loss,
+                                        'mse': sample.mse,
+                                        'mae': sample.mae,
+                                        'mape': sample.mape
+                                    }
+                                
+                                # Store chunk
+                                self.model_update_chunks[client_id][chunk_id] = sample.payload
+                                
+                                # Progress update every 20 chunks to reduce console spam
+                                if (chunk_id + 1) % 20 == 0 or (chunk_id + 1) == total_chunks:
+                                    print(f"Received {chunk_id + 1}/{total_chunks} chunks from client {client_id}")
+                                
+                                # Check if all chunks received for this client
+                                if len(self.model_update_chunks[client_id]) == total_chunks:
+                                    print(f"All chunks received from client {client_id}, reassembling...")
+                                    
+                                    # Reassemble chunks in order
+                                    reassembled_data = []
+                                    for i in range(total_chunks):
+                                        if i in self.model_update_chunks[client_id]:
+                                            reassembled_data.extend(self.model_update_chunks[client_id][i])
+                                        else:
+                                            print(f"ERROR: Missing chunk {i} from client {client_id}")
+                                            break
+                                    
+                                    # Only process if we have all chunks
+                                    if len(reassembled_data) > 0:
+                                        # Deserialize client weights
+                                        weights = pickle.loads(bytes(reassembled_data))
+                                        
+                                        metadata = self.model_update_metadata[client_id]
+                                        data = {
+                                            'client_id': client_id,
+                                            'round': sample.round,
+                                            'weights': weights,
+                                            'num_samples': metadata['num_samples'],
+                                            'loss': metadata['loss'],
+                                            'mse': metadata['mse'],
+                                            'mae': metadata['mae'],
+                                            'mape': metadata['mape']
+                                        }
+                                        
+                                        log_received_packet(
+                                            packet_size=len(reassembled_data),
+                                            peer=f"client_{client_id}",
+                                            protocol="DDS",
+                                            round=self.current_round,
+                                            extra_info="model_update_chunked"
+                                        )
+                                        
+                                        self.handle_client_update(data, 'dds')
+                                        
+                                        # Clear chunk buffers for this client
+                                        del self.model_update_chunks[client_id]
+                                        del self.model_update_metadata[client_id]
+                                        
+                                        print(f"Successfully reassembled and processed update from client {client_id}")
+                        
+                        # Read legacy non-chunked model updates (for backwards compatibility)
                         samples_read = list(update_reader.take(10))
                         if samples_read:
                             print(f"[DDS] Read {len(samples_read)} update samples from DDS")
@@ -1460,22 +1620,27 @@ class UnifiedFederatedLearningServer:
                     print(f"[gRPC] Global model ready for client {client_id} to pull (round {self.current_round})")
                     
                 elif protocol == 'dds':
-                    # DDS uses pub/sub - publish to DDS topic
-                    if DDS_AVAILABLE and 'global_model' in self.dds_writers:
+                    # FAIR CONFIG: DDS uses pub/sub with chunking (matching standalone)
+                    if DDS_AVAILABLE and 'global_model_chunk' in self.dds_writers:
                         try:
-                            # Publish global model
-                            global_model = GlobalModel(
-                                round=self.current_round,
-                                weights=list(map(int, base64.b64decode(weights_data if weights_key == 'quantized_data' else weights_data)))
+                            # Serialize weights to bytes for chunking
+                            weights_bytes = base64.b64decode(weights_data if weights_key == 'quantized_data' else weights_data)
+                            weights_list = list(weights_bytes)  # Convert bytes to List[int]
+                            
+                            # Send using chunking
+                            model_config_json = json.dumps(self.model_config) if self.model_config else ""
+                            self.send_global_model_chunked(
+                                round_num=self.current_round,
+                                serialized_weights=weights_list,
+                                model_config=model_config_json
                             )
-                            self.dds_writers['global_model'].write(global_model)
-                            print(f"[DDS] Published global model to DDS topic for client {client_id}")
+                            print(f"[DDS] Published chunked global model to DDS topic for client {client_id}")
                         except Exception as dds_error:
                             print(f"[DDS] Error publishing global model: {dds_error}")
                             import traceback
                             traceback.print_exc()
                     else:
-                        print(f"[DDS] DDS writer not available for client {client_id}")
+                        print(f"[DDS] DDS chunk writer not available for client {client_id}")
                     
             except Exception as e:
                 print(f"[{protocol.upper()}] Error broadcasting to client {client_id}: {e}")

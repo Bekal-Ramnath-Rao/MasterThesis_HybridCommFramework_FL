@@ -283,18 +283,18 @@ class FederatedLearningServer:
         # Create domain participant
         self.participant = DomainParticipant(DDS_DOMAIN_ID)
         
-        # Reliable QoS for critical control messages (registration, config, commands)
+        # FAIR CONFIG: Control QoS for registration/commands (60s for responsiveness)
         # TransientLocal durability ensures messages survive discovery delays
         reliable_qos = Qos(
-            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=60)),
             Policy.History.KeepLast(10),
             Policy.Durability.TransientLocal,
         )
 
-        # Reliable QoS for chunks - need large history buffer for multiple clients × 144 chunks
+        # FAIR CONFIG: Chunk QoS for data (600s timeout, 2048 chunks = 128 MB buffer)
         chunk_qos = Qos(
-            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=5)),
-            Policy.History.KeepLast(500),  # Support multiple clients sending 144 chunks simultaneously
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),  # 10 min for very_poor network
+            Policy.History.KeepLast(2048),  # 2048 × 64KB = 128 MB buffer (aligned with AMQP)
             Policy.Durability.Volatile
         )
 
@@ -343,7 +343,7 @@ class FederatedLearningServer:
         self.writers['global_model_chunk'] = DataWriter(self.participant, topic_global_model_chunk, qos=chunk_qos)
         self.writers['status'] = DataWriter(self.participant, topic_status, qos=best_effort_qos)
         
-        print("DDS setup complete (Reliable QoS for control and chunks with KeepLast(200), BestEffort for status)\n")
+        print("DDS setup complete (Reliable QoS for control and chunks with KeepLast(2048), BestEffort for status)\n")
         time.sleep(0.5)  # Allow time for discovery
     
     def publish_status(self):

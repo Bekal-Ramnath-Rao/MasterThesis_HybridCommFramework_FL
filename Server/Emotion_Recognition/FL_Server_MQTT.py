@@ -123,10 +123,10 @@ class FederatedLearningServer:
         # Initialize MQTT client with fair comparison settings
         # clean_session=True for stateless operation (like other protocols)
         self.mqtt_client = mqtt.Client(client_id="fl_server", protocol=mqtt.MQTTv311, clean_session=True)
-        # Set max packet size to 12MB+ for FL model weights
-        self.mqtt_client._max_packet_size = 15 * 1024 * 1024  # 15MB with overhead
-        # Set keepalive to 60s (aligned with AMQP/gRPC/QUIC/DDS)
-        self.mqtt_client.keepalive = 60
+        # FAIR CONFIG: Set max packet size to 128MB (aligned with AMQP default)
+        self.mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
+        # FAIR CONFIG: Set keepalive to 600s for very_poor network scenarios
+        self.mqtt_client.keepalive = 600
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
 
@@ -813,8 +813,8 @@ class FederatedLearningServer:
         for attempt in range(max_retries):
             try:
                 print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
-                # Use 1 hour keepalive (3600 seconds) to prevent timeout during long training
-                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=3600)
+                # FAIR CONFIG: keepalive 600s for very_poor network
+                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=600)
                 print(f"Successfully connected to MQTT broker!\n")
                 self.mqtt_client.loop_forever()
                 break

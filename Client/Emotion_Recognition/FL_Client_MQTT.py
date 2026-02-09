@@ -139,9 +139,10 @@ class FederatedLearningClient:
         # Use MQTTv5 for better large message handling
         self.mqtt_client = mqtt.Client(client_id=f"fl_client_{client_id}", protocol=mqtt.MQTTv311)
         self.mqtt_client.max_inflight_messages_set(20)
-        self.mqtt_client.max_queued_messages_set(0)  # Unlimited queue
-        # Set max packet size to 20MB (20 * 1024 * 1024)
-        self.mqtt_client._max_packet_size = 20 * 1024 * 1024
+        # FAIR CONFIG: Limited queue to 1000 messages (aligned with AMQP/gRPC)
+        self.mqtt_client.max_queued_messages_set(1000)
+        # FAIR CONFIG: Set max packet size to 128MB (aligned with AMQP default)
+        self.mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
         self.mqtt_client.on_disconnect = self.on_disconnect
@@ -566,7 +567,8 @@ class FederatedLearningClient:
                 # Use 1 hour keepalive (3600 seconds) to prevent timeout during long training
                 # Enable automatic reconnection on connection loss
                 self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=120)
-                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 3600)
+                # FAIR CONFIG: keepalive 600s for very_poor network
+                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 600)
                 print(f"Successfully connected to MQTT broker!\n")
                 self.mqtt_client.loop_forever(retry_first_connection=True)
                 break

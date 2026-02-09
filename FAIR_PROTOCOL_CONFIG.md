@@ -1,254 +1,254 @@
-# Fair Protocol Comparison Configuration
+# Fair Protocol Configuration Standard
 
-## Overview
-This document defines standardized configurations for all communication protocols to ensure fair performance comparison in Federated Learning experiments.
+## Purpose
+This document defines standardized configuration parameters for **fair, unbiased comparison** of all communication protocols (MQTT, AMQP, gRPC, QUIC, DDS) in the Federated Learning evaluation.
 
-## Configuration Assessment ✅
-
-Your proposed configurations are **FAIR and WELL-DESIGNED** for the following reasons:
-
-### ✅ Consistent Reliability
-- All protocols use reliable delivery mechanisms
-- Ensures no data loss during model transmission
-- Fair comparison of overhead vs. reliability trade-offs
-
-### ✅ Consistent Keepalive/Heartbeat (60s)
-- Uniform connection management across protocols
-- Prevents premature disconnections
-- Allows fair comparison of connection overhead
-
-### ✅ Adequate Message Sizes
-- 50MB for gRPC/QUIC handles 12MB models + overhead
-- MQTT broker configured for 12MB+ messages
-- Sufficient headroom for serialization overhead
-
-### ✅ Similar QoS Guarantees
-- All protocols configured for at-least-once delivery
-- Comparable reliability guarantees
-- Fair latency vs. reliability trade-off
-
-## Detailed Configuration
-
-### 1. MQTT Configuration
-
-**Server/Client Settings:**
-```python
-QoS: 1 (at-least-once delivery)
-Keep-alive: 60 seconds
-Clean session: True (stateless between rounds)
-Message retention: False
-```
-
-**Broker Settings (Mosquitto):**
-```conf
-max_packet_size 12582912  # 12MB (12 * 1024 * 1024)
-message_size_limit 12582912
-keepalive_interval 60
-max_keepalive 120
-max_connections 1000
-```
-
-**Rationale:**
-- QoS 1 balances reliability and performance
-- Clean session ensures stateless operation
-- 12MB+ handles typical FL model sizes
+## Date: 2026-02-09
+## Status: MANDATORY for all protocol implementations
 
 ---
 
-### 2. AMQP Configuration
+## 1. MESSAGE SIZE LIMITS
 
-**Connection Settings:**
-```python
-Delivery mode: 2 (persistent messages)
-Acknowledgment: Manual ACK (guaranteed delivery)
-Heartbeat: 60 seconds
-Prefetch count: 1 (one model at a time)
-Blocked connection timeout: 300 seconds
-```
+**Standard: 128 MB** (based on AMQP's RabbitMQ default, which is the most permissive)
 
-**Queue Settings:**
-```python
-Durable: True (survive broker restart)
-Auto-delete: False
-Exclusive: False
-```
+| Protocol | Configuration | Value |
+|----------|--------------|-------|
+| **MQTT** | `_max_packet_size` | 128 * 1024 * 1024 (128 MB) |
+| **AMQP** | RabbitMQ default | 128 MB (no explicit config needed) |
+| **gRPC** | `max_send_message_length`<br>`max_receive_message_length` | 128 * 1024 * 1024 (128 MB) |
+| **QUIC** | `max_stream_data`<br>`max_data` | 128 MB per stream<br>256 MB total connection |
+| **DDS** | Chunking with buffer | KeepLast(2048) × 64KB = 128 MB |
 
-**Rationale:**
-- Persistent messages ensure reliability
-- Manual ACK provides delivery guarantees
-- Prefetch=1 optimizes for large model updates
-- Heartbeat aligns with other protocols
+**Rationale:** Using maximum supported limit eliminates artificial constraints that could bias results. AMQP's 128 MB default is chosen as the common ceiling.
 
 ---
 
-### 3. gRPC Configuration
+## 2. QUEUE/BUFFER MANAGEMENT
 
-**Message Size Limits:**
+**Standard: Limited queueing with 1000 message cap**
+
+| Protocol | Configuration | Value |
+|----------|--------------|-------|
+| **MQTT** | `max_queued_messages_set` | 1000 (was unlimited/0) |
+| **AMQP** | RabbitMQ queue length | 1000 (default) |
+| **gRPC** | Streaming flow control | Dynamic, effectively ~1000 |
+| **QUIC** | Connection buffer | 256 MB (2× max_stream) |
+| **DDS** | History policy | KeepLast(1000) for updates |
+
+**Rationale:** Unlimited queuing (MQTT's previous setting) masks network issues and creates unfair advantage. Standardizing to 1000 messages ensures comparable buffering behavior.
+
+---
+
+## 3. TIMEOUT/HEARTBEAT SETTINGS
+
+**Standard: 600 seconds (10 minutes) for very_poor network scenarios**
+
+| Protocol | Configuration | Value |
+|----------|--------------|-------|
+| **MQTT** | `keepalive` | 600 seconds |
+| **AMQP** | `heartbeat` | 600 seconds |
+| **gRPC** | `keepalive_time_ms` | 600000 ms (600s) |
+| **QUIC** | `idle_timeout` | 600.0 seconds |
+| **DDS** | `max_blocking_time` | 600 seconds (data)<br>60 seconds (control) |
+
+**Rationale:** Very poor network conditions (high packet loss, long interruptions) require generous timeouts. 10 minutes allows protocols to survive temporary outages while still detecting true failures. Control messages remain at 60s for responsiveness.
+
+---
+
+## 4. CHUNKING IMPLEMENTATION
+
+**Standard: All protocols implement 64 KB chunking with consistent reassembly**
+
+| Protocol | Chunk Size | Buffer Size | Implementation |
+|----------|-----------|-------------|----------------|
+| **MQTT** | 64 KB | 2048 chunks (128 MB) | NEW: Add chunking |
+| **AMQP** | 64 KB | 2048 chunks (128 MB) | NEW: Add chunking |
+| **gRPC** | 64 KB | 2048 chunks (128 MB) | NEW: Add chunking |
+| **QUIC** | 64 KB | 2048 chunks (128 MB) | NEW: Add chunking |
+| **DDS** | 64 KB | 2048 chunks (128 MB) | EXISTING: Already implemented |
+
+**Rationale:** 
+- **Fair comparison:** DDS already uses chunking for reliability. Adding chunking to all protocols ensures equal footing.
+- **Better reliability:** 64 KB chunks work better in poor network conditions than large monolithic messages.
+- **Consistent behavior:** All protocols now handle large models identically.
+
+---
+
+## 5. CONSISTENCY BETWEEN STANDALONE AND UNIFIED
+
+**CRITICAL REQUIREMENT:** Configuration must be **identical** between:
+- Standalone protocol implementations (`FL_Client_MQTT.py`, `FL_Server_MQTT.py`, etc.)
+- Unified RL-based implementation (`FL_Client_Unified.py`, `FL_Server_Unified.py`)
+
+**Verification checklist:**
+- [ ] Message size limits match
+- [ ] Queue/buffer sizes match
+- [ ] Timeout settings match
+- [ ] Chunking configuration matches
+- [ ] QoS policies match (for DDS)
+
+---
+
+## 6. STANDARDIZED CONFIGURATION CODE
+
+### MQTT Configuration
 ```python
-max_send_message_length: 52428800  # 50MB (50 * 1024 * 1024)
-max_receive_message_length: 52428800  # 50MB
+# Client and Server
+mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
+mqtt_client.max_inflight_messages_set(20)
+mqtt_client.max_queued_messages_set(1000)  # Limited to 1000 messages
+mqtt_client.keepalive = 600  # 10 minutes for very_poor network
 ```
 
-**Keepalive Settings:**
+### AMQP Configuration
 ```python
-grpc.keepalive_time_ms: 60000  # 60s
-grpc.keepalive_timeout_ms: 20000  # 20s
-grpc.keepalive_permit_without_calls: 1
-grpc.http2.max_pings_without_data: 0
+# Client and Server
+parameters = pika.ConnectionParameters(
+    host=AMQP_HOST,
+    port=AMQP_PORT,
+    credentials=credentials,
+    heartbeat=600,  # 10 minutes for very_poor network
+    blocked_connection_timeout=600  # Aligned with heartbeat
+)
+# RabbitMQ default max message: 128 MB (no explicit config needed)
+# Queue max length: 1000 (RabbitMQ default)
 ```
 
-**Timeout Settings:**
+### gRPC Configuration
 ```python
-grpc.http2.min_time_between_pings_ms: 10000  # 10s
-grpc.http2.max_ping_strikes: 2
-Call timeout: 300 seconds (for large messages)
+# Client and Server - SAME FOR STANDALONE AND UNIFIED
+options = [
+    ('grpc.max_send_message_length', 128 * 1024 * 1024),     # 128 MB
+    ('grpc.max_receive_message_length', 128 * 1024 * 1024),  # 128 MB
+    ('grpc.keepalive_time_ms', 600000),  # 10 minutes
+    ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
+    ('grpc.keepalive_permit_without_calls', 1),
+    ('grpc.http2.max_pings_without_data', 0),
+    ('grpc.http2.min_time_between_pings_ms', 10000),
+    ('grpc.http2.max_ping_strikes', 2),
+]
 ```
 
-**Rationale:**
-- 50MB handles 12MB models with overhead
-- Keepalive prevents idle disconnections
-- Extended timeout for large model transmission
-- HTTP/2 optimizes flow control
-
----
-
-### 4. QUIC Configuration
-
-**Stream Settings:**
+### QUIC Configuration
 ```python
-max_stream_data: 52428800  # 50MB per stream
-max_data: 104857600  # 100MB total connection
-idle_timeout: 60.0  # 60 seconds
+# Client and Server
+config = QuicConfiguration(
+    is_client=True/False,  # Client/Server specific
+    alpn_protocols=["fl"],
+    verify_mode=ssl.CERT_NONE,
+    max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
+    max_data=256 * 1024 * 1024,         # 256 MB total connection
+    idle_timeout=600.0,                 # 10 minutes for very_poor network
+    max_datagram_frame_size=65536       # 64 KB frames
+)
 ```
 
-**Connection Settings:**
+### DDS Configuration
 ```python
-max_datagram_frame_size: 65536  # 64KB
-initial_max_streams_bidi: 100
-initial_max_streams_uni: 100
+# Chunking configuration
+CHUNK_SIZE = 64 * 1024  # 64 KB
+
+# QoS for control messages (registration, commands)
+control_qos = Qos(
+    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=60)),
+    Policy.History.KeepLast(10),
+    Policy.Durability.TransientLocal
+)
+
+# QoS for data chunks (model updates)
+chunk_qos = Qos(
+    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),  # 10 min
+    Policy.History.KeepLast(2048),  # 2048 × 64KB = 128 MB buffer
+    Policy.Durability.Volatile
+)
+
+# QoS for metrics (small messages)
+metrics_qos = Qos(
+    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=60)),
+    Policy.History.KeepLast(10),
+    Policy.Durability.TransientLocal
+)
 ```
 
-**Congestion Control:**
-```python
-congestion_control_algorithm: 'cubic'  # Default, or 'bbr' if available
+---
+
+## 7. IMPLEMENTATION CHECKLIST
+
+For each protocol implementation, verify:
+
+### Standalone Implementations
+- [ ] `FL_Client_MQTT.py` - Updated
+- [ ] `FL_Server_MQTT.py` - Updated
+- [ ] `FL_Client_AMQP.py` - Updated
+- [ ] `FL_Server_AMQP.py` - Updated
+- [ ] `FL_Client_gRPC.py` - Updated
+- [ ] `FL_Server_gRPC.py` - Updated
+- [ ] `FL_Client_QUIC.py` - Updated
+- [ ] `FL_Server_QUIC.py` - Updated
+- [ ] `FL_Client_DDS.py` - Verified
+- [ ] `FL_Server_DDS.py` - Verified
+
+### Unified RL Implementation
+- [ ] `FL_Client_Unified.py` - MQTT section
+- [ ] `FL_Client_Unified.py` - AMQP section
+- [ ] `FL_Client_Unified.py` - gRPC section
+- [ ] `FL_Client_Unified.py` - QUIC section
+- [ ] `FL_Client_Unified.py` - DDS section
+- [ ] `FL_Server_Unified.py` - MQTT section
+- [ ] `FL_Server_Unified.py` - AMQP section
+- [ ] `FL_Server_Unified.py` - gRPC section
+- [ ] `FL_Server_Unified.py` - QUIC section
+- [ ] `FL_Server_Unified.py` - DDS section
+
+---
+
+## 8. TESTING REQUIREMENTS
+
+After applying these configurations, test under:
+
+1. **Excellent Network** (0% loss, 10ms latency, 100 Mbps)
+2. **Good Network** (1% loss, 50ms latency, 50 Mbps)
+3. **Fair Network** (5% loss, 100ms latency, 10 Mbps)
+4. **Poor Network** (10% loss, 200ms latency, 1 Mbps)
+5. **Very Poor Network** (20% loss, 500ms latency, 256 Kbps)
+
+**Expected behavior:** All protocols should:
+- Successfully transmit 128 MB messages (either directly or via chunking)
+- Survive 10-minute idle periods
+- Handle queue pressure identically
+- Show performance differences due to **protocol design**, not configuration bias
+
+---
+
+## 9. VALIDATION
+
+Run comparison tests with:
+```bash
+# Test each protocol independently
+python experiment_runner.py --protocol mqtt --network very_poor
+python experiment_runner.py --protocol amqp --network very_poor
+python experiment_runner.py --protocol grpc --network very_poor
+python experiment_runner.py --protocol quic --network very_poor
+python experiment_runner.py --protocol dds --network very_poor
+
+# Test unified RL-based protocol selection
+python experiment_runner.py --protocol rl_unified --network very_poor
 ```
 
-**Rationale:**
-- QUIC streams are inherently reliable
-- 50MB per stream accommodates FL models
-- Cubic CC is standard and well-tested
-- BBR can be used for comparison if needed
+**Success criteria:**
+- All protocols complete FL training successfully
+- Performance differences reflect protocol design, not config bias
+- Unified RL implementation shows same behavior as standalone when selecting each protocol
 
 ---
 
-### 5. DDS (CycloneDDS) Configuration
+## 10. MAINTENANCE
 
-**QoS Settings:**
-```xml
-<Reliability>
-    <Kind>RELIABLE</Kind>
-    <MaxBlockingTime>300s</MaxBlockingTime>  <!-- 5 minutes -->
-</Reliability>
+**Last Updated:** 2026-02-09
+**Next Review:** After any protocol implementation changes
 
-<History>
-    <Kind>KEEP_LAST</Kind>
-    <Depth>1</Depth>  <!-- Only latest model -->
-</History>
-
-<ResourceLimits>
-    <MaxSamples>1</MaxSamples>
-    <MaxInstances>100</MaxInstances>
-    <MaxSamplesPerInstance>1</MaxSamplesPerInstance>
-</ResourceLimits>
-```
-
-**Discovery & Lease:**
-```xml
-<Discovery>
-    <ParticipantLeaseDuration>60s</ParticipantLeaseDuration>
-    <AllowMulticast>false</AllowMulticast>  <!-- Unicast for Docker -->
-</Discovery>
-```
-
-**Data Transmission:**
-```xml
-<Internal>
-    <FragmentSize>8192</FragmentSize>  <!-- 8KB fragments -->
-    <EnableSharedMemory>false</EnableSharedMemory>  <!-- Docker compatibility -->
-</Internal>
-
-<MaxMessageSize>10485760</MaxMessageSize>  <!-- 10MB -->
-```
-
-**Rationale:**
-- Reliable QoS with 5-min blocking suitable for FL
-- KeepLast(1) ensures only latest model is stored
-- 60s lease duration aligns with other protocols
-- 8KB fragments optimize network transmission
-- Shared memory disabled for Docker isolation
-
----
-
-## Comparison Summary
-
-| Protocol | Reliability | Keepalive/Lease | Max Message | Timeout | Delivery Guarantee |
-|----------|-------------|-----------------|-------------|---------|-------------------|
-| **MQTT** | QoS 1 | 60s | 12MB+ | Default | At-least-once |
-| **AMQP** | Persistent | 60s | Unlimited* | 300s | Exactly-once (manual ACK) |
-| **gRPC** | HTTP/2 | 60s | 50MB | 300s | At-least-once |
-| **QUIC** | Stream-level | 60s | 50MB per stream | 60s idle | At-least-once |
-| **DDS** | Reliable | 60s | 10MB (fragmented) | 300s | At-least-once |
-
-\* AMQP has no hard limit, but practical limits apply based on broker memory
-
----
-
-## Implementation Checklist
-
-### ✅ To Configure
-
-- [x] MQTT: Update broker config (mosquitto.conf)
-- [x] MQTT: Ensure QoS 1 in all publish/subscribe calls
-- [x] AMQP: Set heartbeat to 60s
-- [x] AMQP: Verify delivery_mode=2 and manual ACK
-- [x] gRPC: Add keepalive settings
-- [x] gRPC: Update message size to 50MB
-- [x] QUIC: Update idle_timeout to 60s
-- [x] QUIC: Update max_stream_data to 50MB
-- [x] DDS: Update XML config for KeepLast(1)
-- [x] DDS: Set lease duration to 60s
-- [x] DDS: Configure fragment size to 8KB
-
----
-
-## Fairness Validation
-
-### Parameters Aligned:
-1. **Connection Management**: All use 60s keepalive/heartbeat/lease
-2. **Reliability**: All guarantee at-least-once delivery minimum
-3. **Message Capacity**: All support 12MB+ models
-4. **Timeout Handling**: Consistent 300s for large transfers
-5. **Stateless Operation**: Clean session/no history retention
-
-### Expected Differences (Protocol Characteristics):
-- **Overhead**: Varies based on protocol design
-- **Latency**: Varies based on framing/acknowledgment
-- **Resource Usage**: Varies based on implementation
-- **Network Efficiency**: Varies based on serialization
-
-These differences reflect **inherent protocol characteristics**, making the comparison meaningful and fair.
-
----
-
-## Testing Recommendations
-
-1. **Baseline Test**: Run all protocols in good network conditions
-2. **Stress Test**: Test with 12MB models at various network conditions
-3. **Reliability Test**: Verify delivery guarantees under packet loss
-4. **Timeout Test**: Ensure all protocols handle timeouts consistently
-5. **Resource Test**: Monitor CPU/memory across all protocols
-
----
-
-**Status**: Configuration design approved ✅
-**Next Step**: Implement configurations in codebase
+**Approval Required:** Any deviation from these standards must be documented with:
+1. Technical justification
+2. Impact analysis on fairness
+3. Alternative fair comparison approach

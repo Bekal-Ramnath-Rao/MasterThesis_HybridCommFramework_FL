@@ -641,17 +641,18 @@ async def main():
     server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
     # Fair comparison settings aligned with MQTT/AMQP/gRPC/DDS
+    # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/DDS for unbiased comparison
     configuration = QuicConfiguration(
         is_client=False,
-        alpn_protocols=["fl"],  # Add this for consistency
+        alpn_protocols=["fl"],
         
-        # Data limits - your values are good
-        max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
-        max_data=100 * 1024 * 1024,  # 100 MB total
+        # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
+        max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
+        max_data=256 * 1024 * 1024,  # 256 MB total connection
         
-        # Timeout - INCREASE to match FL workflow
-        idle_timeout=3600.0,  # 60 minutes (not 60 seconds!)
-        max_datagram_frame_size=65536,  # Larger frame size for better throughput
+        # FAIR CONFIG: Timeout 600s for very_poor network scenarios
+        idle_timeout=600.0,  # 10 minutes
+        max_datagram_frame_size=65536,  # 64 KB frames
         # Poor network adjustments
         initial_rtt=0.15,  # Account for network latency
     )

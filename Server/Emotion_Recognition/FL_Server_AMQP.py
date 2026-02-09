@@ -196,12 +196,13 @@ class FederatedLearningServer:
             try:
                 print(f"Attempting to connect to RabbitMQ at {AMQP_HOST}:{AMQP_PORT}...")
                 credentials = pika.PlainCredentials(AMQP_USER, AMQP_PASSWORD)
+                # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
                 parameters = pika.ConnectionParameters(
                     host=AMQP_HOST,
                     port=AMQP_PORT,
                     credentials=credentials,
-                    heartbeat=60,  # Aligned with MQTT/gRPC/QUIC/DDS (60s)
-                    blocked_connection_timeout=300
+                    heartbeat=600,  # 10 minutes for very_poor network
+                    blocked_connection_timeout=600  # Aligned with heartbeat
                 )
                 self.connection = pika.BlockingConnection(parameters)
                 self.channel = self.connection.channel()

@@ -189,6 +189,8 @@ TOPIC_TRAINING_COMPLETE = "fl/training_complete"
 
 # DDS Configuration
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
+# FAIR CONFIG: 64 KB chunks for better DDS performance in poor networks
+CHUNK_SIZE = 64 * 1024  # 64KB chunks
 
 # DDS Data Structures (must be defined at module level for Python 3.8)
 if DDS_AVAILABLE:
@@ -198,6 +200,14 @@ if DDS_AVAILABLE:
     class GlobalModel(IdlStruct):
         round: int
         weights: sequence[int]  # CycloneDDS sequence type for sequence<octet> in IDL
+    
+    @dataclass
+    class GlobalModelChunk(IdlStruct):
+        round: int
+        chunk_id: int
+        total_chunks: int
+        payload: sequence[int]
+        model_config_json: str = ""  # JSON string containing model configuration
     
     @dataclass
     class TrainingCommand(IdlStruct):
@@ -211,6 +221,19 @@ if DDS_AVAILABLE:
         client_id: int
         round: int
         weights: sequence[int]  # CycloneDDS sequence type for sequence<octet> in IDL
+        num_samples: int
+        loss: float
+        mse: float
+        mae: float
+        mape: float
+    
+    @dataclass
+    class ModelUpdateChunk(IdlStruct):
+        client_id: int
+        round: int
+        chunk_id: int
+        total_chunks: int
+        payload: sequence[int]
         num_samples: int
         loss: float
         mse: float
@@ -285,36 +308,70 @@ class UnifiedFLClient_Emotion:
             'success': False
         }
         
+        # DDS chunk reassembly buffers (FAIR CONFIG: matching standalone)
+        self.global_model_chunks = {}  # {chunk_id: payload}
+        self.global_model_metadata = {}  # {round, total_chunks, model_config_json}
+        
         # DDS Components
         if DDS_AVAILABLE:
             try:
                 # Create DDS participant
                 self.dds_participant = DomainParticipant(DDS_DOMAIN_ID)
                 
-                # Create QoS for reliable communication
-                qos = Qos(
-                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+                # FAIR CONFIG: Control QoS for registration/commands (60s for responsiveness)
+                reliable_qos = Qos(
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=60)),
                     Policy.History.KeepLast(10),
                     Policy.Durability.TransientLocal
                 )
                 
-                # Create topics and writers
+                # FAIR CONFIG: Chunk QoS for data (600s timeout, 2048 chunks = 128 MB buffer)
+                chunk_qos = Qos(
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),  # 10 min for very_poor network
+                    Policy.History.KeepLast(2048),  # 2048 × 64KB = 128 MB buffer (aligned with AMQP)
+                    Policy.Durability.Volatile
+                )
+                
+                # Best effort QoS for legacy non-chunked messages
+                best_effort_qos = Qos(
+                    Policy.Reliability.BestEffort,
+                    Policy.History.KeepLast(1),
+                )
+                
+                # Create topics
+                global_model_topic = Topic(self.dds_participant, "GlobalModel", GlobalModel)
+                global_model_chunk_topic = Topic(self.dds_participant, "GlobalModelChunk", GlobalModelChunk)
                 self.dds_update_topic = Topic(self.dds_participant, "ModelUpdate", ModelUpdate)
-                self.dds_update_writer = DataWriter(self.dds_participant, self.dds_update_topic, qos=qos)
-                
+                update_chunk_topic = Topic(self.dds_participant, "ModelUpdateChunk", ModelUpdateChunk)
                 self.dds_metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
-                self.dds_metrics_writer = DataWriter(self.dds_participant, self.dds_metrics_topic, qos=qos)
                 
-                print(f"[DDS] Client {client_id} initialized on domain {DDS_DOMAIN_ID}")
+                # Create readers (for receiving from server)
+                # Use BestEffort for legacy global_model, chunk_qos for chunks with large history buffer
+                self.dds_global_model_reader = DataReader(self.dds_participant, global_model_topic, qos=best_effort_qos)
+                self.dds_global_model_chunk_reader = DataReader(self.dds_participant, global_model_chunk_topic, qos=chunk_qos)
+                
+                # Create writers (for sending to server)
+                # Use best_effort for legacy, chunk_qos for chunks, reliable for metrics
+                self.dds_update_writer = DataWriter(self.dds_participant, self.dds_update_topic, qos=best_effort_qos)
+                self.dds_update_chunk_writer = DataWriter(self.dds_participant, update_chunk_topic, qos=chunk_qos)
+                self.dds_metrics_writer = DataWriter(self.dds_participant, self.dds_metrics_topic, qos=reliable_qos)
+                
+                print(f"[DDS] Client {client_id} initialized on domain {DDS_DOMAIN_ID} with chunking support")
             except Exception as e:
                 print(f"[DDS] Initialization failed: {e}")
                 self.dds_participant = None
                 self.dds_update_writer = None
+                self.dds_update_chunk_writer = None
                 self.dds_metrics_writer = None
+                self.dds_global_model_reader = None
+                self.dds_global_model_chunk_reader = None
         else:
             self.dds_participant = None
             self.dds_update_writer = None
+            self.dds_update_chunk_writer = None
             self.dds_metrics_writer = None
+            self.dds_global_model_reader = None
+            self.dds_global_model_chunk_reader = None
         
         # Initialize packet logger
         init_db()
@@ -342,8 +399,10 @@ class UnifiedFLClient_Emotion:
         # Initialize MQTT client for listening (always used for signal/sync)
         self.mqtt_client = mqtt.Client(client_id=f"fl_client_{client_id}", protocol=mqtt.MQTTv311)
         self.mqtt_client.max_inflight_messages_set(20)
-        self.mqtt_client.max_queued_messages_set(0)
-        self.mqtt_client._max_packet_size = 20 * 1024 * 1024
+        # FAIR CONFIG: Limited queue to 1000 messages (aligned with AMQP/gRPC)
+        self.mqtt_client.max_queued_messages_set(1000)
+        # FAIR CONFIG: Set max packet size to 128MB (aligned with AMQP default)
+        self.mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
         self.mqtt_client.on_disconnect = self.on_disconnect
@@ -494,12 +553,13 @@ class UnifiedFLClient_Emotion:
                         retry_delay *= 2  # Exponential backoff
                     
                     credentials = pika.PlainCredentials('guest', 'guest')
+                    # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
                     parameters = pika.ConnectionParameters(
                         host=os.getenv("AMQP_HOST", "rabbitmq-broker-unified"),
                         port=int(os.getenv("AMQP_PORT", "5672")),
                         credentials=credentials,
-                        heartbeat=600,
-                        blocked_connection_timeout=300
+                        heartbeat=600,  # 10 minutes for very_poor network
+                        blocked_connection_timeout=600  # Aligned with heartbeat
                     )
                     
                     self.amqp_listener_connection = pika.BlockingConnection(parameters)
@@ -1204,6 +1264,38 @@ class UnifiedFLClient_Emotion:
         encoded = base64.b64encode(serialized).decode('utf-8')
         return encoded
     
+    def split_into_chunks(self, data):
+        """Split serialized data into chunks of CHUNK_SIZE (for DDS)"""
+        chunks = []
+        for i in range(0, len(data), CHUNK_SIZE):
+            chunks.append(data[i:i + CHUNK_SIZE])
+        return chunks
+    
+    def send_model_update_chunked(self, round_num, serialized_weights, num_samples, loss, mse, mae, mape):
+        """Send model update as chunks via DDS"""
+        chunks = self.split_into_chunks(serialized_weights)
+        total_chunks = len(chunks)
+        
+        print(f"Client {self.client_id}: Sending model update in {total_chunks} chunks ({len(serialized_weights)} bytes total)")
+        
+        for chunk_id, chunk_data in enumerate(chunks):
+            chunk = ModelUpdateChunk(
+                client_id=self.client_id,
+                round=round_num,
+                chunk_id=chunk_id,
+                total_chunks=total_chunks,
+                payload=chunk_data,
+                num_samples=num_samples,
+                loss=loss,
+                mse=mse,
+                mae=mae,
+                mape=mape
+            )
+            self.dds_update_chunk_writer.write(chunk)
+            # Reliable QoS handles delivery, no need for artificial delay
+            if (chunk_id + 1) % 20 == 0:  # Progress update every 20 chunks
+                print(f"  Sent {chunk_id + 1}/{total_chunks} chunks")
+    
     def deserialize_weights(self, encoded_weights):
         """Deserialize model weights received from server"""
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
@@ -1414,10 +1506,13 @@ class UnifiedFLClient_Emotion:
             
             # Connect to RabbitMQ
             credentials = pika.PlainCredentials(amqp_user, amqp_password)
+            # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
             parameters = pika.ConnectionParameters(
                 host=amqp_host,
                 port=amqp_port,
                 credentials=credentials,
+                heartbeat=600,  # 10 minutes for very_poor network
+                blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=3,
                 retry_delay=2
             )
@@ -1464,10 +1559,13 @@ class UnifiedFLClient_Emotion:
             amqp_password = os.getenv("AMQP_PASSWORD", "guest")
             
             credentials = pika.PlainCredentials(amqp_user, amqp_password)
+            # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
             parameters = pika.ConnectionParameters(
                 host=amqp_host,
                 port=amqp_port,
                 credentials=credentials,
+                heartbeat=600,  # 10 minutes for very_poor network
+                blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=3,
                 retry_delay=2
             )
@@ -1506,9 +1604,13 @@ class UnifiedFLClient_Emotion:
             grpc_host = os.getenv("GRPC_HOST", "localhost")
             grpc_port = int(os.getenv("GRPC_PORT", "50051"))
             
+            # FAIR CONFIG: Set max message size to 128MB (aligned with AMQP default)
             options = [
-                ('grpc.max_send_message_length', 100 * 1024 * 1024),
-                ('grpc.max_receive_message_length', 100 * 1024 * 1024),
+                ('grpc.max_send_message_length', 128 * 1024 * 1024),
+                ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                # FAIR CONFIG: Keepalive settings 600s for very_poor network
+                ('grpc.keepalive_time_ms', 600000),  # 10 minutes
+                ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
             ]
             channel = grpc.insecure_channel(f'{grpc_host}:{grpc_port}', options=options)
             stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
@@ -1558,9 +1660,13 @@ class UnifiedFLClient_Emotion:
             grpc_host = os.getenv("GRPC_HOST", "localhost")
             grpc_port = int(os.getenv("GRPC_PORT", "50051"))
             
+            # FAIR CONFIG: Set max message size to 128MB (aligned with AMQP default)
             options = [
-                ('grpc.max_send_message_length', 100 * 1024 * 1024),
-                ('grpc.max_receive_message_length', 100 * 1024 * 1024),
+                ('grpc.max_send_message_length', 128 * 1024 * 1024),
+                ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                # FAIR CONFIG: Keepalive settings 600s for very_poor network
+                ('grpc.keepalive_time_ms', 600000),  # 10 minutes
+                ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
             ]
             channel = grpc.insecure_channel(f'{grpc_host}:{grpc_port}', options=options)
             stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
@@ -1639,17 +1745,20 @@ class UnifiedFLClient_Emotion:
         quic_host = os.getenv("QUIC_HOST", "localhost")
         quic_port = int(os.getenv("QUIC_PORT", "4433"))
         
+        # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/DDS for unbiased comparison
         config = QuicConfiguration(
             is_client=True, 
             alpn_protocols=["fl"],  # CRITICAL: Must match server's ALPN
             verify_mode=ssl.CERT_NONE,
-            max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
-            max_data=100 * 1024 * 1024,  # 100 MB total
-            idle_timeout=3600.0  # 1 hour
+            # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
+            max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
+            max_data=256 * 1024 * 1024,  # 256 MB total connection
+            # FAIR CONFIG: Timeout 600s for very_poor network scenarios
+            idle_timeout=600.0  # 10 minutes
         )
         
         print(f"[QUIC] Client {self.client_id} connecting to {quic_host}:{quic_port}...")
-        print(f"[QUIC] Configuration: verify_mode=CERT_NONE, idle_timeout=3600s")
+        print(f"[QUIC] Configuration: verify_mode=CERT_NONE, idle_timeout=600s")
         
         # Create protocol factory that sets client reference
         def create_protocol(*args, **kwargs):
@@ -1992,20 +2101,19 @@ class UnifiedFLClient_Emotion:
                     raise
     
     def _send_via_dds(self, message: dict):
-        """Send model update via DDS"""
-        if not DDS_AVAILABLE or not self.dds_update_writer:
+        """Send model update via DDS with chunking (matching standalone)"""
+        if not DDS_AVAILABLE or not self.dds_update_chunk_writer:
             raise NotImplementedError("DDS not available - triggering fallback")
         
         try:
-            # Serialize weights and convert to list of integers
+            # Serialize weights and convert to list of integers for chunking
             weights_bytes = pickle.dumps(message['weights'])
             weights_list = list(weights_bytes)  # Convert bytes to List[int]
             
-            # Create DDS message
-            dds_msg = ModelUpdate(
-                client_id=self.client_id,
-                round=message['round'],
-                weights=weights_list,
+            # FAIR CONFIG: Use chunking to match standalone DDS implementation
+            self.send_model_update_chunked(
+                round_num=message['round'],
+                serialized_weights=weights_list,
                 num_samples=message.get('num_samples', 0),
                 loss=message.get('loss', 0.0),
                 mse=message.get('mse', 0.0),
@@ -2013,19 +2121,16 @@ class UnifiedFLClient_Emotion:
                 mape=message.get('mape', 0.0)
             )
             
-            # Write to DDS
-            self.dds_update_writer.write(dds_msg)
-            
-            # Log the packet
+            # Log the packet (log total size, not individual chunks)
             log_sent_packet(
                 packet_size=len(weights_bytes),
                 peer="server",
                 protocol="DDS",
                 round=self.current_round,
-                extra_info="model_update"
+                extra_info="model_update_chunked"
             )
             
-            print(f"Client {self.client_id} sent model update for round {self.current_round} via DDS")
+            print(f"Client {self.client_id} sent chunked model update for round {self.current_round} via DDS")
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending via DDS: {e}")
             raise
@@ -2065,6 +2170,78 @@ class UnifiedFLClient_Emotion:
             print(f"Client {self.client_id} ERROR sending metrics via DDS: {e}")
             raise
     
+    def check_global_model_chunks(self):
+        """Check for global model chunks from server (matching standalone DDS)"""
+        if not DDS_AVAILABLE or not self.dds_global_model_chunk_reader:
+            return None
+        
+        try:
+            # Check for chunked global model
+            chunk_samples = self.dds_global_model_chunk_reader.take()
+            
+            for sample in chunk_samples:
+                if not sample or not hasattr(sample, 'round'):
+                    continue
+                
+                round_num = sample.round
+                chunk_id = sample.chunk_id
+                total_chunks = sample.total_chunks
+                
+                # Initialize buffers if needed
+                if not self.global_model_metadata:
+                    self.global_model_metadata = {
+                        'round': round_num,
+                        'total_chunks': total_chunks,
+                        'model_config_json': sample.model_config_json if hasattr(sample, 'model_config_json') else ''
+                    }
+                    print(f"Client {self.client_id}: Receiving global model in {total_chunks} chunks...")
+                
+                # Store chunk
+                self.global_model_chunks[chunk_id] = sample.payload
+                
+                # Progress logging - show every 20 chunks to reduce spam
+                chunks_received = len(self.global_model_chunks)
+                if chunks_received % 20 == 0 or chunks_received == total_chunks:
+                    print(f"Client {self.client_id}: Received {chunks_received}/{total_chunks} chunks")
+                
+                # Check if all chunks received
+                if chunks_received == total_chunks:
+                    print(f"Client {self.client_id}: All chunks received, reassembling...")
+                    
+                    try:
+                        # Reassemble chunks in order
+                        reassembled_data = []
+                        for i in range(total_chunks):
+                            if i in self.global_model_chunks:
+                                reassembled_data.extend(self.global_model_chunks[i])
+                            else:
+                                print(f"ERROR: Missing chunk {i}")
+                                break
+                        
+                        # Only process if we have all chunks
+                        if len(reassembled_data) > 0:
+                            # Deserialize weights
+                            weights = pickle.loads(bytes(reassembled_data))
+                            
+                            # Clear buffers
+                            self.global_model_chunks.clear()
+                            self.global_model_metadata.clear()
+                            
+                            return {'weights': weights, 'round': round_num}
+                    
+                    except Exception as e:
+                        print(f"[ERROR] Client {self.client_id}: Exception during model reassembly: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Clear buffers on error
+                        self.global_model_chunks.clear()
+                        self.global_model_metadata.clear()
+        
+        except Exception as e:
+            print(f"Client {self.client_id} ERROR checking global model chunks: {e}")
+        
+        return None
+    
     def start(self):
         """Connect to MQTT broker and start listening"""
         max_retries = 5
@@ -2074,7 +2251,8 @@ class UnifiedFLClient_Emotion:
             try:
                 print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
                 self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=120)
-                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 3600)
+                # FAIR CONFIG: keepalive 600s for very_poor network
+                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 600)
                 print(f"Successfully connected to MQTT broker!\n")
                 self.mqtt_client.loop_forever(retry_first_connection=True)
                 break

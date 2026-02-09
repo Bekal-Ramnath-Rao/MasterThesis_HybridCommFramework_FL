@@ -125,10 +125,13 @@ class FederatedLearningClient:
         for attempt in range(max_retries):
             try:
                 print(f"Attempting to connect to gRPC server at {GRPC_HOST}:{GRPC_PORT}...")
-                # Set max message size to 100MB for large model weights
+                # FAIR CONFIG: Set max message size to 128MB (aligned with AMQP default)
                 options = [
-                    ('grpc.max_send_message_length', 100 * 1024 * 1024),
-                    ('grpc.max_receive_message_length', 100 * 1024 * 1024),
+                    ('grpc.max_send_message_length', 128 * 1024 * 1024),
+                    ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                    # FAIR CONFIG: Keepalive settings 600s for very_poor network
+                    ('grpc.keepalive_time_ms', 600000),  # 10 minutes
+                    ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
                 ]
                 self.channel = grpc.insecure_channel(f'{GRPC_HOST}:{GRPC_PORT}', options=options)
                 self.stub = federated_learning_pb2_grpc.FederatedLearningStub(self.channel)
