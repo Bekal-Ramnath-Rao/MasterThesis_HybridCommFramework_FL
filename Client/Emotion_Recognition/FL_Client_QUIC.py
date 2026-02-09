@@ -15,8 +15,16 @@ from aioquic.asyncio.protocol import QuicConnectionProtocol
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
-gpu_device = os.environ.get("GPU_DEVICE_ID", "0")
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
 os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
 
@@ -69,10 +77,14 @@ if compression_path not in sys.path:
 from quantization_client import Quantization, QuantizationConfig
 
 # QUIC Configuration
-QUIC_HOST = os.getenv("QUIC_HOST", "localhost")
+QUIC_HOST = os.getenv("QUIC_HOST", "fl-server-quic-emotion")
 QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "1"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+
+# Model initialization timeout (seconds) - longer for poor network conditions
+# Default: 300s (5 minutes) for very poor network conditions with large models
+MODEL_INIT_TIMEOUT = float(os.getenv("MODEL_INIT_TIMEOUT", "300"))
 
 
 class FederatedLearningClientProtocol(QuicConnectionProtocol):
@@ -90,6 +102,13 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             
             # Append new data to buffer
             self._stream_buffers[event.stream_id] += event.data
+            buffer_size = len(self._stream_buffers[event.stream_id])
+            # Reduced logging - only show progress for large messages (every 100KB)
+            if buffer_size % (100 * 1024) < len(event.data):
+                print(f"[DEBUG] Client stream {event.stream_id}: ~{buffer_size // 1024}KB received")
+            
+            # Send flow control updates to allow more data (critical for poor networks)
+            self.transmit()
             
             # Try to decode complete messages (delimited by newline)
             while b'\n' in self._stream_buffers[event.stream_id]:
@@ -98,6 +117,8 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
                     try:
                         data = message_data.decode('utf-8')
                         message = json.loads(data)
+                        msg_type = message.get('type', 'unknown')
+                        print(f"[DEBUG] Client decoded message from stream {event.stream_id}: type={msg_type}, size={len(message_data)} bytes")
                         if self.client:
                             asyncio.create_task(self.client.handle_message(message))
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -105,9 +126,12 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             
             # If stream ended and buffer has remaining data, try to process it
             if event.end_stream and self._stream_buffers[event.stream_id]:
+                print(f"[DEBUG] Client stream {event.stream_id} ended with {len(self._stream_buffers[event.stream_id])} bytes remaining")
                 try:
                     data = self._stream_buffers[event.stream_id].decode('utf-8')
                     message = json.loads(data)
+                    msg_type = message.get('type', 'unknown')
+                    print(f"[DEBUG] Client decoded end-of-stream message: type={msg_type}")
                     if self.client:
                         asyncio.create_task(self.client.handle_message(message))
                     self._stream_buffers[event.stream_id] = b''
@@ -155,6 +179,45 @@ class FederatedLearningClient:
         weights = pickle.loads(serialized)
         return weights
     
+    def build_model_from_config(self, model_config):
+        """Build model from server-provided configuration"""
+        input_shape = model_config.get('input_shape')
+        num_classes = model_config.get('num_classes')
+        layers = model_config.get('layers', [])
+        
+        model = tf.keras.Sequential()
+        model.add(tf.keras.layers.Input(shape=input_shape))
+        
+        for layer in layers:
+            if layer['type'] == 'conv':
+                model.add(tf.keras.layers.Conv2D(
+                    layer['filters'], 
+                    layer['kernel'], 
+                    activation=layer['activation'],
+                    padding='same'
+                ))
+            elif layer['type'] == 'maxpool':
+                model.add(tf.keras.layers.MaxPooling2D(layer['pool_size']))
+            elif layer['type'] == 'flatten':
+                model.add(tf.keras.layers.Flatten())
+            elif layer['type'] == 'dense':
+                model.add(tf.keras.layers.Dense(layer['units'], activation=layer['activation']))
+            elif layer['type'] == 'dropout':
+                model.add(tf.keras.layers.Dropout(layer['rate']))
+            elif layer['type'] == 'lstm':
+                model.add(tf.keras.layers.LSTM(layer['units'], return_sequences=layer.get('return_sequences', False)))
+            elif layer['type'] == 'gru':
+                model.add(tf.keras.layers.GRU(layer['units'], return_sequences=layer.get('return_sequences', False)))
+        
+        model.compile(
+            optimizer='adam',
+            loss=model_config.get('loss', 'categorical_crossentropy'),
+            metrics=['accuracy']
+        )
+        
+        return model
+    
+    
     async def send_message(self, message):
         """Send message to server via QUIC stream"""
         if self.protocol:
@@ -172,16 +235,17 @@ class FederatedLearningClient:
             # Transmit immediately
             self.protocol.transmit()
             
-            # For large messages, give more time for transmission
+            # For large messages, give more time for transmission with multiple transmit calls
             if len(data) > 1000000:  # > 1MB
                 #print(f"[DEBUG] Client {self.client_id} waiting for large message transmission...")
-                # Multiple transmit calls with delays for very large messages
-                for i in range(5):
-                    await asyncio.sleep(1)
+                # Multiple transmit calls with shorter delays for very large messages
+                for i in range(3):
+                    await asyncio.sleep(0.5)
                     self.protocol.transmit()
-                    #print(f"[DEBUG] Client {self.client_id} transmit call {i+1}/5")
+                    #print(f"[DEBUG] Client {self.client_id} transmit call {i+1}/3")
             else:
-                await asyncio.sleep(0.5)
+                # Single small delay for flow control
+                await asyncio.sleep(0.1)
             
             #print(f"[DEBUG] Client {self.client_id} sent {msg_type} on stream {self.stream_id}")
     
@@ -215,25 +279,29 @@ class FederatedLearningClient:
     async def handle_global_model(self, message):
         """Receive and set global model weights and architecture from server"""
         round_num = message['round']
-        encoded_weights = message['weights']
+        print(f"Client {self.client_id}: Received global_model message for round {round_num}")
         
         # Decompress or deserialize weights
         if 'quantized_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['quantized_data'])
+            # Deserialize base64+pickle encoded quantized data
+            compressed_data = pickle.loads(base64.b64decode(message['quantized_data']))
+            weights = self.quantizer.decompress(compressed_data)
             print(f"Client {self.client_id}: Received and decompressed quantized global model")
         elif 'compressed_data' in message and self.quantizer is not None:
             weights = self.quantizer.decompress(message['compressed_data'])
             print(f"Client {self.client_id}: Received and decompressed quantized global model")
-        else:
+        elif 'weights' in message:
+            encoded_weights = message['weights']
             weights = self.deserialize_weights(encoded_weights)
+            print(f"Client {self.client_id}: Deserialized global model weights ({len(encoded_weights)} bytes)")
+        else:
+            print(f"Client {self.client_id}: ERROR - No weights found in message!")
+            return
         
-        if round_num == 0:
-            # If we've already moved past initialization, ignore repeated initial models
-            if self.current_round > 0:
-                #print(f"Client {self.client_id} ignoring duplicate initial global model (already in round {self.current_round})")
-                return
+        # Check if model needs initialization (works for late-joiners too)
+        if self.model is None:
             # Initial model from server - create model from server's config
-            print(f"Client {self.client_id} received initial global model from server")
+            print(f"Client {self.client_id} received initial global model from server (round {round_num})")
             
             model_config = message.get('model_config')
             if model_config:
@@ -298,11 +366,13 @@ class FederatedLearningClient:
         # Wait for model to be initialized (with timeout)
         if not self.model_ready.is_set():
             print(f"Client {self.client_id} waiting for model initialization before training round {round_num}...")
+            print(f"Client {self.client_id} using timeout of {MODEL_INIT_TIMEOUT}s (configured via MODEL_INIT_TIMEOUT env var)")
             try:
-                await asyncio.wait_for(self.model_ready.wait(), timeout=30.0)
+                await asyncio.wait_for(self.model_ready.wait(), timeout=MODEL_INIT_TIMEOUT)
                 print(f"Client {self.client_id} model ready, proceeding with training")
             except asyncio.TimeoutError:
-                print(f"Client {self.client_id} ERROR: Timeout waiting for model initialization")
+                print(f"Client {self.client_id} ERROR: Timeout waiting for model initialization after {MODEL_INIT_TIMEOUT}s")
+                print(f"Client {self.client_id} TIP: Increase MODEL_INIT_TIMEOUT env var for very poor network conditions")
                 return
         
         if self.current_round == 0 and round_num == 1:
@@ -386,7 +456,7 @@ class FederatedLearningClient:
             print(f"Client {self.client_id}: Compressed weights - "
                   f"Ratio: {stats['compression_ratio']:.2f}x, "
                   f"Size: {stats['compressed_size_mb']:.2f}MB")
-            weights_data = compressed_data
+            weights_data = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             weights_key = 'compressed_data'
         else:
             weights_data = self.serialize_weights(updated_weights)
@@ -497,12 +567,18 @@ async def main():
     client = FederatedLearningClient(CLIENT_ID, NUM_CLIENTS, train_generator, validation_generator)
     
     # Configure QUIC with large stream data limits for model weights
+    # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/DDS for unbiased comparison
     configuration = QuicConfiguration(
         is_client=True,
         alpn_protocols=["fl"],
-        max_stream_data=20 * 1024 * 1024,  # 20 MB per stream
-        max_data=50 * 1024 * 1024,  # 50 MB total connection data
-        idle_timeout=3600.0,  # 1 hour idle timeout (training can take long)
+        # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
+        max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
+        max_data=256 * 1024 * 1024,  # 256 MB total connection
+        # FAIR CONFIG: Timeout 600s for very_poor network scenarios
+        idle_timeout=600.0,  # 10 minutes
+        max_datagram_frame_size=65536,  # 64 KB frames
+        # Poor network adjustments
+        initial_rtt=0.15,  # 150ms (account for 100ms latency + jitter)
     )
     
     # Load CA certificate for verification (optional - set verify_mode to False for testing)

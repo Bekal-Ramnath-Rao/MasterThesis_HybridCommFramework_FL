@@ -24,6 +24,22 @@ from data_partitioner import get_client_data, NUM_CLASSES, ID2LBL, LBL2ID
 
 # Suppress TensorFlow warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+# GPU Configuration - Must be done BEFORE TensorFlow import
+# Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
+os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
+
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # GPU Configuration
@@ -51,6 +67,10 @@ QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 
+# Model initialization timeout (seconds) - longer for poor network conditions
+# Default: 300s (5 minutes) for very poor network conditions with large models
+MODEL_INIT_TIMEOUT = float(os.getenv("MODEL_INIT_TIMEOUT", "300"))
+
 # Training Configuration
 AUTOTUNE = tf.data.AUTOTUNE
 SMOOTH_EPS = 0.05
@@ -69,6 +89,11 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
                 self._stream_buffers[event.stream_id] = b''
             
             self._stream_buffers[event.stream_id] += event.data
+            buffer_size = len(self._stream_buffers[event.stream_id])
+            print(f"[DEBUG] Client stream {event.stream_id}: received {len(event.data)} bytes, buffer now {buffer_size} bytes, end_stream={event.end_stream}")
+            
+            # Send flow control updates to allow more data (critical for poor networks)
+            self.transmit()
             
             while b'\n' in self._stream_buffers[event.stream_id]:
                 message_data, self._stream_buffers[event.stream_id] = self._stream_buffers[event.stream_id].split(b'\n', 1)
@@ -76,10 +101,26 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
                     try:
                         data = message_data.decode('utf-8')
                         message = json.loads(data)
+                        msg_type = message.get('type', 'unknown')
+                        print(f"[DEBUG] Client decoded message from stream {event.stream_id}: type={msg_type}, size={len(message_data)} bytes")
                         if self.client:
                             asyncio.create_task(self.client.handle_message(message))
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
                         print(f"Error decoding message: {e}")
+            
+            # If stream ended and buffer has remaining data, try to process it
+            if event.end_stream and self._stream_buffers[event.stream_id]:
+                print(f"[DEBUG] Client stream {event.stream_id} ended with {len(self._stream_buffers[event.stream_id])} bytes remaining")
+                try:
+                    data = self._stream_buffers[event.stream_id].decode('utf-8')
+                    message = json.loads(data)
+                    msg_type = message.get('type', 'unknown')
+                    print(f"[DEBUG] Client decoded end-of-stream message: type={msg_type}")
+                    if self.client:
+                        asyncio.create_task(self.client.handle_message(message))
+                    self._stream_buffers[event.stream_id] = b''
+                except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                    print(f"Error decoding remaining buffer: {e}")
 
 
 class FederatedLearningClient:
@@ -306,6 +347,45 @@ class FederatedLearningClient:
         weights = pickle.loads(serialized)
         return weights
     
+    def build_model_from_config(self, model_config):
+        """Build model from server-provided configuration"""
+        input_shape = model_config.get('input_shape')
+        num_classes = model_config.get('num_classes')
+        layers = model_config.get('layers', [])
+        
+        model = tf.keras.Sequential()
+        model.add(tf.keras.layers.Input(shape=input_shape))
+        
+        for layer in layers:
+            if layer['type'] == 'conv':
+                model.add(tf.keras.layers.Conv2D(
+                    layer['filters'], 
+                    layer['kernel'], 
+                    activation=layer['activation'],
+                    padding='same'
+                ))
+            elif layer['type'] == 'maxpool':
+                model.add(tf.keras.layers.MaxPooling2D(layer['pool_size']))
+            elif layer['type'] == 'flatten':
+                model.add(tf.keras.layers.Flatten())
+            elif layer['type'] == 'dense':
+                model.add(tf.keras.layers.Dense(layer['units'], activation=layer['activation']))
+            elif layer['type'] == 'dropout':
+                model.add(tf.keras.layers.Dropout(layer['rate']))
+            elif layer['type'] == 'lstm':
+                model.add(tf.keras.layers.LSTM(layer['units'], return_sequences=layer.get('return_sequences', False)))
+            elif layer['type'] == 'gru':
+                model.add(tf.keras.layers.GRU(layer['units'], return_sequences=layer.get('return_sequences', False)))
+        
+        model.compile(
+            optimizer='adam',
+            loss=model_config.get('loss', 'categorical_crossentropy'),
+            metrics=['accuracy']
+        )
+        
+        return model
+    
+    
     async def send_message(self, message):
         """Send message to server via QUIC stream"""
         if self.protocol:
@@ -320,11 +400,13 @@ class FederatedLearningClient:
             self.protocol._quic.send_stream_data(self.stream_id, data, end_stream=True)
             self.protocol.transmit()
             
-            # Wait longer for large messages to be transmitted
+            # Multiple transmit calls for large messages (improved for poor networks)
             if len(data) > 1000000:  # > 1MB
-                await asyncio.sleep(2)
+                for _ in range(3):
+                    await asyncio.sleep(0.5)
+                    self.protocol.transmit()
             else:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.1)
             print(f"[DEBUG] Client {self.client_id} sent {msg_type} on stream {self.stream_id}")
     
     async def handle_message(self, message):
@@ -370,8 +452,13 @@ class FederatedLearningClient:
         else:
             weights = self.deserialize_weights(encoded_weights)
         
-        if round_num == 0:
-            print(f"Client {self.client_id} received initial global model from server")
+        # Initialize model if not yet created (works for any round)
+
+        
+        if self.model is None:
+
+        
+            print(f"Client {self.client_id} initializing model from server (round {round_num})")
             
             model_config = message.get('model_config')
             if model_config:
@@ -409,11 +496,13 @@ class FederatedLearningClient:
         
         if not self.model_ready.is_set():
             print(f"Client {self.client_id} waiting for model initialization before training round {round_num}...")
+            print(f"Client {self.client_id} using timeout of {MODEL_INIT_TIMEOUT}s (configured via MODEL_INIT_TIMEOUT env var)")
             try:
-                await asyncio.wait_for(self.model_ready.wait(), timeout=30.0)
+                await asyncio.wait_for(self.model_ready.wait(), timeout=MODEL_INIT_TIMEOUT)
                 print(f"Client {self.client_id} model ready, proceeding with training")
             except asyncio.TimeoutError:
-                print(f"Client {self.client_id} ERROR: Timeout waiting for model initialization")
+                print(f"Client {self.client_id} ERROR: Timeout waiting for model initialization after {MODEL_INIT_TIMEOUT}s")
+                print(f"Client {self.client_id} TIP: Increase MODEL_INIT_TIMEOUT env var for very poor network conditions")
                 return
         
         # Update to the new round and start training
@@ -526,9 +615,11 @@ async def main():
     configuration = QuicConfiguration(
         is_client=True,
         alpn_protocols=["fl"],
-        max_stream_data=20 * 1024 * 1024,
-        max_data=50 * 1024 * 1024,
-        idle_timeout=300.0,  # 5 minutes idle timeout
+        max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
+        max_data=100 * 1024 * 1024,  # 100 MB total
+        idle_timeout=3600.0,  # 60 minutes idle timeout
+        max_datagram_frame_size=65536,  # Larger frame size for better throughput
+        initial_rtt=0.15,  # 150ms (account for 100ms latency + jitter)
     )
     
     # Load CA certificate for verification (optional - set verify_mode to False for testing)

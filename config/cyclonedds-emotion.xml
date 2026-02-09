@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+    <Domain id="any">
+        <General>
+            <!-- Disable multicast for Docker/poor networks -->
+            <AllowMulticast>false</AllowMulticast>
+        </General>
+        <Discovery>
+            <ParticipantIndex>auto</ParticipantIndex>
+            <!-- Explicit peer list for unicast discovery in Docker -->
+            <!-- Use Docker service names for container-to-container communication -->
+            <Peers>
+                <Peer address="fl-server-dds-emotion"/>
+                <Peer address="fl-client-dds-emotion-1"/>
+                <Peer address="fl-client-dds-emotion-2"/>
+            </Peers>
+        </Discovery>
+        <Internal>
+            <HeartbeatInterval>500ms</HeartbeatInterval>
+        </Internal>
+        <Tracing>
+            <!-- Enable for debugging: info, config, fine, finer, finest -->
+            <Verbosity>warning</Verbosity>
+            <OutputFile>stderr</OutputFile>
+        </Tracing>
+    </Domain>
+</CycloneDDS>

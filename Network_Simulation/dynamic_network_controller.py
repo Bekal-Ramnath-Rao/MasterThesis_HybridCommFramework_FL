@@ -67,7 +67,7 @@ NETWORK_SCENARIOS = {
     'very_poor': {
         'latency': '200ms',
         'bandwidth': '1mbit',
-        'loss': '5',
+        'loss': '1',
         'jitter': '50ms'
     }
 }

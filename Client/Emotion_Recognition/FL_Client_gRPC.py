@@ -12,8 +12,16 @@ import grpc
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
-gpu_device = os.environ.get("GPU_DEVICE_ID", "0")
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
 os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
 
@@ -117,10 +125,13 @@ class FederatedLearningClient:
         for attempt in range(max_retries):
             try:
                 print(f"Attempting to connect to gRPC server at {GRPC_HOST}:{GRPC_PORT}...")
-                # Set max message size to 100MB for large model weights
+                # FAIR CONFIG: Set max message size to 128MB (aligned with AMQP default)
                 options = [
-                    ('grpc.max_send_message_length', 100 * 1024 * 1024),
-                    ('grpc.max_receive_message_length', 100 * 1024 * 1024),
+                    ('grpc.max_send_message_length', 128 * 1024 * 1024),
+                    ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                    # FAIR CONFIG: Keepalive settings 600s for very_poor network
+                    ('grpc.keepalive_time_ms', 600000),  # 10 minutes
+                    ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
                 ]
                 self.channel = grpc.insecure_channel(f'{GRPC_HOST}:{GRPC_PORT}', options=options)
                 self.stub = federated_learning_pb2_grpc.FederatedLearningStub(self.channel)
@@ -180,8 +191,8 @@ class FederatedLearningClient:
                     print(f"Client {self.client_id} received initial model from server\n")
                 else:
                     retry_count += 1
-                    if retry_count % 5 == 0:
-                        print(f"Still waiting for initial model... ({retry_count}/{max_connection_retries})")
+                    #f retry_count % 5 == 0:
+                        #print(f"Still waiting for initial model... ({retry_count}/{max_connection_retries})")
                     time.sleep(2)
                     
             except grpc.RpcError as e:

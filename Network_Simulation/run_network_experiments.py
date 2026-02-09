@@ -26,12 +26,14 @@ class ExperimentRunner:
     """Automates running FL experiments across different network conditions"""
     
     def __init__(self, use_case: str = "emotion", num_rounds: int = 10, enable_congestion: bool = False,
-                 use_quantization: bool = False, quantization_params: Dict[str, str] = None, enable_gpu: bool = False):
+                 use_quantization: bool = False, quantization_params: Dict[str, str] = None, enable_gpu: bool = False,
+                 baseline_mode: bool = False):
         self.use_case = use_case
         self.num_rounds = num_rounds
         self.enable_congestion = enable_congestion
         self.use_quantization = use_quantization
         self.enable_gpu = enable_gpu
+        self.baseline_mode = baseline_mode
         # quantization_params expected to be a dict of simple string values
         self.quantization_params = quantization_params or {}
         
@@ -51,18 +53,23 @@ class ExperimentRunner:
         project_root = script_dir.parent
         
         # Build descriptive folder name
-        folder_parts = [use_case]
-        if use_quantization:
-            folder_parts.append("quantized")
-            if quantization_params.get('QUANTIZATION_BITS'):
-                folder_parts.append(f"{quantization_params['QUANTIZATION_BITS']}bit")
-        if enable_congestion:
-            folder_parts.append("congestion")
-        folder_parts.append(datetime.now().strftime('%Y%m%d_%H%M%S'))
-        folder_name = "_".join(folder_parts)
+        if baseline_mode:
+            # Baseline results go to dedicated baseline folder
+            folder_name = use_case
+            self.results_dir = project_root / "experiment_results_baseline" / folder_name
+        else:
+            # Regular experiments
+            folder_parts = [use_case]
+            if use_quantization:
+                folder_parts.append("quantized")
+                if quantization_params.get('QUANTIZATION_BITS'):
+                    folder_parts.append(f"{quantization_params['QUANTIZATION_BITS']}bit")
+            if enable_congestion:
+                folder_parts.append("congestion")
+            folder_parts.append(datetime.now().strftime('%Y%m%d_%H%M%S'))
+            folder_name = "_".join(folder_parts)
+            self.results_dir = project_root / "experiment_results" / folder_name
         
-        # Set paths relative to project root
-        self.results_dir = project_root / "experiment_results" / folder_name
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.results_dir = str(self.results_dir)
         
@@ -82,7 +89,7 @@ class ExperimentRunner:
                 self.enable_congestion = False
         
         # Define protocols to test
-        self.protocols = ["mqtt", "amqp", "grpc", "quic", "dds"]
+        self.protocols = ["mqtt", "amqp", "grpc", "quic", "dds", "rl_unified"]
         
         # Define network scenarios to test
         self.network_scenarios = [
@@ -99,41 +106,70 @@ class ExperimentRunner:
         
         # Docker compose file mapping (relative to project root)
         docker_dir = project_root / "Docker"
-        self.compose_files = {
-            "emotion": str(docker_dir / "docker-compose-emotion.yml"),
-            "mentalstate": str(docker_dir / "docker-compose-mentalstate.yml"),
-            "temperature": str(docker_dir / "docker-compose-temperature.yml")
-        }
         
-        # GPU overlay files
-        self.gpu_overlay_files = {
-            "emotion": str(docker_dir / "docker-compose-emotion.gpu.yml"),
-            "mentalstate": str(docker_dir / "docker-compose-mentalstate.gpu.yml"),
-            "temperature": str(docker_dir / "docker-compose-temperature.gpu.yml")
-        }
+        # Use GPU-isolated files when GPU is enabled, otherwise use standard files
+        if enable_gpu:
+            self.compose_files = {
+                "emotion": str(docker_dir / "docker-compose-emotion.gpu-isolated.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-mentalstate.gpu-isolated.yml"),
+                "temperature": str(docker_dir / "docker-compose-temperature.gpu-isolated.yml")
+            }
+            # Unified compose files for RL-based protocol selection
+            self.unified_compose_files = {
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.yml"),
+                "temperature": str(docker_dir / "docker-compose-unified-temperature.yml")
+            }
+            # No overlay files needed with GPU-isolated (they are standalone)
+            self.gpu_overlay_files = {}
+        else:
+            self.compose_files = {
+                "emotion": str(docker_dir / "docker-compose-emotion.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-mentalstate.yml"),
+                "temperature": str(docker_dir / "docker-compose-temperature.yml")
+            }
+            # Unified compose files for RL-based protocol selection (non-GPU)
+            self.unified_compose_files = {
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.yml"),
+                "temperature": str(docker_dir / "docker-compose-unified-temperature.yml")
+            }
+            # GPU overlay files (not used when enable_gpu=False)
+            self.gpu_overlay_files = {
+                "emotion": str(docker_dir / "docker-compose-emotion.gpu.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-mentalstate.gpu.yml"),
+                "temperature": str(docker_dir / "docker-compose-temperature.gpu.yml")
+            }
         
         # Service name patterns
+        # Note: Use different broker names for GPU-isolated vs standard compose files
+        broker_mqtt = "mqtt-broker" if enable_gpu else "mqtt-broker"
+        broker_amqp = "amqp-broker" if enable_gpu else "rabbitmq"
+        
         self.service_patterns = {
             "emotion": {
-                "mqtt": ["mqtt-broker", "fl-server-mqtt-emotion", "fl-client-mqtt-emotion-1", "fl-client-mqtt-emotion-2"],
-                "amqp": ["rabbitmq", "fl-server-amqp-emotion", "fl-client-amqp-emotion-1", "fl-client-amqp-emotion-2"],
+                "mqtt": [broker_mqtt, "fl-server-mqtt-emotion", "fl-client-mqtt-emotion-1", "fl-client-mqtt-emotion-2"],
+                "amqp": [broker_amqp, "fl-server-amqp-emotion", "fl-client-amqp-emotion-1", "fl-client-amqp-emotion-2"],
                 "grpc": ["fl-server-grpc-emotion", "fl-client-grpc-emotion-1", "fl-client-grpc-emotion-2"],
                 "quic": ["fl-server-quic-emotion", "fl-client-quic-emotion-1", "fl-client-quic-emotion-2"],
-                "dds": ["fl-server-dds-emotion", "fl-client-dds-emotion-1", "fl-client-dds-emotion-2"]
+                "dds": ["fl-server-dds-emotion", "fl-client-dds-emotion-1", "fl-client-dds-emotion-2"],
+                "rl_unified": ["fl-server-unified-emotion", "fl-client-unified-emotion-1", "fl-client-unified-emotion-2"]
             },
             "mentalstate": {
                 "mqtt": ["mqtt-broker-mental", "fl-server-mqtt-mental", "fl-client-mqtt-mental-1", "fl-client-mqtt-mental-2"],
                 "amqp": ["rabbitmq-mental", "fl-server-amqp-mental", "fl-client-amqp-mental-1", "fl-client-amqp-mental-2"],
                 "grpc": ["fl-server-grpc-mental", "fl-client-grpc-mental-1", "fl-client-grpc-mental-2"],
                 "quic": ["fl-server-quic-mental", "fl-client-quic-mental-1", "fl-client-quic-mental-2"],
-                "dds": ["fl-server-dds-mental", "fl-client-dds-mental-1", "fl-client-dds-mental-2"]
+                "dds": ["fl-server-dds-mental", "fl-client-dds-mental-1", "fl-client-dds-mental-2"],
+                "rl_unified": ["fl-server-unified-mental", "fl-client-unified-mental-1", "fl-client-unified-mental-2"]
             },
             "temperature": {
                 "mqtt": ["mqtt-broker-temp", "fl-server-mqtt-temp", "fl-client-mqtt-temp-1", "fl-client-mqtt-temp-2"],
                 "amqp": ["rabbitmq-temp", "fl-server-amqp-temp", "fl-client-amqp-temp-1", "fl-client-amqp-temp-2"],
                 "grpc": ["fl-server-grpc-temp", "fl-client-grpc-temp-1", "fl-client-grpc-temp-2"],
                 "quic": ["fl-server-quic-temp", "fl-client-quic-temp-1", "fl-client-quic-temp-2"],
-                "dds": ["fl-server-dds-temp", "fl-client-dds-temp-1", "fl-client-dds-temp-2"]
+                "dds": ["fl-server-dds-temp", "fl-client-dds-temp-1", "fl-client-dds-temp-2"],
+                "rl_unified": ["fl-server-unified-temp", "fl-client-unified-temp-1", "fl-client-unified-temp-2"]
             }
         }
     
@@ -162,13 +198,48 @@ class ExperimentRunner:
     
     def start_containers(self, protocol: str, scenario: str = "excellent", congestion_level: str = "none"):
         """Start Docker containers for a specific protocol with staged startup"""
+        
+        # Check if rl_unified is selected - use unified compose file
+        if protocol == "rl_unified":
+            print("\n" + "="*70)
+            print("STARTING RL-UNIFIED MODE")
+            print("="*70)
+            print("Using unified docker-compose file with all protocol brokers")
+            print("Server will handle: MQTT, AMQP, gRPC, QUIC, DDS")
+            print("Clients will use RL-based Q-Learning to select protocol")
+            print("="*70 + "\n")
+            
+            compose_file = self.unified_compose_files[self.use_case]
+            
+            # For unified mode, start all services together
+            compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"]
+            
+            print(f"Starting unified FL system for {self.use_case}...")
+            result = self.run_command(compose_cmd)
+            
+            if result.returncode != 0:
+                print(f"[ERROR] Failed to start unified containers:")
+                print(result.stderr)
+                raise RuntimeError("Failed to start unified containers")
+            
+            print("[SUCCESS] All unified containers started")
+            print("  ✓ MQTT Broker")
+            print("  ✓ AMQP Broker")
+            print("  ✓ Unified FL Server")
+            print("  ✓ Unified FL Clients")
+            
+            # Wait for services to initialize
+            print("\nWaiting for services to initialize (15 seconds)...")
+            time.sleep(15)
+            
+            return True
+        
+        # Regular protocol handling (existing code)
         compose_file = self.compose_files[self.use_case]
         
-        # Build compose command with GPU overlay if enabled
+        # Build compose command (no overlay needed with GPU-isolated files)
         compose_cmd_base = ["docker", "compose", "-f", compose_file]
-        if self.enable_gpu:
-            gpu_overlay = self.gpu_overlay_files[self.use_case]
-            compose_cmd_base.extend(["-f", gpu_overlay])
+        # Note: GPU-isolated files are standalone, no overlay needed
         
         services = self.service_patterns[self.use_case][protocol]
         
@@ -253,17 +324,19 @@ class ExperimentRunner:
     
     def stop_containers(self, protocol: str):
         """Stop Docker containers for a specific protocol"""
-        compose_file = self.compose_files[self.use_case]
+        
+        # Use unified compose file for rl_unified
+        if protocol == "rl_unified":
+            compose_file = self.unified_compose_files[self.use_case]
+        else:
+            compose_file = self.compose_files[self.use_case]
         services = self.service_patterns[self.use_case][protocol]
         
         print(f"\nStopping containers for {protocol.upper()} protocol...")
         
-        # Build compose command with GPU overlay if enabled
-        cmd = ["docker", "compose", "-f", compose_file]
-        if self.enable_gpu:
-            gpu_overlay = self.gpu_overlay_files[self.use_case]
-            cmd.extend(["-f", gpu_overlay])
-        cmd.append("down")
+        # Build compose command (no overlay needed with GPU-isolated files)
+        cmd = ["docker", "compose", "-f", compose_file, "down"]
+        # Note: GPU-isolated files are standalone, no overlay needed
         
         self.run_command(cmd, check=False)
         
@@ -300,8 +373,8 @@ class ExperimentRunner:
         success_count = 0
         for container in services:
             # Skip brokers - they represent reliable infrastructure
-            if 'broker' in container.lower() or 'rabbitmq' in container.lower():
-                print(f"[INFO] Skipping network conditions for broker: {container} (infrastructure)")
+            if 'broker' in container.lower() or 'rabbitmq' in container.lower() or 'server' in container.lower():
+                print(f"[INFO] Skipping network conditions for broker/server: {container} (infrastructure)")
                 continue
             
             try:
@@ -315,12 +388,17 @@ class ExperimentRunner:
         return success_count > 0  # At least one container should succeed
     
     def wait_for_completion(self, protocol: str, timeout: int = 3600):
-        """Wait for FL training to complete"""
+        """Wait for FL training to complete and track round trip times"""
         print(f"\nWaiting for {protocol.upper()} training to complete (timeout: {timeout}s)...")
         
         # Get server container name
         services = self.service_patterns[self.use_case][protocol]
         server_container = [s for s in services if "server" in s][0]
+        
+        # Track round trip times (time from global model sent to next round start)
+        round_trip_times = []
+        last_round_complete_time = None
+        current_round = 0
         
         # Common completion markers that servers print when training ends
         completion_markers = [
@@ -342,18 +420,46 @@ class ExperimentRunner:
             
             if server_container not in result.stdout:
                 print(f"Server container stopped. Training complete!")
-                return True
+                return True, round_trip_times
             
-            # Check logs for completion indicators
+            # Check logs for completion indicators and RTT tracking
             logs = self.run_command([
-                "docker", "logs", "--tail", "50", server_container
+                "docker", "logs", "--tail", "100", server_container
             ], check=False)
             
+            # Track round trip time by looking for round completion markers
+            log_content = logs.stdout or ""
+            
+            # Look for round completion patterns
+            import re
+            round_patterns = [
+                r'Round (\d+)/\d+ completed',
+                r'\[Round (\d+)\] completed',
+                r'Completed round (\d+)',
+                r'Round (\d+) finished',
+                r'Starting Round (\d+)/',  # QUIC format
+                r'Round (\d+) - Aggregated Metrics:',  # QUIC aggregation
+                r'Aggregated global model from round (\d+)'  # QUIC model distribution
+            ]
+            
+            for pattern in round_patterns:
+                matches = re.findall(pattern, log_content)
+                if matches:
+                    latest_round = max([int(m) for m in matches])
+                    if latest_round > current_round:
+                        current_time = time.time()
+                        if last_round_complete_time is not None:
+                            rtt = current_time - last_round_complete_time
+                            round_trip_times.append(rtt)
+                            print(f"  Round {latest_round} RTT: {rtt:.2f}s")
+                        last_round_complete_time = current_time
+                        current_round = latest_round
+            
             # If any known completion marker appears, treat as complete
-            if any(marker in (logs.stdout or "") for marker in completion_markers):
+            if any(marker in log_content for marker in completion_markers):
                 print(f"Training completed successfully (marker detected)!")
                 time.sleep(5)  # Give time for final results to be written
-                return True
+                return True, round_trip_times
 
             # Check if training has reached the target number of rounds
             # by examining the results file content (not just existence)
@@ -375,13 +481,13 @@ class ExperimentRunner:
                         if rounds_completed >= self.num_rounds:
                             print(f"Training completed successfully ({rounds_completed}/{self.num_rounds} rounds)!")
                             time.sleep(3)
-                            return True
+                            return True, round_trip_times
                         else:
                             print(f"Progress: {rounds_completed}/{self.num_rounds} rounds completed...")
                     elif isinstance(results_data, list) and len(results_data) >= self.num_rounds:
                         print(f"Training completed successfully ({len(results_data)}/{self.num_rounds} rounds)!")
                         time.sleep(3)
-                        return True
+                        return True, round_trip_times
                 except json.JSONDecodeError:
                     # File exists but not valid JSON yet (still being written)
                     pass
@@ -389,10 +495,10 @@ class ExperimentRunner:
             time.sleep(10)  # Check every 10 seconds
         
         print(f"[WARNING] Training timed out after {timeout}s")
-        return False
+        return False, round_trip_times
     
-    def collect_results(self, protocol: str, scenario: str):
-        """Collect and save experiment results"""
+    def collect_results(self, protocol: str, scenario: str, round_trip_times: List[float] = None):
+        """Collect and save experiment results including RTT data"""
         print(f"\nCollecting results for {protocol.upper()} - {scenario}...")
         
         # Create directory for this experiment
@@ -412,6 +518,21 @@ class ExperimentRunner:
             f.write(logs.stdout or "")
             f.write("\n\n=== STDERR ===\n\n")
             f.write(logs.stderr or "")
+
+        # Save broker logs (if broker exists for this protocol)
+        broker_containers = [s for s in services if "broker" in s.lower() or "rabbitmq" in s.lower()]
+        if broker_containers:
+            print(f"Collecting logs for broker: {', '.join(broker_containers)}")
+            for broker in broker_containers:
+                try:
+                    b_logs = self.run_command(["docker", "logs", broker], check=False)
+                    out_path = os.path.join(exp_dir, "broker_logs.txt")
+                    with open(out_path, "w", encoding='utf-8', errors='replace') as bf:
+                        bf.write(b_logs.stdout or "")
+                        bf.write("\n\n=== STDERR ===\n\n")
+                        bf.write(b_logs.stderr or "")
+                except Exception as e:
+                    print(f"[WARNING] Failed to collect logs for {broker}: {e}")
 
         # Save client logs as well for debugging client-side behavior
         client_containers = [s for s in services if "client" in s]
@@ -453,11 +574,36 @@ class ExperimentRunner:
             "scenario": scenario,
             "use_case": self.use_case,
             "num_rounds": self.num_rounds,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "baseline_mode": self.baseline_mode,
+            "network_conditions_applied": not self.baseline_mode
         }
         
         with open(os.path.join(exp_dir, "metadata.json"), "w") as f:
             json.dump(metadata, f, indent=2)
+        
+        # Save RTT data if available
+        if round_trip_times and len(round_trip_times) > 0:
+            avg_rtt = sum(round_trip_times) / len(round_trip_times)
+            rtt_data = {
+                "protocol": protocol,
+                "scenario": scenario,
+                "use_case": self.use_case,
+                "num_rounds": self.num_rounds,
+                "rtt_per_round": round_trip_times,
+                "avg_rtt_per_round": avg_rtt,
+                "min_rtt": min(round_trip_times),
+                "max_rtt": max(round_trip_times),
+                "total_rtt": sum(round_trip_times),
+                "timestamp": datetime.now().isoformat(),
+                "baseline_mode": self.baseline_mode
+            }
+            
+            rtt_filename = f"{protocol}_baseline_rtt.json" if self.baseline_mode else f"{protocol}_rtt.json"
+            with open(os.path.join(exp_dir, rtt_filename), "w") as f:
+                json.dump(rtt_data, f, indent=2)
+            
+            print(f"  RTT Stats: Avg={avg_rtt:.2f}s, Min={min(round_trip_times):.2f}s, Max={max(round_trip_times):.2f}s")
         
         print(f"Results saved to: {exp_dir}")
     
@@ -467,6 +613,8 @@ class ExperimentRunner:
         print(f"# EXPERIMENT: {protocol.upper()} - {scenario.upper()}")
         print(f"# Use Case: {self.use_case.title()}")
         print(f"# Rounds: {self.num_rounds}")
+        if self.baseline_mode:
+            print(f"# Mode: BASELINE (no network conditions)")
         if self.enable_congestion and congestion_level != "none":
             print(f"# Congestion Level: {congestion_level.upper()}")
         print(f"{'#'*70}\n")
@@ -492,18 +640,25 @@ class ExperimentRunner:
                 print(f"[ERROR] Failed to start containers for {protocol}")
                 return False
             
-            # 2. Apply network scenario
-            if not self.apply_network_scenario(scenario, protocol):
-                print(f"[WARNING] Failed to apply network scenario {scenario}, continuing anyway...")
+            # 2. Apply network scenario (skip if baseline mode)
+            if not self.baseline_mode:
+                if not self.apply_network_scenario(scenario, protocol):
+                    print(f"[WARNING] Failed to apply network scenario {scenario}, continuing anyway...")
+            else:
+                print(f"[BASELINE] Skipping network conditions - running with ideal network")
             
-            # 3. Wait for completion with adaptive timeout
+            # 3. Wait for completion with adaptive timeout and RTT tracking
             print(f"[INFO] Using timeout: {timeout}s ({timeout/3600:.1f} hours) for {scenario} network")
-            if not self.wait_for_completion(protocol, timeout=timeout):
+            success, round_trip_times = self.wait_for_completion(protocol, timeout=timeout)
+            
+            if not success:
                 print(f"[WARNING] Experiment may not have completed")
             
-            # 4. Collect results
+            # 4. Collect results including RTT data
             result_suffix = f"{scenario}_congestion_{congestion_level}" if congestion_level != "none" else scenario
-            self.collect_results(protocol, result_suffix)
+            if self.baseline_mode:
+                result_suffix = "baseline"
+            self.collect_results(protocol, result_suffix, round_trip_times)
             
             # 5. Stop traffic generators (if running)
             if self.enable_congestion and self.congestion_manager and congestion_level != "none":
@@ -596,10 +751,10 @@ def main():
                        choices=["emotion", "mentalstate", "temperature"],
                        default="emotion",
                        help="Use case to run experiments for")
-    parser.add_argument("--protocols", "-p", 
+    parser.add_argument("--protocols", "-p",
                        nargs="+",
-                       choices=["mqtt", "amqp", "grpc", "quic", "dds"],
-                       help="Specific protocols to test (default: all)")
+                       choices=["mqtt", "amqp", "grpc", "quic", "dds", "rl_unified"],
+                       help="Specific protocols to test (default: all). Use 'rl_unified' for RL-based dynamic protocol selection")
     parser.add_argument("--scenarios", "-s",
                        nargs="+",
                        choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
@@ -621,8 +776,8 @@ def main():
     parser.add_argument("--single", action="store_true",
                        help="Run single experiment (requires --protocol and --scenario)")
     parser.add_argument("--protocol",
-                       choices=["mqtt", "amqp", "grpc", "quic", "dds"],
-                       help="Protocol for single experiment")
+                       choices=["mqtt", "amqp", "grpc", "quic", "dds", "rl_unified"],
+                       help="Protocol for single experiment (use 'rl_unified' for RL-based selection)")
     parser.add_argument("--scenario",
                        choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
                                "congested_light", "congested_moderate", "congested_heavy"],
@@ -641,6 +796,8 @@ def main():
                 help="Set QUANTIZATION_PER_CHANNEL=1 if per-channel quantization should be used")
     parser.add_argument("--enable-gpu", "-g", action="store_true",
                 help="Enable GPU acceleration using NVIDIA runtime (requires nvidia-docker)")
+    parser.add_argument("--baseline", "-b", action="store_true",
+                help="Baseline mode: Run without network conditions and save to baseline folder")
     
     args = parser.parse_args()
     
@@ -671,7 +828,18 @@ def main():
                             enable_congestion=args.enable_congestion,
                             use_quantization=args.use_quantization,
                             quantization_params=quant_params,
-                            enable_gpu=args.enable_gpu)
+                            enable_gpu=args.enable_gpu,
+                            baseline_mode=args.baseline)
+    
+    # In baseline mode, run all protocols with excellent scenario (no network conditions)
+    if args.baseline:
+        print("\n" + "="*70)
+        print("BASELINE MODE: Running all protocols without network conditions")
+        print("="*70 + "\n")
+        protocols = args.protocols or runner.protocols
+        for protocol in protocols:
+            runner.run_single_experiment(protocol, "excellent", "none")
+        return
     
     if args.single:
         if not args.protocol or not args.scenario:

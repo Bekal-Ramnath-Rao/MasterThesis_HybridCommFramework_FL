@@ -29,7 +29,9 @@ AMQP_HOST = os.getenv("AMQP_HOST", "localhost")
 AMQP_PORT = int(os.getenv("AMQP_PORT", "5672"))
 AMQP_USER = os.getenv("AMQP_USER", "guest")
 AMQP_PASSWORD = os.getenv("AMQP_PASSWORD", "guest")
-NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+# Dynamic client configuration
+MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
+MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
 NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
 
@@ -47,8 +49,10 @@ QUEUE_CLIENT_METRICS = "fl.client.metrics"
 
 
 class FederatedLearningServer:
-    def __init__(self, num_clients, num_rounds):
-        self.num_clients = num_clients
+    def __init__(self, min_clients, num_rounds, max_clients=100):
+        self.min_clients = min_clients
+        self.max_clients = max_clients
+        self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
@@ -67,6 +71,8 @@ class FederatedLearningServer:
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.converged = False
+        self.training_started = False
+        self.training_started = False
         self.start_time = None
         self.convergence_time = None
         
@@ -207,16 +213,40 @@ class FederatedLearningServer:
             data = json.loads(body.decode())
             client_id = data['client_id']
             self.registered_clients.add(client_id)
-            print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
+            print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
+        
+        # Update total client count if more clients join
+        if len(self.registered_clients) > self.num_clients:
+            self.update_client_count(len(self.registered_clients))
             
             # If all clients registered, distribute initial global model and start federated learning
-            if len(self.registered_clients) == self.num_clients:
+            # Check if this is a late-joining client
+        if self.training_started:
+            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
+            if len(self.registered_clients) > self.num_clients:
+                self.update_client_count(len(self.registered_clients))
+            if self.global_weights is not None:
+                self.send_current_model_to_client(client_id)
+            return
+        
+        # Check if this is a late-joining client
+        if self.training_started:
+            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
+            if len(self.registered_clients) > self.num_clients:
+                self.update_client_count(len(self.registered_clients))
+            if self.global_weights is not None:
+                self.send_current_model_to_client(client_id)
+            return
+        
+        if len(self.registered_clients) >= self.min_clients:
                 print("\nAll clients registered. Distributing initial global model...\n")
                 time.sleep(2)
                 self.distribute_initial_model()
                 # Record training start time
                 self.start_time = time.time()
-                print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                            self.training_started = True
+            self.training_started = True
+print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         except Exception as e:
             print(f"Server error handling registration: {e}")
     
@@ -255,7 +285,8 @@ class FederatedLearningServer:
                       f"({len(self.client_updates)}/{self.num_clients})")
                 
                 # If all clients sent updates, aggregate
-                if len(self.client_updates) == self.num_clients:
+                # Wait for all registered clients (dynamic)
+            if len(self.client_updates) >= len(self.registered_clients):
                     self.aggregate_models()
         except Exception as e:
             print(f"Server error handling client update: {e}")
@@ -277,7 +308,8 @@ class FederatedLearningServer:
                       f"({len(self.client_metrics)}/{self.num_clients})")
                 
                 # If all clients sent metrics, aggregate and continue
-                if len(self.client_metrics) == self.num_clients:
+                # Wait for all registered clients (dynamic)
+            if len(self.client_metrics) >= len(self.registered_clients):
                     self.aggregate_metrics()
                     self.continue_training()
         except Exception as e:
@@ -406,7 +438,8 @@ class FederatedLearningServer:
             global_model_message = {
                 "message_type": "global_model",
                 "round": self.current_round,
-                "quantized_data": serialized
+                "quantized_data": serialized,
+                "model_config": self.model_config
             }
         else:
             global_model_message = {
@@ -657,11 +690,11 @@ if __name__ == "__main__":
     print(f"\n{'='*70}")
     print(f"Federated Learning Server with AMQP")
     print(f"Broker: {AMQP_HOST}:{AMQP_PORT}")
-    print(f"Clients: {NUM_CLIENTS}")
+    print(f"Clients: {MIN_CLIENTS} (min) - {MAX_CLIENTS} (max)")
     print(f"Rounds: {NUM_ROUNDS}")
     print(f"{'='*70}\n")
     
-    server = FederatedLearningServer(NUM_CLIENTS, NUM_ROUNDS)
+    server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
     try:
         server.connect()

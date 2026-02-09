@@ -1,0 +1,662 @@
+version: '3.8'
+
+# ==============================================================================
+# Docker Compose for Federated Learning - Temperature Regulation
+# ==============================================================================
+# This file contains all protocol setups for the Temperature Regulation use case.
+# For other use cases, see:
+#   - docker-compose-emotion.yml
+#   - docker-compose-mentalstate.yml
+# ==============================================================================
+
+services:
+  # ============================================================================
+  # MQTT Protocol Setup (Temperature Regulation)
+  # ============================================================================
+  
+  # MQTT Broker (Mosquitto)
+  mqtt-broker-temp:
+    image: eclipse-mosquitto:2
+    container_name: fl-mqtt-broker-temp
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "1884:1883"
+      - "9002:9001"
+    volumes:
+      - ../mqtt-config:/mosquitto/config
+    networks:
+      - fl-mqtt-network-temp
+    command: mosquitto -c /mosquitto/config/mosquitto.conf
+
+  # MQTT FL Server (Temperature Regulation)
+  fl-server-mqtt-temp:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-mqtt-temp
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - mqtt-broker-temp
+    environment:
+      - MQTT_BROKER=mqtt-broker-temp
+      - MQTT_PORT=1883
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Server/Temperature_Regulation/FL_Server_MQTT.py
+    networks:
+      - fl-mqtt-network-temp
+    volumes:
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+
+  # MQTT FL Client 1 (Temperature Regulation)
+  fl-client-mqtt-temp-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-mqtt-temp-1
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - mqtt-broker-temp
+      - fl-server-mqtt-temp
+    environment:
+      - MQTT_BROKER=mqtt-broker-temp
+      - MQTT_PORT=1883
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+    networks:
+      - fl-mqtt-network-temp
+
+  # MQTT FL Client 2 (Temperature Regulation)
+  fl-client-mqtt-temp-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-mqtt-temp-2
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - mqtt-broker-temp
+      - fl-server-mqtt-temp
+    environment:
+      - MQTT_BROKER=mqtt-broker-temp
+      - MQTT_PORT=1883
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+    networks:
+      - fl-mqtt-network-temp
+
+  # ============================================================================
+  # AMQP Protocol Setup (Temperature Regulation)
+  # ============================================================================
+  
+  # RabbitMQ Broker
+  rabbitmq-temp:
+    image: rabbitmq:3-management
+    container_name: fl-rabbitmq-temp
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "5673:5672"
+      - "15673:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    networks:
+      - fl-amqp-network-temp
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # AMQP FL Server (Temperature Regulation)
+  fl-server-amqp-temp:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-amqp-temp
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      rabbitmq-temp:
+        condition: service_healthy
+    environment:
+      - AMQP_HOST=rabbitmq-temp
+      - AMQP_PORT=5672
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Server/Temperature_Regulation/FL_Server_AMQP.py
+    networks:
+      - fl-amqp-network-temp
+    volumes:
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+
+  # AMQP FL Client 1 (Temperature Regulation)
+  fl-client-amqp-temp-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-amqp-temp-1
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-amqp-temp
+    environment:
+      - AMQP_HOST=rabbitmq-temp
+      - AMQP_PORT=5672
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+    networks:
+      - fl-amqp-network-temp
+
+  # AMQP FL Client 2 (Temperature Regulation)
+  fl-client-amqp-temp-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-amqp-temp-2
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-amqp-temp
+    environment:
+      - AMQP_HOST=rabbitmq-temp
+      - AMQP_PORT=5672
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+    networks:
+      - fl-amqp-network-temp
+
+  # ============================================================================
+  # gRPC Protocol Setup (Temperature Regulation)
+  # ============================================================================
+  
+  # gRPC FL Server (Temperature Regulation)
+  fl-server-grpc-temp:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-grpc-temp
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "50052:50051"
+    environment:
+      - GRPC_PORT=50051
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Server/Temperature_Regulation/FL_Server_gRPC.py
+    networks:
+      - fl-grpc-network-temp
+    volumes:
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+
+  # gRPC FL Client 1 (Temperature Regulation)
+  fl-client-grpc-temp-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-grpc-temp-1
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-grpc-temp
+    environment:
+      - GRPC_HOST=fl-server-grpc-temp
+      - GRPC_PORT=50051
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../certs:/app/certs
+    networks:
+      - fl-grpc-network-temp
+
+  # gRPC FL Client 2 (Temperature Regulation)
+  fl-client-grpc-temp-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-grpc-temp-2
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-grpc-temp
+    environment:
+      - GRPC_HOST=fl-server-grpc-temp
+      - GRPC_PORT=50051
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../certs:/app/certs
+    networks:
+      - fl-grpc-network-temp
+
+  # ============================================================================
+  # QUIC Protocol Setup (Temperature Regulation)
+  # ============================================================================
+  
+  # QUIC FL Server (Temperature Regulation)
+  fl-server-quic-temp:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-quic-temp
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "4434:4433/udp"
+    environment:
+      - QUIC_HOST=0.0.0.0
+      - QUIC_PORT=4433
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Server/Temperature_Regulation/FL_Server_QUIC.py
+    networks:
+      - fl-quic-network-temp
+    volumes:
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+      - ../certs:/app/certs
+
+  # QUIC FL Client 1 (Temperature Regulation)
+  fl-client-quic-temp-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-quic-temp-1
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-quic-temp
+    environment:
+      - QUIC_HOST=fl-server-quic-temp
+      - QUIC_PORT=4433
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../certs:/app/certs
+    networks:
+      - fl-quic-network-temp
+
+  # QUIC FL Client 2 (Temperature Regulation)
+  fl-client-quic-temp-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-quic-temp-2
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-quic-temp
+    environment:
+      - QUIC_HOST=fl-server-quic-temp
+      - QUIC_PORT=4433
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../certs:/app/certs
+    networks:
+      - fl-quic-network-temp
+
+  # ============================================================================
+  # DDS Protocol Setup (Temperature Regulation)
+  # ============================================================================
+  
+  # DDS FL Server (Temperature Regulation)
+  fl-server-dds-temp:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-dds-temp
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - DDS_DOMAIN_ID=2
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - CYCLONEDDS_URI=file:///app/cyclonedds-temperature.xml
+    command: python -u Server/Temperature_Regulation/FL_Server_DDS.py
+    networks:
+      - fl-dds-network-temp
+    volumes:
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+      - ../cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
+
+  # DDS FL Client 1 (Temperature Regulation)
+  fl-client-dds-temp-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-dds-temp-1
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-dds-temp
+    environment:
+      - DDS_DOMAIN_ID=2
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - CYCLONEDDS_URI=file:///app/cyclonedds-temperature.xml
+    command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
+    networks:
+      - fl-dds-network-temp
+
+  # DDS FL Client 2 (Temperature Regulation)
+  fl-client-dds-temp-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-dds-temp-2
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-dds-temp
+    environment:
+      - DDS_DOMAIN_ID=2
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - CYCLONEDDS_URI=file:///app/cyclonedds-temperature.xml
+    command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
+    networks:
+      - fl-dds-network-temp
+
+  # ============================================================================
+  # Traffic Generator Containers (for Congestion Testing)
+  # ============================================================================
+  # These containers are optional and only started when congestion testing is enabled
+  # They generate background traffic to simulate network congestion
+  
+  http-traffic-gen-1-temp:
+    image: alpine:latest
+    container_name: http-traffic-gen-1-temp
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - fl-mqtt-network-temp
+      - fl-amqp-network-temp
+      - fl-grpc-network-temp
+      - fl-quic-network-temp
+      - fl-dds-network-temp
+    command: >
+      sh -c "
+      apk add --no-cache curl &&
+      echo 'Starting HTTP traffic generator...' &&
+      while true; do
+        curl -s -o /dev/null http://fl-server-mqtt-temp:5000 2>/dev/null || true;
+        curl -s -o /dev/null http://fl-server-amqp-temp:5000 2>/dev/null || true;
+        curl -s -o /dev/null http://fl-server-grpc-temp:50051 2>/dev/null || true;
+        sleep 0.5;
+      done
+      "
+    restart: unless-stopped
+    profiles:
+      - congestion
+
+  http-traffic-gen-2-temp:
+    image: alpine:latest
+    container_name: http-traffic-gen-2-temp
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - fl-mqtt-network-temp
+      - fl-amqp-network-temp
+      - fl-grpc-network-temp
+      - fl-quic-network-temp
+      - fl-dds-network-temp
+    command: >
+      sh -c "
+      apk add --no-cache curl &&
+      echo 'Starting HTTP traffic generator...' &&
+      while true; do
+        curl -s -o /dev/null http://mqtt-broker-temp:1883 2>/dev/null || true;
+        curl -s -o /dev/null http://rabbitmq-temp:5672 2>/dev/null || true;
+        sleep 1;
+      done
+      "
+    restart: unless-stopped
+    profiles:
+      - congestion
+
+  bandwidth-hog-temp:
+    image: alpine:latest
+    container_name: bandwidth-hog-temp
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - fl-mqtt-network-temp
+      - fl-amqp-network-temp
+      - fl-grpc-network-temp
+      - fl-quic-network-temp
+      - fl-dds-network-temp
+    command: >
+      sh -c "
+      apk add --no-cache iperf3 &&
+      echo 'Starting bandwidth hog...' &&
+      while true; do
+        iperf3 -c fl-server-mqtt-temp -u -b 20M -t 10 2>/dev/null || true;
+        iperf3 -c fl-server-amqp-temp -u -b 20M -t 10 2>/dev/null || true;
+        sleep 5;
+      done
+      "
+    restart: unless-stopped
+    profiles:
+      - congestion
+
+  packet-spammer-temp:
+    image: alpine:latest
+    container_name: packet-spammer-temp
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - fl-mqtt-network-temp
+      - fl-amqp-network-temp
+      - fl-grpc-network-temp
+      - fl-quic-network-temp
+      - fl-dds-network-temp
+    command: >
+      sh -c "
+      echo 'Starting packet spammer...' &&
+      while true; do
+        ping -i 0.1 -s 64 fl-server-mqtt-temp -c 100 2>/dev/null || true;
+        ping -i 0.1 -s 64 fl-server-amqp-temp -c 100 2>/dev/null || true;
+        sleep 2;
+      done
+      "
+    restart: unless-stopped
+    profiles:
+      - congestion
+
+  connection-flooder-temp:
+    image: python:3.9-alpine
+    container_name: connection-flooder-temp
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - fl-mqtt-network-temp
+      - fl-amqp-network-temp
+      - fl-grpc-network-temp
+      - fl-quic-network-temp
+      - fl-dds-network-temp
+    command:
+      - /bin/sh
+      - -c
+      - |
+        pip install --no-cache-dir paho-mqtt pika >/dev/null 2>&1
+        python -c 'import time, socket, threading
+        from datetime import datetime
+        def flood_connections(host, port, num_conns=10):
+            while True:
+                try:
+                    threads = []
+                    for i in range(num_conns):
+                        def connect():
+                            try:
+                                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                                s.settimeout(2)
+                                s.connect((host, port))
+                                s.sendall(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+                                s.recv(1024)
+                                s.close()
+                            except:
+                                pass
+                        t = threading.Thread(target=connect)
+                        threads.append(t)
+                        t.start()
+                    for t in threads:
+                        t.join(timeout=3)
+                    time.sleep(0.5)
+                except:
+                    time.sleep(1)
+        print(f"[{datetime.now()}] Starting connection flooder...")
+        targets = [("mqtt-broker-temp", 1883), ("rabbitmq-temp", 5672), ("fl-server-grpc-temp", 50051)]
+        threads = []
+        for host, port in targets:
+            t = threading.Thread(target=flood_connections, args=(host, port, 5))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+        while True:
+            time.sleep(60)
+            print(f"[{datetime.now()}] Connection flooder still running...")
+        '
+    restart: unless-stopped
+    profiles:
+      - congestion
+
+# ==============================================================================
+# Networks
+# ==============================================================================
+
+networks:
+  fl-mqtt-network-temp:
+    driver: bridge
+  fl-amqp-network-temp:
+    driver: bridge
+  fl-grpc-network-temp:
+    driver: bridge
+  fl-quic-network-temp:
+    driver: bridge
+  fl-dds-network-temp:
+    driver: bridge
+
+volumes:
+  mqtt-data-temp:
+  rabbitmq-data-temp:
+
+
+
+
+

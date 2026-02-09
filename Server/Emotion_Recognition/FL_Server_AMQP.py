@@ -10,6 +10,17 @@ from typing import List, Dict
 import matplotlib.pyplot as plt
 from pathlib import Path
 
+# Detect Docker environment and set project root accordingly
+if os.path.exists('/app'):
+    project_root = '/app'
+else:
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+    
+from packet_logger import log_sent_packet, log_received_packet, init_db
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
@@ -28,7 +39,9 @@ AMQP_HOST = os.getenv("AMQP_HOST", "localhost")
 AMQP_PORT = int(os.getenv("AMQP_PORT", "5672"))
 AMQP_USER = os.getenv("AMQP_USER", "guest")
 AMQP_PASSWORD = os.getenv("AMQP_PASSWORD", "guest")
-NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+# Dynamic client configuration
+MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
+MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
 
 # Convergence Settings (primary stopping criterion)
@@ -45,8 +58,10 @@ QUEUE_CLIENT_METRICS = "fl.client.metrics"
 
 
 class FederatedLearningServer:
-    def __init__(self, num_clients, num_rounds):
-        self.num_clients = num_clients
+    def __init__(self, min_clients, num_rounds, max_clients=100):
+        self.min_clients = min_clients
+        self.max_clients = max_clients
+        self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
@@ -63,8 +78,13 @@ class FederatedLearningServer:
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.converged = False
+        self.training_started = False
+        self.training_started = False
         self.start_time = None
         self.convergence_time = None
+
+        # Initialize packet logging database
+        init_db()
         
         # Initialize quantization handler (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
@@ -176,12 +196,13 @@ class FederatedLearningServer:
             try:
                 print(f"Attempting to connect to RabbitMQ at {AMQP_HOST}:{AMQP_PORT}...")
                 credentials = pika.PlainCredentials(AMQP_USER, AMQP_PASSWORD)
+                # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
                 parameters = pika.ConnectionParameters(
                     host=AMQP_HOST,
                     port=AMQP_PORT,
                     credentials=credentials,
-                    heartbeat=600,
-                    blocked_connection_timeout=300
+                    heartbeat=600,  # 10 minutes for very_poor network
+                    blocked_connection_timeout=600  # Aligned with heartbeat
                 )
                 self.connection = pika.BlockingConnection(parameters)
                 self.channel = self.connection.channel()
@@ -204,7 +225,7 @@ class FederatedLearningServer:
                 self.channel.basic_consume(queue=QUEUE_CLIENT_REGISTER, on_message_callback=self.on_client_register, auto_ack=True)
                 self.channel.basic_consume(queue=QUEUE_CLIENT_UPDATE, on_message_callback=self.on_client_update, auto_ack=True)
                 self.channel.basic_consume(queue=QUEUE_CLIENT_METRICS, on_message_callback=self.on_client_metrics, auto_ack=True)
-                
+
                 print(f"Server connected to RabbitMQ broker\n")
                 return True
                 
@@ -225,23 +246,61 @@ class FederatedLearningServer:
         """Handle client registration"""
         try:
             data = json.loads(body.decode())
+            log_received_packet(
+                packet_size=len(body),
+                peer=EXCHANGE_CLIENT_UPDATES,
+                protocol="AMQP",
+                round=None,
+                extra_info="Client registration"
+            )
             client_id = data['client_id']
             self.registered_clients.add(client_id)
-            print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
+            print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
+        
+        # Update total client count if more clients join
+        if len(self.registered_clients) > self.num_clients:
+            self.update_client_count(len(self.registered_clients))
             
             # If all clients registered, distribute initial global model and start federated learning
-            if len(self.registered_clients) == self.num_clients:
+            # Check if this is a late-joining client
+        if self.training_started:
+            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
+            if len(self.registered_clients) > self.num_clients:
+                self.update_client_count(len(self.registered_clients))
+            if self.global_weights is not None:
+                self.send_current_model_to_client(client_id)
+            return
+        
+        # Check if this is a late-joining client
+        if self.training_started:
+            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
+            if len(self.registered_clients) > self.num_clients:
+                self.update_client_count(len(self.registered_clients))
+            if self.global_weights is not None:
+                self.send_current_model_to_client(client_id)
+            return
+        
+        if len(self.registered_clients) >= self.min_clients:
                 print("\nAll clients registered. Distributing initial global model...\n")
                 time.sleep(2)
                 self.distribute_initial_model()
                 # Record training start time
                 self.start_time = time.time()
-                print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                            self.training_started = True
+            self.training_started = True
+print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         except Exception as e:
             print(f"Server error handling registration: {e}")
     
     def on_client_update(self, ch, method, properties, body):
         """Handle model update from client"""
+        log_received_packet(
+            packet_size=len(body),
+            peer=EXCHANGE_CLIENT_UPDATES,
+            protocol="AMQP",
+            round=None,
+            extra_info="Model update"
+        )
         try:
             data = json.loads(body.decode())
             client_id = data['client_id']
@@ -275,13 +334,21 @@ class FederatedLearningServer:
                       f"({len(self.client_updates)}/{self.num_clients})")
                 
                 # If all clients sent updates, aggregate
-                if len(self.client_updates) == self.num_clients:
+                # Wait for all registered clients (dynamic)
+            if len(self.client_updates) >= len(self.registered_clients):
                     self.aggregate_models()
         except Exception as e:
             print(f"Server error handling client update: {e}")
     
     def on_client_metrics(self, ch, method, properties, body):
         """Handle evaluation metrics from client"""
+        log_received_packet(
+            packet_size=len(body),
+            peer=EXCHANGE_CLIENT_UPDATES,
+            protocol="AMQP",
+            round=None,
+            extra_info="Evaluation metrics"
+        )
         try:
             data = json.loads(body.decode())
             client_id = data['client_id']
@@ -297,7 +364,8 @@ class FederatedLearningServer:
                       f"({len(self.client_metrics)}/{self.num_clients})")
                 
                 # If all clients sent metrics, aggregate and continue
-                if len(self.client_metrics) == self.num_clients:
+                # Wait for all registered clients (dynamic)
+            if len(self.client_metrics) >= len(self.registered_clients):
                     self.aggregate_metrics()
                     self.continue_training()
         except Exception as e:
@@ -375,6 +443,13 @@ class FederatedLearningServer:
             body=message_json,
             properties=pika.BasicProperties(delivery_mode=2)
         )
+        log_sent_packet(
+            packet_size=message_size,
+            peer=EXCHANGE_BROADCAST,
+            protocol="AMQP",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="Initial global model distribution"
+        )
         
         print("Initial global model sent to all clients")
         
@@ -434,7 +509,8 @@ class FederatedLearningServer:
             global_model_message = {
                 "message_type": "global_model",
                 "round": self.current_round,
-                "quantized_data": serialized
+                "quantized_data": serialized,
+                "model_config": self.model_config
             }
         else:
             global_model_message = {
@@ -449,6 +525,13 @@ class FederatedLearningServer:
             body=json.dumps(global_model_message),
             properties=pika.BasicProperties(delivery_mode=2)
         )
+        log_sent_packet(
+            packet_size=message_size,
+            peer=EXCHANGE_BROADCAST,
+            protocol="AMQP",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="Aggregated global model distribution"
+        )
         
         print(f"Aggregated global model from round {self.current_round} sent to all clients")
         
@@ -462,6 +545,16 @@ class FederatedLearningServer:
                 "round": self.current_round
             }),
             properties=pika.BasicProperties(delivery_mode=2)
+        )
+        log_sent_packet(
+            packet_size=len(json.dumps({
+                "message_type": "start_evaluation",
+                "round": self.current_round
+            })),
+            peer=EXCHANGE_BROADCAST,
+            protocol="AMQP",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="Start evaluation signal"
         )
     
     def aggregate_metrics(self):
@@ -532,6 +625,16 @@ class FederatedLearningServer:
                 }),
                 properties=pika.BasicProperties(delivery_mode=2)
             )
+            log_sent_packet(
+                packet_size=len(json.dumps({
+                    "message_type": "start_training",
+                    "round": self.current_round
+                })),
+                peer=EXCHANGE_BROADCAST,
+                protocol="AMQP",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Start training signal for next round"
+            )
         else:
             self.convergence_time = time.time() - self.start_time if self.start_time else 0
             print("\n" + "="*70)
@@ -581,6 +684,15 @@ class FederatedLearningServer:
                 "message_type": "training_complete"
             }),
             properties=pika.BasicProperties(delivery_mode=2)
+        )
+        log_sent_packet(
+            packet_size=len(json.dumps({
+                "message_type": "training_complete"
+            })),
+            peer=EXCHANGE_BROADCAST,
+            protocol="AMQP",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="Training complete signal"
         )
         print("Training complete signal sent to all clients")
     
@@ -668,7 +780,7 @@ class FederatedLearningServer:
 
 
 if __name__ == "__main__":
-    server = FederatedLearningServer(NUM_CLIENTS, NUM_ROUNDS)
+    server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
     try:
         server.connect()

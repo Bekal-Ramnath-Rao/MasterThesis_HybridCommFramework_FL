@@ -12,10 +12,25 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 
+# Detect Docker environment and set project root accordingly
+if os.path.exists('/app'):
+    # Likely running in Docker, code is under /app
+    project_root = '/app'
+else:
+    # Local development: go up two levels from this file
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+print(f"Project root set to: {project_root}")
+from packet_logger import init_db, log_sent_packet, log_received_packet
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
     sys.path.insert(0, compression_path)
+
 
 try:
     from quantization_server import ServerQuantizationHandler, QuantizationConfig
@@ -25,9 +40,12 @@ except ImportError:
     QUANTIZATION_AVAILABLE = False
 
 # Server Configuration
-MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")  # MQTT broker address
+# Auto-detect environment: Docker (/app exists) or local
+MQTT_BROKER = os.getenv("MQTT_BROKER", 'mqtt-broker' if os.path.exists('/app') else 'localhost')
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))  # MQTT broker port
-NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+# Dynamic client configuration
+MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
+MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
 
 # Convergence Settings (primary stopping criterion)
@@ -45,14 +63,19 @@ TOPIC_TRAINING_COMPLETE = "fl/training_complete"
 
 
 class FederatedLearningServer:
-    def __init__(self, num_clients, num_rounds):
-        self.num_clients = num_clients
+    def __init__(self, min_clients, num_rounds, max_clients=100):
+        self.min_clients = min_clients
+        self.max_clients = max_clients
+        self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
         self.global_weights = None
+        
+        # Track which clients are expected to send updates for current round
+        self.round_participants = set()
         
         # Metrics storage (for classification)
         self.ACCURACY = []
@@ -63,6 +86,7 @@ class FederatedLearningServer:
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.converged = False
+        self.training_started = False  # Track if training has begun
         self.start_time = None
         self.convergence_time = None
         
@@ -83,6 +107,9 @@ class FederatedLearningServer:
             else:
                 print("Server: Quantization disabled")
         
+        # Initialize packet logging database
+        init_db()
+        
         # Initialize global model
         self.initialize_global_model()
         
@@ -93,12 +120,67 @@ class FederatedLearningServer:
             "local_epochs": 20  # Reduced from 20 for faster experiments (configurable via env)
         }
         
-        # Initialize MQTT client
-        self.mqtt_client = mqtt.Client(client_id="fl_server", protocol=mqtt.MQTTv311)
-        # Set max packet size to 20MB for large model weights
-        self.mqtt_client._max_packet_size = 20 * 1024 * 1024
+        # Initialize MQTT client with fair comparison settings
+        # clean_session=True for stateless operation (like other protocols)
+        self.mqtt_client = mqtt.Client(client_id="fl_server", protocol=mqtt.MQTTv311, clean_session=True)
+        # FAIR CONFIG: Set max packet size to 128MB (aligned with AMQP default)
+        self.mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
+        # FAIR CONFIG: Set keepalive to 600s for very_poor network scenarios
+        self.mqtt_client.keepalive = 600
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
+
+
+    
+    def update_client_count(self, new_count):
+        """Update expected client count when new clients join"""
+        if new_count > self.num_clients and new_count <= self.max_clients:
+            old_count = self.num_clients
+            self.num_clients = new_count
+            print(f"[DYNAMIC] Updated client count: {old_count} -> {new_count}")
+            return True
+        return False
+    
+    def handle_late_joining_client(self, client_id):
+        """Handle a client joining after training has started"""
+        if client_id not in self.registered_clients:
+            self.registered_clients.add(client_id)
+            print(f"[LATE JOIN] Client {client_id} joined after training started")
+            
+            # Update client count if needed
+            if len(self.registered_clients) > self.num_clients:
+                self.update_client_count(len(self.registered_clients))
+            
+            # Send current global model to late-joining client
+            if self.global_weights is not None:
+                self.send_global_model_to_client(client_id)
+    
+    def get_active_clients(self):
+        """Get list of currently active clients"""
+        return list(self.registered_clients)
+    
+    def adaptive_wait_for_clients(self, client_dict, timeout=300):
+        """
+        Adaptive waiting for client responses
+        - Waits for minimum clients first
+        - Then waits additional time for late-joining clients
+        - Returns when all registered clients respond or timeout
+        """
+        import time
+        start_time = time.time()
+        min_received = len(client_dict) >= self.min_clients
+        all_registered_received = len(client_dict) >= len(self.registered_clients)
+        
+        while not all_registered_received and (time.time() - start_time) < timeout:
+            time.sleep(0.5)
+            min_received = len(client_dict) >= self.min_clients
+            all_registered_received = len(client_dict) >= len(self.registered_clients)
+            
+            # If we have minimum and haven't seen new clients for 10 seconds, proceed
+            if min_received and (time.time() - start_time) > 10:
+                break
+        
+        return len(client_dict) >= self.min_clients
 
     def initialize_global_model(self):
         """Initialize the global model structure (CNN for Emotion Recognition)"""
@@ -174,15 +256,26 @@ class FederatedLearningServer:
                 print("Server connected to MQTT broker")
                 self._connected_once = True
             
-            # Subscribe to client topics
-            self.mqtt_client.subscribe(TOPIC_CLIENT_REGISTER)
-            self.mqtt_client.subscribe("fl/client/+/update", qos=0)
-            self.mqtt_client.subscribe("fl/client/+/metrics")
+            # Subscribe to client topics with QoS 1 for reliable delivery
+            self.mqtt_client.subscribe(TOPIC_CLIENT_REGISTER, qos=1)
+            self.mqtt_client.subscribe("fl/client/+/update", qos=1)
+            self.mqtt_client.subscribe("fl/client/+/metrics", qos=1)
         else:
             print(f"Server failed to connect, return code {rc}")
     
     def on_message(self, client, userdata, msg):
         """Callback when message received"""
+        try:
+            log_received_packet(
+                packet_size=len(msg.payload),
+                peer=msg.topic,
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Received message"
+            )
+        except Exception as e:
+            print(f"Server error logging received packet: {e}")
+
         try:
             if msg.topic == TOPIC_CLIENT_REGISTER:
                 self.handle_client_registration(msg.payload)
@@ -197,17 +290,77 @@ class FederatedLearningServer:
         """Handle client registration"""
         data = json.loads(payload.decode())
         client_id = data['client_id']
-        self.registered_clients.add(client_id)
-        print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
         
-        # If all clients registered, distribute initial global model and start federated learning
-        if len(self.registered_clients) == self.num_clients:
-            print("\nAll clients registered. Distributing initial global model...\n")
+        # Check if client is already registered
+        if client_id in self.registered_clients:
+            print(f"Client {client_id} re-registered (already known)")
+            return
+        
+        self.registered_clients.add(client_id)
+        print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
+        
+        # Update total client count if more clients join
+        if len(self.registered_clients) > self.num_clients:
+            self.update_client_count(len(self.registered_clients))
+        
+        # Check if this is a late-joining client (training already started)
+        if self.training_started:
+            print(f"[LATE JOIN] Client {client_id} joining during training (round {self.current_round})")
+            # Send current global model to late-joining client
+            if self.global_weights is not None:
+                self.send_current_model_to_client(client_id)
+            return
+        
+        # If minimum clients registered and training not started, begin training
+        if len(self.registered_clients) >= self.min_clients and not self.training_started:
+            print("\nMinimum clients registered. Distributing initial global model...\n")
             time.sleep(2)  # Give clients time to be ready
             self.distribute_initial_model()
             # Record training start time
             self.start_time = time.time()
+            self.training_started = True
             print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
+    def send_current_model_to_client(self, client_id):
+        """Send current global model to a late-joining client"""
+        try:
+            print(f"📤 Sending current global model (round {self.current_round}) to late-joining client {client_id}")
+            
+            # Prepare payload with current model
+            if self.quantization_handler is not None:
+                compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+                serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
+                model_message = {
+                    'round': self.current_round,
+                    'quantized_data': serialized,
+                    'model_config': self.model_config,
+                    'training_config': self.training_config
+                }
+            else:
+                model_message = {
+                    'round': self.current_round,
+                    'weights': self.serialize_weights(self.global_weights),
+                    'model_config': self.model_config,
+                    'training_config': self.training_config
+                }
+            
+            # Broadcast to all clients on general topic (late-joiner will receive it)
+            # This is simpler than client-specific topics and works with our generic model handling
+            payload = json.dumps(model_message).encode()
+            self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, payload, qos=1)
+            
+            log_sent_packet(
+                packet_size=len(payload),
+                peer=f"client_{client_id}",
+                protocol="MQTT",
+                round=self.current_round,
+                extra_info=f"Late-join model broadcast (for client {client_id})"
+            )
+            
+            print(f"✅ Current model (round {self.current_round}) broadcast to late-joining client {client_id}")
+            
+        except Exception as e:
+            print(f"❌ Error sending current model to client {client_id}: {e}")
     
     def handle_client_update(self, payload):
         """Handle model update from client"""
@@ -241,10 +394,11 @@ class FederatedLearningServer:
             }
             
             print(f"Received update from client {client_id} "
-                  f"({len(self.client_updates)}/{self.num_clients})")
+                  f"({len(self.client_updates)}/{len(self.round_participants)})")
             
-            # If all clients sent updates, aggregate
-            if len(self.client_updates) == self.num_clients:
+            # If all PARTICIPATING clients sent updates, aggregate
+            # Only wait for clients that were present at round start
+            if len(self.client_updates) >= len(self.round_participants):
                 self.aggregate_models()
     
     def handle_client_metrics(self, payload):
@@ -263,7 +417,8 @@ class FederatedLearningServer:
                   f"({len(self.client_metrics)}/{self.num_clients})")
             
             # If all clients sent metrics, aggregate and continue
-            if len(self.client_metrics) == self.num_clients:
+            # Wait for all registered clients (dynamic)
+            if len(self.client_metrics) >= len(self.registered_clients):
                 self.aggregate_metrics()
                 self.continue_training()
     
@@ -273,6 +428,13 @@ class FederatedLearningServer:
         self.mqtt_client.publish(TOPIC_TRAINING_CONFIG, 
                             json.dumps(self.training_config),
                             qos=1)
+        log_sent_packet(
+            packet_size=len(json.dumps(self.training_config)),
+            peer=TOPIC_TRAINING_CONFIG,  # or client_id/server_id as appropriate
+            protocol="MQTT",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="any additional info"
+        )
         
         self.current_round = 1
         
@@ -313,6 +475,13 @@ class FederatedLearningServer:
             result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, 
                                              message_json,
                                              qos=0)
+            log_sent_packet(
+                packet_size=len(message_json),
+                peer=TOPIC_GLOBAL_MODEL,  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Initial global model distribution"
+            )
             
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
                 print(f"  Attempt {i+1}/3: Initial model sent successfully")
@@ -321,9 +490,13 @@ class FederatedLearningServer:
             
             time.sleep(0.5)  # Small delay between sends
         
-        # Wait for clients to receive and build the model
+        # Wait for clients to receive and build the model...
         print("\nWaiting for clients to receive and build the model...")
         time.sleep(3)
+        
+        # Capture which clients will participate in this round
+        self.round_participants = self.registered_clients.copy()
+        print(f"Round {self.current_round} participants: {sorted(list(self.round_participants))}")
         
         print(f"\n{'='*70}")
         print(f"Starting Round {self.current_round}/{self.num_rounds}")
@@ -334,6 +507,13 @@ class FederatedLearningServer:
         result = self.mqtt_client.publish(TOPIC_START_TRAINING,
                                 json.dumps({"round": self.current_round}),
                                 qos=1)
+        log_sent_packet(
+            packet_size=len(json.dumps({"round": self.current_round})),
+            peer=TOPIC_START_TRAINING,  # or client_id/server_id as appropriate
+            protocol="MQTT",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="Start training signal"
+        )
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
             print("Start training signal sent successfully\n")
         else:
@@ -373,13 +553,15 @@ class FederatedLearningServer:
             serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             global_model_message = {
                 "round": self.current_round,
-                "quantized_data": serialized
+                "quantized_data": serialized,
+                "model_config": self.model_config  # Always include for late-joiners
             }
         else:
             # Send global model to all clients
             global_model_message = {
                 "round": self.current_round,
-                "weights": self.serialize_weights(self.global_weights)
+                "weights": self.serialize_weights(self.global_weights),
+                "model_config": self.model_config  # Always include for late-joiners
             }
         
         # Publish aggregated model (QoS 1 for at-least-once) and avoid duplicates
@@ -387,6 +569,13 @@ class FederatedLearningServer:
         message_json = json.dumps(global_model_message)
         for i in range(3):
             result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, message_json, qos=1)
+            log_sent_packet(
+                packet_size=len(message_json),
+                peer=TOPIC_GLOBAL_MODEL,  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Aggregated global model distribution"
+            )
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
                 print(f"  Attempt {i+1}/3: Aggregated model sent")
                 break
@@ -401,6 +590,13 @@ class FederatedLearningServer:
         print("Requesting client evaluation...")
         self.mqtt_client.publish(TOPIC_START_EVALUATION,
                                 json.dumps({"round": self.current_round}), qos=1)
+        log_sent_packet(
+            packet_size=len(json.dumps({"round": self.current_round})),
+            peer=TOPIC_START_EVALUATION,  # or client_id/server_id as appropriate
+            protocol="MQTT",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="Start evaluation signal"
+        )
     
     def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
@@ -449,6 +645,13 @@ class FederatedLearningServer:
             print("Sending training completion signal to all clients...")
             print(f"Publishing to topic: {TOPIC_TRAINING_COMPLETE}")
             result = self.mqtt_client.publish(TOPIC_TRAINING_COMPLETE, json.dumps({"message": "Training completed"}), qos=1)
+            log_sent_packet(
+                packet_size=len(json.dumps({"message": "Training completed"})),
+                peer=TOPIC_TRAINING_COMPLETE,  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Training completion signal"
+            )
             print(f"Publish result: rc={result.rc}, mid={result.mid}")
             if result.rc != mqtt.MQTT_ERR_SUCCESS:
                 print(f"ERROR: Failed to publish training completion message, rc={result.rc}")
@@ -464,8 +667,12 @@ class FederatedLearningServer:
         if self.current_round < self.num_rounds:
             self.current_round += 1
             
+            # Capture participants for this new round (includes late-joiners)
+            self.round_participants = self.registered_clients.copy()
+            
             print(f"\n{'='*70}")
             print(f"Starting Round {self.current_round}/{self.num_rounds}")
+            print(f"Round {self.current_round} participants: {sorted(list(self.round_participants))}")
             print(f"{'='*70}\n")
             
             time.sleep(2)
@@ -494,6 +701,13 @@ class FederatedLearningServer:
             print("Sending training completion signal to all clients...")
             print(f"Publishing to topic: {TOPIC_TRAINING_COMPLETE}")
             result = self.mqtt_client.publish(TOPIC_TRAINING_COMPLETE, json.dumps({"message": "Training completed"}), qos=1)
+            log_sent_packet(
+                packet_size=len(json.dumps({"message": "Training completed"})),
+                peer=TOPIC_TRAINING_COMPLETE,  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Training completion signal"
+            )
             print(f"Publish result: rc={result.rc}, mid={result.mid}")
             if result.rc != mqtt.MQTT_ERR_SUCCESS:
                 print(f"ERROR: Failed to publish training completion message, rc={result.rc}")
@@ -598,14 +812,9 @@ class FederatedLearningServer:
         
         for attempt in range(max_retries):
             try:
-                # Resolve broker host based on environment (Docker vs local)
-                broker_host = MQTT_BROKER.strip() if isinstance(MQTT_BROKER, str) else str(MQTT_BROKER)
-                if not broker_host:
-                    broker_host = 'mqtt-broker' if os.path.exists('/app') else 'localhost'
-                
-                print(f"Attempting to connect to MQTT broker at {broker_host}:{MQTT_PORT}...")
-                # Use 1 hour keepalive (3600 seconds) to prevent timeout during long training
-                self.mqtt_client.connect(broker_host, MQTT_PORT, keepalive=3600)
+                print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
+                # FAIR CONFIG: keepalive 600s for very_poor network
+                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=600)
                 print(f"Successfully connected to MQTT broker!\n")
                 self.mqtt_client.loop_forever()
                 break
@@ -615,10 +824,11 @@ class FederatedLearningServer:
                     print(f"Retrying in {retry_delay} seconds...\n")
                     time.sleep(retry_delay)
                 else:
+                    print(f"Error: Could not connect to MQTT broker. {e}")
                     print(f"\nFailed to connect to MQTT broker after {max_retries} attempts.")
                     print(f"\nPlease ensure:")
                     print(f"  1. Mosquitto broker is running (service or container)")
-                    print(f"  2. Broker address is correct: {broker_host}:{MQTT_PORT}")
+                    print(f"  2. Broker address is correct: {MQTT_BROKER}:{MQTT_PORT}")
                     print(f"  3. Firewall allows connection on port {MQTT_PORT}")
                     raise
 
@@ -627,12 +837,12 @@ if __name__ == "__main__":
     print(f"\n{'='*70}")
     print(f"Federated Learning Server with MQTT")
     print(f"Broker: {MQTT_BROKER}:{MQTT_PORT}")
-    print(f"Clients: {NUM_CLIENTS}")
+    print(f"Clients: {MIN_CLIENTS} (min) - {MAX_CLIENTS} (max)")
     print(f"Rounds: {NUM_ROUNDS}")
     print(f"{'='*70}\n")
     print("Waiting for clients to connect...\n")
     
-    server = FederatedLearningServer(NUM_CLIENTS, NUM_ROUNDS)
+    server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
     try:
         server.start()

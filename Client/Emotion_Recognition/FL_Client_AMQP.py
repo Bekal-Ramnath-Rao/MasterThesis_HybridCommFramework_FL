@@ -9,11 +9,30 @@ import time
 import random
 import pika
 
+# Detect Docker environment and set project root accordingly
+if os.path.exists('/app'):
+    project_root = '/app'
+else:
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from packet_logger import log_received_packet, log_sent_packet, init_db
+
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
-gpu_device = os.environ.get("GPU_DEVICE_ID", "0")
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
 os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
 
@@ -82,6 +101,19 @@ class FederatedLearningClient:
     def __init__(self, client_id, num_clients, train_generator=None, validation_generator=None):
         self.client_id = client_id
         self.num_clients = num_clients
+        self.current_round = 0
+        # Default batch size adjusted for separate GPUs
+        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        # Deduplication tracking
+        self.last_global_round = -1
+        self.last_training_round = -1
+        self.evaluated_rounds = set()
+        
+        # Store data generators
+        self.train_generator = train_generator
+        self.validation_generator = validation_generator
+        
+        # Model will be initialized from server config
         self.model = None
         
         # Initialize quantization compression (default: disabled unless explicitly enabled)
@@ -93,10 +125,9 @@ class FederatedLearningClient:
         else:
             self.quantizer = None
             print(f"Client {self.client_id}: Quantization disabled")
-        self.train_generator = train_generator
-        self.validation_generator = validation_generator
-        self.current_round = 0
-        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        
+        # Initialize packet logging database
+        init_db()
         
         # AMQP connection
         self.connection = None
@@ -120,6 +151,45 @@ class FederatedLearningClient:
         weights = pickle.loads(serialized)
         return weights
     
+    def build_model_from_config(self, model_config):
+        """Build model from server-provided configuration"""
+        input_shape = model_config.get('input_shape')
+        num_classes = model_config.get('num_classes')
+        layers = model_config.get('layers', [])
+        
+        model = tf.keras.Sequential()
+        model.add(tf.keras.layers.Input(shape=input_shape))
+        
+        for layer in layers:
+            if layer['type'] == 'conv':
+                model.add(tf.keras.layers.Conv2D(
+                    layer['filters'], 
+                    layer['kernel'], 
+                    activation=layer['activation'],
+                    padding='same'
+                ))
+            elif layer['type'] == 'maxpool':
+                model.add(tf.keras.layers.MaxPooling2D(layer['pool_size']))
+            elif layer['type'] == 'flatten':
+                model.add(tf.keras.layers.Flatten())
+            elif layer['type'] == 'dense':
+                model.add(tf.keras.layers.Dense(layer['units'], activation=layer['activation']))
+            elif layer['type'] == 'dropout':
+                model.add(tf.keras.layers.Dropout(layer['rate']))
+            elif layer['type'] == 'lstm':
+                model.add(tf.keras.layers.LSTM(layer['units'], return_sequences=layer.get('return_sequences', False)))
+            elif layer['type'] == 'gru':
+                model.add(tf.keras.layers.GRU(layer['units'], return_sequences=layer.get('return_sequences', False)))
+        
+        model.compile(
+            optimizer='adam',
+            loss=model_config.get('loss', 'categorical_crossentropy'),
+            metrics=['accuracy']
+        )
+        
+        return model
+    
+    
     def connect(self):
         """Connect to RabbitMQ broker"""
         max_retries = 5
@@ -129,12 +199,13 @@ class FederatedLearningClient:
             try:
                 print(f"Attempting to connect to RabbitMQ at {AMQP_HOST}:{AMQP_PORT}...")
                 credentials = pika.PlainCredentials(AMQP_USER, AMQP_PASSWORD)
+                # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
                 parameters = pika.ConnectionParameters(
                     host=AMQP_HOST,
                     port=AMQP_PORT,
                     credentials=credentials,
-                    heartbeat=600,
-                    blocked_connection_timeout=300
+                    heartbeat=600,  # 10 minutes for very_poor network
+                    blocked_connection_timeout=600  # Aligned with heartbeat
                 )
                 self.connection = pika.BlockingConnection(parameters)
                 self.channel = self.connection.channel()
@@ -190,12 +261,13 @@ class FederatedLearningClient:
                         pass
                 
                 credentials = pika.PlainCredentials(AMQP_USER, AMQP_PASSWORD)
+                # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
                 parameters = pika.ConnectionParameters(
                     host=AMQP_HOST,
                     port=AMQP_PORT,
                     credentials=credentials,
-                    heartbeat=600,
-                    blocked_connection_timeout=300
+                    heartbeat=600,  # 10 minutes for very_poor network
+                    blocked_connection_timeout=600  # Aligned with heartbeat
                 )
                 self.connection = pika.BlockingConnection(parameters)
                 self.channel = self.connection.channel()
@@ -227,6 +299,15 @@ class FederatedLearningClient:
                     body=body,
                     properties=properties
                 )
+
+                log_sent_packet(
+                    packet_size=len(body),
+                    peer=exchange,
+                    protocol="AMQP",
+                    round=None,
+                    extra_info=f"Published to {routing_key}"
+                )
+                
                 return True
                 
             except (pika.exceptions.StreamLostError, 
@@ -255,12 +336,26 @@ class FederatedLearningClient:
             body=json.dumps(registration),
             properties=pika.BasicProperties(delivery_mode=2)
         ):
+            log_sent_packet(
+                packet_size=len(json.dumps(registration)),
+                peer=EXCHANGE_CLIENT_UPDATES,
+                protocol="AMQP",
+                round=None,
+                extra_info="Client registration"
+            )
             print(f"Client {self.client_id} registration sent")
         else:
             print(f"Client {self.client_id} ERROR: Failed to send registration")
     
     def on_broadcast_message(self, ch, method, properties, body):
         """Unified handler for all broadcast messages - routes based on message_type"""
+        log_received_packet(
+            packet_size=len(body),
+            peer=EXCHANGE_BROADCAST,
+            protocol="AMQP",
+            round=None,
+            extra_info="Broadcast message"
+        )
         try:
             data = json.loads(body.decode())
             message_type = data.get('message_type')
@@ -315,9 +410,9 @@ class FederatedLearningClient:
                 encoded_weights = data['weights']
                 weights = self.deserialize_weights(encoded_weights)
             
-            if round_num == 0:
-                # Initial model from server - create model from server's config
-                print(f"Client {self.client_id} received initial global model from server")
+            # Initialize model if not yet created (works for any round)
+            if self.model is None:
+                print(f"Client {self.client_id} initializing model from server (round {round_num})")
                 
                 model_config = data.get('model_config')
                 if model_config:
@@ -516,6 +611,13 @@ class FederatedLearningClient:
             body=json.dumps(update_message),
             properties=pika.BasicProperties(delivery_mode=2)
         ):
+            log_sent_packet(
+                packet_size=len(json.dumps(update_message)),
+                peer=EXCHANGE_CLIENT_UPDATES,
+                protocol="AMQP",
+                round=self.current_round,
+                extra_info="Model update"
+            )
             print(f"Client {self.client_id} sent model update for round {self.current_round}")
         else:
             print(f"Client {self.client_id} ERROR: Failed to send model update for round {self.current_round}")
@@ -550,6 +652,13 @@ class FederatedLearningClient:
             properties=pika.BasicProperties(delivery_mode=2)
         ):
             print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
+            log_sent_packet(
+                packet_size=len(json.dumps(metrics_message)),
+                peer=EXCHANGE_CLIENT_UPDATES,
+                protocol="AMQP",
+                round=self.current_round,
+                extra_info="Evaluation metrics"
+            )
         else:
             print(f"Client {self.client_id} ERROR: Failed to send evaluation metrics")
     

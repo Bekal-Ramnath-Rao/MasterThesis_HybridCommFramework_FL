@@ -37,7 +37,9 @@ import federated_learning_pb2_grpc
 # Server Configuration
 GRPC_HOST = os.getenv("GRPC_HOST", "0.0.0.0")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
-NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
+# Dynamic client configuration
+MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
+MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "16"))
 
 # EEG Settings
@@ -202,8 +204,10 @@ def build_model():
 
 # ---------------- Federated Learning Servicer ----------------
 class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningServicer):
-    def __init__(self, num_clients, num_rounds):
-        self.num_clients = num_clients
+    def __init__(self, min_clients, num_rounds, max_clients=100):
+        self.min_clients = min_clients
+        self.max_clients = max_clients
+        self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
@@ -296,7 +300,11 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             client_id = request.client_id
             print(f"[DEBUG] Acquired lock. Processing client {client_id}")
             self.registered_clients.add(client_id)
-            print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
+            print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
+        
+        # Update total client count if more clients join
+        if len(self.registered_clients) > self.num_clients:
+            self.update_client_count(len(self.registered_clients))
             print(f"[DEBUG] Currently registered clients: {sorted(self.registered_clients)}")
 
             if len(self.registered_clients) == self.num_clients and not self.training_started:
@@ -383,17 +391,14 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             if self.global_weights is not None:
                 # Send current round model (not initial round 0)
                 round_to_send = self.current_round
-                model_config_json = ""
                 
-                # Only include model_config for initial model fetch
-                if request.round == 0 and self.current_round == 1:
-                    model_config = {
-                        "architecture": "CNN+BiLSTM+MHA",
-                        "input_shape": [256, 20],
-                        "num_classes": NUM_CLASSES
-                    }
-                    model_config_json = json.dumps(model_config)
-                    print(f"[DEBUG] GetGlobalModel - Sending initial model config")
+                # Always include model_config for late-joining clients
+                model_config = {
+                    "architecture": "CNN+BiLSTM+MHA",
+                    "input_shape": [256, 20],
+                    "num_classes": NUM_CLASSES
+                }
+                model_config_json = json.dumps(model_config)
 
                 print(f"[DEBUG] GetGlobalModel - Sending round {round_to_send} to client {request.client_id} (request.round={request.round})")
                 
@@ -454,7 +459,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 print(f"Received update from client {client_id} "
                       f"({len(self.client_updates)}/{self.num_clients})")
 
-                if len(self.client_updates) == self.num_clients:
+                # Wait for all registered clients (dynamic)
+            if len(self.client_updates) >= len(self.registered_clients):
                     self.aggregate_models()
 
                 return federated_learning_pb2.UpdateResponse(

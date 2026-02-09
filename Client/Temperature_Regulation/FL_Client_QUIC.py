@@ -1,10 +1,6 @@
 import numpy as np
 import pandas as pd
 import math
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM
-from sklearn.preprocessing import MinMaxScaler
 import json
 import pickle
 import base64
@@ -18,8 +14,27 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import QuicEvent, StreamDataReceived
 from aioquic.asyncio.protocol import QuicConnectionProtocol
 
+# GPU Configuration - Must be done BEFORE TensorFlow import
+# Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
+os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
 # Make TensorFlow logs less verbose
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM
+from sklearn.preprocessing import MinMaxScaler
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # QUIC Configuration
@@ -45,6 +60,9 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             
             # Append new data to buffer
             self._stream_buffers[event.stream_id] += event.data
+            
+            # Send flow control updates to allow more data (critical for poor networks)
+            self.transmit()
             
             # Try to decode complete messages (delimited by newline)
             while b'\n' in self._stream_buffers[event.stream_id]:
@@ -143,8 +161,16 @@ class FederatedLearningClient:
             # Add newline delimiter for message framing
             data = (json.dumps(message) + '\n').encode('utf-8')
             self.stream_id = self.protocol._quic.get_next_available_stream_id()
-            self.protocol._quic.send_stream_data(self.stream_id, data, end_stream=False)
+            self.protocol._quic.send_stream_data(self.stream_id, data, end_stream=True)
             self.protocol.transmit()
+            
+            # Multiple transmit calls for large messages (improved for poor networks)
+            if len(data) > 1000000:  # > 1MB
+                for _ in range(3):
+                    await asyncio.sleep(0.5)
+                    self.protocol.transmit()
+            else:
+                await asyncio.sleep(0.1)
     
     async def handle_message(self, message):
         """Handle incoming messages from server"""
@@ -184,9 +210,13 @@ class FederatedLearningClient:
         else:
             weights = self.deserialize_weights(encoded_weights)
         
-        if round_num == 0:
-            # Initial model from server - create model from server's config
-            print(f"Client {self.client_id} received initial global model from server")
+        # Initialize model if not yet created (works for any round)
+
+        
+        if self.model is None:
+
+        
+            print(f"Client {self.client_id} initializing model from server (round {round_num})")
             
             model_config = message.get('model_config')
             if model_config:
@@ -349,7 +379,15 @@ class FederatedLearningClient:
     
     async def start(self):
         """Connect to QUIC server and start client"""
-        configuration = QuicConfiguration(is_client=True)
+        configuration = QuicConfiguration(
+            is_client=True,
+            alpn_protocols=["fl"],
+            max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
+            max_data=100 * 1024 * 1024,  # 100 MB total
+            idle_timeout=3600.0,  # 60 minutes idle timeout
+            max_datagram_frame_size=65536,  # Larger frame size for better throughput
+            initial_rtt=0.15,  # 150ms (account for 100ms latency + jitter)
+        )
         
         # Load CA certificate for verification (optional - set verify_mode to False for testing)
         # cert_dir = Path(__file__).parent.parent.parent / "certs"

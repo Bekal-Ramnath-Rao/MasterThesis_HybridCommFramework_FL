@@ -1,6 +1,27 @@
 import numpy as np
 import pandas as pd
 import math
+import os
+import sys
+import logging
+
+# GPU Configuration - Must be done BEFORE TensorFlow import
+# Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
+os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
+# Make TensorFlow logs less verbose
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, LSTM
@@ -10,9 +31,6 @@ import pickle
 import base64
 import time
 import random
-import os
-import sys
-import logging
 import paho.mqtt.client as mqtt
 
 # Add Compression_Technique to path
@@ -27,7 +45,8 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # MQTT Configuration
-MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")  # MQTT broker address
+# Auto-detect environment: Docker (/app exists) or local
+MQTT_BROKER = os.getenv("MQTT_BROKER", 'mqtt-broker' if os.path.exists('/app') else 'localhost')
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))  # MQTT broker port
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))  # Can be set via environment variable
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
@@ -216,9 +235,9 @@ class FederatedLearningClient:
             encoded_weights = data['weights']
             weights = self.deserialize_weights(encoded_weights)
         
-        if round_num == 0:
-            # Initial model from server - create model from server's config
-            print(f"Client {self.client_id} received initial global model from server")
+        # Initialize model if not yet created (works for any round)
+        if self.model is None:
+            print(f"Client {self.client_id} initializing model from server (round {round_num})")
             
             model_config = data.get('model_config')
             if model_config:

@@ -30,7 +30,9 @@ from aioquic.quic.events import QuicEvent, StreamDataReceived
 # Server Configuration
 QUIC_HOST = os.getenv("QUIC_HOST", "localhost")
 QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
-NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+# Dynamic client configuration
+MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
+MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
 NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
 
@@ -55,6 +57,9 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
             # Append new data to buffer
             self._stream_buffers[event.stream_id] += event.data
             
+            # Send flow control updates to allow more data (critical for poor networks)
+            self.transmit()
+            
             # Try to decode complete messages (delimited by newline)
             while b'\n' in self._stream_buffers[event.stream_id]:
                 message_data, self._stream_buffers[event.stream_id] = self._stream_buffers[event.stream_id].split(b'\n', 1)
@@ -69,8 +74,10 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
 
 
 class FederatedLearningServer:
-    def __init__(self, num_clients, num_rounds):
-        self.num_clients = num_clients
+    def __init__(self, min_clients, num_rounds, max_clients=100):
+        self.min_clients = min_clients
+        self.max_clients = max_clients
+        self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = {}  # Maps client_id to protocol reference
@@ -89,6 +96,8 @@ class FederatedLearningServer:
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.converged = False
+        self.training_started = False
+        self.training_started = False
         self.start_time = None
         self.convergence_time = None
         
@@ -154,9 +163,17 @@ class FederatedLearningServer:
             stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
             # Add newline delimiter for message framing
             data = (json.dumps(message) + '\n').encode('utf-8')
-            protocol._quic.send_stream_data(stream_id, data, end_stream=False)
+            protocol._quic.send_stream_data(stream_id, data, end_stream=True)
             protocol.transmit()
             print(f"Sent message type '{message.get('type')}' to client {client_id} on stream {stream_id}")
+            
+            # Multiple transmit calls for large messages (improved for poor networks)
+            if len(data) > 1_000_000:  # > 1MB
+                for _ in range(3):
+                    await asyncio.sleep(0.5)
+                    protocol.transmit()
+            else:
+                await asyncio.sleep(0.1)
     
     async def broadcast_message(self, message):
         """Broadcast message to all registered clients"""
@@ -181,14 +198,38 @@ class FederatedLearningServer:
         """Handle client registration"""
         client_id = message['client_id']
         self.registered_clients[client_id] = protocol  # Store protocol reference
-        print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
+        print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
         
-        if len(self.registered_clients) == self.num_clients:
+        # Update total client count if more clients join
+        if len(self.registered_clients) > self.num_clients:
+            self.update_client_count(len(self.registered_clients))
+        
+        # Check if this is a late-joining client
+        if self.training_started:
+            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
+            if len(self.registered_clients) > self.num_clients:
+                self.update_client_count(len(self.registered_clients))
+            if self.global_weights is not None:
+                self.send_current_model_to_client(client_id)
+            return
+        
+        # Check if this is a late-joining client
+        if self.training_started:
+            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
+            if len(self.registered_clients) > self.num_clients:
+                self.update_client_count(len(self.registered_clients))
+            if self.global_weights is not None:
+                self.send_current_model_to_client(client_id)
+            return
+        
+        if len(self.registered_clients) >= self.min_clients:
             print("\nAll clients registered. Distributing initial global model...\n")
             await asyncio.sleep(2)
             await self.distribute_initial_model()
             self.start_time = time.time()
-            print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                        self.training_started = True
+            self.training_started = True
+print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     
     async def handle_client_update(self, message):
         """Handle model update from client"""
@@ -212,7 +253,8 @@ class FederatedLearningServer:
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{self.num_clients})")
             
-            if len(self.client_updates) == self.num_clients:
+            # Wait for all registered clients (dynamic)
+            if len(self.client_updates) >= len(self.registered_clients):
                 await self.aggregate_models()
     
     async def handle_client_metrics(self, message):
@@ -229,7 +271,8 @@ class FederatedLearningServer:
             print(f"Received metrics from client {client_id} "
                   f"({len(self.client_metrics)}/{self.num_clients})")
             
-            if len(self.client_metrics) == self.num_clients:
+            # Wait for all registered clients (dynamic)
+            if len(self.client_metrics) >= len(self.registered_clients):
                 await self.aggregate_metrics()
                 await self.continue_training()
     
@@ -317,10 +360,21 @@ class FederatedLearningServer:
             weights_data = self.serialize_weights(self.global_weights)
             weights_key = 'weights'
         
+        # Define model_config for late-joiners
+        model_config = {
+            "architecture": "LSTM",
+            "layers": [
+                {"type": "LSTM", "units": 50, "activation": "relu", "input_shape": [1, 4]},
+                {"type": "Dense", "units": 1}
+            ],
+            "compile_config": {"loss": "mse", "optimizer": "adam", "metrics": ["mae"]}
+        }
+        
         await self.broadcast_message({
             'type': 'global_model',
             'round': self.current_round,
-        weights_key: weights_data
+            weights_key: weights_data,
+            'model_config': model_config  # Always include for late-joiners
         })
         
         print(f"Aggregated global model from round {self.current_round} sent to all clients")
@@ -506,12 +560,12 @@ async def main():
     print(f"\n{'='*70}")
     print(f"Federated Learning Server with QUIC")
     print(f"Host: {QUIC_HOST}:{QUIC_PORT}")
-    print(f"Clients: {NUM_CLIENTS}")
+    print(f"Clients: {MIN_CLIENTS} (min) - {MAX_CLIENTS} (max)")
     print(f"Rounds: {NUM_ROUNDS}")
     print(f"{'='*70}\n")
     print("Waiting for clients to connect...\n")
     
-    server = FederatedLearningServer(NUM_CLIENTS, NUM_ROUNDS)
+    server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
     # Configure QUIC
     configuration = QuicConfiguration(

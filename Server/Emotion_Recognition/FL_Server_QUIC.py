@@ -27,9 +27,11 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import QuicEvent, StreamDataReceived
 
 # Server Configuration
-QUIC_HOST = os.getenv("QUIC_HOST", "localhost")
+QUIC_HOST = os.getenv("QUIC_HOST", "fl-server-quic-emotion")
 QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
-NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+# Dynamic client configuration
+MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
+MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
 
 # Convergence Settings
@@ -92,8 +94,10 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
 
 
 class FederatedLearningServer:
-    def __init__(self, num_clients, num_rounds):
-        self.num_clients = num_clients
+    def __init__(self, min_clients, num_rounds, max_clients=100):
+        self.min_clients = min_clients
+        self.max_clients = max_clients
+        self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = {}  # Maps client_id to protocol reference
@@ -110,8 +114,11 @@ class FederatedLearningServer:
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.converged = False
+        self.training_started = False
+        self.training_started = False
         self.start_time = None
         self.convergence_time = None
+        self.model_config_json = None  # Will be set during distribute_initial_model
         
         # Protocol reference
         self.protocol: Optional[FederatedLearningServerProtocol] = None
@@ -192,21 +199,29 @@ class FederatedLearningServer:
         return weights
     
     async def send_message(self, client_id, message):
-        """Send message to client via QUIC stream"""
+        """Send message to client via QUIC stream with improved transmission for poor networks"""
         if client_id in self.registered_clients:
             protocol = self.registered_clients[client_id]
             # Create a new stream for each message
             stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
             # Add newline delimiter for message framing
             data = (json.dumps(message) + '\n').encode('utf-8')
-            protocol._quic.send_stream_data(stream_id, data, end_stream=False)
+            # Set end_stream=True to ensure proper message delivery, especially for large messages
+            protocol._quic.send_stream_data(stream_id, data, end_stream=True)
             protocol.transmit()
             
             msg_type = message.get('type')
-            print(f"Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(data)} bytes)")
+            msg_size_mb = len(data) / (1024 * 1024)
+            print(f"Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(data)} bytes = {msg_size_mb:.2f} MB)")
             
-            # Give event loop time to transmit large messages
-            await asyncio.sleep(0.1)
+            # Multiple transmit calls for large messages (improved for poor networks)
+            if len(data) > 1_000_000:  # > 1MB
+                for _ in range(3):
+                    await asyncio.sleep(0.5)
+                    protocol.transmit()
+            else:
+                # Small delay for flow control
+                await asyncio.sleep(0.1)
     
     async def broadcast_message(self, message):
         """Broadcast message to all registered clients"""
@@ -237,13 +252,36 @@ class FederatedLearningServer:
         """Handle client registration"""
         client_id = message['client_id']
         self.registered_clients[client_id] = protocol  # Store protocol reference
-        print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
+        print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
         
-        if len(self.registered_clients) == self.num_clients:
+        # Update total client count if more clients join
+        if len(self.registered_clients) > self.num_clients:
+            self.update_client_count(len(self.registered_clients))
+        
+        # Check if this is a late-joining client
+        if self.training_started:
+            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
+            if len(self.registered_clients) > self.num_clients:
+                self.update_client_count(len(self.registered_clients))
+            if self.global_weights is not None:
+                self.send_current_model_to_client(client_id)
+            return
+        
+        # Check if this is a late-joining client
+        if self.training_started:
+            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
+            if len(self.registered_clients) > self.num_clients:
+                self.update_client_count(len(self.registered_clients))
+            if self.global_weights is not None:
+                self.send_current_model_to_client(client_id)
+            return
+        
+        if len(self.registered_clients) >= self.min_clients:
             print("\nAll clients registered. Distributing initial global model...\n")
             await asyncio.sleep(2)
             await self.distribute_initial_model()
             self.start_time = time.time()
+            self.training_started = True
             print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     
     async def handle_client_update(self, message):
@@ -255,7 +293,9 @@ class FederatedLearningServer:
             # Decompress or deserialize client weights
             if 'compressed_data' in message and self.quantization_handler is not None:
                 start_t = time.time()
-                weights = self.quantization_handler.decompress_client_update(message['client_id'], message['compressed_data'])
+                # Deserialize base64+pickle encoded compressed data
+                compressed_data = pickle.loads(base64.b64decode(message['compressed_data']))
+                weights = self.quantization_handler.decompress_client_update(message['client_id'], compressed_data)
                 dt = time.time() - start_t
                 print(f"Server: Received and decompressed update from client {message['client_id']} in {dt:.2f}s")
             else:
@@ -284,7 +324,8 @@ class FederatedLearningServer:
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{self.num_clients})")
             
-            if len(self.client_updates) == self.num_clients:
+            # Wait for all registered clients (dynamic)
+            if len(self.client_updates) >= len(self.registered_clients):
                 await self.aggregate_models()
         #else:
             #print(f"[DEBUG] Ignoring model_update from client {client_id} for round {round_num} (server at {self.current_round})")
@@ -303,7 +344,8 @@ class FederatedLearningServer:
             print(f"Received metrics from client {client_id} "
                   f"({len(self.client_metrics)}/{self.num_clients})")
             
-            if len(self.client_metrics) == self.num_clients:
+            # Wait for all registered clients (dynamic)
+            if len(self.client_metrics) >= len(self.registered_clients):
                 await self.aggregate_metrics()
                 await self.continue_training()
     
@@ -343,12 +385,16 @@ class FederatedLearningServer:
             ]
         }
         
+        # Store model config for late-joiners and aggregation
+        self.model_config_json = model_config
+        
         # Prepare global model (compress if quantization enabled)
         if self.quantization_handler is not None:
             compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
             stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
             print(f"Server: Compressed initial global model - Ratio: {stats['compression_ratio']:.2f}x")
-            weights_data = compressed_data
+            # Serialize compressed data to JSON-safe base64 string
+            weights_data = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             weights_key = 'quantized_data'
         else:
             weights_data = self.serialize_weights(self.global_weights)
@@ -363,11 +409,14 @@ class FederatedLearningServer:
                 'model_config': model_config
             })
             print(f"  Attempt {i+1}/3: Initial model broadcast complete")
-            await asyncio.sleep(0.5)
+            # Longer delay for poor network conditions (was 0.5s, now 2s)
+            await asyncio.sleep(2.0)
         
         print("Initial global model (architecture + weights) sent to all clients")
         print("Waiting for clients to initialize their models (TensorFlow + CNN building)...")
-        await asyncio.sleep(8)
+        # Increased wait time for very poor network conditions (was 8s, now 30s)
+        # This allows time for large model transfer + TensorFlow initialization
+        await asyncio.sleep(30)
         
         print(f"\n{'='*70}")
         print(f"Starting Round {self.current_round}/{self.num_rounds}")
@@ -406,7 +455,8 @@ class FederatedLearningServer:
             compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
             stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
             print(f"Server: Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
-            weights_data = compressed_data
+            # Serialize compressed data to JSON-safe base64 string
+            weights_data = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             weights_key = 'quantized_data'
         else:
             weights_data = self.serialize_weights(self.global_weights)
@@ -415,7 +465,8 @@ class FederatedLearningServer:
         await self.broadcast_message({
             'type': 'global_model',
             'round': self.current_round,
-            weights_key: weights_data
+            weights_key: weights_data,
+            'model_config': self.model_config_json  # Always include for late-joiners
         })
         
         print(f"Aggregated global model from round {self.current_round} sent to all clients")
@@ -583,23 +634,32 @@ async def main():
     print(f"\n{'='*70}")
     print(f"Federated Learning Server with QUIC - Emotion Recognition")
     print(f"Host: {QUIC_HOST}:{QUIC_PORT}")
-    print(f"Clients: {NUM_CLIENTS}")
+    print(f"Clients: {MIN_CLIENTS} (min) - {MAX_CLIENTS} (max)")
     print(f"Rounds: {NUM_ROUNDS}")
     print(f"{'='*70}\n")
     
-    server = FederatedLearningServer(NUM_CLIENTS, NUM_ROUNDS)
+    server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
-    # Configure QUIC with large stream data limits for model weights
+    # Fair comparison settings aligned with MQTT/AMQP/gRPC/DDS
+    # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/DDS for unbiased comparison
     configuration = QuicConfiguration(
         is_client=False,
-        max_datagram_frame_size=65536,
-        max_stream_data=20 * 1024 * 1024,  # 20 MB per stream
-        max_data=50 * 1024 * 1024,  # 50 MB total connection data
-        idle_timeout=3600.0,  # 1 hour idle timeout (training can take long)
+        alpn_protocols=["fl"],
+        
+        # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
+        max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
+        max_data=256 * 1024 * 1024,  # 256 MB total connection
+        
+        # FAIR CONFIG: Timeout 600s for very_poor network scenarios
+        idle_timeout=600.0,  # 10 minutes
+        max_datagram_frame_size=65536,  # 64 KB frames
+        # Poor network adjustments
+        initial_rtt=0.15,  # Account for network latency
     )
     
     # Check if certificates exist in the certs directory
-    cert_dir = Path(__file__).parent.parent.parent / "certs"
+    # In Docker, certs are mounted at /app/certs/
+    cert_dir = Path("/app/certs") if Path("/app/certs").exists() else Path(__file__).parent.parent.parent / "certs"
     cert_file = cert_dir / "server-cert.pem"
     key_file = cert_dir / "server-key.pem"
     

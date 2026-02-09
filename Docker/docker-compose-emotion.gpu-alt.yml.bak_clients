@@ -1,0 +1,47 @@
+# GPU overlay using privileged mode with /dev mount (workaround for Docker 29.x nvidia runtime issue)
+# Usage: docker compose -f docker-compose-emotion.yml -f docker-compose-emotion.gpu-alt.yml up
+# Note: Uses privileged mode due to Docker 29.x device passthrough limitations
+
+x-gpu-config: &gpu-config
+  privileged: true
+  volumes:
+    - /dev:/dev
+  environment:
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+services:
+  fl-server-mqtt-emotion:
+    <<: *gpu-config
+  fl-client-mqtt-emotion-1:
+    <<: *gpu-config
+  fl-client-mqtt-emotion-2:
+    <<: *gpu-config
+  
+  fl-server-amqp-emotion:
+    <<: *gpu-config
+  fl-client-amqp-emotion-1:
+    <<: *gpu-config
+  fl-client-amqp-emotion-2:
+    <<: *gpu-config
+  
+  fl-server-grpc-emotion:
+    <<: *gpu-config
+  fl-client-grpc-emotion-1:
+    <<: *gpu-config
+  fl-client-grpc-emotion-2:
+    <<: *gpu-config
+  
+  fl-server-quic-emotion:
+    <<: *gpu-config
+  fl-client-quic-emotion-1:
+    <<: *gpu-config
+  fl-client-quic-emotion-2:
+    <<: *gpu-config
+  
+  fl-server-dds-emotion:
+    <<: *gpu-config
+  fl-client-dds-emotion-1:
+    <<: *gpu-config
+  fl-client-dds-emotion-2:
+    <<: *gpu-config

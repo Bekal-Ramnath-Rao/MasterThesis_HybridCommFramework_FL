@@ -37,7 +37,13 @@ RUN pip install --no-cache-dir aioquic
 # Copy the Protocols directory for gRPC and DDS
 COPY Protocols/ ./Protocols/
 
+# Compile gRPC protobuf files
+RUN cd Protocols && \
+    python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. federated_learning.proto && \
+    cd ..
+
 # Copy the Server directory
+COPY packet_logger.py ./
 COPY Server/ ./Server/
 
 # Copy Client/Compression_Technique for quantization support (needed by Server)
@@ -62,4 +68,4 @@ ENV TF_CPP_MIN_LOG_LEVEL=3
 EXPOSE 1883 5672 50051 4433 7400
 
 # Default command - can be overridden in docker-compose
-CMD ["python", "-u", "../Server/Emotion_Recognition/FL_Server_MQTT.py"]
+CMD ["python", "-u", "Server/Emotion_Recognition/FL_Server_MQTT.py"]

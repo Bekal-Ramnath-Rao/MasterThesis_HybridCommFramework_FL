@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+    <Domain id="any">
+        <General>
+            <!-- Enable unicast-only discovery for Docker -->
+            <AllowMulticast>false</AllowMulticast>
+            <!-- Max message size: 10MB (fragmented for network efficiency) -->
+            <MaxMessageSize>10485760 B</MaxMessageSize>
+            <!-- Fragment size: 16KB - larger fragments reduce overhead for 12MB models (750 fragments vs 1500) -->
+            <FragmentSize>16384 B</FragmentSize>
+        </General>
+        <Discovery>
+            <ParticipantIndex>auto</ParticipantIndex>
+            <!-- SPDP interval for discovery heartbeats -->
+            <SPDPInterval>60s</SPDPInterval>
+            <!-- Explicit peer list for unicast discovery in Docker -->
+            <Peers>
+                <Peer address="fl-server-dds-mentalstate"/>
+                <Peer address="fl-client-dds-mentalstate-1"/>
+                <Peer address="fl-client-dds-mentalstate-2"/>
+            </Peers>
+        </Discovery>
+        <Internal>
+            <SquashParticipants>false</SquashParticipants>
+            
+            <!-- Retransmission tuning for poor networks - reduce congestion storms -->
+            <NackDelay>2s</NackDelay>
+            
+            <!-- Increase transport priority to avoid fragmentation -->
+            <MaxSampleSize>20971520 B</MaxSampleSize>
+            
+            <!-- Allow more pending fragments (12MB / 16KB = 750 fragments) -->
+            <DefragReliableMaxSamples>2000</DefragReliableMaxSamples>
+            <DefragUnreliableMaxSamples>2000</DefragUnreliableMaxSamples>
+        </Internal>
+        <Tracing>
+            <Verbosity>severe</Verbosity>
+            <OutputFile>stderr</OutputFile>
+        </Tracing>
+    </Domain>
+</CycloneDDS>
