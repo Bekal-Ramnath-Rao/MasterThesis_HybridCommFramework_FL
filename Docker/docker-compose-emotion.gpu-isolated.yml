@@ -490,7 +490,7 @@ services:
       - NET_ADMIN
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
-      - ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+      - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     command: bash -c "sleep 10 && python -u Server/Emotion_Recognition/FL_Server_DDS.py"
     # Server does not need GPU resources - only aggregates models
 
@@ -523,7 +523,7 @@ services:
       - NET_ADMIN
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      - ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+      - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     deploy:
       resources:
@@ -562,7 +562,7 @@ services:
       - NET_ADMIN
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      - ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+      - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     deploy:
       resources:

@@ -341,7 +341,7 @@ services:
       - fl-dds-network
     volumes:
       - ../Server/MentalState_Recognition/results:/app/Server/MentalState_Recognition/results
-      - ../cyclonedds-mentalstate.xml:/app/cyclonedds-mentalstate.xml:ro
+      - ../config/cyclonedds-mentalstate.xml:/app/cyclonedds-mentalstate.xml:ro
 
   # DDS FL Client 1 (Mental State Recognition)
   fl-client-dds-mental-1:
@@ -361,7 +361,7 @@ services:
     command: python -u Client/MentalState_Recognition/FL_Client_DDS.py
     volumes:
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
-      - ../cyclonedds-mentalstate.xml:/app/cyclonedds-mentalstate.xml:ro
+      - ../config/cyclonedds-mentalstate.xml:/app/cyclonedds-mentalstate.xml:ro
     networks:
       - fl-dds-network
 
@@ -383,7 +383,7 @@ services:
     command: python -u Client/MentalState_Recognition/FL_Client_DDS.py
     volumes:
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
-      - ../cyclonedds-mentalstate.xml:/app/cyclonedds-mentalstate.xml:ro
+      - ../config/cyclonedds-mentalstate.xml:/app/cyclonedds-mentalstate.xml:ro
     networks:
       - fl-dds-network
 

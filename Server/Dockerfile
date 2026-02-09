@@ -43,7 +43,7 @@ RUN cd Protocols && \
     cd ..
 
 # Copy the Server directory
-COPY packet_logger.py ./
+COPY scripts/utilities/packet_logger.py ./
 COPY Server/ ./Server/
 
 # Copy Client/Compression_Technique for quantization support (needed by Server)

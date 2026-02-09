@@ -42,7 +42,7 @@ RUN cd Protocols && \
     python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. federated_learning.proto && \
     cd ..
 
-COPY packet_logger.py ./
+COPY scripts/utilities/packet_logger.py ./
 # Copy the Client directory
 COPY Client/ ./Client/
 

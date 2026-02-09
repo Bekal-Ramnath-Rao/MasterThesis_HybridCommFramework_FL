@@ -407,7 +407,7 @@ services:
       - fl-dds-network-temp
     volumes:
       - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
-      - ../cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
+      - ../config/cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
 
   # DDS FL Client 1 (Temperature Regulation)
   fl-client-dds-temp-1:
@@ -432,7 +432,7 @@ services:
     command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
-      - ../cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
+      - ../config/cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
     networks:
       - fl-dds-network-temp
 
@@ -459,7 +459,7 @@ services:
     command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
     volumes:
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
-      - ../cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
+      - ../config/cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
     networks:
       - fl-dds-network-temp
 

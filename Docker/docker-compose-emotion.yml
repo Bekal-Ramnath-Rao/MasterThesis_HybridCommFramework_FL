@@ -406,7 +406,7 @@ services:
       - fl-dds-network
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
-      - ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+      - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # DDS FL Client 1 (Emotion Recognition)
@@ -432,7 +432,7 @@ services:
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      - ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+      - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     networks:
       - fl-dds-network
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
@@ -460,7 +460,7 @@ services:
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      - ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+      - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     networks:
       - fl-dds-network
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
