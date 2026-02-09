@@ -28,6 +28,22 @@ from data_partitioner import get_client_data, NUM_CLASSES, ID2LBL, LBL2ID
 
 # Suppress TensorFlow warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+# GPU Configuration - Must be done BEFORE TensorFlow import
+# Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
+os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
+
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # GPU Configuration
@@ -49,7 +65,8 @@ if gpus:
         print(f"[GPU] Configuration error: {e}")
 
 # MQTT Configuration
-MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
+# Auto-detect environment: Docker (/app exists) or local
+MQTT_BROKER = os.getenv("MQTT_BROKER", 'mqtt-broker' if os.path.exists('/app') else 'localhost')
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
@@ -280,267 +297,63 @@ class FederatedLearningClient:
         self.mqtt_client.disconnect()
     
     def handle_global_model(self, payload):
-        """Receive and set global model weights"""
-        data = json.loads(payload.decode())
-        round_num = data['round']
-        # Check if weights are quantized
-        if 'quantized_data' in data and self.quantizer is not None:
-            compressed_data = data['quantized_data']
-            # If server sent serialized base64 string, decode and unpickle
-            if isinstance(compressed_data, str):
-                try:
-                    compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
-                except Exception as e:
-                    print(f"Client {self.client_id} error decoding quantized_data: {e}")
-            weights = self.quantizer.decompress(compressed_data)
-            if round_num > 0:
-                print(f"Client {self.client_id}: Received and decompressed quantized global model")
-        else:
-            encoded_weights = data['weights']
-            weights = self.deserialize_weights(encoded_weights)
-        
-        if round_num == 0:
-            print(f"\n[Client {self.client_id}] Received initial global model")
-            
-            # Build model from config
-            model_config = data.get('model_config')
-            if model_config:
-                print(f"[Client {self.client_id}] Building model architecture...")
-                self.model = self.build_model_from_config(model_config)
-                self.model.set_weights(weights)
-                # Verify model is ready
-                _ = self.model(tf.zeros((1, *model_config['input_shape'])), training=False)
-                print(f"[Client {self.client_id}] Model initialized and verified with global weights")
-        else:
-            if self.model is not None:
-                self.model.set_weights(weights)
-                print(f"\n[Client {self.client_id}] Updated model weights for round {round_num}")
-            else:
-                print(f"[Client {self.client_id}] ERROR: Model not initialized!")
-    
-    def build_model_from_config(self, config):
-        """Build model from server configuration"""
-        # For simplicity, rebuild the full model architecture
-        # This should match the server's model exactly
-        return self.build_eeg_model(
-            input_shape=tuple(config['input_shape']),
-            num_classes=config['num_classes']
-        )
-    
-    def build_eeg_model(self, input_shape, num_classes):
-        """Build CNN+BiLSTM+MHA model for EEG classification"""
-        from tensorflow.keras import layers, Model
-        
-        def se_block(x, r=8):
-            ch = x.shape[-1]
-            s = layers.GlobalAveragePooling1D()(x)
-            s = layers.Dense(max(ch // r, 8), activation='relu')(s)
-            s = layers.Dense(ch, activation='sigmoid', dtype='float32')(s)
-            s = layers.Reshape((1, ch))(s)
-            return layers.Multiply()([x, s])
-        
-        def conv_bn_relu(x, f, k, d=1):
-            x = layers.Conv1D(f, k, padding="same", dilation_rate=d, use_bias=False)(x)
-            x = layers.BatchNormalization()(x)
-            x = layers.ReLU()(x)
-            return x
-        
-        def res_block(x, f, k, d=1):
-            sc = x
-            y = conv_bn_relu(x, f, k, d)
-            y = layers.Conv1D(f, k, padding="same", dilation_rate=d, use_bias=False)(y)
-            y = layers.BatchNormalization()(y)
-            if sc.shape[-1] != f:
-                sc = layers.Conv1D(f, 1, padding="same", use_bias=False)(sc)
-                sc = layers.BatchNormalization()(sc)
-            y = layers.Add()([y, sc])
-            y = layers.ReLU()(y)
-            y = se_block(y)
-            return y
-        
-        inp = layers.Input(shape=input_shape)
-        
-        x = conv_bn_relu(inp, 64, 7, d=1)
-        x = res_block(x, 64, 7, d=1)
-        x = layers.MaxPooling1D(2)(x)
-        
-        # Dilated conv stack
-        for d in [1, 2, 4]:
-            x = res_block(x, 128, 5, d=d)
-        
-        # Temporal modeling
-        x = layers.Bidirectional(
-            layers.LSTM(64, return_sequences=True, dropout=0.25)
-        )(x)
-        
-        # Self-attention
-        attn = layers.MultiHeadAttention(num_heads=4, key_dim=32, dropout=0.1)(x, x)
-        x = layers.Add()([x, attn])
-        x = layers.LayerNormalization()(x)
-        
-        # Pooling and classification
-        x = layers.GlobalAveragePooling1D()(x)
-        x = layers.Dense(256, activation="relu")(x)
-        x = layers.Dropout(0.4)(x)
-        x = layers.Dense(128, activation="relu")(x)
-        x = layers.Dropout(0.35)(x)
-        out = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
-        
-        model = Model(inp, out)
-        
-        # Compile model
-        lr_sched = tf.keras.optimizers.schedules.CosineDecayRestarts(
-            initial_learning_rate=1e-3, first_decay_steps=4, 
-            t_mul=2.0, m_mul=0.8, alpha=1e-5
-        )
-        opt = tf.keras.optimizers.AdamW(
-            learning_rate=lr_sched, weight_decay=1e-4, global_clipnorm=1.0
-        )
-        
-        model.compile(
-            optimizer=opt,
-            loss=tf.keras.losses.CategoricalCrossentropy(),
-            metrics=[
-                tf.keras.metrics.CategoricalAccuracy(name="acc"),
-                tf.keras.metrics.TopKCategoricalAccuracy(k=2, name="top2")
-            ]
-        )
-        
-        return model
-    
-    def handle_training_config(self, payload):
-        """Handle training configuration update"""
-        config = json.loads(payload.decode())
-        self.training_config.update(config)
-        print(f"\n[Client {self.client_id}] Updated training config: {self.training_config}")
-    
-    def handle_start_training(self, payload):
-        """Handle start training command"""
-        data = json.loads(payload.decode())
-        round_num = data['round']
-        self.current_round = round_num
-        
-        print(f"\n{'=' * 70}")
-        print(f"[Client {self.client_id}] Starting training for round {round_num}")
-        print(f"{'=' * 70}")
-        
-        # Wait for model to be initialized (race condition protection)
-        max_wait = 30  # seconds
-        wait_time = 0
-        while self.model is None and wait_time < max_wait:
-            print(f"[Client {self.client_id}] Waiting for model initialization... ({wait_time}s)")
-            time.sleep(1)
-            wait_time += 1
-        
-        if self.model is None:
-            print(f"[Client {self.client_id}] ERROR: Model not initialized after {max_wait}s!")
-            return
-        
-        # Train the model
-        start_time = time.time()
-        history = self.train_local_model()
-        train_time = time.time() - start_time
-        
-        # Send update to server
-        self.send_update_to_server(history, train_time, round_num)
-    
-    def train_local_model(self):
-        """Train the local model"""
-        batch_size = self.training_config['batch_size']
-        epochs = self.training_config['local_epochs']
-        
-        # Create dataset
-        ds_train = self.make_dataset(
-            self.x_train, self.y_train, 
-            batch_size, training=True
-        )
-        
-        # Train
-        print(f"[Client {self.client_id}] Training for {epochs} epochs...")
-        history = self.model.fit(
-            ds_train,
-            epochs=epochs,
-            verbose=2,
-            callbacks=[
-                tf.keras.callbacks.EarlyStopping(
-                    monitor="loss", patience=3,
-                    restore_best_weights=True, verbose=0
-                )
-            ]
-        )
-        
-        return history
-    
-    def send_update_to_server(self, history, train_time, round_num):
-        """Send model update and metrics to server"""
-        # Get updated weights
-        weights = self.model.get_weights()
-        
-        # Prepare update message (use compression if enabled)
-        if self.quantizer is not None:
-            compressed_data = self.quantizer.compress(weights, data_type="weights")
-            # Serialize compressed data to JSON-safe base64 string
-            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
-            update_msg = {
-                "client_id": self.client_id,
-                "round": round_num,
-                "compressed_data": serialized,
-                "num_samples": int(len(self.y_train)),
-                "train_time": float(train_time)
-            }
-        else:
-            encoded_weights = self.serialize_weights(weights)
-            update_msg = {
-                "client_id": self.client_id,
-                "round": round_num,
-                "weights": encoded_weights,
-                "num_samples": int(len(self.y_train)),
-                "train_time": float(train_time)
-            }
-        
-        # Send update
-        print(f"[Client {self.client_id}] Sending update to server...")
-        self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, json.dumps(update_msg), qos=1)
-        
-        # Send metrics
-        final_loss = float(history.history['loss'][-1]) if 'loss' in history.history else 0.0
-        final_acc = float(history.history['acc'][-1]) if 'acc' in history.history else 0.0
-        
-        metrics_msg = {
-            "client_id": self.client_id,
-            "round": round_num,
-            "loss": final_loss,
-            "accuracy": final_acc,
-            "train_time": float(train_time)
-        }
-        
-        self.mqtt_client.publish(TOPIC_CLIENT_METRICS, json.dumps(metrics_msg), qos=1)
-        
-        print(f"[Client {self.client_id}] Update sent successfully")
-        print(f"  Loss: {final_loss:.4f}, Accuracy: {final_acc:.4f}")
-        print(f"  Training time: {train_time:.2f}s")
-    
-    def handle_start_evaluation(self, payload):
-        """Handle start evaluation command"""
-        print(f"\n[Client {self.client_id}] Evaluation requested (no local test set)")
-    
-    def start(self):
-        """Start the client"""
-        print(f"\n{'=' * 70}")
-        print(f"EEG Mental State Recognition - Federated Learning Client {self.client_id}")
-        print(f"{'=' * 70}")
-        print(f"MQTT Broker: {MQTT_BROKER}:{MQTT_PORT}")
-        print(f"Number of clients: {self.num_clients}")
-        print(f"Number of rounds: {NUM_ROUNDS}")
-        print(f"{'=' * 70}\n")
-        
+        """Receive and apply global model from server"""
         try:
-            # Keepalive set to 3600s (1 hour) to prevent timeout during long training
-            self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=3600)
-            self.mqtt_client.loop_forever()
-        except KeyboardInterrupt:
-            print(f"\n[Client {self.client_id}] Interrupted by user")
-            self.mqtt_client.disconnect()
+            data = json.loads(payload.decode()) if isinstance(payload, bytes) else payload
+            round_num = data.get('round', 0)
+            
+            # Check for duplicate (already processed this exact model)
+            if hasattr(self, 'last_global_round') and self.last_global_round == round_num and self.model is not None:
+                print(f"Client {self.client_id} ignoring duplicate global model for round {round_num}")
+                return
+            
+            print(f"Client {self.client_id} received global model (round {round_num})")
+            
+            # Decompress/deserialize weights
+            if 'quantized_data' in data:
+                # Handle quantized/compressed data
+                compressed_data = data['quantized_data']
+                if isinstance(compressed_data, str):
+                    import base64, pickle
+                    compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
+                if hasattr(self, 'quantization') and self.quantization is not None:
+                    weights = self.quantization.decompress(compressed_data)
+                elif hasattr(self, 'quantizer') and self.quantizer is not None:
+                    weights = self.quantizer.decompress(compressed_data)
+                else:
+                    weights = compressed_data
+                print(f"Client {self.client_id} decompressed quantized model")
+            else:
+                # Normal weights
+                if 'weights' in data:
+                    encoded_weights = data['weights']
+                    if isinstance(encoded_weights, str):
+                        import base64, pickle
+                        serialized = base64.b64decode(encoded_weights.encode('utf-8'))
+                        weights = pickle.loads(serialized)
+                    else:
+                        weights = encoded_weights
+                else:
+                    weights = data.get('parameters', [])
+            
+            # Initialize model if not already done (for late-joining or first-time clients)
+            if self.model is None:
+                model_config = data.get('model_config')
+                if model_config:
+                    print(f"Client {self.client_id} initializing model from received configuration...")
+                    self.model = self.build_model_from_config(model_config)
+                    print(f"Client {self.client_id} model built successfully")
+                else:
+                    print(f"Client {self.client_id} WARNING: No model_config in global model, cannot initialize!")
+                    return
+            
+            # Apply received weights
+            self.model.set_weights(weights)
+            self.current_round = round_num
+            if hasattr(self, 'last_global_round'):
+                self.last_global_round = round_num
+            print(f"Client {self.client_id} updated model weights (round {round_num})")
+            
         except Exception as e:
             print(f"\n[Client {self.client_id}] Error: {e}")
             import traceback

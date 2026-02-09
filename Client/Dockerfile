@@ -37,6 +37,12 @@ RUN pip install --no-cache-dir aioquic
 # Copy the Protocols directory for gRPC and DDS
 COPY Protocols/ ./Protocols/
 
+# Compile gRPC protobuf files
+RUN cd Protocols && \
+    python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. federated_learning.proto && \
+    cd ..
+
+COPY packet_logger.py ./
 # Copy the Client directory
 COPY Client/ ./Client/
 
@@ -54,4 +60,4 @@ ENV QUIC_HOST=fl-server
 ENV DDS_DOMAIN_ID=0
 
 # Default command - can be overridden in docker-compose
-CMD ["python", "-u", "../Client/Emotion_Recognition/FL_Client_MQTT.py"]
+CMD ["python", "-u", "Client/Emotion_Recognition/FL_Client_MQTT.py"]

@@ -29,6 +29,22 @@ from data_partitioner import get_client_data, NUM_CLASSES, ID2LBL, LBL2ID
 
 # Suppress TensorFlow warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+# GPU Configuration - Must be done BEFORE TensorFlow import
+# Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
+os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
+
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # GPU Configuration
@@ -471,13 +487,7 @@ class FederatedLearningClient:
                 
                 print(f"Client {self.client_id} built EEG model from server configuration")
                 print(f"  Input shape: {model_config['input_shape']}")
-                print(f"  Output classes: {model_config['num_classes']}")
-            
-            if self.model is None:
-                print(f"Client {self.client_id} ERROR: Model not initialized before setting weights!")
-                return
-            
-            self.model.set_weights(weights)
+                print(f"  Output classes: {model_config['num_classes']}")            self.model.set_weights(weights)
             
             if model_update.model_config:
                 # Verify model is ready (first initialization)

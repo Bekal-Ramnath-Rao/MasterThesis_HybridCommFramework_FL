@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+    <Domain id="any">
+        <General>
+            <!-- Enable unicast-only discovery for Docker/poor networks -->
+            <AllowMulticast>false</AllowMulticast>
+            <!-- Network interface - auto-select -->
+            <NetworkInterfaceAddress>auto</NetworkInterfaceAddress>
+        </General>
+        <Discovery>
+            <!-- Use simple participant discovery protocol (SPDP) with unicast only -->
+            <ParticipantIndex>auto</ParticipantIndex>
+            <!-- CRITICAL: For unicast mode, explicitly list all peer containers -->
+            <!-- This must be configured per-deployment with actual Docker service names -->
+            <Peers>
+                <!-- Example peer entries (replace with actual container names): -->
+                <!-- <Peer address="fl-server-dds-emotion"/> -->
+                <!-- <Peer address="fl-client-dds-emotion-1"/> -->
+                <!-- <Peer address="fl-client-dds-emotion-2"/> -->
+            </Peers>
+        </Discovery>
+        <Internal>
+            <!-- Faster heartbeats for poor networks -->
+            <HeartbeatInterval>500ms</HeartbeatInterval>
+            <!-- Reduce discovery timeout -->
+            <SquashParticipants>false</SquashParticipants>
+        </Internal>
+        <Tracing>
+            <!-- Enable for debugging: none, severe, error, warning, info, config, fine, finer, finest -->
+            <Verbosity>warning</Verbosity>
+            <OutputFile>stderr</OutputFile>
+        </Tracing>
+    </Domain>
+</CycloneDDS>

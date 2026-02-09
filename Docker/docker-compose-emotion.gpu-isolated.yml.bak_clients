@@ -1,0 +1,577 @@
+# Docker Compose for Emotion Recognition with GPU Support (Device-Isolated)
+# This version isolates GPU devices to prevent memory contention between clients
+# Client 1 uses GPU 0, Client 2 uses GPU 1, Server uses both but with memory limits
+# Requires: 2+ NVIDIA GPUs with NVIDIA Container Toolkit
+# Note: Uses Docker Compose V2 syntax (no version: field)
+
+services:
+  mqtt-broker:
+    image: eclipse-mosquitto:latest
+    ports:
+      - "31883:1883"
+      - "39001:9001"
+    volumes:
+      - ../mqtt-config/mosquitto.conf:/mosquitto/config/mosquitto.conf
+    networks:
+      - emotion_network
+    container_name: mqtt-broker
+
+  # ============================================================================
+  # MQTT Protocol Services
+  # ============================================================================
+  
+  fl-server-mqtt-emotion:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=MQTT
+      - USE_CASE=emotion
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
+      - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../Server/Emotion_Recognition/packet_logger.db:/app/Server/Emotion_Recognition/packet_logger.db
+    depends_on:
+      - mqtt-broker
+    networks:
+      - emotion_network
+    container_name: fl-server-mqtt-emotion
+    command: python -u Server/Emotion_Recognition/FL_Server_MQTT.py
+    # Server does not need GPU resources - only aggregates models
+
+  fl-client-mqtt-emotion-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=MQTT
+      - USE_CASE=emotion
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - mqtt-broker
+      - fl-server-mqtt-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-mqtt-emotion-1
+    command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+    volumes:
+      - ../Client/Emotion_Recognition/packet_logger.db:/app/Client/Emotion_Recognition/packet_logger.db
+
+  fl-client-mqtt-emotion-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=MQTT
+      - USE_CASE=emotion
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - mqtt-broker
+      - fl-server-mqtt-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-mqtt-emotion-2
+    command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+    volumes:
+      - ../Client/Emotion_Recognition/packet_logger.db:/app/Client/Emotion_Recognition/packet_logger.db
+
+  # ============================================================================
+  # AMQP Protocol Services
+  # ============================================================================
+  
+  amqp-broker:
+    image: rabbitmq:3.12-management
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    ports:
+      - "35672:5672"
+      - "35671:15672"
+    networks:
+      - emotion_network
+    container_name: amqp-broker
+
+  fl-server-amqp-emotion:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=AMQP
+      - USE_CASE=emotion
+      - AMQP_HOST=amqp-broker
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
+      - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - amqp-broker
+    networks:
+      - emotion_network
+    container_name: fl-server-amqp-emotion
+    command: python -u Server/Emotion_Recognition/FL_Server_AMQP.py
+    # Server does not need GPU resources - only aggregates models
+
+  fl-client-amqp-emotion-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=AMQP
+      - USE_CASE=emotion
+      - AMQP_HOST=amqp-broker
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - amqp-broker
+      - fl-server-amqp-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-amqp-emotion-1
+    command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-amqp-emotion-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=AMQP
+      - USE_CASE=emotion
+      - AMQP_HOST=amqp-broker
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - amqp-broker
+      - fl-server-amqp-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-amqp-emotion-2
+    command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  # ============================================================================
+  # gRPC Protocol Services
+  # ============================================================================
+  
+  fl-server-grpc-emotion:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=gRPC
+      - USE_CASE=emotion
+      - GRPC_PORT=50051
+      - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "50051:50051"
+    networks:
+      - emotion_network
+    container_name: fl-server-grpc-emotion
+    command: python -u Server/Emotion_Recognition/FL_Server_gRPC.py
+    # Server does not need GPU resources - only aggregates models
+
+  fl-client-grpc-emotion-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=gRPC
+      - USE_CASE=emotion
+      - GRPC_HOST=fl-server-grpc-emotion
+      - GRPC_PORT=50051
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-grpc-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-grpc-emotion-1
+    command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-grpc-emotion-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=gRPC
+      - USE_CASE=emotion
+      - GRPC_HOST=fl-server-grpc-emotion
+      - GRPC_PORT=50051
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-grpc-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-grpc-emotion-2
+    command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  # ============================================================================
+  # QUIC Protocol Services
+  # ============================================================================
+  
+  fl-server-quic-emotion:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=QUIC
+      - USE_CASE=emotion
+      - QUIC_PORT=4433
+      - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "4433:4433/udp"
+    volumes:
+      - ../certs:/app/certs:ro
+    networks:
+      - emotion_network
+    container_name: fl-server-quic-emotion
+    command: python -u Server/Emotion_Recognition/FL_Server_QUIC.py
+    # Server runs on CPU to avoid competing for GPU memory with clients
+
+  fl-client-quic-emotion-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=QUIC
+      - USE_CASE=emotion
+      - QUIC_HOST=fl-server-quic-emotion
+      - QUIC_PORT=4433
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-quic-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-quic-emotion-1
+    command: python -u Client/Emotion_Recognition/FL_Client_QUIC.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-quic-emotion-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=QUIC
+      - USE_CASE=emotion
+      - QUIC_HOST=fl-server-quic-emotion
+      - QUIC_PORT=4433
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-quic-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-quic-emotion-2
+    command: python -u Client/Emotion_Recognition/FL_Client_QUIC.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  # ============================================================================
+  # DDS Protocol Services
+  # ============================================================================
+  
+  fl-server-dds-emotion:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=DDS
+      - USE_CASE=emotion
+      - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
+      - LOCAL_EPOCHS=20
+      - DDS_DOMAIN_ID=0
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      #- CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
+    networks:
+      - emotion_network
+    container_name: fl-server-dds-emotion
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+      #- ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+    command: bash -c "sleep 10 && python -u Server/Emotion_Recognition/FL_Server_DDS.py"
+    # Server does not need GPU resources - only aggregates models
+
+  fl-client-dds-emotion-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=DDS
+      - USE_CASE=emotion
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - DDS_DOMAIN_ID=0
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      #- CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
+    depends_on:
+      - fl-server-dds-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-dds-emotion-1
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      #- ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+    command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-dds-emotion-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=DDS
+      - USE_CASE=emotion
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - DDS_DOMAIN_ID=0
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      #- CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
+    depends_on:
+      - fl-server-dds-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-dds-emotion-2
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      #- ../cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
+    command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+networks:
+  emotion_network:
+    driver: bridge

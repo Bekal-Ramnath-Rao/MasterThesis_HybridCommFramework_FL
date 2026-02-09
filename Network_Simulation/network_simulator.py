@@ -121,7 +121,14 @@ class NetworkSimulator:
             return False
     
     def apply_network_conditions(self, container_name: str, conditions: Dict[str, str]):
-        """Apply network conditions to a specific container"""
+        """Apply network conditions to a specific container.
+        
+        Uses a hierarchical qdisc setup when both netem (latency/loss/jitter) and
+        bandwidth limiting (tbf) are needed:
+          root -> netem (handle 1:0) -> tbf (parent 1:1)
+        This avoids the 'root qdisc already exists' error that occurs when trying
+        to add two separate root qdiscs.
+        """
         try:
             print(f"\n{'='*60}")
             print(f"Applying network conditions to: {container_name}")
@@ -152,24 +159,46 @@ class NetworkSimulator:
             if conditions.get("loss"):
                 netem_params.append(f"loss {conditions['loss']}")
             
-            # Apply netem rules
-            if netem_params:
+            has_netem = len(netem_params) > 0
+            has_bandwidth = bool(conditions.get("bandwidth"))
+            
+            if has_netem and has_bandwidth:
+                # Hierarchical setup: netem as root, tbf as child
                 netem_cmd = " ".join(netem_params)
                 self.run_command([
                     "docker", "exec", container_name,
-                    "sh", "-c", f"tc qdisc add dev {interface} root netem {netem_cmd}"
+                    "sh", "-c",
+                    f"tc qdisc add dev {interface} root handle 1: netem {netem_cmd}"
                 ])
-                print(f"✓ Applied: {netem_cmd}")
-            
-            # Apply bandwidth limit if specified
-            if conditions.get("bandwidth"):
+                print(f"  Applied netem (root): {netem_cmd}")
+                
+                self.run_command([
+                    "docker", "exec", container_name,
+                    "sh", "-c",
+                    f"tc qdisc add dev {interface} parent 1:1 handle 10: tbf "
+                    f"rate {conditions['bandwidth']} burst 32kbit latency 400ms"
+                ])
+                print(f"  Applied tbf (child): rate {conditions['bandwidth']}")
+                
+            elif has_netem:
+                # Only netem (latency/loss/jitter), no bandwidth cap
+                netem_cmd = " ".join(netem_params)
+                self.run_command([
+                    "docker", "exec", container_name,
+                    "sh", "-c",
+                    f"tc qdisc add dev {interface} root netem {netem_cmd}"
+                ])
+                print(f"  Applied netem: {netem_cmd}")
+                
+            elif has_bandwidth:
+                # Only bandwidth limit, no netem
                 self.run_command([
                     "docker", "exec", container_name,
                     "sh", "-c", 
                     f"tc qdisc add dev {interface} root tbf rate {conditions['bandwidth']} "
                     f"burst 32kbit latency 400ms"
                 ])
-                print(f"✓ Applied bandwidth limit: {conditions['bandwidth']}")
+                print(f"  Applied tbf: rate {conditions['bandwidth']}")
             
             print(f"{'='*60}\n")
             return True

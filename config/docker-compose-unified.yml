@@ -1,0 +1,236 @@
+version: '3.8'
+
+services:
+  # ============================================================================
+  # MQTT Broker (Always required for control signals)
+  # ============================================================================
+  mqtt-broker:
+    image: eclipse-mosquitto:latest
+    container_name: mqtt-broker-unified
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+    networks:
+      - fl-network
+
+  # ============================================================================
+  # AMQP Broker (RabbitMQ)
+  # ============================================================================
+  amqp-broker:
+    image: rabbitmq:3-management
+    container_name: amqp-broker-unified
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    networks:
+      - fl-network
+
+  # ============================================================================
+  # Federated Learning Server (Unified - All Protocols)
+  # ============================================================================
+  fl-server-unified:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: fl-server-unified
+    depends_on:
+      - mqtt-broker
+      - amqp-broker
+    environment:
+      # Server identification
+      - NODE_TYPE=server
+      
+      # FL Configuration
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+      - MIN_ROUNDS=3
+      - CONVERGENCE_THRESHOLD=0.001
+      - CONVERGENCE_PATIENCE=2
+      
+      # Protocol Endpoints
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
+      - AMQP_BROKER=amqp-broker
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
+      - GRPC_PORT=50051
+      - QUIC_HOST=0.0.0.0
+      - QUIC_PORT=4433
+      - DDS_DOMAIN_ID=0
+      
+      # Optional Features
+      - USE_QUANTIZATION=false
+    ports:
+      - "50051:50051"  # gRPC
+      - "4433:4433"    # QUIC
+    volumes:
+      - ./shared_data:/shared_data
+      - ./results:/app/results
+    networks:
+      - fl-network
+    cap_add:
+      - NET_ADMIN
+    command: python Server/Emotion_Recognition/FL_Server_Unified.py
+
+  # ============================================================================
+  # Federated Learning Client 1 (Unified - RL Protocol Selection)
+  # ============================================================================
+  fl-client-1-unified:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: fl-client-1-unified
+    depends_on:
+      - fl-server-unified
+      - mqtt-broker
+      - amqp-broker
+    environment:
+      # Client identification
+      - NODE_TYPE=client
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      
+      # RL Configuration
+      - USE_RL_SELECTION=true
+      
+      # Protocol Endpoints
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
+      - AMQP_HOST=amqp-broker
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
+      - GRPC_HOST=fl-server-unified
+      - GRPC_PORT=50051
+      - QUIC_HOST=fl-server-unified
+      - QUIC_PORT=4433
+      - DDS_DOMAIN_ID=0
+      
+      # Training Configuration
+      - STEPS_PER_EPOCH=100
+      - VAL_STEPS=25
+      
+      # Optional Features
+      - USE_QUANTIZATION=false
+      
+      # GPU Configuration (if available)
+      - GPU_DEVICE_ID=0
+    volumes:
+      - ./shared_data:/shared_data
+      - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+    networks:
+      - fl-network
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: python Client/Emotion_Recognition/FL_Client_Unified.py
+
+  # ============================================================================
+  # Federated Learning Client 2 (Unified - RL Protocol Selection)
+  # ============================================================================
+  fl-client-2-unified:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: fl-client-2-unified
+    depends_on:
+      - fl-server-unified
+      - mqtt-broker
+      - amqp-broker
+    environment:
+      # Client identification
+      - NODE_TYPE=client
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      
+      # RL Configuration
+      - USE_RL_SELECTION=true
+      
+      # Protocol Endpoints
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
+      - AMQP_HOST=amqp-broker
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
+      - GRPC_HOST=fl-server-unified
+      - GRPC_PORT=50051
+      - QUIC_HOST=fl-server-unified
+      - QUIC_PORT=4433
+      - DDS_DOMAIN_ID=0
+      
+      # Training Configuration
+      - STEPS_PER_EPOCH=100
+      - VAL_STEPS=25
+      
+      # Optional Features
+      - USE_QUANTIZATION=false
+      
+      # GPU Configuration (if available)
+      - GPU_DEVICE_ID=1
+    volumes:
+      - ./shared_data:/shared_data
+      - ./Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+    networks:
+      - fl-network
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: python Client/Emotion_Recognition/FL_Client_Unified.py
+
+networks:
+  fl-network:
+    driver: bridge
+
+# ============================================================================
+# Volume Explanations:
+# ============================================================================
+# shared_data/ - Shared directory for packet logs
+#   - packet_logs_server.db - Server packet logs
+#   - packet_logs_client_1.db - Client 1 packet logs
+#   - packet_logs_client_2.db - Client 2 packet logs
+#   
+# results/ - FL training results and metrics
+#
+# Dataset/ - Training data for each client
+# ============================================================================
+
+# ============================================================================
+# Usage:
+# ============================================================================
+# Start all services:
+#   docker-compose -f docker-compose-unified.yml up --build
+#
+# Start with specific number of clients:
+#   docker-compose -f docker-compose-unified.yml up --build --scale fl-client-unified=3
+#
+# View logs:
+#   docker-compose -f docker-compose-unified.yml logs -f fl-server-unified
+#   docker-compose -f docker-compose-unified.yml logs -f fl-client-1-unified
+#
+# Stop all services:
+#   docker-compose -f docker-compose-unified.yml down
+#
+# View packet logs on host:
+#   ls -lh shared_data/
+#   sqlite3 shared_data/packet_logs_server.db "SELECT * FROM sent_packets LIMIT 10;"
+#   sqlite3 shared_data/packet_logs_client_1.db "SELECT * FROM received_packets LIMIT 10;"
+# ============================================================================

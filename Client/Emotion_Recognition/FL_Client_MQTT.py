@@ -1,6 +1,4 @@
 import numpy as np
-import pandas as pd
-import math
 import os
 import sys
 import logging
@@ -14,8 +12,16 @@ import paho.mqtt.client as mqtt
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
-gpu_device = os.environ.get("GPU_DEVICE_ID", "0")
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(0)  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
 os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
 os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
 
@@ -26,10 +32,20 @@ import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, Dense, Dropout, Flatten, Input
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.optimizers.schedules import ExponentialDecay
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from sklearn.preprocessing import MinMaxScaler
 
+# Detect Docker environment and set project root accordingly
+if os.path.exists('/app'):
+    # Likely running in Docker, code is under /app
+    project_root = '/app'
+else:
+    # Local development: go up two levels from this file
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+    
+from packet_logger import log_sent_packet, log_received_packet, init_db
 # Make TensorFlow logs less verbose
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
@@ -71,7 +87,8 @@ if compression_path not in sys.path:
 from quantization_client import Quantization, QuantizationConfig
 
 # MQTT Configuration
-MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")  # MQTT broker address
+# Auto-detect environment: Docker (/app exists) or local
+MQTT_BROKER = os.getenv("MQTT_BROKER", 'mqtt-broker' if os.path.exists('/app') else 'localhost')
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))  # MQTT broker port
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))  # Can be set via environment variable
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
@@ -104,6 +121,9 @@ class FederatedLearningClient:
         
         # Model will be initialized from server config
         self.model = None
+
+        # Initialize packet logger database
+        init_db()
         
         # Initialize quantization compression (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
@@ -119,9 +139,10 @@ class FederatedLearningClient:
         # Use MQTTv5 for better large message handling
         self.mqtt_client = mqtt.Client(client_id=f"fl_client_{client_id}", protocol=mqtt.MQTTv311)
         self.mqtt_client.max_inflight_messages_set(20)
-        self.mqtt_client.max_queued_messages_set(0)  # Unlimited queue
-        # Set max packet size to 20MB (20 * 1024 * 1024)
-        self.mqtt_client._max_packet_size = 20 * 1024 * 1024
+        # FAIR CONFIG: Limited queue to 1000 messages (aligned with AMQP/gRPC)
+        self.mqtt_client.max_queued_messages_set(1000)
+        # FAIR CONFIG: Set max packet size to 128MB (aligned with AMQP default)
+        self.mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
         self.mqtt_client.on_disconnect = self.on_disconnect
@@ -138,6 +159,51 @@ class FederatedLearningClient:
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
+    
+    def build_model_from_config(self, model_config):
+        """Build CNN model from server-provided configuration"""
+        input_shape = model_config.get('input_shape', (48, 48, 1))
+        num_classes = model_config.get('num_classes', 7)
+        layers = model_config.get('layers', [
+            {'type': 'conv', 'filters': 64, 'kernel': 3, 'activation': 'relu'},
+            {'type': 'maxpool', 'pool_size': 2},
+            {'type': 'conv', 'filters': 128, 'kernel': 3, 'activation': 'relu'},
+            {'type': 'maxpool', 'pool_size': 2},
+            {'type': 'conv', 'filters': 256, 'kernel': 3, 'activation': 'relu'},
+            {'type': 'maxpool', 'pool_size': 2},
+            {'type': 'flatten'},
+            {'type': 'dense', 'units': 256, 'activation': 'relu'},
+            {'type': 'dropout', 'rate': 0.5},
+            {'type': 'dense', 'units': num_classes, 'activation': 'softmax'}
+        ])
+        
+        model = tf.keras.Sequential()
+        model.add(tf.keras.layers.Input(shape=input_shape))
+        
+        for layer in layers:
+            if layer['type'] == 'conv':
+                model.add(tf.keras.layers.Conv2D(
+                    layer['filters'], 
+                    layer['kernel'], 
+                    activation=layer['activation'],
+                    padding='same'
+                ))
+            elif layer['type'] == 'maxpool':
+                model.add(tf.keras.layers.MaxPooling2D(layer['pool_size']))
+            elif layer['type'] == 'flatten':
+                model.add(tf.keras.layers.Flatten())
+            elif layer['type'] == 'dense':
+                model.add(tf.keras.layers.Dense(layer['units'], activation=layer['activation']))
+            elif layer['type'] == 'dropout':
+                model.add(tf.keras.layers.Dropout(layer['rate']))
+        
+        model.compile(
+            optimizer='adam',
+            loss='categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        
+        return model
     
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
@@ -166,6 +232,14 @@ class FederatedLearningClient:
             # Send registration message
             self.mqtt_client.publish("fl/client_register", 
                                     json.dumps({"client_id": self.client_id}), qos=1)
+            log_sent_packet(
+                packet_size=len(json.dumps({"client_id": self.client_id})),
+                peer="fl/client_register",  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="any additional info"
+            )
+            
             print(f"  Registration message sent")
         else:
             print(f"Client {self.client_id} failed to connect, return code {rc}")
@@ -174,6 +248,13 @@ class FederatedLearningClient:
         """Callback when message received"""
         try:
             print(f"Client {self.client_id} received message on topic: {msg.topic}, size: {len(msg.payload)} bytes")
+            log_received_packet(
+                packet_size=len(msg.payload),
+                peer=msg.topic,  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info=msg.topic
+            )
             
             if msg.topic == TOPIC_GLOBAL_MODEL:
                 self.handle_global_model(msg.payload)
@@ -243,9 +324,9 @@ class FederatedLearningClient:
                 encoded_weights = data['weights']
                 weights = self.deserialize_weights(encoded_weights)
             
-            if round_num == 0:
-                # Initial model from server - create model from server's config
-                print(f"Client {self.client_id} received initial global model from server")
+            # Initialize model if not yet created (works for any round)
+            if self.model is None:
+                print(f"Client {self.client_id} initializing model from server (round {round_num})")
                 
                 model_config = data.get('model_config')
                 if model_config:
@@ -289,12 +370,9 @@ class FederatedLearningClient:
                 print(f"Client {self.client_id} model initialized with server weights")
                 self.current_round = 0
                 # Mark initial global model processed to ignore duplicates
-                self.last_global_round = 0
+                self.last_global_round = round_num
             else:
-                # Updated model after aggregation
-                if self.model is None:
-                    print(f"Client {self.client_id} ERROR: Received model for round {round_num} but local model not initialized!")
-                    return
+                # Updated model after aggregation (model already initialized)
                 self.model.set_weights(weights)
                 self.current_round = round_num
                 self.last_global_round = round_num
@@ -316,8 +394,7 @@ class FederatedLearningClient:
         
         # Check if model is initialized
         if self.model is None:
-            print(f"Client {self.client_id} ERROR: Model not initialized yet, cannot start training for round {round_num}")
-            print(f"Client {self.client_id} waiting for global model from server...")
+            print(f"Client {self.client_id} waiting for global model (not yet initialized)...")
             return
         
         # Check for duplicate training signals
@@ -325,22 +402,11 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} ignoring duplicate start training for round {round_num}")
             return
         
-        # Check if we're ready for this round
-        if self.current_round == 0 and round_num == 1:
-            # First training round with initial global model
-            self.current_round = round_num
-            self.last_training_round = round_num
-            print(f"\nClient {self.client_id} starting training for round {round_num} with initial global model...")
-            self.train_local_model()
-        elif round_num >= self.current_round and round_num <= self.current_round + 1:
-            # Next round - use model from current_round (might be round_num-1 if global model arrives late)
-            # This handles race condition where start_training arrives before global_model
-            self.current_round = round_num
-            self.last_training_round = round_num
-            print(f"\nClient {self.client_id} starting training for round {round_num}...")
-            self.train_local_model()
-        else:
-            print(f"Client {self.client_id} round mismatch - received signal for round {round_num}, currently at {self.current_round}")
+        # Start training regardless of round number (generic approach)
+        self.current_round = round_num
+        self.last_training_round = round_num
+        print(f"\nClient {self.client_id} starting training for round {round_num}...")
+        self.train_local_model()
     
     def handle_start_evaluation(self, payload):
         """Start evaluation when server signals"""
@@ -349,22 +415,20 @@ class FederatedLearningClient:
         
         # Check if model is initialized
         if self.model is None:
-            print(f"Client {self.client_id} ERROR: Model not initialized yet, cannot evaluate for round {round_num}")
+            print(f"Client {self.client_id} waiting for global model (not yet initialized)...")
             return
         
-        if round_num == self.current_round:
-            if round_num in self.evaluated_rounds:
-                print(f"Client {self.client_id} ignoring duplicate evaluation for round {round_num}")
-                return
-            print(f"Client {self.client_id} starting evaluation for round {round_num}...")
-            self.evaluate_model()
-            # After evaluation, prepare for next round
-            # Do NOT increment current_round here; wait for server's start_training signal
-            # to advance to the next round. This keeps round alignment consistent.
-            self.evaluated_rounds.add(round_num)
-            print(f"Client {self.client_id} evaluation completed for round {round_num}. Awaiting start_training for round {round_num + 1}.")
-        else:
-            print(f"Client {self.client_id} skipping evaluation signal for round {round_num} (current: {self.current_round})")
+        # Check for duplicate evaluation signals
+        if round_num in self.evaluated_rounds:
+            print(f"Client {self.client_id} ignoring duplicate evaluation for round {round_num}")
+            return
+        
+        # Evaluate regardless of round number (generic approach)
+        self.current_round = round_num
+        print(f"Client {self.client_id} starting evaluation for round {round_num}...")
+        self.evaluate_model()
+        self.evaluated_rounds.add(round_num)
+        print(f"Client {self.client_id} evaluation completed for round {round_num}")
     
     def train_local_model(self):
         """Train model on local data and send updates to server"""
@@ -378,39 +442,6 @@ class FederatedLearningClient:
             steps_per_epoch = 100
             val_steps = 25
         
-        # Add training progress callbacks
-        class BatchLogger(tf.keras.callbacks.Callback):
-            def __init__(self, client_id: int, frequency: int = 100):
-                super().__init__()
-                self.client_id = client_id
-                self.frequency = frequency
-            def on_train_batch_end(self, batch, logs=None):
-                if batch % self.frequency == 0:
-                    logs = logs or {}
-                    loss = logs.get('loss')
-                    acc = logs.get('accuracy')
-                    try:
-                        print(f"[BatchLogger] Client {self.client_id} batch {batch}: loss={loss:.4f}, acc={acc:.4f}")
-                    except Exception:
-                        print(f"[BatchLogger] Client {self.client_id} batch {batch}: logs={logs}")
-
-        class EpochLogger(tf.keras.callbacks.Callback):
-            def __init__(self, client_id: int, total_epochs: int):
-                super().__init__()
-                self.client_id = client_id
-                self.total_epochs = total_epochs
-            def on_epoch_end(self, epoch, logs=None):
-                logs = logs or {}
-                loss = logs.get('loss')
-                acc = logs.get('accuracy')
-                val_loss = logs.get('val_loss')
-                val_acc = logs.get('val_accuracy')
-                try:
-                    print(f"[EpochLogger] Client {self.client_id} epoch {epoch+1}/{self.total_epochs}: "
-                          f"loss={loss:.4f}, acc={acc:.4f}, val_loss={val_loss:.4f}, val_acc={val_acc:.4f}")
-                except Exception:
-                    print(f"[EpochLogger] Client {self.client_id} epoch {epoch+1}/{self.total_epochs}: logs={logs}")
-
         # Train the model using generator
         history = self.model.fit(
             self.train_generator,
@@ -418,8 +449,7 @@ class FederatedLearningClient:
             validation_data=self.validation_generator,
             steps_per_epoch=steps_per_epoch,
             validation_steps=val_steps,
-            verbose=2,
-            callbacks=[BatchLogger(self.client_id), EpochLogger(self.client_id, epochs)]
+            verbose=2
         )
         
         # Get updated weights
@@ -477,6 +507,13 @@ class FederatedLearningClient:
             # Use QoS 1 for reliable delivery of large model update messages
             result = self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, payload, qos=1)
             
+            log_sent_packet(
+                packet_size=len(payload),
+                peer=TOPIC_CLIENT_UPDATE,  # or client_id/server_id as appropriate
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="any additional info"
+            )
             # Wait for the message to be published
             result.wait_for_publish(timeout=30)
             
@@ -510,6 +547,13 @@ class FederatedLearningClient:
         }
         
         self.mqtt_client.publish(TOPIC_CLIENT_METRICS, json.dumps(metrics_message))
+        log_sent_packet(
+            packet_size=len(json.dumps(metrics_message)),
+            peer=TOPIC_CLIENT_METRICS,  # or client_id/server_id as appropriate
+            protocol="MQTT",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="any additional info"
+        )
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
     
     def start(self):
@@ -523,7 +567,8 @@ class FederatedLearningClient:
                 # Use 1 hour keepalive (3600 seconds) to prevent timeout during long training
                 # Enable automatic reconnection on connection loss
                 self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=120)
-                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 3600)
+                # FAIR CONFIG: keepalive 600s for very_poor network
+                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 600)
                 print(f"Successfully connected to MQTT broker!\n")
                 self.mqtt_client.loop_forever(retry_first_connection=True)
                 break

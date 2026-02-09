@@ -1210,6 +1210,108 @@
             }
         },
         {
+            "name": "RL Protocol Selector Test - Emotion",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/rl_q_learning_selector.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1"
+            },
+            "presentation": {
+                "hidden": false,
+                "group": "RL Testing",
+                "order": 1
+            }
+        },
+        {
+            "name": "RL Unified Client 1- Emotion (Local)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_Unified.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "1",
+                "NUM_CLIENTS": "2",
+                "USE_RL_SELECTION": "true",
+                "DEFAULT_PROTOCOL": "mqtt",
+                "MQTT_BROKER": "localhost",
+                "AMQP_HOST": "localhost",
+                "GRPC_HOST": "localhost",
+                "GRPC_PORT": "50051",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433",
+                "DDS_DOMAIN_ID": "0"
+            },
+            "presentation": {
+                "hidden": false,
+                "group": "RL Testing",
+                "order": 2
+            }
+        },
+        {
+            "name": "RL Unified Client 2- Emotion (Local)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Client/Emotion_Recognition/FL_Client_Unified.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Client/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "CLIENT_ID": "2",
+                "NUM_CLIENTS": "2",
+                "USE_RL_SELECTION": "true",
+                "DEFAULT_PROTOCOL": "mqtt",
+                "MQTT_BROKER": "localhost",
+                "AMQP_HOST": "localhost",
+                "GRPC_HOST": "localhost",
+                "GRPC_PORT": "50051",
+                "QUIC_HOST": "localhost",
+                "QUIC_PORT": "4433",
+                "DDS_DOMAIN_ID": "0"
+            },
+            "presentation": {
+                "hidden": false,
+                "group": "RL Testing",
+                "order": 2
+            }
+
+        },
+        {
+            "name": "RL Unified Server - Emotion (Local)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/Server/Emotion_Recognition/FL_Server_Unified.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/Server/Emotion_Recognition",
+            "justMyCode": true,
+            "env": {
+                "PYTHONUNBUFFERED": "1",
+                "NUM_CLIENTS": "2",
+                "NUM_ROUNDS": "10",
+                "MQTT_BROKER": "localhost",
+                "AMQP_BROKER": "localhost",
+                "GRPC_PORT": "50051",
+                "QUIC_HOST": "0.0.0.0",
+                "QUIC_PORT": "4433",
+                "DDS_DOMAIN_ID": "0",
+                "CONVERGENCE_THRESHOLD": "0.001",
+                "CONVERGENCE_PATIENCE": "2",
+                "MIN_ROUNDS": "3"
+            },
+            "presentation": {
+                "hidden": false,
+                "group": "RL Testing",
+                "order": 3
+            }
+        },
+        {
             "name": "MentalState: Server MQTT - Local (2 Clients)",
             "type": "debugpy",
             "request": "launch",
@@ -2125,7 +2227,19 @@
                 "group": "MentalState Recognition",
                 "order": 10
             }
+        },
+        {
+            "name": "RL System Test - Unified Server + Client (Emotion)",
+            "configurations": [
+                "RL Unified Server - Emotion (Local)",
+                "RL Unified Client - Emotion (Local)"
+            ],
+            "stopAll": true,
+            "presentation": {
+                "hidden": false,
+                "group": "RL Testing",
+                "order": 1
+            }
         }
     ]
 }
-

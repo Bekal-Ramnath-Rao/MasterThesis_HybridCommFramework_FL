@@ -19,6 +19,22 @@ from data_partitioner import get_client_data, NUM_CLASSES, ID2LBL, LBL2ID
 
 # Suppress TensorFlow warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+# GPU Configuration - Must be done BEFORE TensorFlow import
+# Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
+# Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
+# This ensures different clients use different GPUs in multi-GPU setups
+client_id_env = os.environ.get("CLIENT_ID", "0")
+try:
+    default_gpu = str(max(0, int(client_id_env) - 1))  # Client 1->GPU 0, Client 2->GPU 1, etc.
+except (ValueError, TypeError):
+    default_gpu = "0"
+gpu_device = os.environ.get("GPU_DEVICE_ID", default_gpu)
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_device  # Isolate to specific GPU
+print(f"GPU Configuration: CLIENT_ID={client_id_env}, GPU_DEVICE_ID={gpu_device}, CUDA_VISIBLE_DEVICES={gpu_device}")
+os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"  # Allow gradual GPU memory growth
+os.environ["TF_GPU_THREAD_MODE"] = "gpu_private"  # GPU thread mode
+
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # GPU Configuration
@@ -68,6 +84,9 @@ DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 
+# Chunking configuration for large messages
+CHUNK_SIZE = 64 * 1024  # 64KB chunks for better DDS performance in poor networks
+
 # Training Configuration
 AUTOTUNE = tf.data.AUTOTUNE
 SMOOTH_EPS = 0.05
@@ -102,10 +121,31 @@ class GlobalModel(IdlStruct):
 
 
 @dataclass
+class GlobalModelChunk(IdlStruct):
+    round: int
+    chunk_id: int
+    total_chunks: int
+    payload: sequence[int]
+    model_config_json: str = ""  # JSON string containing model configuration
+
+
+@dataclass
 class ModelUpdate(IdlStruct):
     client_id: int
     round: int
     weights: sequence[int]
+    num_samples: int
+    loss: float
+    accuracy: float
+
+
+@dataclass
+class ModelUpdateChunk(IdlStruct):
+    client_id: int
+    round: int
+    chunk_id: int
+    total_chunks: int
+    payload: sequence[int]
     num_samples: int
     loss: float
     accuracy: float
@@ -154,6 +194,10 @@ class FederatedLearningClient:
         }
         self.class_weights = None
         self.running = True
+        
+        # Chunk reassembly buffers
+        self.global_model_chunks = {}  # {chunk_id: payload}
+        self.global_model_metadata = {}  # {round, total_chunks, model_config_json}
         
         # DDS entities
         self.participant = None
@@ -353,6 +397,35 @@ class FederatedLearningClient:
         """Deserialize model weights received from DDS"""
         return pickle.loads(bytes(serialized_weights))
     
+    def split_into_chunks(self, data):
+        """Split serialized data into chunks of CHUNK_SIZE"""
+        chunks = []
+        for i in range(0, len(data), CHUNK_SIZE):
+            chunks.append(data[i:i + CHUNK_SIZE])
+        return chunks
+    
+    def send_model_update_chunked(self, round_num, serialized_weights, num_samples, loss, accuracy):
+        """Send model update as chunks"""
+        chunks = self.split_into_chunks(serialized_weights)
+        total_chunks = len(chunks)
+        
+        print(f"Client {self.client_id}: Sending model update in {total_chunks} chunks ({len(serialized_weights)} bytes total)")
+        
+        for chunk_id, chunk_data in enumerate(chunks):
+            chunk = ModelUpdateChunk(
+                client_id=self.client_id,
+                round=round_num,
+                chunk_id=chunk_id,
+                total_chunks=total_chunks,
+                payload=chunk_data,
+                num_samples=num_samples,
+                loss=loss,
+                accuracy=accuracy
+            )
+            self.writers['model_update_chunk'].write(chunk)
+            print(f"  Sent chunk {chunk_id + 1}/{total_chunks} ({len(chunk_data)} bytes)")
+            time.sleep(0.05)  # Small delay between chunks
+    
     def setup_dds(self):
         """Initialize DDS participant, topics, readers, and writers"""
         print(f"Setting up DDS on domain {DDS_DOMAIN_ID}...")
@@ -360,11 +433,18 @@ class FederatedLearningClient:
         # Create domain participant
         self.participant = DomainParticipant(DDS_DOMAIN_ID)
         
-        # Create QoS policy for reliable communication
+        # Reliable QoS for critical control messages (registration, config, commands)
+        # TransientLocal durability ensures messages survive discovery delays
         reliable_qos = Qos(
             Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
-            Policy.History.KeepAll,
+            Policy.History.KeepLast(10),
             Policy.Durability.TransientLocal
+        )
+
+        # Best effort QoS for large data transfers (model chunks)
+        best_effort_qos = Qos(
+            Policy.Reliability.BestEffort(),
+            Policy.History.KeepLast(1),
         )
         
         # Create topics
@@ -372,32 +452,43 @@ class FederatedLearningClient:
         topic_config = Topic(self.participant, "TrainingConfig", TrainingConfig)
         topic_command = Topic(self.participant, "TrainingCommand", TrainingCommand)
         topic_global_model = Topic(self.participant, "GlobalModel", GlobalModel)
+        topic_global_model_chunk = Topic(self.participant, "GlobalModelChunk", GlobalModelChunk)
         topic_model_update = Topic(self.participant, "ModelUpdate", ModelUpdate)
+        topic_model_update_chunk = Topic(self.participant, "ModelUpdateChunk", ModelUpdateChunk)
         topic_metrics = Topic(self.participant, "EvaluationMetrics", EvaluationMetrics)
         topic_status = Topic(self.participant, "ServerStatus", ServerStatus)
         
-        # Create readers with reliable QoS
+        # Create readers (for receiving from server)
+        # Use Reliable QoS for config and commands (critical control messages)
         self.readers['config'] = DataReader(self.participant, topic_config, qos=reliable_qos)
         self.readers['command'] = DataReader(self.participant, topic_command, qos=reliable_qos)
-        self.readers['global_model'] = DataReader(self.participant, topic_global_model, qos=reliable_qos)
-        self.readers['status'] = DataReader(self.participant, topic_status, qos=reliable_qos)
+        # Use BestEffort for chunked model data
+        self.readers['global_model'] = DataReader(self.participant, topic_global_model, qos=best_effort_qos)
+        self.readers['global_model_chunk'] = DataReader(self.participant, topic_global_model_chunk, qos=best_effort_qos)
+        self.readers['status'] = DataReader(self.participant, topic_status, qos=best_effort_qos)
         
-        # Create writers with reliable QoS
+        # Create writers (for sending to server)
+        # Use Reliable QoS for registration (critical to ensure server receives it)
         self.writers['registration'] = DataWriter(self.participant, topic_registration, qos=reliable_qos)
-        self.writers['model_update'] = DataWriter(self.participant, topic_model_update, qos=reliable_qos)
-        self.writers['metrics'] = DataWriter(self.participant, topic_metrics, qos=reliable_qos)
+        # Use BestEffort for chunked data and metrics
+        self.writers['model_update'] = DataWriter(self.participant, topic_model_update, qos=best_effort_qos)
+        self.writers['model_update_chunk'] = DataWriter(self.participant, topic_model_update_chunk, qos=best_effort_qos)
+        self.writers['metrics'] = DataWriter(self.participant, topic_metrics, qos=best_effort_qos)
+
+        print(f"Client {self.client_id} DDS setup complete (Reliable QoS for control, BestEffort for data)")
+        time.sleep(2.0)  # Wait for DDS endpoint discovery
         
-        print(f"Client {self.client_id} DDS setup complete with RELIABLE QoS")
-        time.sleep(2)
-        
-        # Register with server
+        # Register with server (send multiple times for reliability)
         registration = ClientRegistration(
             client_id=self.client_id,
             message=f"Client {self.client_id} ready"
         )
-        print(f"[DEBUG] Client {self.client_id} sending registration to server")
-        self.writers['registration'].write(registration)
-        print(f"Client {self.client_id} registered with server\n")
+        print(f"Client {self.client_id} sending registration...")
+        for i in range(3):
+            self.writers['registration'].write(registration)
+            print(f"  Registration attempt {i+1}/3")
+            time.sleep(0.3)
+        print(f"Client {self.client_id} registration sent\n")
     
     def run(self):
         """Main client loop"""
@@ -431,11 +522,9 @@ class FederatedLearningClient:
             self.cleanup()
     
     def get_training_config(self):
-        """Get training configuration from server"""
-        timeout = 10
-        start_time = time.time()
+        """Get training configuration from server (no timeout)"""
         
-        while time.time() - start_time < timeout:
+        while True:  # Wait indefinitely for config
             samples = self.readers['config'].take()
             for sample in samples:
                 if sample:
@@ -470,46 +559,101 @@ class FederatedLearningClient:
                         print(f"\nClient {self.client_id} starting training for round {self.current_round} with initial global model...")
                         self.train_local_model()
                     elif sample.round > self.current_round:
-                        if self.model is None:
-                            print(f"Client {self.client_id} ERROR: Model not initialized!")
-                            return
+                        # Subsequent rounds
                         self.current_round = sample.round
                         print(f"\nClient {self.client_id} starting training for round {self.current_round}...")
                         self.train_local_model()
     
     def check_global_model(self):
-        """Check for global model updates from server"""
-        samples = self.readers['global_model'].take()
+        """Check for global model updates from server (chunked version)"""
+        # Check for chunked global model
+        chunk_samples = self.readers['global_model_chunk'].take()
         
-        for sample in samples:
-            if sample:
-                round_num = sample.round
-                weights = self.deserialize_weights(sample.weights)
+        for sample in chunk_samples:
+            if not sample or not hasattr(sample, 'round'):
+                continue
+            
+            round_num = sample.round
+            chunk_id = sample.chunk_id
+            total_chunks = sample.total_chunks
+            
+            # Initialize buffers if needed
+            if not self.global_model_metadata:
+                self.global_model_metadata = {
+                    'round': round_num,
+                    'total_chunks': total_chunks,
+                    'model_config_json': sample.model_config_json if hasattr(sample, 'model_config_json') else ''
+                }
+                print(f"Client {self.client_id}: Receiving global model in {total_chunks} chunks...")
+            
+            # Store chunk
+            self.global_model_chunks[chunk_id] = sample.payload
+            print(f"Client {self.client_id}: Received chunk {chunk_id + 1}/{total_chunks}")
+            
+            # Check if all chunks received
+            if len(self.global_model_chunks) == total_chunks:
+                print(f"Client {self.client_id}: All chunks received, reassembling...")
                 
-                if round_num == 0:
-                    print(f"[DEBUG] Client {self.client_id} received initial model - round={round_num}, has_config={hasattr(sample, 'model_config_json') and bool(sample.model_config_json)}")
-                    print(f"Client {self.client_id} received initial global model from server")
-                    
-                    if hasattr(sample, 'model_config_json') and sample.model_config_json:
-                        model_config = json.loads(sample.model_config_json)
-                        self.model = self.build_eeg_model(
-                            input_shape=tuple(model_config['input_shape']),
-                            num_classes=model_config['num_classes']
-                        )
-                        print(f"Client {self.client_id} built EEG model from server configuration")
-                        print(f"  Input shape: {model_config['input_shape']}")
-                        print(f"  Output classes: {model_config['num_classes']}")
+                # Reassemble chunks in order
+                reassembled_data = []
+                for i in range(total_chunks):
+                    if i in self.global_model_chunks:
+                        reassembled_data.extend(self.global_model_chunks[i])
                     else:
-                        # Default EEG model
-                        self.model = self.build_eeg_model((256, 20), NUM_CLASSES)
-                        print(f"Client {self.client_id} using default EEG model architecture")
+                        print(f"ERROR: Missing chunk {i}")
+                        break
+                
+                # Only process if we have all chunks
+                if len(reassembled_data) > 0:
+                    # Deserialize and potentially decompress weights
+                    raw_weights = self.deserialize_weights(reassembled_data)
                     
-                    self.model.set_weights(weights)
-                    print(f"Client {self.client_id} model initialized with server weights")
-                    self.current_round = 0
-                elif round_num == self.current_round:
-                    self.model.set_weights(weights)
-                    print(f"Client {self.client_id} received global model for round {self.current_round}")
+                    # Check if weights are compressed (quantized)
+                    if isinstance(raw_weights, dict) and 'compressed_data' in raw_weights:
+                        if self.quantizer is not None:
+                            weights = self.quantizer.decompress(raw_weights)
+                            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+                        else:
+                            print(f"Client {self.client_id}: ERROR - Received quantized data but quantizer not initialized!")
+                            # Clear buffers and continue
+                            self.global_model_chunks.clear()
+                            self.global_model_metadata.clear()
+                            continue
+                    else:
+                        weights = raw_weights
+                    
+                    # Check if model needs initialization (works for late-joiners too)
+                    if self.model is None:
+                        print(f"Client {self.client_id} received initial global model from server (round {round_num})")
+                        
+                        # Parse model config if available
+                        model_config_json = self.global_model_metadata.get('model_config_json', '')
+                        if model_config_json:
+                            model_config = json.loads(model_config_json)
+                            self.model = self.build_eeg_model(
+                                input_shape=tuple(model_config['input_shape']),
+                                num_classes=model_config['num_classes']
+                            )
+                            print(f"Client {self.client_id} built EEG model from server configuration")
+                            print(f"  Input shape: {model_config['input_shape']}")
+                            print(f"  Output classes: {model_config['num_classes']}")
+                        else:
+                            # Default EEG model
+                            self.model = self.build_eeg_model((256, 20), NUM_CLASSES)
+                            print(f"Client {self.client_id} using default EEG model architecture")
+                        
+                        # Set the initial weights from server
+                        self.model.set_weights(weights)
+                        print(f"Client {self.client_id} model initialized with server weights")
+                        self.current_round = 0
+                    elif round_num == self.current_round:
+                        # Updated model after aggregation
+                        self.model.set_weights(weights)
+                        print(f"Client {self.client_id} received global model for round {self.current_round}")
+                    
+                    # Clear chunk buffers
+                    self.global_model_chunks.clear()
+                    self.global_model_metadata.clear()
     
     def train_local_model(self):
         """Train model on local data and send updates to server"""
@@ -547,7 +691,8 @@ class FederatedLearningClient:
             compressed_data = self.quantizer.compress(weights, data_type="weights")
             stats = self.quantizer.get_compression_stats(weights, compressed_data)
             print(f"Client {self.client_id}: Compressed weights - Ratio: {stats['compression_ratio']:.2f}x, Size: {stats['compressed_size_mb']:.2f}MB")
-            serialized_weights = compressed_data
+            # Serialize compressed data (pickle + convert to list of ints for DDS)
+            serialized_weights = list(pickle.dumps(compressed_data))
         else:
             serialized_weights = self.serialize_weights(weights)
         
@@ -556,16 +701,14 @@ class FederatedLearningClient:
         print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
         time.sleep(delay)
         
-        # Send model update to server
-        update = ModelUpdate(
-            client_id=self.client_id,
-            round=self.current_round,
-            weights=serialized_weights,
-            num_samples=int(len(self.y_train)),
-            loss=final_loss,
-            accuracy=final_acc
+        # Send model update to server using chunking
+        self.send_model_update_chunked(
+            self.current_round,
+            serialized_weights,
+            int(len(self.y_train)),
+            final_loss,
+            final_acc
         )
-        self.writers['model_update'].write(update)
         
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
         print(f"Training metrics - Loss: {final_loss:.4f}, Accuracy: {final_acc:.4f}")

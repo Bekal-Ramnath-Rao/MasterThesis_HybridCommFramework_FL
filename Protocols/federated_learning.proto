@@ -14,7 +14,7 @@ service FederatedLearning {
     rpc SendModelUpdate(ModelUpdate) returns (UpdateResponse);
     
     // Client sends evaluation metrics to server
-    rpc SendMetrics(EvaluationMetrics) returns (MetricsResponse);
+    rpc SendMetrics(Metrics) returns (MetricsResponse);
     
     // Get training configuration
     rpc GetTrainingConfig(ConfigRequest) returns (TrainingConfig);
@@ -58,16 +58,24 @@ message UpdateResponse {
     string message = 2;
 }
 
-message EvaluationMetrics {
+message Metrics {
     int32 client_id = 1;
     int32 round = 2;
     int32 num_samples = 3;
-    map<string, double> metrics = 4;
+    double loss = 4;
+    double accuracy = 5;
 }
 
 message MetricsResponse {
     bool success = 1;
     string message = 2;
+}
+
+message EvaluationMetrics {
+    int32 client_id = 1;
+    int32 round = 2;
+    int32 num_samples = 3;
+    map<string, double> metrics = 4;
 }
 
 message ConfigRequest {
@@ -86,7 +94,7 @@ message StatusRequest {
 
 message TrainingStatus {
     bool should_train = 1;
-    int32 round = 2;
+    int32 current_round = 2;
     bool should_evaluate = 3;
-    bool training_complete = 4;
+    bool is_complete = 4;
 }

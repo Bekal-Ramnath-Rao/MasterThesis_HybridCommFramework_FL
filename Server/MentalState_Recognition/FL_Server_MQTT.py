@@ -30,9 +30,12 @@ import tensorflow as tf
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 # Server Configuration
-MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
+# Auto-detect environment: Docker (/app exists) or local
+MQTT_BROKER = os.getenv("MQTT_BROKER", 'mqtt-broker' if os.path.exists('/app') else 'localhost')
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
-NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
+# Dynamic client configuration
+MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
+MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "16"))
 
 # Convergence Settings
@@ -208,8 +211,10 @@ def build_model():
 
 # ---------------- Federated Learning Server ----------------
 class FederatedLearningServer:
-    def __init__(self, num_clients, num_rounds):
-        self.num_clients = num_clients
+    def __init__(self, min_clients, num_rounds, max_clients=100):
+        self.min_clients = min_clients
+        self.max_clients = max_clients
+        self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
@@ -229,6 +234,8 @@ class FederatedLearningServer:
         self.start_time = None
         self.convergence_time = None
         self.converged = False
+        self.training_started = False
+        self.training_started = False
         
         # Initialize quantization handler
         use_quantization = os.getenv("USE_QUANTIZATION", "false").lower() == "true"
@@ -303,13 +310,62 @@ class FederatedLearningServer:
         """Handle client registration"""
         data = json.loads(payload.decode())
         client_id = data['client_id']
+        
+        # Check if already registered
+        if client_id in self.registered_clients:
+            print(f"Client {client_id} re-registered")
+            return
+        
         self.registered_clients.add(client_id)
-        print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
+        print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
+        
+        # Update total client count if more clients join
+        if len(self.registered_clients) > self.num_clients:
+            self.update_client_count(len(self.registered_clients))
 
-        if len(self.registered_clients) == self.num_clients:
+        # Check if this is a late-joining client
+        if self.training_started:
+            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
+            if len(self.registered_clients) > self.num_clients:
+                self.update_client_count(len(self.registered_clients))
+            if self.global_weights is not None:
+                self.send_current_model_to_client(client_id)
+            return
+        
+        # Check if this is a late-joining client
+        if self.training_started:
+            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
+            if len(self.registered_clients) > self.num_clients:
+                self.update_client_count(len(self.registered_clients))
+            if self.global_weights is not None:
+                self.send_current_model_to_client(client_id)
+            return
+        
+        if len(self.registered_clients) >= self.min_clients:
             print("\nAll clients registered. Distributing initial global model...\n")
             time.sleep(2)
             self.distribute_initial_model()
+    
+    def send_current_model_to_client(self, client_id):
+        """Send current global model to a late-joining client"""
+        try:
+            print(f"📤 Sending current global model (round {self.current_round}) to late-joining client {client_id}")
+            
+            # Prepare payload with current model
+            model_message = {
+                'round': self.current_round,
+                'weights': self.serialize_weights(self.global_weights),
+                'model_config': self.model_config
+            }
+            
+            # Broadcast to all clients on general topic (late-joiner will receive it)
+            payload = json.dumps(model_message).encode()
+            self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, payload, qos=1)
+            
+            print(f"✅ Current model (round {self.current_round}) broadcast to late-joining client {client_id}")
+            
+        except Exception as e:
+            print(f"❌ Error sending current model to client {client_id}: {e}")
 
     def handle_client_update(self, payload):
         """Handle model update from client"""
@@ -343,7 +399,8 @@ class FederatedLearningServer:
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{self.num_clients})")
 
-            if len(self.client_updates) == self.num_clients:
+            # Wait for all registered clients (dynamic)
+            if len(self.client_updates) >= len(self.registered_clients):
                 self.aggregate_models()
 
     def handle_client_metrics(self, payload):
@@ -440,7 +497,8 @@ class FederatedLearningServer:
             serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             global_model_message = {
                 "round": self.current_round,
-                "quantized_data": serialized
+                "quantized_data": serialized,
+                "model_config": self.model_config
             }
         else:
             global_model_message = {
@@ -651,5 +709,5 @@ class FederatedLearningServer:
 
 
 if __name__ == "__main__":
-    server = FederatedLearningServer(NUM_CLIENTS, NUM_ROUNDS)
+    server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     server.run()

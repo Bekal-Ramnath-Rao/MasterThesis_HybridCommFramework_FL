@@ -2,11 +2,9 @@ version: '3.8'
 
 # Docker Compose for Federated Learning with Quantization Compression
 # Protocol: MQTT | Use Case: Emotion Recognition | Quantization: 8-bit (4x compression)
-
 services:
   # ============================================================================
   # MQTT Broker
-  # ============================================================================
   mqtt-broker:
     image: eclipse-mosquitto:2
     container_name: fl-mqtt-broker-quantized
@@ -18,10 +16,7 @@ services:
     networks:
       - fl-quantized-network
     command: mosquitto -c /mosquitto/config/mosquitto.conf
-
-  # ============================================================================
   # FL Server with 8-bit Quantization (4x compression)
-  # ============================================================================
   fl-server-mqtt-emotion:
     build:
       context: ..
@@ -42,100 +37,45 @@ services:
       - MQTT_PORT=1883
       - NUM_CLIENTS=2
       - NUM_ROUNDS=5
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - CONVERGENCE_THRESHOLD=0.001
       - CONVERGENCE_PATIENCE=2
       - MIN_ROUNDS=3
     command: python -u Server/Emotion_Recognition/FL_Server_MQTT.py
-    networks:
-      - fl-quantized-network
-    volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
     restart: unless-stopped
-
-  # ============================================================================
   # FL Client 1 with 8-bit Quantization
-  # ============================================================================
   fl-client-mqtt-emotion-1:
-    build:
-      context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-mqtt-emotion-1-quantized
-    depends_on:
       - fl-server-mqtt-emotion
-    environment:
-      # ===== QUANTIZATION CONFIGURATION =====
-      - USE_QUANTIZATION=true
-      - QUANTIZATION_BITS=8                      # 4x compression
-      - QUANTIZATION_STRATEGY=parameter_quantization
-      - QUANTIZATION_SYMMETRIC=true
-      - QUANTIZATION_PER_CHANNEL=false
-      
       # ===== CLIENT CONFIGURATION =====
-      - MQTT_BROKER=mqtt-broker
-      - MQTT_PORT=1883
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
     command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
-    volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-    networks:
-      - fl-quantized-network
-    restart: unless-stopped
-
-  # ============================================================================
   # FL Client 2 with 8-bit Quantization
-  # ============================================================================
   fl-client-mqtt-emotion-2:
-    build:
-      context: ..
-      dockerfile: Client/Dockerfile
     container_name: fl-client-mqtt-emotion-2-quantized
-    depends_on:
-      - fl-server-mqtt-emotion
-    environment:
-      # ===== QUANTIZATION CONFIGURATION =====
-      - USE_QUANTIZATION=true
-      - QUANTIZATION_BITS=8                      # 4x compression
-      - QUANTIZATION_STRATEGY=parameter_quantization
-      - QUANTIZATION_SYMMETRIC=true
-      - QUANTIZATION_PER_CHANNEL=false
-      
-      # ===== CLIENT CONFIGURATION =====
-      - MQTT_BROKER=mqtt-broker
-      - MQTT_PORT=1883
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
-    command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
-    volumes:
-      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-    networks:
-      - fl-quantized-network
-    restart: unless-stopped
-
 networks:
   fl-quantized-network:
     driver: bridge
-
 # ============================================================================
 # USAGE:
-# ============================================================================
 # To run with quantization:
 #   docker-compose -f docker-compose-quantized.yml up
 #
 # To view logs:
 #   docker logs fl-server-mqtt-emotion-quantized
 #   docker logs fl-client-mqtt-emotion-1-quantized
-#
 # Look for quantization messages:
 #   - "Server: Quantization enabled"
 #   - "Client 1: Quantization enabled"
 #   - "Compressed weights - Ratio: 4.00x"
-#
 # To disable quantization, change:
 #   USE_QUANTIZATION=false
-#
 # To change compression ratio:
 #   QUANTIZATION_BITS=8   (4x compression - maximum)
 #   QUANTIZATION_BITS=16  (2x compression - balanced)
 #   QUANTIZATION_BITS=32  (no compression)
-# ============================================================================

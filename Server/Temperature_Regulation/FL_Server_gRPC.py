@@ -35,7 +35,9 @@ import federated_learning_pb2_grpc
 # Server Configuration
 GRPC_HOST = os.getenv("GRPC_HOST", "0.0.0.0")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
-NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+# Dynamic client configuration
+MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
+MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
 NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
 
@@ -46,8 +48,10 @@ MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 
 class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningServicer):
-    def __init__(self, num_clients, num_rounds):
-        self.num_clients = num_clients
+    def __init__(self, min_clients, num_rounds, max_clients=100):
+        self.min_clients = min_clients
+        self.max_clients = max_clients
+        self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
@@ -133,7 +137,11 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         with self.lock:
             client_id = request.client_id
             self.registered_clients.add(client_id)
-            print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
+            print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
+        
+        # Update total client count if more clients join
+        if len(self.registered_clients) > self.num_clients:
+            self.update_client_count(len(self.registered_clients))
             
             # If all clients registered, start distributing initial global model
             if len(self.registered_clients) == self.num_clients and not self.training_started:
@@ -236,12 +244,10 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 # For updates after aggregation, send current_round
                 round_to_send = 0 if request.round == 0 and self.training_started else self.current_round
                 
-                # Prepare model config for initial model (round 0)
-                model_config_json = ""
-                if round_to_send == 0:
-                    model_config = {
-                        "architecture": "LSTM",
-                        "layers": [
+                # Always include model_config for late-joining clients
+                model_config = {
+                    "architecture": "LSTM",
+                    "layers": [
                             {
                                 "type": "LSTM",
                                 "units": 50,
@@ -323,7 +329,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                       f"({len(self.client_updates)}/{self.num_clients})")
                 
                 # If all clients sent updates, aggregate
-                if len(self.client_updates) == self.num_clients:
+                # Wait for all registered clients (dynamic)
+            if len(self.client_updates) >= len(self.registered_clients):
                     self.aggregate_models()
                 
                 return federated_learning_pb2.UpdateResponse(
@@ -353,7 +360,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                       f"({len(self.client_metrics)}/{self.num_clients})")
                 
                 # If all clients sent metrics, aggregate and continue
-                if len(self.client_metrics) == self.num_clients:
+                # Wait for all registered clients (dynamic)
+            if len(self.client_metrics) >= len(self.registered_clients):
                     self.aggregate_metrics()
                     self.continue_training()
                 
