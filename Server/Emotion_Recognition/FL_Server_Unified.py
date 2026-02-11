@@ -1096,7 +1096,7 @@ class UnifiedFederatedLearningServer:
             
             # Best effort QoS for large data transfers (model chunks)
             best_effort_qos = Qos(
-                Policy.Reliability.BestEffort(),
+                Policy.Reliability.BestEffort,
                 Policy.History.KeepLast(1),
             )
             
