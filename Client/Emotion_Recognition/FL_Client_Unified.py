@@ -1445,7 +1445,13 @@ class UnifiedFLClient_Emotion:
             print(f"Client {self.client_id} sending via MQTT - size: {payload_size_mb:.2f} MB")
             
             result = self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, payload, qos=1)
-            result.wait_for_publish(timeout=30)
+            # FAIR FIX: Use shorter timeout (5s) aligned with other protocols, or non-blocking check
+            # MQTT QoS 1 ensures delivery, so we don't need to wait for full acknowledgment
+            # This makes MQTT behavior similar to AMQP/gRPC which return immediately after send
+            if result.rc == mqtt.MQTT_ERR_NO_CONN:
+                raise Exception("MQTT not connected")
+            # Only wait briefly to ensure message is queued (not blocking for full delivery)
+            result.wait_for_publish(timeout=5)
             
             log_sent_packet(
                 packet_size=len(payload),
@@ -1469,7 +1475,11 @@ class UnifiedFLClient_Emotion:
         try:
             payload = json.dumps(message)
             result = self.mqtt_client.publish(TOPIC_CLIENT_METRICS, payload, qos=1)
-            result.wait_for_publish(timeout=30)
+            # FAIR FIX: Use shorter timeout (5s) aligned with other protocols
+            # Metrics are small, so 5s is sufficient for queue confirmation
+            if result.rc == mqtt.MQTT_ERR_NO_CONN:
+                raise Exception("MQTT not connected")
+            result.wait_for_publish(timeout=5)
             
             log_sent_packet(
                 packet_size=len(payload),
@@ -2013,11 +2023,10 @@ class UnifiedFLClient_Emotion:
         
         print(f"[QUIC] Client {self.client_id} sent on stream {stream_id}, transmitting...")
         
-        # For large messages, give time for transmission
-        if len(data) > 1000000:  # > 1MB
-            for _ in range(3):
-                await asyncio.sleep(0.5)
-                self.quic_protocol.transmit()
+        # FAIR FIX: Removed artificial 1.5s delay for large messages
+        # QUIC handles flow control automatically, so we don't need manual delays
+        # This makes QUIC behavior similar to other protocols which don't have artificial delays
+        # The transmit() call above is sufficient for immediate transmission
     
     async def _quic_send_data(self, host: str, port: int, payload: str, msg_type: str):
         """Async QUIC data send with timeout and retry (legacy method for registration)"""

@@ -235,17 +235,10 @@ class FederatedLearningClient:
             # Transmit immediately
             self.protocol.transmit()
             
-            # For large messages, give more time for transmission with multiple transmit calls
-            if len(data) > 1000000:  # > 1MB
-                #print(f"[DEBUG] Client {self.client_id} waiting for large message transmission...")
-                # Multiple transmit calls with shorter delays for very large messages
-                for i in range(3):
-                    await asyncio.sleep(0.5)
-                    self.protocol.transmit()
-                    #print(f"[DEBUG] Client {self.client_id} transmit call {i+1}/3")
-            else:
-                # Single small delay for flow control
-                await asyncio.sleep(0.1)
+            # FAIR FIX: Removed artificial delays (1.5s for large, 0.1s for small messages)
+            # QUIC handles flow control automatically, so manual delays are unnecessary
+            # This makes QUIC behavior similar to other protocols which don't have artificial delays
+            # The transmit() call above is sufficient for immediate transmission
             
             #print(f"[DEBUG] Client {self.client_id} sent {msg_type} on stream {self.stream_id}")
     

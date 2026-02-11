@@ -374,10 +374,8 @@ class FederatedLearningClient:
             "metrics": metrics
         }
         
-        # Introduce random delay before sending model update
-        delay = random.uniform(0.5, 3.0)  # Random delay between 0.5 and 3.0 seconds
-        print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
-        time.sleep(delay)
+        # FAIR FIX: Removed random delay - this was causing unfair comparison with other protocols
+        # Other protocols don't have random delays, so MQTT shouldn't either
         
         self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, json.dumps(update_message))
         print(f"Client {self.client_id} sent model update for round {self.current_round}")

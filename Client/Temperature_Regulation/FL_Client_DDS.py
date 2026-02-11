@@ -563,10 +563,8 @@ class FederatedLearningClient:
         else:
             serialized_weights = self.serialize_weights(weights)
         
-        # Introduce random delay before sending model update
-        delay = random.uniform(0.5, 3.0)  # Random delay between 0.5 and 3.0 seconds
-        print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
-        time.sleep(delay)
+        # FAIR FIX: Removed random delay - this was causing unfair comparison with other protocols
+        # Other protocols don't have random delays, so DDS shouldn't either
         
         # Send model update to server using chunking
         self.send_model_update_chunked(

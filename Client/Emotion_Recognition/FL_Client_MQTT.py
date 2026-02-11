@@ -493,10 +493,8 @@ class FederatedLearningClient:
                 "metrics": metrics
             }
         
-        # Introduce random delay before sending model update
-        delay = random.uniform(0.5, 3.0)  # Random delay between 0.5 and 3.0 seconds
-        print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
-        time.sleep(delay)
+        # FAIR FIX: Removed random delay - this was causing unfair comparison with other protocols
+        # Other protocols don't have random delays, so MQTT shouldn't either
         
         # Serialize and send model update with error handling
         try:
@@ -514,8 +512,11 @@ class FederatedLearningClient:
                 round=self.current_round if hasattr(self, 'current_round') else None,
                 extra_info="any additional info"
             )
-            # Wait for the message to be published
-            result.wait_for_publish(timeout=30)
+            # FAIR FIX: Use shorter timeout (5s) aligned with other protocols
+            # MQTT QoS 1 ensures delivery, so we only need to wait for queue confirmation
+            if result.rc == mqtt.MQTT_ERR_NO_CONN:
+                raise Exception("MQTT not connected")
+            result.wait_for_publish(timeout=5)
             
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
                 print(f"Client {self.client_id} sent model update for round {self.current_round}")
