@@ -45,6 +45,8 @@ class FLTrainingDashboard:
         # Real-time RTT tracking
         self.current_rtt_data = {}  # {protocol: {'round_times': [], 'current_round': 0, 'avg_rtt': 0}}
         self.last_round_time = {}  # {protocol: timestamp}
+        # Track previous containers to detect changes
+        self.previous_containers = set()
         self.load_baseline_data()
         
     def load_baseline_data(self):
@@ -90,13 +92,34 @@ class FLTrainingDashboard:
             return (False, '', str(e))
     
     def get_containers(self):
-        """Get list of FL containers"""
+        """Get list of FL containers and detect changes"""
         success, stdout, _ = self.run_command(['docker', 'ps', '--format', '{{.Names}}'])
         
         if not success:
             return
         
         all_containers = [name.strip() for name in stdout.split('\n') if name.strip()]
+        current_container_set = set(all_containers)
+        
+        # Detect if containers have changed (new experiment started)
+        if self.previous_containers and current_container_set != self.previous_containers:
+            # Containers changed - clear RTT tracking data for fresh start
+            containers_removed = self.previous_containers - current_container_set
+            containers_added = current_container_set - self.previous_containers
+            
+            if containers_removed or containers_added:
+                print(f"\n[Dashboard] Container change detected!")
+                if containers_removed:
+                    print(f"  - Removed: {len(containers_removed)} containers")
+                if containers_added:
+                    print(f"  + Added: {len(containers_added)} containers")
+                print("  → Clearing RTT tracking data for fresh experiment\n")
+                
+                # Clear RTT tracking when containers change
+                self.current_rtt_data.clear()
+                self.last_round_time.clear()
+        
+        self.previous_containers = current_container_set
         
         self.client_containers = [c for c in all_containers if 'client' in c.lower()]
         self.server_containers = [c for c in all_containers if 'server' in c.lower()]
@@ -108,20 +131,27 @@ class FLTrainingDashboard:
                 # Get more log lines for round detection
                 cmd = ['docker', 'logs', '--tail', '50', server]
                 success, logs, _ = self.run_command(cmd)
-                if success:
+                if success and logs:
                     current_round = self.extract_round_info(logs, protocol)
                     if current_round is not None:
                         self.update_rtt_tracking(protocol, current_round)
     
     def get_container_stats(self, container: str) -> Dict:
         """Get container resource usage stats"""
+        # First verify container still exists
+        verify_cmd = ['docker', 'ps', '-qf', f'name={container}']
+        success, container_id, _ = self.run_command(verify_cmd)
+        
+        if not success or not container_id.strip():
+            return {'cpu': 'N/A', 'memory': 'N/A', 'network': 'N/A', 'disk': 'N/A'}
+        
         cmd = ['docker', 'stats', container, '--no-stream',
                '--format', '{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}\t{{.BlockIO}}']
         
         success, stdout, _ = self.run_command(cmd)
         
-        if not success:
-            return {}
+        if not success or not stdout.strip():
+            return {'cpu': 'N/A', 'memory': 'N/A', 'network': 'N/A', 'disk': 'N/A'}
         
         try:
             parts = stdout.strip().split('\t')
@@ -132,7 +162,7 @@ class FLTrainingDashboard:
                 'disk': parts[3] if len(parts) > 3 else 'N/A'
             }
         except:
-            return {}
+            return {'cpu': 'N/A', 'memory': 'N/A', 'network': 'N/A', 'disk': 'N/A'}
     
     def get_veth_interface(self, container: str) -> str:
         """Get veth interface for container"""
@@ -210,18 +240,31 @@ class FLTrainingDashboard:
         return ' '.join(conditions) if conditions else "Active (check tc)"
     
     def get_container_logs_tail(self, container: str, lines: int = 3) -> List[str]:
-        """Get last few lines of container logs"""
-        # Fetch more lines than needed to ensure we get the freshest logs
-        fetch_lines = max(lines * 2, 10)
-        cmd = ['docker', 'logs', '--tail', str(fetch_lines), container]
-        success, stdout, _ = self.run_command(cmd)
+        """Get last few lines of container logs with robust error handling"""
+        # First verify container still exists and is running
+        verify_cmd = ['docker', 'ps', '-qf', f'name={container}']
+        success, container_id, _ = self.run_command(verify_cmd)
         
-        if not success or not stdout.strip():
-            return []
+        if not success or not container_id.strip():
+            return [f"⚠️ Container '{container}' not found or stopped"]
+        
+        # Fetch more lines than needed to ensure we get the freshest logs
+        fetch_lines = max(lines * 3, 15)
+        cmd = ['docker', 'logs', '--tail', str(fetch_lines), container]
+        success, stdout, stderr = self.run_command(cmd)
+        
+        if not success:
+            if stderr and 'No such container' in stderr:
+                return [f"⚠️ Container stopped during log fetch"]
+            return [f"⚠️ Failed to fetch logs: {stderr[:50] if stderr else 'unknown error'}"]
+        
+        if not stdout.strip():
+            # Container exists but has no logs yet
+            return [f"⏳ Waiting for logs... (container just started or no output yet)"]
         
         # Filter out empty lines and get the last N lines
         all_lines = [line.strip() for line in stdout.split('\n') if line.strip()]
-        return all_lines[-lines:] if all_lines else []
+        return all_lines[-lines:] if all_lines else [f"⏳ No log output yet"]
     
     def extract_round_info(self, logs: str, protocol: str) -> Optional[int]:
         """Extract current round number from server logs"""
@@ -373,6 +416,11 @@ class FLTrainingDashboard:
                       f"{stats.get('network', 'N/A'):<25} {'Running':<10}")
             
             print("-" * 140)
+        else:
+            print("\n📊 SERVER STATUS")
+            print("-" * 140)
+            print("⚠️  No server containers detected. Waiting for experiment to start...")
+            print("-" * 140)
         
         # Client Status
         if self.client_containers:
@@ -391,6 +439,11 @@ class FLTrainingDashboard:
                       f"{stats.get('network', 'N/A'):<20} {net_cond:<38}")
             
             print("-" * 140)
+        else:
+            print("\n👥 CLIENT STATUS")
+            print("-" * 140)
+            print("⚠️  No client containers detected. Waiting for experiment to start...")
+            print("-" * 140)
         
         # Recent Activity - Server Logs
         if self.server_containers:
@@ -402,13 +455,15 @@ class FLTrainingDashboard:
                 protocol = self.get_protocol_from_container(container)
                 protocol_tag = f"[{protocol.upper()}] " if protocol else ""
                 print(f"\n{protocol_tag}{container}:")
-                if logs:
-                    for log in logs:
-                        # Truncate long logs
-                        log_display = log[:130] + "..." if len(log) > 130 else log
-                        print(f"  {log_display}")
-                else:
-                    print("  No recent logs available")
+                for log in logs:
+                    # Truncate long logs
+                    log_display = log[:130] + "..." if len(log) > 130 else log
+                    print(f"  {log_display}")
+        else:
+            print(f"\n📝 SERVER LOGS")
+            print("-" * 140)
+            print("⚠️  No server containers running. Logs will appear when experiment starts.")
+            print("-" * 140)
         
         # Recent Activity - Client Logs
         if self.client_containers:
@@ -425,13 +480,15 @@ class FLTrainingDashboard:
                 protocol = self.get_protocol_from_container(container)
                 protocol_tag = f"[{protocol.upper()}] " if protocol else ""
                 print(f"\n{protocol_tag}{container}:")
-                if logs:
-                    for log in logs:
-                        # Truncate long logs
-                        log_display = log[:130] + "..." if len(log) > 130 else log
-                        print(f"  {log_display}")
-                else:
-                    print("  No recent logs available")
+                for log in logs:
+                    # Truncate long logs
+                    log_display = log[:130] + "..." if len(log) > 130 else log
+                    print(f"  {log_display}")
+        else:
+            print("\n📝 CLIENT LOGS")
+            print("-" * 140)
+            print("⚠️  No client containers running. Logs will appear when experiment starts.")
+            print("-" * 140)
         
         print("\n" + "-" * 140)
         print("\n💡 TIPS:")

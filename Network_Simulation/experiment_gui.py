@@ -1411,6 +1411,31 @@ class FLExperimentGUI(QMainWindow):
         self.output_tabs.addTab(self.dashboard_text, "📈 FL Training Monitor (vs Baseline)")
         
         # Tab 3: Server Logs
+        server_tab_widget = QWidget()
+        server_tab_layout = QVBoxLayout(server_tab_widget)
+        server_tab_layout.setSpacing(5)
+        server_toolbar = QHBoxLayout()
+        server_toolbar.addWidget(QLabel("Select Server:"))
+        self.server_selector = QComboBox()
+        self.server_selector.setStyleSheet("padding: 5px; font-size: 11px; min-width: 150px;")
+        self.server_selector.addItem("Detecting servers...", None)
+        self.server_selector.currentIndexChanged.connect(self.switch_server_log)
+        server_toolbar.addWidget(self.server_selector)
+        self.refresh_servers_btn = QPushButton("🔄 Refresh")
+        self.refresh_servers_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db;
+                color: white;
+                padding: 5px 10px;
+                border-radius: 3px;
+                font-size: 10px;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """)
+        self.refresh_servers_btn.clicked.connect(self.refresh_server_list)
+        server_toolbar.addWidget(self.refresh_servers_btn)
+        server_toolbar.addStretch()
+        server_tab_layout.addLayout(server_toolbar)
         self.server_log_text = QTextEdit()
         self.server_log_text.setReadOnly(True)
         self.server_log_text.setStyleSheet("""
@@ -1424,7 +1449,8 @@ class FLExperimentGUI(QMainWindow):
                 padding: 10px;
             }
         """)
-        self.output_tabs.addTab(self.server_log_text, "🖥️ Server Logs")
+        server_tab_layout.addWidget(self.server_log_text)
+        self.output_tabs.addTab(server_tab_widget, "🖥️ Server Logs")
 
         # Tab 4: Client Logs
         client_tab_widget = QWidget()
@@ -1713,6 +1739,76 @@ class FLExperimentGUI(QMainWindow):
         except Exception as e:
             self.output_text.append(f"⚠️ Could not detect client targets: {e}\n")
     
+    def refresh_server_list(self):
+        """Refresh the list of available server containers"""
+        try:
+            result = subprocess.run(
+                ['docker', 'ps', '--filter', 'name=server', '--format', '{{.Names}}'],
+                capture_output=True, text=True, timeout=5
+            )
+            
+            if result.returncode == 0:
+                servers = [c.strip() for c in result.stdout.strip().split('\n') if c.strip()]
+                
+                # Filter to only FL servers (exclude brokers)
+                fl_servers = [s for s in servers if 'fl-' in s.lower() and 'server' in s.lower()]
+                
+                # Update server selector dropdown
+                current_server = self.server_selector.currentData()
+                self.server_selector.clear()
+                
+                if fl_servers:
+                    for server in fl_servers:
+                        # Extract protocol and use case from container name
+                        server_label = server.replace('fl-server-', '').replace('-', ' ').title()
+                        self.server_selector.addItem(f"🖥️ {server_label}", server)
+                    
+                    self.output_text.append(f"✅ Detected {len(fl_servers)} server(s) for log viewing\n")
+                    
+                    # If no server was selected or current server not in list, select first one
+                    if current_server not in fl_servers:
+                        self.switch_server_log()
+                else:
+                    self.server_selector.addItem("No servers detected", None)
+                    self.output_text.append("⚠️ No server containers detected\n")
+            
+        except Exception as e:
+            self.output_text.append(f"⚠️ Could not detect servers: {e}\n")
+            self.server_selector.clear()
+            self.server_selector.addItem("Error detecting servers", None)
+    
+    def switch_server_log(self):
+        """Switch to viewing logs of a different server"""
+        server_name = self.server_selector.currentData()
+        
+        if server_name is None:
+            return
+        
+        # Stop current server log monitor if running
+        server_monitor = None
+        for monitor in self.log_monitors:
+            if monitor.log_type == "server" and monitor.isRunning():
+                server_monitor = monitor
+                break
+        
+        if server_monitor:
+            server_monitor.stop()
+            server_monitor.wait()
+            if server_monitor in self.log_monitors:
+                self.log_monitors.remove(server_monitor)
+        
+        # Clear current log display
+        self.server_log_text.clear()
+        self.server_log_text.append(f"=== Logs for {server_name} ===\n")
+        
+        # Start new log monitor for selected server
+        new_server_monitor = LogMonitor(server_name, "server")
+        new_server_monitor.log_update.connect(
+            lambda log_type, text: self.server_log_text.append(text)
+        )
+        new_server_monitor.start()
+        self.log_monitors.append(new_server_monitor)
+    
     def refresh_client_list(self):
         """Refresh available clients for log viewing"""
         try:
@@ -1944,7 +2040,13 @@ class FLExperimentGUI(QMainWindow):
         # Start container log monitoring (after brief delay to let containers start)
         QTimer.singleShot(5000, self.start_log_monitors)
         
-        # Refresh client lists for both network targeting and log viewing
+        # Add periodic retry for log monitors in case containers start late
+        # This ensures logs appear even if containers weren't ready at first attempt
+        QTimer.singleShot(15000, self.retry_log_monitors_if_needed)
+        QTimer.singleShot(30000, self.retry_log_monitors_if_needed)
+        
+        # Refresh server and client lists for both network targeting and log viewing
+        QTimer.singleShot(7000, self.refresh_server_list)
         QTimer.singleShot(7000, self.refresh_client_targets)
         QTimer.singleShot(7000, self.refresh_client_list)
     
@@ -2011,6 +2113,22 @@ class FLExperimentGUI(QMainWindow):
     
     def start_log_monitors(self):
         """Start monitoring server and client container logs"""
+        # IMPORTANT: Stop any existing monitors first to avoid duplicates
+        # This ensures clean restart when running multiple experiments
+        for monitor in self.log_monitors:
+            try:
+                monitor.stop()
+                monitor.wait(1000)  # Wait up to 1 second
+            except:
+                pass
+        self.log_monitors.clear()
+        
+        # Refresh server and client lists first to populate dropdowns
+        if hasattr(self, 'refresh_server_list'):
+            self.refresh_server_list()
+        if hasattr(self, 'refresh_client_list'):
+            self.refresh_client_list()
+        
         # Get running containers
         try:
             result = subprocess.run(
@@ -2027,13 +2145,19 @@ class FLExperimentGUI(QMainWindow):
                 server_containers = [c for c in containers if 'server' in c.lower() and 'fl-' in c]
                 client_containers = [c for c in containers if 'client' in c.lower() and 'fl-' in c]
                 
-                # Monitor first server container
+                # Monitor first server container (or use selected server if available)
                 if server_containers:
-                    server_monitor = LogMonitor(server_containers[0], "server")
+                    # Use selected server from dropdown if available, otherwise use first
+                    selected_server = self.server_selector.currentData() if hasattr(self, 'server_selector') else None
+                    server_to_monitor = selected_server if selected_server and selected_server in server_containers else server_containers[0]
+                    
+                    server_monitor = LogMonitor(server_to_monitor, "server")
                     server_monitor.log_update.connect(self.update_logs)
                     server_monitor.start()
                     self.log_monitors.append(server_monitor)
-                    self.server_log_text.append(f"📡 Monitoring: {server_containers[0]}\n")
+                    self.server_log_text.append(f"📡 Monitoring: {server_to_monitor}\n")
+                else:
+                    self.server_log_text.append(f"⚠️ No server containers found. Waiting...\n")
                 
                 # Monitor first client container
                 if client_containers:
@@ -2042,9 +2166,20 @@ class FLExperimentGUI(QMainWindow):
                     client_monitor.start()
                     self.log_monitors.append(client_monitor)
                     self.client_log_text.append(f"📡 Monitoring: {client_containers[0]}\n")
+                else:
+                    self.client_log_text.append(f"⚠️ No client containers found. Waiting...\n")
                     
         except Exception as e:
             self.server_log_text.append(f"⚠️ Error starting log monitors: {str(e)}\n")
+    
+    def retry_log_monitors_if_needed(self):
+        """Retry starting log monitors if no active monitors are running"""
+        # Check if any log monitors are actually receiving data
+        active_monitors = [m for m in self.log_monitors if m.isRunning()]
+        
+        if len(active_monitors) < 2:  # We expect server + client monitors
+            self.server_log_text.append(f"\n🔄 Retrying log monitor setup (found {len(active_monitors)} active monitors)...\n")
+            self.start_log_monitors()
     
     def stop_all_monitors(self):
         """Stop all monitoring threads"""
@@ -2123,11 +2258,15 @@ class FLExperimentGUI(QMainWindow):
             )
     
     def clear_all_output(self):
-        """Clear all output consoles"""
+        """Clear all output consoles and prepare for fresh experiment"""
         self.output_text.clear()
         self.dashboard_text.clear()
         self.server_log_text.clear()
         self.client_log_text.clear()
+        
+        # Add informative message
+        self.server_log_text.append("📋 Server logs cleared. Waiting for new experiment to start...\n")
+        self.client_log_text.append("📋 Client logs cleared. Waiting for new experiment to start...\n")
     
     def update_output(self, text):
         """Update output console"""
