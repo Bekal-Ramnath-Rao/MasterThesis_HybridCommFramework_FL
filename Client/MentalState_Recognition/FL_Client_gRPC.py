@@ -77,6 +77,9 @@ GRPC_HOST = os.getenv("GRPC_HOST", "localhost")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 # Training Configuration
 AUTOTUNE = tf.data.AUTOTUNE
@@ -101,6 +104,9 @@ class FederatedLearningClient:
         self.x_train = None
         self.y_train = None
         self.current_round = 0
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
+        self.has_converged = False
         self.training_config = {
             "batch_size": 16,
             "local_epochs": 5,
@@ -487,7 +493,8 @@ class FederatedLearningClient:
                 
                 print(f"Client {self.client_id} built EEG model from server configuration")
                 print(f"  Input shape: {model_config['input_shape']}")
-                print(f"  Output classes: {model_config['num_classes']}")            self.model.set_weights(weights)
+                print(f"  Output classes: {model_config['num_classes']}")
+                self.model.set_weights(weights)
             
             if model_update.model_config:
                 # Verify model is ready (first initialization)
@@ -567,6 +574,7 @@ class FederatedLearningClient:
             if response.success:
                 print(f"Client {self.client_id} successfully sent update for round {self.current_round}")
                 print(f"Training metrics - Loss: {final_loss:.4f}, Accuracy: {final_acc:.4f}")
+                self._update_local_convergence(float(final_loss))
             else:
                 print(f"Failed to send update: {response.message}")
                 
@@ -574,6 +582,40 @@ class FederatedLearningClient:
             print(f"Error in train_local_model: {e}")
             import traceback
             traceback.print_exc()
+
+    def _update_local_convergence(self, loss: float):
+        """Track client-local convergence and disconnect when converged."""
+        if self.current_round < MIN_ROUNDS:
+            self.best_loss = min(self.best_loss, loss)
+            return
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            self.best_loss = loss
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+        if self.rounds_without_improvement >= CONVERGENCE_PATIENCE and not self.has_converged:
+            self.has_converged = True
+            print(f"Client {self.client_id} reached local convergence at round {self.current_round}")
+            self._notify_convergence_and_disconnect()
+
+    def _notify_convergence_and_disconnect(self):
+        """Notify server and stop this client."""
+        try:
+            self.stub.SendModelUpdate(
+                federated_learning_pb2.ModelUpdate(
+                    client_id=self.client_id,
+                    round=self.current_round,
+                    weights=b"",
+                    num_samples=0,
+                    metrics={"client_converged": 1.0}
+                )
+            )
+            print(f"Client {self.client_id} convergence notification sent to server")
+        except Exception as e:
+            print(f"Client {self.client_id} failed to notify convergence: {e}")
+        finally:
+            import sys
+            sys.exit(0)
 
 
 if __name__ == "__main__":

@@ -93,6 +93,9 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))  # MQTT broker port
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))  # Can be set via environment variable
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "5"))
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 # MQTT Topics
 TOPIC_GLOBAL_MODEL = "fl/global_model"
@@ -114,6 +117,10 @@ class FederatedLearningClient:
         self.last_global_round = -1
         self.last_training_round = -1
         self.evaluated_rounds = set()
+        # Client-side convergence
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
+        self.has_converged = False
         
         # Store data generators
         self.train_generator = train_generator
@@ -528,6 +535,22 @@ class FederatedLearningClient:
             import traceback
             traceback.print_exc()
     
+    def _update_local_convergence(self, loss: float):
+        """Track client-local convergence and disconnect when converged."""
+        if self.current_round < MIN_ROUNDS:
+            self.best_loss = min(self.best_loss, loss)
+            return
+
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            self.best_loss = loss
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+
+        if self.rounds_without_improvement >= CONVERGENCE_PATIENCE and not self.has_converged:
+            self.has_converged = True
+            print(f"Client {self.client_id} reached local convergence at round {self.current_round}")
+
     def evaluate_model(self):
         """Evaluate model on validation data and send metrics to server"""
         loss, accuracy = self.model.evaluate(
@@ -536,15 +559,21 @@ class FederatedLearningClient:
         )
         
         num_samples = self.validation_generator.n
+
+        self._update_local_convergence(float(loss))
+        
+        metrics_dict = {
+            "loss": float(loss),
+            "accuracy": float(accuracy)
+        }
+        if self.has_converged:
+            metrics_dict["client_converged"] = 1.0
         
         metrics_message = {
             "client_id": self.client_id,
             "round": self.current_round,
             "num_samples": num_samples,
-            "metrics": {
-                "loss": float(loss),
-                "accuracy": float(accuracy)
-            }
+            "metrics": metrics_dict
         }
         
         self.mqtt_client.publish(TOPIC_CLIENT_METRICS, json.dumps(metrics_message))
@@ -556,6 +585,10 @@ class FederatedLearningClient:
             extra_info="any additional info"
         )
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
+        if self.has_converged:
+            print(f"Client {self.client_id} notifying server of convergence and disconnecting")
+            time.sleep(2)
+            self.mqtt_client.disconnect()
     
     def start(self):
         """Connect to MQTT broker and start listening"""

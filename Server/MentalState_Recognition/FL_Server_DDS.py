@@ -138,6 +138,7 @@ class ModelUpdateChunk(IdlStruct):
     num_samples: int
     loss: float
     accuracy: float
+    client_converged: float = 0.0
 
 
 @dataclass
@@ -147,6 +148,7 @@ class EvaluationMetrics(IdlStruct):
     num_samples: int
     loss: float
     accuracy: float
+    client_converged: float = 0.0
 
 
 @dataclass
@@ -296,6 +298,7 @@ class FederatedLearningServer:
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
+        self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
         self.global_weights = None
@@ -547,6 +550,7 @@ class FederatedLearningServer:
             print(f"[DEBUG] Processing registration from client {client_id}")
             if client_id not in self.registered_clients:
                 self.registered_clients.add(client_id)
+                self.active_clients.add(client_id)
                 print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
         
         # Update total client count if more clients join
@@ -599,6 +603,29 @@ class FederatedLearningServer:
             training_complete=False
         )
         self.writers['command'].write(command)
+    
+    def mark_client_converged(self, client_id):
+        """Remove converged client from active federation."""
+        if client_id in self.active_clients:
+            self.active_clients.discard(client_id)
+            self.client_updates.pop(client_id, None)
+            self.model_update_chunks.pop(client_id, None)
+            self.model_update_metadata.pop(client_id, None)
+            print(f"Client {client_id} converged and disconnected. Active clients remaining: {len(self.active_clients)}")
+            if not self.active_clients:
+                self.converged = True
+                self.training_complete = True
+                print("All clients converged. Ending training.")
+                self.convergence_time = time.time() - self.start_time if self.start_time else 0
+                command = TrainingCommand(
+                    round=self.current_round,
+                    start_training=False,
+                    start_evaluation=False,
+                    training_complete=True
+                )
+                self.writers['command'].write(command)
+                self.plot_results()
+                self.save_results()
 
     def check_model_updates(self):
         """Check for model updates from clients (chunked version)"""
@@ -611,6 +638,13 @@ class FederatedLearningServer:
                 
             if sample.round == self.current_round and hasattr(sample, 'client_id'):
                 client_id = sample.client_id
+                if client_id not in self.active_clients:
+                    continue
+                if getattr(sample, 'client_converged', 0.0) >= 1.0:
+                    self.mark_client_converged(client_id)
+                    if len(self.active_clients) == 0:
+                        return
+                    continue
                 chunk_id = sample.chunk_id
                 total_chunks = sample.total_chunks
                 
@@ -667,10 +701,10 @@ class FederatedLearningServer:
                         del self.model_update_metadata[client_id]
                         
                         print(f"Successfully reassembled update from client {client_id} "
-                              f"({len(self.client_updates)}/{len(self.registered_clients)})")
+                              f"({len(self.client_updates)}/{len(self.active_clients)})")
         
-        # If all clients sent updates, aggregate (ensure we have at least one client)
-        if len(self.client_updates) > 0 and len(self.client_updates) >= len(self.registered_clients):
+        # If all active clients sent updates, aggregate
+        if len(self.client_updates) > 0 and len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
             self.aggregate_models()
 
     def aggregate_models(self):
@@ -750,6 +784,22 @@ class FederatedLearningServer:
         """Continue to next round or finish training"""
         self.client_updates.clear()
         self.evaluation_phase = False
+
+        if len(self.active_clients) == 0:
+            self.converged = True
+            print("\n" + "=" * 70)
+            print("All clients converged locally. Training complete.")
+            print("=" * 70 + "\n")
+            command = TrainingCommand(
+                round=self.current_round,
+                start_training=False,
+                start_evaluation=False,
+                training_complete=True
+            )
+            self.writers['command'].write(command)
+            self.training_complete = True
+            self.save_results()
+            return
 
         if self.current_round >= self.num_rounds:
             print("\n" + "=" * 70)

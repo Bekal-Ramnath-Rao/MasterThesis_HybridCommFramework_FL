@@ -127,6 +127,7 @@ class EvaluationMetrics(IdlStruct):
     mse: float
     mae: float
     mape: float
+    client_converged: float = 0.0
 
 
 @dataclass
@@ -146,6 +147,7 @@ class FederatedLearningServer:
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
+        self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
         self.global_weights = None
@@ -401,6 +403,7 @@ class FederatedLearningServer:
             print(f"[DEBUG] Processing registration from client {client_id}")
             if client_id not in self.registered_clients:
                 self.registered_clients.add(client_id)
+                self.active_clients.add(client_id)
                 print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
         
         # Update total client count if more clients join
@@ -416,6 +419,28 @@ class FederatedLearningServer:
             self.training_started = True
             print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     
+    def mark_client_converged(self, client_id):
+        """Remove converged client from active federation."""
+        if client_id in self.active_clients:
+            self.active_clients.discard(client_id)
+            self.client_updates.pop(client_id, None)
+            self.client_metrics.pop(client_id, None)
+            print(f"Client {client_id} converged and disconnected. Active clients remaining: {len(self.active_clients)}")
+            if not self.active_clients:
+                self.converged = True
+                self.training_complete = True
+                print("All clients converged. Ending training.")
+                self.convergence_time = time.time() - self.start_time if self.start_time else 0
+                command = TrainingCommand(
+                    round=self.current_round,
+                    start_training=False,
+                    start_evaluation=False,
+                    training_complete=True
+                )
+                self.writers['command'].write(command)
+                self.plot_results()
+                self.save_results()
+
     def distribute_initial_model(self):
         """Distribute initial global model to all clients"""
         self.training_started = True
@@ -674,40 +699,44 @@ class FederatedLearningServer:
         # No blocking wait here to allow server loop to continue polling
     
     def wait_for_evaluation_metrics(self):
-        """Actively wait for evaluation metrics from all clients (no timeout)"""
-        print(f"\nWaiting for evaluation metrics from {self.num_clients} clients...")
+        """Actively wait for evaluation metrics from all active clients (no timeout)"""
+        print(f"\nWaiting for evaluation metrics from {len(self.active_clients)} active clients...")
         check_count = 0
-        start_time = time.time()  # Track elapsed time for progress logging
+        start_time = time.time()
         
-        while len(self.client_metrics) < self.num_clients:
+        while len(self.client_metrics) < len(self.active_clients) and len(self.active_clients) > 0:
             samples = self.readers['metrics'].take()
             for sample in samples:
-                if sample.round == self.current_round:
-                    client_id = sample.client_id
-                    if client_id not in self.client_metrics:
-                        print(f"Received evaluation metrics from client {client_id}")
-                        metrics_dict = {
-                            'mse': sample.mse,
-                            'mae': sample.mae,
-                            'mape': sample.mape,
-                            'loss': sample.loss
-                        }
-                        self.client_metrics[client_id] = {
-                            'metrics': metrics_dict,
-                            'num_samples': sample.num_samples
-                        }
-                        print(f"Progress: {len(self.client_metrics)}/{self.num_clients} clients")
+                client_id = sample.client_id
+                if client_id not in self.active_clients:
+                    continue
+                if getattr(sample, 'client_converged', 0.0) >= 1.0:
+                    self.mark_client_converged(client_id)
+                    if len(self.active_clients) == 0:
+                        return
+                    continue
+                if sample.round == self.current_round and client_id not in self.client_metrics:
+                    print(f"Received evaluation metrics from client {client_id}")
+                    metrics_dict = {
+                        'mse': sample.mse,
+                        'mae': sample.mae,
+                        'mape': sample.mape,
+                        'loss': sample.loss
+                    }
+                    self.client_metrics[client_id] = {
+                        'metrics': metrics_dict,
+                        'num_samples': sample.num_samples
+                    }
+                    print(f"Progress: {len(self.client_metrics)}/{len(self.active_clients)} clients")
             
-            if len(self.client_metrics) < self.num_clients:
-                time.sleep(0.5)  # Longer sleep for poor network
+            if len(self.client_metrics) < len(self.active_clients) and len(self.active_clients) > 0:
+                time.sleep(0.5)
                 check_count += 1
                 if check_count % 20 == 0:
                     elapsed = time.time() - start_time
-                    print(f"Still waiting for metrics ({len(self.client_metrics)}/{self.num_clients}) - {elapsed:.1f}s elapsed")
+                    print(f"Still waiting for metrics ({len(self.client_metrics)}/{len(self.active_clients)}) - {elapsed:.1f}s elapsed")
         
-        # Wait for all registered clients (dynamic)
-            if len(self.client_metrics) >= len(self.registered_clients):
-            print(f"✓ All evaluation metrics received!")
+        print(f"✓ All evaluation metrics received!")
     
     def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
@@ -750,7 +779,25 @@ class FederatedLearningServer:
         self.client_metrics.clear()
         self.evaluation_phase = False
         
-        # Check for convergence (early stopping)
+        # Stop only when no active clients or max rounds (no server-side convergence)
+        if len(self.active_clients) == 0:
+            self.convergence_time = time.time() - self.start_time if self.start_time else 0
+            self.converged = True
+            print("\n" + "="*70)
+            print("All clients converged locally. Training complete.")
+            print("="*70 + "\n")
+            command = TrainingCommand(
+                round=self.current_round,
+                start_training=False,
+                start_evaluation=False,
+                training_complete=True
+            )
+            self.writers['command'].write(command)
+            self.training_complete = True
+            self.plot_results()
+            self.save_results()
+            return
+        
         if self.current_round >= MIN_ROUNDS and self.check_convergence():
             self.convergence_time = time.time() - self.start_time if self.start_time else 0
             print("\n" + "="*70)

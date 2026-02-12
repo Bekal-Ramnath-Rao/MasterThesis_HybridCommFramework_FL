@@ -70,6 +70,7 @@ class FederatedLearningServer:
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
+        self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
         self.global_weights = None
@@ -87,6 +88,7 @@ class FederatedLearningServer:
         self.rounds_without_improvement = 0
         self.converged = False
         self.training_started = False  # Track if training has begun
+        self.training_complete = False
         self.start_time = None
         self.convergence_time = None
         
@@ -297,6 +299,7 @@ class FederatedLearningServer:
             return
         
         self.registered_clients.add(client_id)
+        self.active_clients.add(client_id)
         print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
         
         # Update total client count if more clients join
@@ -362,12 +365,32 @@ class FederatedLearningServer:
         except Exception as e:
             print(f"❌ Error sending current model to client {client_id}: {e}")
     
+    def mark_client_converged(self, client_id):
+        """Remove converged client from active federation."""
+        if client_id in self.active_clients:
+            self.active_clients.discard(client_id)
+            self.client_updates.pop(client_id, None)
+            self.client_metrics.pop(client_id, None)
+            self.round_participants.discard(client_id)
+            print(f"Client {client_id} converged and disconnected. Active clients remaining: {len(self.active_clients)}")
+            if not self.active_clients:
+                self.converged = True
+                print("All clients converged. Ending training.")
+                self.convergence_time = time.time() - self.start_time if self.start_time else 0
+                self._send_training_complete_and_exit()
+    
     def handle_client_update(self, payload):
         """Handle model update from client"""
         data = json.loads(payload.decode())
         client_id = data['client_id']
         round_num = data['round']
         
+        if client_id not in self.active_clients:
+            return
+        converged = float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
+        if converged:
+            self.mark_client_converged(client_id)
+            return
         if round_num == self.current_round:
             # Check if update is compressed
             if 'compressed_data' in data and self.quantization_handler is not None:
@@ -396,9 +419,9 @@ class FederatedLearningServer:
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{len(self.round_participants)})")
             
-            # If all PARTICIPATING clients sent updates, aggregate
-            # Only wait for clients that were present at round start
-            if len(self.client_updates) >= len(self.round_participants):
+            # If all active participants sent updates, aggregate
+            active_in_round = self.round_participants & self.active_clients
+            if len(self.client_updates) >= len(active_in_round) and len(active_in_round) > 0:
                 self.aggregate_models()
     
     def handle_client_metrics(self, payload):
@@ -407,6 +430,12 @@ class FederatedLearningServer:
         client_id = data['client_id']
         round_num = data['round']
         
+        if client_id not in self.active_clients:
+            return
+        converged = float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
+        if converged:
+            self.mark_client_converged(client_id)
+            return
         if round_num == self.current_round:
             self.client_metrics[client_id] = {
                 'num_samples': data['num_samples'],
@@ -414,11 +443,10 @@ class FederatedLearningServer:
             }
             
             print(f"Received metrics from client {client_id} "
-                  f"({len(self.client_metrics)}/{self.num_clients})")
+                  f"({len(self.client_metrics)}/{len(self.active_clients)})")
             
-            # If all clients sent metrics, aggregate and continue
-            # Wait for all registered clients (dynamic)
-            if len(self.client_metrics) >= len(self.registered_clients):
+            # If all active clients sent metrics, aggregate and continue
+            if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
                 self.aggregate_metrics()
                 self.continue_training()
     
@@ -494,8 +522,8 @@ class FederatedLearningServer:
         print("\nWaiting for clients to receive and build the model...")
         time.sleep(3)
         
-        # Capture which clients will participate in this round
-        self.round_participants = self.registered_clients.copy()
+        # Capture which active clients will participate in this round
+        self.round_participants = self.active_clients.copy()
         print(f"Round {self.current_round} participants: {sorted(list(self.round_participants))}")
         
         print(f"\n{'='*70}")
@@ -630,45 +658,22 @@ class FederatedLearningServer:
         self.client_updates.clear()
         self.client_metrics.clear()
         
-        # Check for convergence (early stopping)
-        if self.current_round >= MIN_ROUNDS and self.check_convergence():
+        # Stop only when no active clients remain or max rounds reached (no server-side convergence)
+        if len(self.active_clients) == 0:
             self.convergence_time = time.time() - self.start_time if self.start_time else 0
-            print("\n" + "="*70)
-            print("CONVERGENCE ACHIEVED!")
-            print(f"Training stopped early at round {self.current_round}/{self.num_rounds}")
-            print(f"Loss improvement below threshold for {CONVERGENCE_PATIENCE} consecutive rounds")
-            print(f"Time to Convergence: {self.convergence_time:.2f} seconds ({self.convergence_time/60:.2f} minutes)")
-            print("="*70 + "\n")
             self.converged = True
-            
-            # Send training complete signal to all clients with QoS 1 (at least once delivery)
-            print("Sending training completion signal to all clients...")
-            print(f"Publishing to topic: {TOPIC_TRAINING_COMPLETE}")
-            result = self.mqtt_client.publish(TOPIC_TRAINING_COMPLETE, json.dumps({"message": "Training completed"}), qos=1)
-            log_sent_packet(
-                packet_size=len(json.dumps({"message": "Training completed"})),
-                peer=TOPIC_TRAINING_COMPLETE,  # or client_id/server_id as appropriate
-                protocol="MQTT",
-                round=self.current_round if hasattr(self, 'current_round') else None,
-                extra_info="Training completion signal"
-            )
-            print(f"Publish result: rc={result.rc}, mid={result.mid}")
-            if result.rc != mqtt.MQTT_ERR_SUCCESS:
-                print(f"ERROR: Failed to publish training completion message, rc={result.rc}")
-            else:
-                print(f"Training completion signal sent successfully (QoS 1)")
-            time.sleep(2)  # Give clients time to receive and process the message
-            
-            self.save_results()
-            self.plot_results()  # This will handle disconnection and exit
+            print("\n" + "="*70)
+            print("All clients converged locally. Training complete.")
+            print("="*70 + "\n")
+            self._send_training_complete_and_exit()
             return
         
         # Check if more rounds needed
         if self.current_round < self.num_rounds:
             self.current_round += 1
             
-            # Capture participants for this new round (includes late-joiners)
-            self.round_participants = self.registered_clients.copy()
+            # Capture active participants for this new round
+            self.round_participants = self.active_clients.copy()
             
             print(f"\n{'='*70}")
             print(f"Starting Round {self.current_round}/{self.num_rounds}")
@@ -696,27 +701,25 @@ class FederatedLearningServer:
             print(f"Maximum rounds ({self.num_rounds}) reached")
             print(f"Total Training Time: {self.convergence_time:.2f} seconds ({self.convergence_time/60:.2f} minutes)")
             print("="*70 + "\n")
-            
-            # Send training complete signal to all clients with QoS 1 (at least once delivery)
-            print("Sending training completion signal to all clients...")
-            print(f"Publishing to topic: {TOPIC_TRAINING_COMPLETE}")
-            result = self.mqtt_client.publish(TOPIC_TRAINING_COMPLETE, json.dumps({"message": "Training completed"}), qos=1)
-            log_sent_packet(
-                packet_size=len(json.dumps({"message": "Training completed"})),
-                peer=TOPIC_TRAINING_COMPLETE,  # or client_id/server_id as appropriate
-                protocol="MQTT",
-                round=self.current_round if hasattr(self, 'current_round') else None,
-                extra_info="Training completion signal"
-            )
-            print(f"Publish result: rc={result.rc}, mid={result.mid}")
-            if result.rc != mqtt.MQTT_ERR_SUCCESS:
-                print(f"ERROR: Failed to publish training completion message, rc={result.rc}")
-            else:
-                print(f"Training completion signal sent successfully (QoS 1)")
-            time.sleep(2)  # Give clients time to receive and process the message
-            
-            self.save_results()
-            self.plot_results()  # This will handle disconnection and exit
+            self._send_training_complete_and_exit()
+    
+    def _send_training_complete_and_exit(self):
+        """Send training completion signal and save/plot results."""
+        if self.training_complete:
+            return
+        self.training_complete = True
+        print("Sending training completion signal to all clients...")
+        result = self.mqtt_client.publish(TOPIC_TRAINING_COMPLETE, json.dumps({"message": "Training completed"}), qos=1)
+        log_sent_packet(
+            packet_size=len(json.dumps({"message": "Training completed"})),
+            peer=TOPIC_TRAINING_COMPLETE,
+            protocol="MQTT",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="Training completion signal"
+        )
+        time.sleep(2)
+        self.save_results()
+        self.plot_results()
     
     def check_convergence(self):
         """Check if model has converged based on loss improvement"""

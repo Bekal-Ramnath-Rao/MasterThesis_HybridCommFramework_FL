@@ -63,6 +63,9 @@ logging.getLogger("tensorflow").setLevel(logging.ERROR)
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 # Chunking configuration for large messages
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for better DDS performance in poor networks
@@ -140,6 +143,7 @@ class EvaluationMetrics(IdlStruct):
     mse: float
     mae: float
     mape: float
+    client_converged: float = 0.0
 
 
 @dataclass
@@ -176,6 +180,9 @@ class FederatedLearningClient:
         self.current_round = 0
         self.training_config = {"batch_size": 16, "local_epochs": 20}
         self.running = True
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
+        self.has_converged = False
         
         # Chunk reassembly buffers
         self.global_model_chunks = {}  # {chunk_id: payload}
@@ -624,8 +631,9 @@ class FederatedLearningClient:
         mse = results[1]
         mae = results[2]
         mape = results[3]
+        self._update_local_convergence(float(loss))
         
-        # Send metrics to server
+        client_converged = 1.0 if self.has_converged else 0.0
         metrics = EvaluationMetrics(
             client_id=self.client_id,
             round=self.current_round,
@@ -633,7 +641,8 @@ class FederatedLearningClient:
             loss=float(loss),
             mse=float(mse),
             mae=float(mae),
-            mape=float(mape)
+            mape=float(mape),
+            client_converged=client_converged
         )
         
         # Write with explicit return check
@@ -645,6 +654,23 @@ class FederatedLearningClient:
         print(f"Client {self.client_id} sent evaluation metrics for round {self.current_round}")
         print(f"Evaluation metrics - Loss: {loss:.4f}, MSE: {mse:.4f}, "
               f"MAE: {mae:.4f}, MAPE: {mape:.4f}\n")
+        if self.has_converged:
+            print(f"Client {self.client_id} notifying server of convergence and stopping")
+            self.running = False
+    
+    def _update_local_convergence(self, loss: float):
+        """Track client-local convergence and stop when converged."""
+        if self.current_round < MIN_ROUNDS:
+            self.best_loss = min(self.best_loss, loss)
+            return
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            self.best_loss = loss
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+        if self.rounds_without_improvement >= CONVERGENCE_PATIENCE and not self.has_converged:
+            self.has_converged = True
+            print(f"Client {self.client_id} reached local convergence at round {self.current_round}")
     
     def cleanup(self):
         """Cleanup DDS resources"""

@@ -55,6 +55,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
+        self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
         self.clients_evaluated = set()  # Track which clients have evaluated this round
@@ -137,6 +138,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         with self.lock:
             client_id = request.client_id
             self.registered_clients.add(client_id)
+            self.active_clients.add(client_id)
             print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
         
         # Update total client count if more clients join
@@ -161,7 +163,24 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             return federated_learning_pb2.RegistrationResponse(
                 success=True,
                 message=f"Client {client_id} registered successfully"
-            )
+                )
+    
+    def mark_client_converged(self, client_id):
+        """Remove converged client from active federation."""
+        with self.lock:
+            if client_id in self.active_clients:
+                self.active_clients.discard(client_id)
+                self.client_updates.pop(client_id, None)
+                self.client_metrics.pop(client_id, None)
+                self.clients_evaluated.discard(client_id)
+                print(f"Client {client_id} converged and disconnected. Active clients remaining: {len(self.active_clients)}")
+                if not self.active_clients:
+                    self.training_complete = True
+                    self.converged = True
+                    print("All clients converged. Ending training.")
+                    self.convergence_time = time.time() - self.start_time if self.start_time else 0
+                    self.plot_results()
+                    self.save_results()
     
     def GetTrainingConfig(self, request, context):
         """Return training configuration"""
@@ -248,24 +267,24 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 model_config = {
                     "architecture": "LSTM",
                     "layers": [
-                            {
-                                "type": "LSTM",
-                                "units": 50,
-                                "activation": "relu",
-                                "input_shape": [1, 4]
-                            },
-                            {
-                                "type": "Dense",
-                                "units": 1
-                            }
-                        ],
-                        "compile_config": {
-                            "loss": "mean_squared_error",
-                            "optimizer": "adam",
-                            "metrics": ["mse", "mae", "mape"]
+                        {
+                            "type": "LSTM",
+                            "units": 50,
+                            "activation": "relu",
+                            "input_shape": [1, 4]
+                        },
+                        {
+                            "type": "Dense",
+                            "units": 1
                         }
+                    ],
+                    "compile_config": {
+                        "loss": "mean_squared_error",
+                        "optimizer": "adam",
+                        "metrics": ["mse", "mae", "mape"]
                     }
-                    model_config_json = json.dumps(model_config)
+                }
+                model_config_json = json.dumps(model_config)
                 
                 # Compress or serialize global weights
                 if self.quantization_handler is not None:
@@ -295,7 +314,18 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         with self.lock:
             client_id = request.client_id
             round_num = request.round
-            
+            metrics = dict(request.metrics)
+            if float(metrics.get('client_converged', 0.0)) >= 1.0:
+                self.mark_client_converged(client_id)
+                return federated_learning_pb2.UpdateResponse(
+                    success=True,
+                    message=f"Client {client_id} convergence acknowledged"
+                )
+            if client_id not in self.active_clients:
+                return federated_learning_pb2.UpdateResponse(
+                    success=True,
+                    message=f"Client {client_id} already inactive"
+                )
             if round_num == self.current_round:
                 # Decompress or deserialize client weights
                 if self.quantization_handler is not None and request.weights:
@@ -322,15 +352,13 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 self.client_updates[client_id] = {
                     'weights': weights,
                     'num_samples': request.num_samples,
-                    'metrics': dict(request.metrics)
+                    'metrics': metrics
                 }
                 
                 print(f"Received update from client {client_id} "
-                      f"({len(self.client_updates)}/{self.num_clients})")
+                      f"({len(self.client_updates)}/{len(self.active_clients)})")
                 
-                # If all clients sent updates, aggregate
-                # Wait for all registered clients (dynamic)
-            if len(self.client_updates) >= len(self.registered_clients):
+                if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
                     self.aggregate_models()
                 
                 return federated_learning_pb2.UpdateResponse(
@@ -348,20 +376,29 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         with self.lock:
             client_id = request.client_id
             round_num = request.round
-            
+            metrics = dict(request.metrics) if hasattr(request, 'metrics') and request.metrics else {}
+            if client_id not in self.active_clients:
+                return federated_learning_pb2.MetricsResponse(
+                    success=True,
+                    message=f"Client {client_id} already inactive"
+                )
+            if float(metrics.get('client_converged', 0.0)) >= 1.0:
+                self.mark_client_converged(client_id)
+                return federated_learning_pb2.MetricsResponse(
+                    success=True,
+                    message="Convergence acknowledged"
+                )
             if round_num == self.current_round:
                 self.client_metrics[client_id] = {
                     'num_samples': request.num_samples,
-                    'metrics': dict(request.metrics)
+                    'metrics': metrics
                 }
-                self.clients_evaluated.add(client_id)  # Mark this client as evaluated
+                self.clients_evaluated.add(client_id)
                 
                 print(f"Received metrics from client {client_id} "
-                      f"({len(self.client_metrics)}/{self.num_clients})")
+                      f"({len(self.client_metrics)}/{len(self.active_clients)})")
                 
-                # If all clients sent metrics, aggregate and continue
-                # Wait for all registered clients (dynamic)
-            if len(self.client_metrics) >= len(self.registered_clients):
+                if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
                     self.aggregate_metrics()
                     self.continue_training()
                 
@@ -447,20 +484,17 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         # Clear updates and metrics for next round
         self.client_updates.clear()
         self.client_metrics.clear()
-        self.clients_evaluated.clear()  # Clear evaluated clients for next round
+        self.clients_evaluated.clear()
         self.evaluation_phase = False
         
-        # Check for convergence (early stopping)
-        if self.current_round >= MIN_ROUNDS and self.check_convergence():
+        # Stop only when no active clients remain or max rounds reached (no server-side convergence)
+        if len(self.active_clients) == 0:
             self.convergence_time = time.time() - self.start_time if self.start_time else 0
-            print("\n" + "="*70)
-            print("CONVERGENCE ACHIEVED!")
-            print(f"Training stopped early at round {self.current_round}/{self.num_rounds}")
-            print(f"Loss improvement below threshold for {CONVERGENCE_PATIENCE} consecutive rounds")
-            print(f"Time to Convergence: {self.convergence_time:.2f} seconds ({self.convergence_time/60:.2f} minutes)")
-            print("="*70 + "\n")
             self.converged = True
             self.training_complete = True
+            print("\n" + "="*70)
+            print("All clients converged locally. Training complete.")
+            print("="*70 + "\n")
             self.plot_results()
             self.save_results()
             return

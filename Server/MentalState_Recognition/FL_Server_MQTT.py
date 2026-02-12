@@ -218,6 +218,7 @@ class FederatedLearningServer:
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
+        self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
         self.global_weights = None
@@ -317,6 +318,7 @@ class FederatedLearningServer:
             return
         
         self.registered_clients.add(client_id)
+        self.active_clients.add(client_id)
         print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
         
         # Update total client count if more clients join
@@ -325,15 +327,7 @@ class FederatedLearningServer:
 
         # Check if this is a late-joining client
         if self.training_started:
-            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
-            if len(self.registered_clients) > self.num_clients:
-                self.update_client_count(len(self.registered_clients))
-            if self.global_weights is not None:
-                self.send_current_model_to_client(client_id)
-            return
-        
-        # Check if this is a late-joining client
-        if self.training_started:
+            self.active_clients.add(client_id)
             print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
             if len(self.registered_clients) > self.num_clients:
                 self.update_client_count(len(self.registered_clients))
@@ -367,12 +361,31 @@ class FederatedLearningServer:
         except Exception as e:
             print(f"❌ Error sending current model to client {client_id}: {e}")
 
+    def mark_client_converged(self, client_id):
+        """Remove converged client from active federation."""
+        if client_id in self.active_clients:
+            self.active_clients.discard(client_id)
+            self.client_updates.pop(client_id, None)
+            self.client_metrics.pop(client_id, None)
+            print(f"Client {client_id} converged and disconnected. Active clients remaining: {len(self.active_clients)}")
+            if not self.active_clients:
+                self.converged = True
+                print("All clients converged. Ending training.")
+                self.convergence_time = time.time() - self.start_time if self.start_time else 0
+                self.finish_training()
+
     def handle_client_update(self, payload):
         """Handle model update from client"""
         data = json.loads(payload.decode())
         client_id = data['client_id']
         round_num = data['round']
 
+        if client_id not in self.active_clients:
+            return
+        m = data.get('metrics', data) if isinstance(data.get('metrics'), dict) else data
+        if float(m.get('client_converged', 0.0)) >= 1.0:
+            self.mark_client_converged(client_id)
+            return
         if round_num == self.current_round:
             # Check if update is compressed
             if 'compressed_data' in data and self.quantization_handler is not None:
@@ -399,8 +412,7 @@ class FederatedLearningServer:
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{self.num_clients})")
 
-            # Wait for all registered clients (dynamic)
-            if len(self.client_updates) >= len(self.registered_clients):
+            if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
                 self.aggregate_models()
 
     def handle_client_metrics(self, payload):
@@ -408,6 +420,12 @@ class FederatedLearningServer:
         data = json.loads(payload.decode())
         client_id = data['client_id']
         
+        if client_id not in self.active_clients:
+            return
+        m = data.get('metrics', data) if isinstance(data.get('metrics'), dict) else data
+        if float(m.get('client_converged', 0.0)) >= 1.0:
+            self.mark_client_converged(client_id)
+            return
         # Store client metrics
         self.client_metrics[client_id] = {
             'loss': data.get('loss', 0),
@@ -536,8 +554,7 @@ class FederatedLearningServer:
         print(f"  Avg Top-2 Accuracy: {avg_top2:.6f}")
         print(f"{'=' * 70}\n")
         
-        # Check convergence
-        self.check_convergence(avg_loss)
+        # No server-side convergence - only stop when no active clients or max rounds
 
     def check_convergence(self, current_loss):
         """Check if training has converged"""
@@ -592,6 +609,14 @@ class FederatedLearningServer:
         self.client_updates.clear()
         self.client_metrics.clear()
 
+        if len(self.active_clients) == 0:
+            self.convergence_time = time.time() - self.start_time if self.start_time else 0
+            self.converged = True
+            print("\n" + "=" * 70)
+            print("All clients converged locally. Training complete.")
+            print("=" * 70 + "\n")
+            self.finish_training()
+            return
         if self.current_round >= self.num_rounds:
             self.convergence_time = time.time() - self.start_time if self.start_time else 0
             print("\n" + "=" * 70)

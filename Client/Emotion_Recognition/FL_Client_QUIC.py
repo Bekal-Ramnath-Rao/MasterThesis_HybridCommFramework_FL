@@ -81,6 +81,9 @@ QUIC_HOST = os.getenv("QUIC_HOST", "fl-server-quic-emotion")
 QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "1"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 # Model initialization timeout (seconds) - longer for poor network conditions
 # Default: 300s (5 minutes) for very poor network conditions with large models
@@ -158,6 +161,9 @@ class FederatedLearningClient:
         self.validation_generator = validation_generator
         self.current_round = 0
         self.training_config = {"batch_size": 32, "local_epochs": 20}
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
+        self.has_converged = False
         self.protocol = None
         self.stream_id = 0
         self.model_ready = asyncio.Event()  # Event to signal model is ready
@@ -477,21 +483,44 @@ class FederatedLearningClient:
         )
         
         loss, accuracy = results[0], results[1]
+        self._update_local_convergence(float(loss))
+        
+        metrics_dict = {
+            'loss': float(loss),
+            'accuracy': float(accuracy)
+        }
+        if self.has_converged:
+            metrics_dict['client_converged'] = 1.0
         
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
         
-        # Send evaluation metrics to server
         await self.send_message({
             'type': 'metrics',
             'client_id': self.client_id,
             'round': self.current_round,
             'num_samples': self.validation_generator.n,
-            'metrics': {
-                'loss': float(loss),
-                'accuracy': float(accuracy)
-            }
+            'metrics': metrics_dict
         })
+        if self.has_converged:
+            print(f"Client {self.client_id} notifying server of convergence and disconnecting")
+            await asyncio.sleep(2)
+            import sys
+            sys.exit(0)
     
+    def _update_local_convergence(self, loss: float):
+        """Track client-local convergence and disconnect when converged."""
+        if self.current_round < MIN_ROUNDS:
+            self.best_loss = min(self.best_loss, loss)
+            return
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            self.best_loss = loss
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+        if self.rounds_without_improvement >= CONVERGENCE_PATIENCE and not self.has_converged:
+            self.has_converged = True
+            print(f"Client {self.client_id} reached local convergence at round {self.current_round}")
+
     async def register_with_server(self):
         """Register with the federated learning server"""
         await self.send_message({

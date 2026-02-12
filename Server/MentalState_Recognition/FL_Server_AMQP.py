@@ -218,6 +218,7 @@ class FederatedLearningServer:
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
+        self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
         self.global_weights = None
@@ -344,36 +345,42 @@ class FederatedLearningServer:
             data = json.loads(body.decode())
             client_id = data['client_id']
             self.registered_clients.add(client_id)
+            self.active_clients.add(client_id)
             print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
-        
-        # Update total client count if more clients join
-        if len(self.registered_clients) > self.num_clients:
-            self.update_client_count(len(self.registered_clients))
-
-            # Check if this is a late-joining client
-        if self.training_started:
-            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
+            
             if len(self.registered_clients) > self.num_clients:
                 self.update_client_count(len(self.registered_clients))
-            if self.global_weights is not None:
-                self.send_current_model_to_client(client_id)
-            return
-        
-        # Check if this is a late-joining client
-        if self.training_started:
-            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
-            if len(self.registered_clients) > self.num_clients:
-                self.update_client_count(len(self.registered_clients))
-            if self.global_weights is not None:
-                self.send_current_model_to_client(client_id)
-            return
-        
-        if len(self.registered_clients) >= self.min_clients:
+            
+            if self.training_started:
+                self.active_clients.add(client_id)
+                print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
+                if len(self.registered_clients) > self.num_clients:
+                    self.update_client_count(len(self.registered_clients))
+                if self.global_weights is not None:
+                    self.send_current_model_to_client(client_id)
+                return
+            
+            if len(self.registered_clients) >= self.min_clients:
                 print("\nAll clients registered. Distributing initial global model...\n")
                 time.sleep(2)
                 self.distribute_initial_model()
+                self.start_time = time.time()
+                self.training_started = True
         except Exception as e:
             print(f"Server error handling registration: {e}")
+
+    def mark_client_converged(self, client_id):
+        """Remove converged client from active federation."""
+        if client_id in self.active_clients:
+            self.active_clients.discard(client_id)
+            self.client_updates.pop(client_id, None)
+            self.client_metrics.pop(client_id, None)
+            print(f"Client {client_id} converged and disconnected. Active clients remaining: {len(self.active_clients)}")
+            if not self.active_clients:
+                self.converged = True
+                print("All clients converged. Ending training.")
+                self.convergence_time = time.time() - self.start_time if self.start_time else 0
+                self.finish_training()
 
     def on_client_update(self, ch, method, properties, body):
         """Handle model update from client"""
@@ -381,7 +388,13 @@ class FederatedLearningServer:
             data = json.loads(body.decode())
             client_id = data['client_id']
             round_num = data['round']
+            m = data.get('metrics', data) if isinstance(data.get('metrics'), dict) else data
 
+            if client_id not in self.active_clients:
+                return
+            if float(m.get('client_converged', 0.0)) >= 1.0:
+                self.mark_client_converged(client_id)
+                return
             if round_num == self.current_round:
                 # Check if update is compressed
                 if 'compressed_data' in data and self.quantization_handler is not None:
@@ -402,14 +415,15 @@ class FederatedLearningServer:
                 
                 self.client_updates[client_id] = {
                     'weights': weights,
-                    'num_samples': data['num_samples']
+                    'num_samples': data['num_samples'],
+                    'metrics': data.get('metrics', {})
                 }
+                self.client_metrics[client_id] = data.get('metrics', {'loss': 0, 'accuracy': 0, 'top2_accuracy': 0})
 
                 print(f"Received update from client {client_id} "
-                      f"({len(self.client_updates)}/{self.num_clients})")
+                      f"({len(self.client_updates)}/{len(self.active_clients)})")
 
-                # Wait for all registered clients (dynamic)
-            if len(self.client_updates) >= len(self.registered_clients):
+                if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
                     self.aggregate_models()
         except Exception as e:
             print(f"Server error handling client update: {e}")
@@ -541,10 +555,10 @@ class FederatedLearningServer:
             print("No client metrics available yet")
             return
         
-        # Average client metrics
-        avg_loss = np.mean([m['loss'] for m in self.client_metrics.values()])
-        avg_acc = np.mean([m['accuracy'] for m in self.client_metrics.values()])
-        avg_top2 = np.mean([m['top2_accuracy'] for m in self.client_metrics.values()])
+        # Average client metrics (use 0 for missing top2_accuracy)
+        avg_loss = np.mean([m.get('loss', 0) for m in self.client_metrics.values()])
+        avg_acc = np.mean([m.get('accuracy', 0) for m in self.client_metrics.values()])
+        avg_top2 = np.mean([m.get('top2_accuracy', 0) for m in self.client_metrics.values()])
         
         # Store aggregated metrics
         self.LOSS.append(float(avg_loss))
@@ -558,9 +572,6 @@ class FederatedLearningServer:
         print(f"  Avg Accuracy: {avg_acc:.6f}")
         print(f"  Avg Top-2 Accuracy: {avg_top2:.6f}")
         print(f"{'=' * 70}\n")
-        
-        # Check convergence
-        self.check_convergence(avg_loss)
     
     def check_convergence(self, current_loss):
         """Check if training has converged"""
@@ -617,6 +628,16 @@ class FederatedLearningServer:
         
         self.client_updates.clear()
         self.client_metrics.clear()
+
+        # Stop only when no active clients or max rounds (no server-side convergence)
+        if len(self.active_clients) == 0:
+            self.convergence_time = time.time() - self.start_time if self.start_time else 0
+            self.converged = True
+            print("\n" + "=" * 70)
+            print("All clients converged locally. Training complete.")
+            print("=" * 70 + "\n")
+            self.finish_training()
+            return
 
         if self.current_round >= self.num_rounds:
             self.convergence_time = time.time() - self.start_time if self.start_time else 0

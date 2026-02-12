@@ -83,6 +83,9 @@ from typing import List
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 # Chunking configuration for large messages
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for better DDS performance in poor networks
@@ -149,6 +152,7 @@ class ModelUpdateChunk(IdlStruct):
     num_samples: int
     loss: float
     accuracy: float
+    client_converged: float = 0.0
 
 
 @dataclass
@@ -158,6 +162,7 @@ class EvaluationMetrics(IdlStruct):
     num_samples: int
     loss: float
     accuracy: float
+    client_converged: float = 0.0
 
 
 @dataclass
@@ -193,6 +198,9 @@ class FederatedLearningClient:
             "val_split": 0.10
         }
         self.class_weights = None
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
+        self.has_converged = False
         self.running = True
         
         # Chunk reassembly buffers
@@ -404,7 +412,7 @@ class FederatedLearningClient:
             chunks.append(data[i:i + CHUNK_SIZE])
         return chunks
     
-    def send_model_update_chunked(self, round_num, serialized_weights, num_samples, loss, accuracy):
+    def send_model_update_chunked(self, round_num, serialized_weights, num_samples, loss, accuracy, client_converged=0.0):
         """Send model update as chunks"""
         chunks = self.split_into_chunks(serialized_weights)
         total_chunks = len(chunks)
@@ -420,7 +428,8 @@ class FederatedLearningClient:
                 payload=chunk_data,
                 num_samples=num_samples,
                 loss=loss,
-                accuracy=accuracy
+                accuracy=accuracy,
+                client_converged=client_converged
             )
             self.writers['model_update_chunk'].write(chunk)
             print(f"  Sent chunk {chunk_id + 1}/{total_chunks} ({len(chunk_data)} bytes)")
@@ -687,6 +696,8 @@ class FederatedLearningClient:
         # Get metrics
         final_loss = float(history.history['loss'][-1]) if 'loss' in history.history else 0.0
         final_acc = float(history.history['acc'][-1]) if 'acc' in history.history else 0.0
+        self._update_local_convergence(final_loss)
+        client_converged = 1.0 if self.has_converged else 0.0
         
         # Get model weights
         weights = self.model.get_weights()
@@ -711,13 +722,31 @@ class FederatedLearningClient:
             serialized_weights,
             int(len(self.y_train)),
             final_loss,
-            final_acc
+            final_acc,
+            client_converged
         )
         
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
         print(f"Training metrics - Loss: {final_loss:.4f}, Accuracy: {final_acc:.4f}")
+        if self.has_converged:
+            print(f"Client {self.client_id} notifying server of convergence and stopping")
+            self.running = False
         
         time.sleep(0.5)
+    
+    def _update_local_convergence(self, loss: float):
+        """Track client-local convergence and stop when converged."""
+        if self.current_round < MIN_ROUNDS:
+            self.best_loss = min(self.best_loss, loss)
+            return
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            self.best_loss = loss
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+        if self.rounds_without_improvement >= CONVERGENCE_PATIENCE and not self.has_converged:
+            self.has_converged = True
+            print(f"Client {self.client_id} reached local convergence at round {self.current_round}")
     
     def cleanup(self):
         """Cleanup DDS resources"""

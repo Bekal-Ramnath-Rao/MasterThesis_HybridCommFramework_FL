@@ -91,6 +91,9 @@ AMQP_USER = os.getenv("AMQP_USER", "guest")
 AMQP_PASSWORD = os.getenv("AMQP_PASSWORD", "guest")
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 # AMQP Exchanges and Queues
 EXCHANGE_BROADCAST = "fl_broadcast"
@@ -108,6 +111,9 @@ class FederatedLearningClient:
         self.last_global_round = -1
         self.last_training_round = -1
         self.evaluated_rounds = set()
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
+        self.has_converged = False
         
         # Store data generators
         self.train_generator = train_generator
@@ -624,6 +630,20 @@ class FederatedLearningClient:
             return
         print(f"Training metrics - Loss: {metrics['loss']:.4f}, Accuracy: {metrics['accuracy']:.4f}")
     
+    def _update_local_convergence(self, loss: float):
+        """Track client-local convergence and disconnect when converged."""
+        if self.current_round < MIN_ROUNDS:
+            self.best_loss = min(self.best_loss, loss)
+            return
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            self.best_loss = loss
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+        if self.rounds_without_improvement >= CONVERGENCE_PATIENCE and not self.has_converged:
+            self.has_converged = True
+            print(f"Client {self.client_id} reached local convergence at round {self.current_round}")
+
     def evaluate_model(self):
         """Evaluate model on validation data with GPU acceleration and send metrics to server"""
         # Use GPU device context for evaluation
@@ -634,15 +654,20 @@ class FederatedLearningClient:
             )
         
         num_samples = self.validation_generator.n
+        self._update_local_convergence(float(loss))
+        
+        metrics_dict = {
+            "loss": float(loss),
+            "accuracy": float(accuracy)
+        }
+        if self.has_converged:
+            metrics_dict["client_converged"] = 1.0
         
         metrics_message = {
             "client_id": self.client_id,
             "round": self.current_round,
             "num_samples": num_samples,
-            "metrics": {
-                "loss": float(loss),
-                "accuracy": float(accuracy)
-            }
+            "metrics": metrics_dict
         }
         
         if self.publish_with_retry(
@@ -659,6 +684,10 @@ class FederatedLearningClient:
                 round=self.current_round,
                 extra_info="Evaluation metrics"
             )
+            if self.has_converged:
+                print(f"Client {self.client_id} notifying server of convergence and disconnecting")
+                time.sleep(2)
+                self.stop()
         else:
             print(f"Client {self.client_id} ERROR: Failed to send evaluation metrics")
     

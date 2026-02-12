@@ -52,6 +52,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
+        self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
         self.clients_evaluated = set()
@@ -174,6 +175,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         """Handle client registration"""
         with self.lock:
             self.registered_clients.add(request.client_id)
+            self.active_clients.add(request.client_id)
             print(f"Client {request.client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
             
             if len(self.registered_clients) == self.num_clients and not self.training_started:
@@ -187,6 +189,22 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 message=f"Client {request.client_id} registered successfully"
             )
     
+    def mark_client_converged(self, client_id):
+        """Remove converged client from active federation."""
+        with self.lock:
+            if client_id in self.active_clients:
+                self.active_clients.remove(client_id)
+                self.client_updates.pop(client_id, None)
+                self.client_metrics.pop(client_id, None)
+                self.clients_evaluated.discard(client_id)
+                print(f"Client {client_id} converged and disconnected. "
+                      f"Active clients remaining: {len(self.active_clients)}")
+                if not self.active_clients:
+                    self.training_complete = True
+                    self.evaluation_phase = False
+                    self.converged = True
+                    print("All clients converged. Ending training.")
+
     def GetTrainingConfig(self, request, context):
         """Send training configuration to client"""
         return federated_learning_pb2.TrainingConfig(
@@ -260,6 +278,14 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             
             # Extract metrics from map
             metrics = dict(request.metrics)
+
+            converged_flag = float(metrics.get('client_converged', 0.0)) >= 1.0
+            if converged_flag:
+                self.mark_client_converged(client_id)
+                return federated_learning_pb2.UpdateResponse(
+                    success=True,
+                    message=f"Client {client_id} convergence acknowledged"
+                )
             
             # Store update
             self.client_updates[client_id] = {
@@ -274,7 +300,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             
             # Check if all clients have submitted
             # Wait for all registered clients (dynamic)
-            if len(self.client_updates) >= len(self.registered_clients):
+            if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
                 print(f"\nAll clients submitted updates for round {self.current_round}")
                 # Aggregate in separate thread
                 threading.Thread(target=self.aggregate_updates).start()
@@ -289,6 +315,12 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         with self.lock:
             client_id = request.client_id
             round_num = request.round
+
+            if client_id not in self.active_clients:
+                return federated_learning_pb2.MetricsResponse(
+                    success=True,
+                    message=f"Client {client_id} already inactive"
+                )
             
             # Extract metrics from map
             metrics = dict(request.metrics)
@@ -305,7 +337,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             print(f"  Progress: {len(self.clients_evaluated)}/{self.num_clients} clients evaluated")
             
             # Check if all clients evaluated
-            if len(self.clients_evaluated) == self.num_clients:
+            if len(self.clients_evaluated) >= len(self.active_clients) and len(self.active_clients) > 0:
                 print(f"\nAll clients completed evaluation for round {self.current_round}")
                 # Aggregate metrics and start next round
                 threading.Thread(target=self.aggregate_metrics).start()
@@ -348,6 +380,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
     
     def aggregate_updates(self):
         """Aggregate client model updates using FedAvg"""
+        if not self.client_updates:
+            return
         print(f"\n{'='*70}")
         print(f"AGGREGATING UPDATES - Round {self.current_round}")
         print(f"{'='*70}")
@@ -377,7 +411,9 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         print(f"Clients should now evaluate the model\n")
     
     def aggregate_metrics(self):
-        """Aggregate evaluation metrics and check convergence"""
+        """Aggregate evaluation metrics and advance rounds."""
+        if not self.client_metrics:
+            return
         # Calculate weighted average metrics
         total_samples = sum(m['num_samples'] for m in self.client_metrics.values())
         
@@ -395,22 +431,13 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         print(f"Average Loss: {avg_loss:.4f}")
         print(f"Average Accuracy: {avg_accuracy:.4f}")
         
-        # Check for convergence
-        if avg_loss < self.best_loss - CONVERGENCE_THRESHOLD:
-            self.best_loss = avg_loss
-            self.rounds_without_improvement = 0
-            print(f"✓ Loss improved! New best: {self.best_loss:.4f}")
-        else:
-            self.rounds_without_improvement += 1
-            print(f"No significant improvement ({self.rounds_without_improvement}/{CONVERGENCE_PATIENCE})")
-        
         # Check stopping criteria
         should_stop = False
         stop_reason = ""
-        
-        if self.current_round >= MIN_ROUNDS and self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
+
+        if len(self.active_clients) == 0:
             should_stop = True
-            stop_reason = f"Converged (no improvement for {CONVERGENCE_PATIENCE} rounds)"
+            stop_reason = "All clients converged locally"
             self.converged = True
             self.convergence_time = time.time() - self.start_time
         elif self.current_round >= self.num_rounds:
@@ -523,7 +550,7 @@ def serve():
         ('grpc.http2.max_ping_strikes', 2),
     ]
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10), options=options)
-    servicer = FederatedLearningServicer(NUM_CLIENTS, NUM_ROUNDS)
+    servicer = FederatedLearningServicer(MIN_CLIENTS, NUM_ROUNDS, max_clients=MAX_CLIENTS)
     federated_learning_pb2_grpc.add_FederatedLearningServicer_to_server(servicer, server)
     
     server.add_insecure_port(f'{GRPC_HOST}:{GRPC_PORT}')
@@ -533,7 +560,7 @@ def serve():
     print(f"Federated Learning gRPC Server - Emotion Recognition")
     print(f"{'='*70}")
     print(f"Server listening on {GRPC_HOST}:{GRPC_PORT}")
-    print(f"Waiting for {NUM_CLIENTS} clients to register...")
+    print(f"Waiting for at least {MIN_CLIENTS} clients to register...")
     print(f"{'='*70}\n")
     
     try:

@@ -65,6 +65,7 @@ class FederatedLearningServer:
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = set()
+        self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
         self.global_weights = None
@@ -255,42 +256,46 @@ class FederatedLearningServer:
             )
             client_id = data['client_id']
             self.registered_clients.add(client_id)
+            self.active_clients.add(client_id)
             print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
-        
-        # Update total client count if more clients join
-        if len(self.registered_clients) > self.num_clients:
-            self.update_client_count(len(self.registered_clients))
             
-            # If all clients registered, distribute initial global model and start federated learning
-            # Check if this is a late-joining client
-        if self.training_started:
-            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
             if len(self.registered_clients) > self.num_clients:
                 self.update_client_count(len(self.registered_clients))
-            if self.global_weights is not None:
-                self.send_current_model_to_client(client_id)
-            return
-        
-        # Check if this is a late-joining client
-        if self.training_started:
-            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
-            if len(self.registered_clients) > self.num_clients:
-                self.update_client_count(len(self.registered_clients))
-            if self.global_weights is not None:
-                self.send_current_model_to_client(client_id)
-            return
-        
-        if len(self.registered_clients) >= self.min_clients:
+            
+            if self.training_started:
+                self.active_clients.add(client_id)
+                print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
+                if len(self.registered_clients) > self.num_clients:
+                    self.update_client_count(len(self.registered_clients))
+                if self.global_weights is not None:
+                    self.send_current_model_to_client(client_id)
+                return
+            
+            if len(self.registered_clients) >= self.min_clients:
                 print("\nAll clients registered. Distributing initial global model...\n")
                 time.sleep(2)
                 self.distribute_initial_model()
-                # Record training start time
                 self.start_time = time.time()
-                            self.training_started = True
-            self.training_started = True
-print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                self.training_started = True
+                print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         except Exception as e:
             print(f"Server error handling registration: {e}")
+    
+    def mark_client_converged(self, client_id):
+        """Remove converged client from active federation."""
+        if client_id in self.active_clients:
+            self.active_clients.discard(client_id)
+            self.client_updates.pop(client_id, None)
+            self.client_metrics.pop(client_id, None)
+            print(f"Client {client_id} converged and disconnected. Active clients remaining: {len(self.active_clients)}")
+            if not self.active_clients:
+                self.converged = True
+                print("All clients converged. Ending training.")
+                self.convergence_time = time.time() - self.start_time if self.start_time else 0
+                self.send_training_complete()
+                self.plot_results()
+                self.save_results()
+                self.stop()
     
     def on_client_update(self, ch, method, properties, body):
         """Handle model update from client"""
@@ -306,6 +311,11 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             client_id = data['client_id']
             round_num = data['round']
             
+            if client_id not in self.active_clients:
+                return
+            if float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+                self.mark_client_converged(client_id)
+                return
             if round_num == self.current_round:
                 # Check if update is compressed
                 if 'compressed_data' in data and self.quantization_handler is not None:
@@ -331,11 +341,9 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 }
                 
                 print(f"Received update from client {client_id} "
-                      f"({len(self.client_updates)}/{self.num_clients})")
+                      f"({len(self.client_updates)}/{len(self.active_clients)})")
                 
-                # If all clients sent updates, aggregate
-                # Wait for all registered clients (dynamic)
-            if len(self.client_updates) >= len(self.registered_clients):
+                if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
                     self.aggregate_models()
         except Exception as e:
             print(f"Server error handling client update: {e}")
@@ -354,6 +362,11 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             client_id = data['client_id']
             round_num = data['round']
             
+            if client_id not in self.active_clients:
+                return
+            if float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+                self.mark_client_converged(client_id)
+                return
             if round_num == self.current_round:
                 self.client_metrics[client_id] = {
                     'num_samples': data['num_samples'],
@@ -361,11 +374,9 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
                 }
                 
                 print(f"Received metrics from client {client_id} "
-                      f"({len(self.client_metrics)}/{self.num_clients})")
+                      f"({len(self.client_metrics)}/{len(self.active_clients)})")
                 
-                # If all clients sent metrics, aggregate and continue
-                # Wait for all registered clients (dynamic)
-            if len(self.client_metrics) >= len(self.registered_clients):
+                if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
                     self.aggregate_metrics()
                     self.continue_training()
         except Exception as e:
@@ -587,18 +598,13 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         self.client_updates.clear()
         self.client_metrics.clear()
         
-        # Check for convergence (early stopping)
-        if self.current_round >= MIN_ROUNDS and self.check_convergence():
+        # Stop only when no active clients remain or max rounds reached (no server-side convergence)
+        if len(self.active_clients) == 0:
             self.convergence_time = time.time() - self.start_time if self.start_time else 0
-            print("\n" + "="*70)
-            print("CONVERGENCE ACHIEVED!")
-            print(f"Training stopped early at round {self.current_round}/{self.num_rounds}")
-            print(f"Loss improvement below threshold for {CONVERGENCE_PATIENCE} consecutive rounds")
-            print(f"Time to Convergence: {self.convergence_time:.2f} seconds ({self.convergence_time/60:.2f} minutes)")
-            print("="*70 + "\n")
             self.converged = True
-            
-            # Send completion signal
+            print("\n" + "="*70)
+            print("All clients converged locally. Training complete.")
+            print("="*70 + "\n")
             self.send_training_complete()
             self.plot_results()
             self.save_results()

@@ -92,6 +92,9 @@ from typing import List
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 # Chunking configuration for large messages
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for better DDS performance in poor networks
@@ -170,6 +173,7 @@ class EvaluationMetrics(IdlStruct):
     num_samples: int
     loss: float
     accuracy: float
+    client_converged: float = 0.0
 
 
 @dataclass
@@ -201,6 +205,9 @@ class FederatedLearningClient:
         self.current_round = 0
         self.training_config = {"batch_size": 32, "local_epochs": 20}
         self.running = True
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
+        self.has_converged = False
         
         # Chunk reassembly buffers
         self.global_model_chunks = {}  # {chunk_id: payload}
@@ -726,10 +733,27 @@ class FederatedLearningClient:
         
         print(f"Client {self.client_id} WARNING: Timeout waiting for global model round {self.current_round}")
     
+    def _update_local_convergence(self, loss: float):
+        """Track client-local convergence and disconnect when converged."""
+        if self.current_round < MIN_ROUNDS:
+            self.best_loss = min(self.best_loss, loss)
+            return
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            self.best_loss = loss
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+        if self.rounds_without_improvement >= CONVERGENCE_PATIENCE and not self.has_converged:
+            self.has_converged = True
+            print(f"Client {self.client_id} reached local convergence at round {self.current_round}")
+
     def evaluate_model(self):
         """Evaluate model on validation data and send metrics to server"""
         # Evaluate on validation set
         loss, accuracy = self.model.evaluate(self.validation_generator, verbose=0)
+        
+        self._update_local_convergence(float(loss))
+        client_converged = 1.0 if self.has_converged else 0.0
         
         # Send metrics to server
         metrics = EvaluationMetrics(
@@ -737,7 +761,8 @@ class FederatedLearningClient:
             round=self.current_round,
             num_samples=self.validation_generator.n,
             loss=float(loss),
-            accuracy=float(accuracy)
+            accuracy=float(accuracy),
+            client_converged=client_converged
         )
         
         # Write with explicit return check
@@ -748,6 +773,9 @@ class FederatedLearningClient:
         
         print(f"Client {self.client_id} sent evaluation metrics for round {self.current_round}")
         print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}\n")
+        if self.has_converged:
+            print(f"Client {self.client_id} notifying server of convergence and disconnecting")
+            self.running = False
     
     def cleanup(self):
         """Cleanup DDS resources"""

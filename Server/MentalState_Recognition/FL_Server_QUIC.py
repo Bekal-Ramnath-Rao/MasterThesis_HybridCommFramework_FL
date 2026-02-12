@@ -1,4 +1,5 @@
 import os
+import sys
 import glob
 import json
 import pickle
@@ -255,6 +256,7 @@ class FederatedLearningServer:
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = {}
+        self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
         self.global_weights = None
@@ -384,6 +386,7 @@ class FederatedLearningServer:
         client_id = message['client_id']
         print(f"[DEBUG] Received registration from client {client_id}")
         self.registered_clients[client_id] = protocol
+        self.active_clients.add(client_id)
         print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
         
         # Update total client count if more clients join
@@ -391,17 +394,8 @@ class FederatedLearningServer:
             self.update_client_count(len(self.registered_clients))
         print(f"[DEBUG] Registered clients: {sorted(self.registered_clients.keys())}")
 
-        # Check if this is a late-joining client
         if self.training_started:
-            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
-            if len(self.registered_clients) > self.num_clients:
-                self.update_client_count(len(self.registered_clients))
-            if self.global_weights is not None:
-                self.send_current_model_to_client(client_id)
-            return
-        
-        # Check if this is a late-joining client
-        if self.training_started:
+            self.active_clients.add(client_id)
             print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
             if len(self.registered_clients) > self.num_clients:
                 self.update_client_count(len(self.registered_clients))
@@ -414,10 +408,33 @@ class FederatedLearningServer:
             await asyncio.sleep(2)
             await self.distribute_initial_model()
 
+    async def mark_client_converged(self, client_id):
+        """Remove converged client from active federation."""
+        if client_id in self.active_clients:
+            self.active_clients.discard(client_id)
+            self.registered_clients.pop(client_id, None)
+            self.client_updates.pop(client_id, None)
+            self.client_metrics.pop(client_id, None)
+            print(f"Client {client_id} converged and disconnected. Active clients remaining: {len(self.active_clients)}")
+            if not self.active_clients:
+                self.converged = True
+                print("All clients converged. Ending training.")
+                self.convergence_time = time.time() - self.start_time if self.start_time else 0
+                await self.broadcast_message({'type': 'training_complete', 'message': 'Training completed'})
+                await asyncio.sleep(2)
+                self.save_results()
+                self.plot_results()
+
     async def handle_client_update(self, message):
         """Handle model update from client"""
         client_id = message['client_id']
         round_num = message['round']
+        m = message.get('metrics', {})
+        if client_id not in self.active_clients:
+            return
+        if float(m.get('client_converged', 0.0)) >= 1.0:
+            await self.mark_client_converged(client_id)
+            return
 
         print(f"[DEBUG] Server received model_update - client_id={client_id}, round_num={round_num}, current_round={self.current_round}")
 
@@ -435,10 +452,9 @@ class FederatedLearningServer:
             }
 
             print(f"Received update from client {client_id} "
-                  f"({len(self.client_updates)}/{self.num_clients})")
+                  f"({len(self.client_updates)}/{len(self.active_clients)})")
 
-            # Wait for all registered clients (dynamic)
-            if len(self.client_updates) >= len(self.registered_clients):
+            if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
                 await self.aggregate_models()
         else:
             print(f"[DEBUG] Ignoring update from client {client_id} - round mismatch (got {round_num}, expected {self.current_round})")

@@ -208,6 +208,7 @@ class UnifiedFederatedLearningServer:
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = {}  # Maps client_id -> protocol_used
+        self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
         self.global_weights = None
@@ -215,6 +216,7 @@ class UnifiedFederatedLearningServer:
         
         # Server state
         self.running = True
+        self.training_started = False
         
         # Metrics storage
         self.ACCURACY = []
@@ -232,8 +234,8 @@ class UnifiedFederatedLearningServer:
         self.model_update_chunks = {}  # {client_id: {chunk_id: payload}}
         self.model_update_metadata = {}  # {client_id: {total_chunks, num_samples, loss, mse, mae, mape}}
         
-        # Lock for thread-safe operations
-        self.lock = threading.Lock()
+        # Lock for thread-safe operations (reentrant for nested handlers)
+        self.lock = threading.RLock()
         
         # Protocol handlers
         self.mqtt_client = None
@@ -1326,16 +1328,35 @@ class UnifiedFederatedLearningServer:
         """Handle client registration (thread-safe)"""
         with self.lock:
             self.registered_clients[client_id] = protocol
+            self.active_clients.add(client_id)
             print(f"[{protocol.upper()}] Client {client_id} registered "
                   f"({len(self.registered_clients)}/{self.num_clients})")
             
-            if len(self.registered_clients) >= self.min_clients:
+            if not self.training_started and len(self.registered_clients) >= self.min_clients:
+                self.training_started = True
                 print(f"\n[Server] All {self.num_clients} clients registered!")
                 print("[Server] Distributing initial global model...\n")
                 time.sleep(2)
                 self.distribute_initial_model()
                 self.start_time = time.time()
                 print(f"[Server] Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    def mark_client_converged(self, client_id):
+        """Remove converged client from active training set."""
+        with self.lock:
+            if client_id in self.active_clients:
+                self.active_clients.remove(client_id)
+                self.client_updates.pop(client_id, None)
+                self.client_metrics.pop(client_id, None)
+                self.grpc_should_train[client_id] = False
+                self.grpc_should_evaluate[client_id] = False
+                print(f"[Server] Client {client_id} converged and disconnected. "
+                      f"Active clients remaining: {len(self.active_clients)}")
+
+                if not self.active_clients:
+                    print("[Server] All clients converged. Stopping training.")
+                    self.converged = True
+                    self.signal_training_complete()
     
     def handle_client_update(self, data, protocol):
         """Handle client model update (thread-safe)"""
@@ -1359,6 +1380,20 @@ class UnifiedFederatedLearningServer:
             
             # Update the protocol this client is using (RL agent may change protocol per round)
             self.registered_clients[client_id] = protocol
+
+            if client_id not in self.active_clients:
+                print(f"[{protocol.upper()}] Ignoring update from inactive client {client_id}")
+                return
+
+            client_metrics = data.get('metrics') or {}
+            try:
+                converged_flag = float(client_metrics.get('client_converged', 0.0)) >= 1.0
+            except Exception:
+                converged_flag = False
+            if converged_flag:
+                print(f"[{protocol.upper()}] Received convergence signal from client {client_id}")
+                self.mark_client_converged(client_id)
+                return
             
             # Deserialize weights
             if 'compressed_data' in data and self.quantization_handler is not None:
@@ -1382,8 +1417,8 @@ class UnifiedFederatedLearningServer:
             print(f"[{protocol.upper()}] Received update from client {client_id} "
                   f"({len(self.client_updates)}/{self.num_clients})")
             
-            # Wait for all registered clients (dynamic)
-            if len(self.client_updates) >= len(self.registered_clients):
+            # Wait for all active clients only
+            if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
                 self.aggregate_models()
     
     def handle_client_metrics(self, data, protocol):
@@ -1415,6 +1450,10 @@ class UnifiedFederatedLearningServer:
             
             # Update the protocol this client is using (RL agent may change protocol per round)
             self.registered_clients[client_id] = protocol
+
+            if client_id not in self.active_clients:
+                print(f"[{protocol.upper()}] Ignoring metrics from inactive client {client_id}")
+                return
             
             self.client_metrics[client_id] = {
                 'round': round_num,
@@ -1427,8 +1466,8 @@ class UnifiedFederatedLearningServer:
             print(f"[{protocol.upper()}] Received metrics from client {client_id} "
                   f"({len(self.client_metrics)}/{self.num_clients})")
             
-            # Wait for all registered clients (dynamic)
-            if len(self.client_metrics) >= len(self.registered_clients):
+            # Wait for all active clients only
+            if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
                 print(f"[{protocol.upper()}] All {self.num_clients} metrics received! Triggering aggregate_metrics()")
                 self.aggregate_metrics()
     
@@ -1444,6 +1483,8 @@ class UnifiedFederatedLearningServer:
             weights_key = 'weights'
         
         for client_id, protocol in self.registered_clients.items():
+            if client_id not in self.active_clients:
+                continue
             try:
                 if protocol == 'mqtt':
                     message = {
@@ -1496,6 +1537,8 @@ class UnifiedFederatedLearningServer:
         """Signal all clients to start training for current round"""
         # Broadcast to ALL protocols (clients listen to multiple protocols simultaneously)
         for client_id in self.registered_clients.keys():
+            if client_id not in self.active_clients:
+                continue
             message = {'round': self.current_round}
             
             # MQTT
@@ -1534,6 +1577,8 @@ class UnifiedFederatedLearningServer:
         """Signal all clients to start evaluation for current round"""
         # Broadcast to ALL protocols (clients listen to multiple protocols simultaneously)
         for client_id in self.registered_clients.keys():
+            if client_id not in self.active_clients:
+                continue
             message = {'round': self.current_round}
             
             # MQTT
@@ -1580,6 +1625,8 @@ class UnifiedFederatedLearningServer:
             weights_key = 'weights'
         
         for client_id, protocol in self.registered_clients.items():
+            if client_id not in self.active_clients:
+                continue
             try:
                 if protocol == 'mqtt':
                     message = {
@@ -1642,6 +1689,8 @@ class UnifiedFederatedLearningServer:
     
     def aggregate_models(self):
         """Aggregate client model updates using FedAvg"""
+        if not self.client_updates:
+            return
         print(f"\n{'='*70}")
         print(f"ROUND {self.current_round}/{self.num_rounds} - AGGREGATING MODELS")
         print(f"{'='*70}")
@@ -1677,6 +1726,8 @@ class UnifiedFederatedLearningServer:
     
     def aggregate_metrics(self):
         """Aggregate client evaluation metrics"""
+        if not self.client_metrics:
+            return
         total_samples = sum(m['num_samples'] for m in self.client_metrics.values())
         
         # Weighted average
@@ -1690,24 +1741,6 @@ class UnifiedFederatedLearningServer:
         print(f"\nRound {self.current_round} Results:")
         print(f"  Avg Loss: {avg_loss:.4f}")
         print(f"  Avg Accuracy: {avg_accuracy:.4f}")
-        
-        # Check convergence
-        if self.current_round >= MIN_ROUNDS:
-            if self.best_loss - avg_loss > CONVERGENCE_THRESHOLD:
-                self.best_loss = avg_loss
-                self.rounds_without_improvement = 0
-            else:
-                self.rounds_without_improvement += 1
-            
-            if self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
-                self.converged = True
-                self.convergence_time = time.time() - self.start_time
-                print(f"\n✅ CONVERGENCE ACHIEVED at round {self.current_round}")
-                self.save_results()
-                self.signal_training_complete()
-                return
-        else:
-            self.best_loss = min(self.best_loss, avg_loss)
         
         # Clear metrics
         self.client_metrics.clear()
@@ -1728,6 +1761,8 @@ class UnifiedFederatedLearningServer:
         message = {'status': 'complete'}
         
         for client_id, protocol in self.registered_clients.items():
+            if client_id not in self.active_clients:
+                continue
             try:
                 if protocol == 'mqtt':
                     self.mqtt_client.publish("fl/training_complete", json.dumps(message), qos=1)
@@ -1788,9 +1823,9 @@ class UnifiedFederatedLearningServer:
         
         # Keep main thread alive
         try:
-            while not self.converged:
+            while self.running:
                 time.sleep(1)
-                if self.current_round > self.num_rounds:
+                if self.converged or self.current_round > self.num_rounds:
                     break
         except KeyboardInterrupt:
             print("\n[Server] Interrupted by user")

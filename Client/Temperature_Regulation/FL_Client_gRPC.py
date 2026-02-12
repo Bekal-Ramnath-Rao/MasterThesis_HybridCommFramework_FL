@@ -56,6 +56,9 @@ GRPC_HOST = os.getenv("GRPC_HOST", "localhost")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 
 class FederatedLearningClient:
@@ -84,6 +87,9 @@ class FederatedLearningClient:
         self.channel = None
         self.stub = None
         self.running = True
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
+        self.has_converged = False
         
         # Prepare data and model
         self.prepare_data_and_model(dataframe)
@@ -457,8 +463,42 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} sent evaluation metrics for round {self.current_round}")
             print(f"Evaluation metrics - Loss: {loss:.4f}, MSE: {mse:.4f}, "
                   f"MAE: {mae:.4f}, MAPE: {mape:.4f}\n")
+            self._update_local_convergence(float(loss))
         else:
             print(f"Client {self.client_id} failed to send metrics: {response.message}")
+    
+    def _update_local_convergence(self, loss: float):
+        """Track client-local convergence and disconnect when converged."""
+        if self.current_round < MIN_ROUNDS:
+            self.best_loss = min(self.best_loss, loss)
+            return
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            self.best_loss = loss
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+        if self.rounds_without_improvement >= CONVERGENCE_PATIENCE and not self.has_converged:
+            self.has_converged = True
+            print(f"Client {self.client_id} reached local convergence at round {self.current_round}")
+            self._notify_convergence_and_disconnect()
+
+    def _notify_convergence_and_disconnect(self):
+        """Notify server and stop this client."""
+        try:
+            self.stub.SendModelUpdate(
+                federated_learning_pb2.ModelUpdate(
+                    client_id=self.client_id,
+                    round=self.current_round,
+                    weights=b"",
+                    num_samples=0,
+                    metrics={"client_converged": 1.0}
+                )
+            )
+            print(f"Client {self.client_id} convergence notification sent to server")
+        except Exception as e:
+            print(f"Client {self.client_id} failed to notify convergence: {e}")
+        finally:
+            self.running = False
     
     def disconnect(self):
         """Close gRPC channel"""

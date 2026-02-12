@@ -81,6 +81,7 @@ class FederatedLearningServer:
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = {}  # Maps client_id to protocol reference
+        self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
         self.global_weights = None
@@ -198,23 +199,15 @@ class FederatedLearningServer:
         """Handle client registration"""
         client_id = message['client_id']
         self.registered_clients[client_id] = protocol  # Store protocol reference
+        self.active_clients.add(client_id)
         print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
         
         # Update total client count if more clients join
         if len(self.registered_clients) > self.num_clients:
             self.update_client_count(len(self.registered_clients))
         
-        # Check if this is a late-joining client
         if self.training_started:
-            print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
-            if len(self.registered_clients) > self.num_clients:
-                self.update_client_count(len(self.registered_clients))
-            if self.global_weights is not None:
-                self.send_current_model_to_client(client_id)
-            return
-        
-        # Check if this is a late-joining client
-        if self.training_started:
+            self.active_clients.add(client_id)
             print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
             if len(self.registered_clients) > self.num_clients:
                 self.update_client_count(len(self.registered_clients))
@@ -227,15 +220,35 @@ class FederatedLearningServer:
             await asyncio.sleep(2)
             await self.distribute_initial_model()
             self.start_time = time.time()
-                        self.training_started = True
             self.training_started = True
-print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    
+    async def mark_client_converged(self, client_id):
+        """Remove converged client from active federation."""
+        if client_id in self.active_clients:
+            self.active_clients.discard(client_id)
+            self.registered_clients.pop(client_id, None)
+            self.client_updates.pop(client_id, None)
+            self.client_metrics.pop(client_id, None)
+            print(f"Client {client_id} converged and disconnected. Active clients remaining: {len(self.active_clients)}")
+            if not self.active_clients:
+                self.converged = True
+                print("All clients converged. Ending training.")
+                self.convergence_time = time.time() - self.start_time if self.start_time else 0
+                await self.broadcast_message({'type': 'training_complete', 'message': 'Training completed'})
+                await asyncio.sleep(2)
+                self.save_results()
+                self.plot_results()
     
     async def handle_client_update(self, message):
         """Handle model update from client"""
         client_id = message['client_id']
         round_num = message['round']
-        
+        if client_id not in self.active_clients:
+            return
+        if float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+            await self.mark_client_converged(client_id)
+            return
         if round_num == self.current_round:
             # Decompress or deserialize client weights
             if 'compressed_data' in message and self.quantization_handler is not None:
@@ -251,17 +264,20 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             }
             
             print(f"Received update from client {client_id} "
-                  f"({len(self.client_updates)}/{self.num_clients})")
+                  f"({len(self.client_updates)}/{len(self.active_clients)})")
             
-            # Wait for all registered clients (dynamic)
-            if len(self.client_updates) >= len(self.registered_clients):
+            if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
                 await self.aggregate_models()
     
     async def handle_client_metrics(self, message):
         """Handle evaluation metrics from client"""
         client_id = message['client_id']
         round_num = message['round']
-        
+        if client_id not in self.active_clients:
+            return
+        if float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+            await self.mark_client_converged(client_id)
+            return
         if round_num == self.current_round:
             self.client_metrics[client_id] = {
                 'num_samples': message['num_samples'],
@@ -269,10 +285,9 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             }
             
             print(f"Received metrics from client {client_id} "
-                  f"({len(self.client_metrics)}/{self.num_clients})")
+                  f"({len(self.client_metrics)}/{len(self.active_clients)})")
             
-            # Wait for all registered clients (dynamic)
-            if len(self.client_metrics) >= len(self.registered_clients):
+            if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
                 await self.aggregate_metrics()
                 await self.continue_training()
     
@@ -422,6 +437,18 @@ print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         """Continue to next round or finish training"""
         self.client_updates.clear()
         self.client_metrics.clear()
+        
+        if len(self.active_clients) == 0:
+            self.convergence_time = time.time() - self.start_time if self.start_time else 0
+            self.converged = True
+            print("\n" + "="*70)
+            print("All clients converged locally. Training complete.")
+            print("="*70 + "\n")
+            await self.broadcast_message({'type': 'training_complete', 'message': 'Training completed'})
+            await asyncio.sleep(2)
+            self.save_results()
+            self.plot_results()
+            return
         
         if self.current_round >= MIN_ROUNDS and self.check_convergence():
             self.convergence_time = time.time() - self.start_time if self.start_time else 0

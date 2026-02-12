@@ -72,6 +72,9 @@ AMQP_USER = os.getenv("AMQP_USER", "guest")
 AMQP_PASSWORD = os.getenv("AMQP_PASSWORD", "guest")
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 # AMQP Exchanges and Queues
 EXCHANGE_BROADCAST = "fl_broadcast"
@@ -106,6 +109,9 @@ class FederatedLearningClient:
             "val_split": 0.10
         }
         self.class_weights = None
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
+        self.has_converged = False
         
         # AMQP connection
         self.connection = None
@@ -479,7 +485,7 @@ class FederatedLearningClient:
             if self.model is None:
 
             
-                print(f"Client {self.client_id} initializing model from server (round {round_num})"
+                print(f"Client {self.client_id} initializing model from server (round {round_num})")
                 
                 model_config = data.get('model_config')
                 if model_config:
@@ -549,6 +555,20 @@ class FederatedLearningClient:
             import traceback
             traceback.print_exc()
     
+    def _update_local_convergence(self, loss: float):
+        """Track client-local convergence and disconnect when converged."""
+        if self.current_round < MIN_ROUNDS:
+            self.best_loss = min(self.best_loss, loss)
+            return
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            self.best_loss = loss
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+        if self.rounds_without_improvement >= CONVERGENCE_PATIENCE and not self.has_converged:
+            self.has_converged = True
+            print(f"Client {self.client_id} reached local convergence at round {self.current_round}")
+
     def on_start_evaluation(self, ch, method, properties, body):
         """Callback for starting evaluation"""
         print(f"\n[Client {self.client_id}] Evaluation requested (no local test set)")
@@ -584,10 +604,13 @@ class FederatedLearningClient:
         # Prepare metrics
         final_loss = float(history.history['loss'][-1]) if 'loss' in history.history else 0.0
         final_acc = float(history.history.get('acc', [0.0])[-1])
+        self._update_local_convergence(final_loss)
         metrics = {
             "loss": final_loss,
             "accuracy": final_acc
         }
+        if self.has_converged:
+            metrics["client_converged"] = 1.0
         num_samples = int(len(self.y_train))
         
         # Compress weights if quantization is enabled
@@ -631,6 +654,10 @@ class FederatedLearningClient:
         
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
         print(f"Training metrics - Loss: {final_loss:.4f}, Accuracy: {final_acc:.4f}")
+        if self.has_converged:
+            print(f"Client {self.client_id} notifying server of convergence and disconnecting")
+            time.sleep(2)
+            self.stop()
     
     def start(self):
         """Start consuming messages"""

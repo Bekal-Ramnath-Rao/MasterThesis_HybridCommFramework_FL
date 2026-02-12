@@ -173,6 +173,9 @@ except Exception as e:
 CLIENT_ID = int(os.getenv("CLIENT_ID", "1"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 USE_RL_SELECTION = os.getenv("USE_RL_SELECTION", "true").lower() == "true"
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 # MQTT Configuration
 MQTT_BROKER = os.getenv("MQTT_BROKER", 'localhost')
@@ -282,6 +285,10 @@ class UnifiedFLClient_Emotion:
         self.last_training_round = -1
         self.evaluated_rounds = set()
         self.waiting_for_aggregated_model = False  # Track if we sent update and waiting for aggregated model
+        self.is_active = True
+        self.has_converged = False
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
         
         # Training configuration
         self.training_config = {"batch_size": 32, "local_epochs": 20}
@@ -422,23 +429,26 @@ class UnifiedFLClient_Emotion:
             self.mqtt_client.subscribe(TOPIC_TRAINING_COMPLETE, qos=1)
             
             time.sleep(2)
-            
-            # Send registration message
-            registration_msg = json.dumps({"client_id": self.client_id})
-            self.mqtt_client.publish("fl/client_register", registration_msg, qos=1)
-            log_sent_packet(
-                packet_size=len(registration_msg),
-                peer="server",
-                protocol="MQTT",
-                round=0,
-                extra_info="registration"
-            )
-            print(f"  Registration message sent\n")
+
+            if not self.register_with_server_grpc():
+                # Fallback only if gRPC is unavailable.
+                registration_msg = json.dumps({"client_id": self.client_id})
+                self.mqtt_client.publish("fl/client_register", registration_msg, qos=1)
+                log_sent_packet(
+                    packet_size=len(registration_msg),
+                    peer="server",
+                    protocol="MQTT",
+                    round=0,
+                    extra_info="registration_fallback"
+                )
+                print("  Registration fallback sent via MQTT\n")
         else:
             print(f"Client {self.client_id} failed to connect, return code {rc}")
     
     def on_message(self, client, userdata, msg):
         """Callback when message received"""
+        if not self.is_active:
+            return
         try:
             log_received_packet(
                 packet_size=len(msg.payload),
@@ -891,18 +901,29 @@ class UnifiedFLClient_Emotion:
             
             # Deserialize weights
             weights = pickle.loads(response.weights)
-            
+
+            # Initialize model on first pull (round 0)
+            if self.model is None:
+                if response.model_config:
+                    model_config = json.loads(response.model_config)
+                    self.model = self.build_model_from_config(model_config)
+                    print(f"[gRPC] Client {self.client_id} initialized model from gRPC config")
+                else:
+                    print(f"[gRPC] Client {self.client_id} missing model_config in initial model")
+                    return
+
             # Update model
-            if self.model and round_num > self.last_global_round:
+            if round_num >= self.last_global_round:
                 self.model.set_weights(weights)
+                self.current_round = max(self.current_round, round_num)
                 self.last_global_round = round_num
                 self.waiting_for_aggregated_model = False  # Clear flag: received aggregated model
                 print(f"[gRPC] Client {self.client_id} updated model weights for round {round_num}")
-                
+
                 # Check if should evaluate
                 status_request = federated_learning_pb2.StatusRequest(client_id=self.client_id)
                 status = self.grpc_stub.CheckTrainingStatus(status_request)
-                
+
                 if status.should_evaluate and round_num == self.current_round:
                     if round_num not in self.evaluated_rounds:
                         self.evaluated_rounds.add(round_num)  # Add BEFORE evaluate to prevent race condition
@@ -1017,6 +1038,8 @@ class UnifiedFLClient_Emotion:
     
     def handle_start_training(self, payload):
         """Start local training when server signals"""
+        if not self.is_active:
+            return
         data = json.loads(payload.decode())
         round_num = data['round']
         
@@ -1047,6 +1070,8 @@ class UnifiedFLClient_Emotion:
     
     def handle_start_evaluation(self, payload):
         """Start evaluation when server signals"""
+        if not self.is_active:
+            return
         data = json.loads(payload.decode())
         round_num = data['round']
         if round_num == self.current_round:
@@ -1062,6 +1087,7 @@ class UnifiedFLClient_Emotion:
     
     def handle_training_complete(self):
         """Handle training completion signal from server"""
+        self.is_active = False
         print("\n" + "="*70)
         print(f"Client {self.client_id} - Training completed!")
         print("="*70)
@@ -1069,6 +1095,45 @@ class UnifiedFLClient_Emotion:
         time.sleep(1)
         self.mqtt_client.disconnect()
         print(f"Client {self.client_id} disconnected successfully.")
+
+    def register_with_server_grpc(self) -> bool:
+        """Register this client using gRPC to drive round-0 model delivery."""
+        if grpc is None or federated_learning_pb2 is None or federated_learning_pb2_grpc is None:
+            print(f"[gRPC] Client {self.client_id} registration skipped: gRPC not available")
+            return False
+
+        try:
+            grpc_host = os.getenv("GRPC_HOST", "fl-server-unified-emotion")
+            grpc_port = int(os.getenv("GRPC_PORT", "50051"))
+            options = [
+                ('grpc.max_send_message_length', 128 * 1024 * 1024),
+                ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                ('grpc.keepalive_time_ms', 600000),
+                ('grpc.keepalive_timeout_ms', 60000),
+            ]
+            channel = grpc.insecure_channel(f'{grpc_host}:{grpc_port}', options=options)
+            stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
+            response = stub.RegisterClient(
+                federated_learning_pb2.ClientRegistration(client_id=self.client_id)
+            )
+            if response.success:
+                print(f"[gRPC] Client {self.client_id} registered successfully")
+                log_sent_packet(
+                    packet_size=len(str(self.client_id)),
+                    peer="server",
+                    protocol="gRPC",
+                    round=0,
+                    extra_info="registration"
+                )
+                channel.close()
+                return True
+
+            print(f"[gRPC] Registration failed: {response.message}")
+            channel.close()
+            return False
+        except Exception as e:
+            print(f"[gRPC] Client {self.client_id} registration error: {e}")
+            return False
     
     def measure_network_condition(self):
         """
@@ -1385,6 +1450,9 @@ class UnifiedFLClient_Emotion:
     
     def evaluate_model(self):
         """Evaluate model on validation data and send metrics to server via RL-selected protocol"""
+        if not self.is_active:
+            return
+
         loss, accuracy = self.model.evaluate(
             self.validation_generator,
             verbose=0
@@ -1428,10 +1496,75 @@ class UnifiedFLClient_Emotion:
             self.round_metrics['communication_time'] = time.time() - comm_start
             print(f"Client {self.client_id} sent evaluation metrics for round {self.current_round}")
             print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
+            self._update_client_convergence_and_maybe_disconnect(loss)
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending metrics: {e}")
             import traceback
             traceback.print_exc()
+
+    def _update_client_convergence_and_maybe_disconnect(self, loss: float):
+        """Track local convergence and disconnect this client when converged."""
+        if self.current_round < MIN_ROUNDS:
+            self.best_loss = min(self.best_loss, float(loss))
+            return
+
+        if self.best_loss - float(loss) > CONVERGENCE_THRESHOLD:
+            self.best_loss = float(loss)
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+
+        if self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
+            self.has_converged = True
+            print(f"[Client {self.client_id}] Local convergence reached at round {self.current_round}")
+            self._notify_convergence_to_server()
+            self._disconnect_after_convergence()
+
+    def _notify_convergence_to_server(self):
+        """Notify server this client is converged using gRPC control signal."""
+        if grpc is None or federated_learning_pb2 is None or federated_learning_pb2_grpc is None:
+            print(f"[gRPC] Client {self.client_id} convergence signal skipped: gRPC unavailable")
+            return
+        try:
+            grpc_host = os.getenv("GRPC_HOST", "fl-server-unified-emotion")
+            grpc_port = int(os.getenv("GRPC_PORT", "50051"))
+            options = [
+                ('grpc.max_send_message_length', 128 * 1024 * 1024),
+                ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                ('grpc.keepalive_time_ms', 600000),
+                ('grpc.keepalive_timeout_ms', 60000),
+            ]
+            channel = grpc.insecure_channel(f'{grpc_host}:{grpc_port}', options=options)
+            stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
+            response = stub.SendModelUpdate(
+                federated_learning_pb2.ModelUpdate(
+                    client_id=self.client_id,
+                    round=self.current_round,
+                    weights=b"",
+                    num_samples=0,
+                    metrics={"client_converged": 1.0}
+                )
+            )
+            if response.success:
+                print(f"[gRPC] Client {self.client_id} convergence notification sent")
+            else:
+                print(f"[gRPC] Convergence notification failed: {response.message}")
+            channel.close()
+        except Exception as e:
+            print(f"[gRPC] Client {self.client_id} failed to notify convergence: {e}")
+
+    def _disconnect_after_convergence(self):
+        """Stop participating once local convergence is reached."""
+        self.is_active = False
+        print(f"[Client {self.client_id}] Disconnecting after local convergence")
+        try:
+            self.cleanup()
+        except Exception:
+            pass
+        try:
+            self.mqtt_client.disconnect()
+        except Exception:
+            pass
     
     # ============================================================================
     # Protocol-Specific Send Methods (Data Transmission)
