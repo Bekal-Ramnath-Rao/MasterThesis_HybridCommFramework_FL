@@ -44,7 +44,12 @@ else:
 
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-    
+
+# packet_logger lives in scripts/utilities (Docker: /app/scripts/utilities, local: project_root/scripts/utilities)
+_utilities_path = os.path.join(project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+
 from packet_logger import log_sent_packet, log_received_packet, init_db
 # Make TensorFlow logs less verbose
 logging.getLogger("tensorflow").setLevel(logging.ERROR)

@@ -19,6 +19,7 @@ import logging
 import threading
 import socket
 import re
+import fcntl
 from typing import Dict, Tuple, Optional, List, Sequence
 import numpy as np
 import tensorflow as tf
@@ -138,7 +139,17 @@ else:
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+# packet_logger lives in scripts/utilities (Docker: /app/scripts/utilities, local: project_root/scripts/utilities)
+_utilities_path = os.path.join(project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+
 from packet_logger import init_db, log_sent_packet, log_received_packet
+try:
+    from q_learning_logger import init_db as init_qlearning_db, log_q_step
+except ImportError:
+    init_qlearning_db = None
+    log_q_step = None
 
 # Import custom modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -176,6 +187,10 @@ USE_RL_SELECTION = os.getenv("USE_RL_SELECTION", "true").lower() == "true"
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+# When True, training ends when Q-learning value converges; when False, ends on accuracy convergence
+USE_QL_CONVERGENCE = os.getenv("USE_QL_CONVERGENCE", "false").lower() == "true"
+Q_CONVERGENCE_THRESHOLD = float(os.getenv("Q_CONVERGENCE_THRESHOLD", "0.01"))
+Q_CONVERGENCE_PATIENCE = int(os.getenv("Q_CONVERGENCE_PATIENCE", "5"))
 
 # MQTT Configuration
 MQTT_BROKER = os.getenv("MQTT_BROKER", 'localhost')
@@ -283,6 +298,9 @@ class UnifiedFLClient_Emotion:
         self.current_round = 0
         self.last_global_round = -1
         self.last_training_round = -1
+        self.pending_start_training_round = None
+        self.grpc_registered = False
+        self.protocol_listeners_started = False
         self.evaluated_rounds = set()
         self.waiting_for_aggregated_model = False  # Track if we sent update and waiting for aggregated model
         self.is_active = True
@@ -314,6 +332,7 @@ class UnifiedFLClient_Emotion:
             'accuracy': 0.0,
             'success': False
         }
+        self._last_rl_state = None  # for Q-learning log (state at time of action)
         
         # DDS chunk reassembly buffers (FAIR CONFIG: matching standalone)
         self.global_model_chunks = {}  # {chunk_id: payload}
@@ -332,10 +351,17 @@ class UnifiedFLClient_Emotion:
                     Policy.Durability.TransientLocal
                 )
                 
-                # Best effort QoS for large data transfers (model chunks)
+                # Best effort QoS for non-critical bulk paths
                 best_effort_qos = Qos(
                     Policy.Reliability.BestEffort,
                     Policy.History.KeepLast(1),
+                )
+
+                # Reliable QoS for chunked model transfer to prevent dropped chunks.
+                chunk_qos = Qos(
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+                    Policy.History.KeepLast(2048),
+                    Policy.Durability.TransientLocal
                 )
                 
                 # Create topics
@@ -346,14 +372,14 @@ class UnifiedFLClient_Emotion:
                 self.dds_metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
                 
                 # Create readers (for receiving from server)
-                # Use BestEffort for chunked model data
+                # Use reliable QoS for chunked model data
                 self.dds_global_model_reader = DataReader(self.dds_participant, global_model_topic, qos=best_effort_qos)
-                self.dds_global_model_chunk_reader = DataReader(self.dds_participant, global_model_chunk_topic, qos=best_effort_qos)
+                self.dds_global_model_chunk_reader = DataReader(self.dds_participant, global_model_chunk_topic, qos=chunk_qos)
                 
                 # Create writers (for sending to server)
-                # Use BestEffort for chunked data and metrics
+                # Use reliable QoS for chunked updates; metrics can remain best-effort
                 self.dds_update_writer = DataWriter(self.dds_participant, self.dds_update_topic, qos=best_effort_qos)
-                self.dds_update_chunk_writer = DataWriter(self.dds_participant, update_chunk_topic, qos=best_effort_qos)
+                self.dds_update_chunk_writer = DataWriter(self.dds_participant, update_chunk_topic, qos=chunk_qos)
                 self.dds_metrics_writer = DataWriter(self.dds_participant, self.dds_metrics_topic, qos=best_effort_qos)
                 
                 print(f"[DDS] Client {client_id} initialized on domain {DDS_DOMAIN_ID} with chunking support")
@@ -373,8 +399,10 @@ class UnifiedFLClient_Emotion:
             self.dds_global_model_reader = None
             self.dds_global_model_chunk_reader = None
         
-        # Initialize packet logger
+        # Initialize packet logger and Q-learning logger
         init_db()
+        if init_qlearning_db is not None:
+            init_qlearning_db()
         
         # QUIC persistent connection components
         self.quic_protocol = None
@@ -430,7 +458,7 @@ class UnifiedFLClient_Emotion:
             
             time.sleep(2)
 
-            if not self.register_with_server_grpc():
+            if not self.grpc_registered and not self.register_with_server_grpc():
                 # Fallback only if gRPC is unavailable.
                 registration_msg = json.dumps({"client_id": self.client_id})
                 self.mqtt_client.publish("fl/client_register", registration_msg, qos=1)
@@ -509,6 +537,10 @@ class UnifiedFLClient_Emotion:
     
     def start_all_protocol_listeners(self):
         """Start listeners for all protocols (mirroring single-protocol implementations)"""
+        if self.protocol_listeners_started:
+            print("[Client] Protocol listeners already started - skipping duplicate start")
+            return
+        self.protocol_listeners_started = True
         print("[Client] Starting protocol listeners...")
         
         # MQTT already started in __init__
@@ -633,11 +665,12 @@ class UnifiedFLClient_Emotion:
             else:
                 weights = self.deserialize_weights(data['weights'])
             
-            # Update model
-            if self.model and round_num > self.last_global_round:
-                self.model.set_weights(weights)
-                self.last_global_round = round_num
-                print(f"[AMQP] Client {self.client_id} updated model weights for round {round_num}")
+            self._apply_global_model_weights(
+                round_num=round_num,
+                weights=weights,
+                model_config=data.get('model_config'),
+                source="AMQP"
+            )
                 
         except Exception as e:
             print(f"[AMQP] Client {self.client_id} error handling global model: {e}")
@@ -683,7 +716,8 @@ class UnifiedFLClient_Emotion:
             
             # Check if model is initialized
             if self.model is None:
-                print(f"[AMQP] Client {self.client_id} ERROR: Model not initialized yet, cannot start training for round {round_num}")
+                self._defer_start_training(round_num, "AMQP")
+                self.pending_start_training_round = round_num
                 return
             
             # Check for duplicate training signals
@@ -803,7 +837,8 @@ class UnifiedFLClient_Emotion:
             if sample.start_training:
                 # Check if model is initialized
                 if self.model is None:
-                    print(f"[DDS] Client {self.client_id} ERROR: Model not initialized yet, cannot start training for round {round_num}")
+                    self._defer_start_training(round_num, "DDS")
+                    self.pending_start_training_round = round_num
                     return
                 
                 # Check for duplicate training signals
@@ -847,7 +882,13 @@ class UnifiedFLClient_Emotion:
                 # Create gRPC channel and stub
                 grpc_host = os.getenv("GRPC_HOST", "fl-server-unified-emotion")
                 grpc_port = os.getenv("GRPC_PORT", "50051")
-                channel = grpc.insecure_channel(f"{grpc_host}:{grpc_port}")
+                options = [
+                    ('grpc.max_send_message_length', 128 * 1024 * 1024),
+                    ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                    ('grpc.keepalive_time_ms', 600000),
+                    ('grpc.keepalive_timeout_ms', 60000),
+                ]
+                channel = grpc.insecure_channel(f"{grpc_host}:{grpc_port}", options=options)
                 self.grpc_stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
                 
                 print(f"[gRPC] Listener started for client {self.client_id}")
@@ -855,6 +896,17 @@ class UnifiedFLClient_Emotion:
                 # Polling loop
                 while True:
                     try:
+                        # Poll control-plane status first (gRPC-only signaling in unified RL mode)
+                        status_request = federated_learning_pb2.StatusRequest(client_id=self.client_id)
+                        status = self.grpc_stub.CheckTrainingStatus(status_request)
+                        if status.should_train and self.is_active:
+                            self.handle_start_training(
+                                json.dumps({'round': status.current_round}).encode(),
+                                source="gRPC"
+                            )
+                        if status.should_evaluate and self.is_active:
+                            self.handle_start_evaluation(json.dumps({'round': status.current_round}).encode())
+
                         # Poll for global model (request round 0 to get latest available)
                         # This allows client to get new model even if current_round hasn't updated yet
                         request = federated_learning_pb2.ModelRequest(
@@ -902,23 +954,15 @@ class UnifiedFLClient_Emotion:
             # Deserialize weights
             weights = pickle.loads(response.weights)
 
-            # Initialize model on first pull (round 0)
-            if self.model is None:
-                if response.model_config:
-                    model_config = json.loads(response.model_config)
-                    self.model = self.build_model_from_config(model_config)
-                    print(f"[gRPC] Client {self.client_id} initialized model from gRPC config")
-                else:
-                    print(f"[gRPC] Client {self.client_id} missing model_config in initial model")
-                    return
-
-            # Update model
-            if round_num >= self.last_global_round:
-                self.model.set_weights(weights)
-                self.current_round = max(self.current_round, round_num)
-                self.last_global_round = round_num
+            model_config = json.loads(response.model_config) if response.model_config else None
+            applied = self._apply_global_model_weights(
+                round_num=round_num,
+                weights=weights,
+                model_config=model_config,
+                source="gRPC"
+            )
+            if applied:
                 self.waiting_for_aggregated_model = False  # Clear flag: received aggregated model
-                print(f"[gRPC] Client {self.client_id} updated model weights for round {round_num}")
 
                 # Check if should evaluate
                 status_request = federated_learning_pb2.StatusRequest(client_id=self.client_id)
@@ -1008,35 +1052,53 @@ class UnifiedFLClient_Emotion:
                 else:
                     weights = data.get('parameters', [])
             
-            # Initialize model if not already done (for late-joining or first-time clients)
-            if self.model is None:
-                model_config = data.get('model_config')
-                if model_config:
-                    print(f"Client {self.client_id} initializing model from received configuration...")
-                    self.model = self.build_model_from_config(model_config)
-                    print(f"Client {self.client_id} model built successfully")
-                else:
-                    print(f"Client {self.client_id} WARNING: No model_config in global model, cannot initialize!")
-                    return
-            
-            # Apply received weights
-            self.model.set_weights(weights)
-            self.current_round = round_num
-            if hasattr(self, 'last_global_round'):
-                self.last_global_round = round_num
-            print(f"Client {self.client_id} updated model weights (round {round_num})")
+            self._apply_global_model_weights(
+                round_num=round_num,
+                weights=weights,
+                model_config=data.get('model_config'),
+                source="MQTT"
+            )
             
         except Exception as e:
             print(f"Client {self.client_id} ERROR in handle_global_model: {e}")
             import traceback
             traceback.print_exc()
+
+    def _apply_global_model_weights(self, round_num, weights, model_config=None, source="UNKNOWN"):
+        """Initialize model if needed and apply incoming global weights."""
+        if self.model is None:
+            if model_config:
+                print(f"[{source}] Client {self.client_id} initializing model from received configuration...")
+                self.model = self.build_model_from_config(model_config)
+                print(f"[{source}] Client {self.client_id} model built successfully")
+            else:
+                print(f"[{source}] Client {self.client_id} waiting for model_config to initialize model")
+                return False
+
+        if round_num >= self.last_global_round:
+            self.model.set_weights(weights)
+            self.current_round = max(self.current_round, round_num)
+            self.last_global_round = round_num
+            print(f"[{source}] Client {self.client_id} updated model weights (round {round_num})")
+
+            if self.pending_start_training_round is not None:
+                pending_round = self.pending_start_training_round
+                self.pending_start_training_round = None
+                if self.last_training_round != pending_round and self.is_active:
+                    self.current_round = max(self.current_round, pending_round)
+                    self.last_training_round = pending_round
+                    print(f"[{source}] Client {self.client_id} processing deferred start_training for round {pending_round}")
+                    self.train_local_model()
+            return True
+
+        return False
     
     def handle_training_config(self, payload):
         """Update training configuration"""
         self.training_config = json.loads(payload.decode())
         print(f"Client {self.client_id} updated config: {self.training_config}")
     
-    def handle_start_training(self, payload):
+    def handle_start_training(self, payload, source="MQTT"):
         """Start local training when server signals"""
         if not self.is_active:
             return
@@ -1045,8 +1107,8 @@ class UnifiedFLClient_Emotion:
         
         # Check if model is initialized - WAIT for global model
         if self.model is None:
-            print(f"Client {self.client_id} ERROR: Model not initialized yet, cannot start training for round {round_num}")
-            print(f"Client {self.client_id} waiting for global model from server...")
+            self._defer_start_training(round_num, source)
+            self.pending_start_training_round = round_num
             return
         
         # Check for duplicate training signals
@@ -1098,6 +1160,8 @@ class UnifiedFLClient_Emotion:
 
     def register_with_server_grpc(self) -> bool:
         """Register this client using gRPC to drive round-0 model delivery."""
+        if self.grpc_registered:
+            return True
         if grpc is None or federated_learning_pb2 is None or federated_learning_pb2_grpc is None:
             print(f"[gRPC] Client {self.client_id} registration skipped: gRPC not available")
             return False
@@ -1117,6 +1181,7 @@ class UnifiedFLClient_Emotion:
                 federated_learning_pb2.ClientRegistration(client_id=self.client_id)
             )
             if response.success:
+                self.grpc_registered = True
                 print(f"[gRPC] Client {self.client_id} registered successfully")
                 log_sent_packet(
                     packet_size=len(str(self.client_id)),
@@ -1134,6 +1199,11 @@ class UnifiedFLClient_Emotion:
         except Exception as e:
             print(f"[gRPC] Client {self.client_id} registration error: {e}")
             return False
+
+    def _defer_start_training(self, round_num: int, source: str):
+        """Defer start_training until the initial/global model is available."""
+        if self.pending_start_training_round != round_num:
+            print(f"[{source}] Client {self.client_id} deferring start_training round {round_num} until global model arrives")
     
     def measure_network_condition(self):
         """
@@ -1460,8 +1530,10 @@ class UnifiedFLClient_Emotion:
         
         num_samples = self.validation_generator.n
         
-        # Select protocol based on RL
+        # Select protocol based on RL (store state for Q-learning log)
         protocol = self.select_protocol()
+        if self.env_manager is not None:
+            self._last_rl_state = self.env_manager.get_current_state()
         
         metrics_message = {
             "client_id": self.client_id,
@@ -1496,7 +1568,53 @@ class UnifiedFLClient_Emotion:
             self.round_metrics['communication_time'] = time.time() - comm_start
             print(f"Client {self.client_id} sent evaluation metrics for round {self.current_round}")
             print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
-            self._update_client_convergence_and_maybe_disconnect(loss)
+            # RL update and optional Q-convergence end condition
+            if USE_RL_SELECTION and self.rl_selector and self.env_manager:
+                try:
+                    resources = self.env_manager.get_resource_consumption()
+                    reward = self.rl_selector.calculate_reward(
+                        self.round_metrics['communication_time'],
+                        self.round_metrics['success'],
+                        self.round_metrics.get('training_time', 0.0),
+                        self.round_metrics['accuracy'],
+                        resources,
+                    )
+                    self.rl_selector.update_q_value(reward, next_state=None, done=True)
+                    q_delta = self.rl_selector.get_last_q_delta()
+                    avg_reward = (np.mean(self.rl_selector.total_rewards[-100:])
+                                 if self.rl_selector.total_rewards else 0.0)
+                    self.rl_selector.end_episode()
+                    q_converged = self.rl_selector.check_q_converged(
+                        threshold=Q_CONVERGENCE_THRESHOLD,
+                        patience=Q_CONVERGENCE_PATIENCE,
+                    )
+                    if log_q_step is not None and self._last_rl_state is not None:
+                        st = self._last_rl_state
+                        log_q_step(
+                            client_id=self.client_id,
+                            round_num=self.current_round,
+                            episode=self.rl_selector.episode_count - 1,
+                            state_network=st.get('network', ''),
+                            state_resource=st.get('resource', ''),
+                            state_model_size=st.get('model_size', ''),
+                            state_mobility=st.get('mobility', ''),
+                            action=self.selected_protocol or 'mqtt',
+                            reward=reward,
+                            q_delta=q_delta,
+                            epsilon=self.rl_selector.epsilon,
+                            avg_reward_last_100=float(avg_reward),
+                            converged=USE_QL_CONVERGENCE and q_converged,
+                        )
+                    if USE_QL_CONVERGENCE and q_converged:
+                        self.has_converged = True
+                        print(f"[Client {self.client_id}] Q-learning convergence reached at round {self.current_round}")
+                        self._notify_convergence_to_server()
+                        self._disconnect_after_convergence()
+                        return
+                except Exception as rl_e:
+                    print(f"[Client {self.client_id}] RL update error: {rl_e}")
+            if not USE_QL_CONVERGENCE:
+                self._update_client_convergence_and_maybe_disconnect(loss)
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending metrics: {e}")
             import traceback
@@ -1986,10 +2104,12 @@ class UnifiedFLClient_Emotion:
             else:
                 weights = self.deserialize_weights(message['weights'])
             
-            # Update model
-            if self.model:
-                self.model.set_weights(weights)
-                print(f"[QUIC] Client {self.client_id} updated model weights for round {round_num}")
+            self._apply_global_model_weights(
+                round_num=round_num,
+                weights=weights,
+                model_config=message.get('model_config'),
+                source="QUIC"
+            )
             
             # Set event to signal model is ready
             if hasattr(self, 'model_received'):
@@ -2458,6 +2578,15 @@ def load_emotion_data(client_id: int):
 
 def main():
     """Main function"""
+    # Prevent duplicate client instance with same client_id in the same container/host.
+    lock_path = f"/tmp/unified_emotion_client_{CLIENT_ID}.lock"
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"[Startup] Another unified client instance is already running for client_id={CLIENT_ID}. Exiting.")
+        return
+
     print(f"Unified FL Client - Emotion Recognition (Client {CLIENT_ID})")
     
     # Load real emotion recognition dataset

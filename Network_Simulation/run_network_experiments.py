@@ -27,13 +27,14 @@ class ExperimentRunner:
     
     def __init__(self, use_case: str = "emotion", num_rounds: int = 10, enable_congestion: bool = False,
                  use_quantization: bool = False, quantization_params: Dict[str, str] = None, enable_gpu: bool = False,
-                 baseline_mode: bool = False):
+                 baseline_mode: bool = False, use_ql_convergence: bool = False):
         self.use_case = use_case
         self.num_rounds = num_rounds
         self.enable_congestion = enable_congestion
         self.use_quantization = use_quantization
         self.enable_gpu = enable_gpu
         self.baseline_mode = baseline_mode
+        self.use_ql_convergence = use_ql_convergence
         # quantization_params expected to be a dict of simple string values
         self.quantization_params = quantization_params or {}
         
@@ -207,9 +208,17 @@ class ExperimentRunner:
             print("Using unified docker-compose file with all protocol brokers")
             print("Server will handle: MQTT, AMQP, gRPC, QUIC, DDS")
             print("Clients will use RL-based Q-Learning to select protocol")
+            if self.use_ql_convergence:
+                print("End condition: Q-learning convergence (multiple episodes)")
+            else:
+                print("End condition: accuracy convergence (current behavior)")
             print("="*70 + "\n")
             
             compose_file = self.unified_compose_files[self.use_case]
+            if self.use_ql_convergence:
+                os.environ["USE_QL_CONVERGENCE"] = "true"
+            else:
+                os.environ["USE_QL_CONVERGENCE"] = "false"
             
             # For unified mode, start all services together
             compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"]
@@ -798,6 +807,8 @@ def main():
                 help="Enable GPU acceleration using NVIDIA runtime (requires nvidia-docker)")
     parser.add_argument("--baseline", "-b", action="store_true",
                 help="Baseline mode: Run without network conditions and save to baseline folder")
+    parser.add_argument("--use-ql-convergence", action="store_true",
+                help="Unified only: End training when Q-learning value converges (multiple episodes); else end on accuracy convergence")
     
     args = parser.parse_args()
     
@@ -829,7 +840,8 @@ def main():
                             use_quantization=args.use_quantization,
                             quantization_params=quant_params,
                             enable_gpu=args.enable_gpu,
-                            baseline_mode=args.baseline)
+                            baseline_mode=args.baseline,
+                            use_ql_convergence=args.use_ql_convergence)
     
     # In baseline mode, run all protocols with excellent scenario (no network conditions)
     if args.baseline:

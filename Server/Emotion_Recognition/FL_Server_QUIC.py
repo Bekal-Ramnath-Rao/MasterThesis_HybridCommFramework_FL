@@ -302,6 +302,10 @@ class FederatedLearningServer:
                 await asyncio.sleep(2)
                 self.save_results()
                 self.plot_results()
+            elif len(self.client_metrics) >= len(self.active_clients):
+                # If remaining active clients already sent metrics, do not stall.
+                await self.aggregate_metrics()
+                await self.continue_training()
     
     async def handle_client_update(self, message):
         """Handle model update from client"""

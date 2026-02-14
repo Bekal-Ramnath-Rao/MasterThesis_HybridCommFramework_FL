@@ -7,6 +7,16 @@ This simulates what happens inside Docker containers.
 import os
 import sys
 
+# Resolve project root and packet_logger path (Docker: /app, local: from this file)
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+if os.path.exists('/app'):
+    _project_root = '/app'
+else:
+    _project_root = os.path.abspath(os.path.join(_this_dir, '..', '..'))
+_utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+
 # Test 1: Simulate server environment
 print("=" * 60)
 print("TEST 1: Simulating Server Environment")

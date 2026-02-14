@@ -84,6 +84,10 @@ class QLearningProtocolSelector:
         self.state_history = []
         self.action_history = []
         self.reward_history = []
+
+        # Q-value convergence tracking (for "end on Q convergence" mode)
+        self._q_deltas = []  # abs(new_q - current_q) per update
+        self._q_delta_window = 50  # keep last N deltas
         
     def get_state_index(self, state: Dict) -> Tuple[int, int, int, int]:
         """
@@ -222,7 +226,13 @@ class QLearningProtocolSelector:
             )
         
         # Update Q-table
+        q_delta = abs(new_q - current_q)
         self.q_table[state_idx][action_idx] = new_q
+
+        # Track Q-deltas for convergence check
+        self._q_deltas.append(q_delta)
+        if len(self._q_deltas) > self._q_delta_window:
+            self._q_deltas.pop(0)
         
         # Store reward
         self.reward_history.append(reward)
@@ -367,6 +377,27 @@ class QLearningProtocolSelector:
         action_idx = np.argmax(self.q_table[state_idx])
         return self.PROTOCOLS[action_idx]
     
+    def get_last_q_delta(self) -> float:
+        """Return the last Q-update delta (for logging)."""
+        return self._q_deltas[-1] if self._q_deltas else 0.0
+
+    def check_q_converged(
+        self,
+        threshold: Optional[float] = None,
+        patience: Optional[int] = None,
+    ) -> bool:
+        """
+        Return True if Q-values have converged: last `patience` updates
+        all had delta <= threshold. Used when USE_QL_CONVERGENCE is enabled.
+        """
+        if threshold is None:
+            threshold = float(os.getenv("Q_CONVERGENCE_THRESHOLD", "0.01"))
+        if patience is None:
+            patience = int(os.getenv("Q_CONVERGENCE_PATIENCE", "5"))
+        if len(self._q_deltas) < patience:
+            return False
+        return all(d <= threshold for d in self._q_deltas[-patience:])
+
     def reset_episode(self):
         """Reset episode history"""
         self.state_history = []

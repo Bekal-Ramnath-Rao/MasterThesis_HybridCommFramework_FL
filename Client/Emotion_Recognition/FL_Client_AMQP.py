@@ -18,6 +18,11 @@ else:
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+# packet_logger lives in scripts/utilities (Docker: /app/scripts/utilities, local: project_root/scripts/utilities)
+_utilities_path = os.path.join(project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+
 from packet_logger import log_received_packet, log_sent_packet, init_db
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
@@ -111,6 +116,7 @@ class FederatedLearningClient:
         self.last_global_round = -1
         self.last_training_round = -1
         self.evaluated_rounds = set()
+        self.pending_start_training_round = None
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.has_converged = False
@@ -462,6 +468,11 @@ class FederatedLearningClient:
                 self.model.set_weights(weights)
                 print(f"Client {self.client_id} model initialized with server weights")
                 self.current_round = 0
+                if self.pending_start_training_round == 1:
+                    print(f"Client {self.client_id} processing deferred start_training for round 1")
+                    self.pending_start_training_round = None
+                    self.current_round = 1
+                    self.train_local_model()
             else:
                 # Updated model after aggregation
                 self.model.set_weights(weights)
@@ -501,6 +512,7 @@ class FederatedLearningClient:
             if self.current_round == 0 and round_num == 1:
                 if self.model is None:
                     print(f"Client {self.client_id} received start_training but model not initialized yet; waiting for global model.")
+                    self.pending_start_training_round = round_num
                     return
                 # First training round with initial global model
                 self.current_round = round_num

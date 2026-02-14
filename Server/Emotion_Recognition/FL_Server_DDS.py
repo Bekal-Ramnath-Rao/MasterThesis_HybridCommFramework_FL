@@ -312,6 +312,13 @@ class FederatedLearningServer:
             Policy.Reliability.BestEffort,
             Policy.History.KeepLast(50),  # Buffer up to 50 chunks to handle burst losses
         )
+        # Reliable chunk QoS for large initial model transfer.
+        # KeepLast must exceed total chunk count (~144 for current model).
+        chunk_qos = Qos(
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.History.KeepLast(2048),
+            Policy.Durability.TransientLocal,
+        )
 
         # Create topics
         topic_registration = Topic(self.participant, "ClientRegistration", ClientRegistration)
@@ -340,9 +347,9 @@ class FederatedLearningServer:
         # Use Reliable QoS for registration and ready signals to ensure delivery
         self.readers['registration'] = DataReader(self.participant, topic_registration, qos=reliable_qos)
         self.readers['ready'] = DataReader(self.participant, topic_ready, qos=reliable_qos)
-        # Use BestEffort for chunked data (many small messages, retransmission handled by chunking)
+        # Use Reliable+deep-history for chunk streams to prevent partial reassembly stalls.
         self.readers['model_update'] = DataReader(self.participant, topic_model_update, qos=best_effort_qos)
-        self.readers['model_update_chunk'] = DataReader(self.participant, topic_model_update_chunk, qos=best_effort_qos)
+        self.readers['model_update_chunk'] = DataReader(self.participant, topic_model_update_chunk, qos=chunk_qos)
         self.readers['metrics'] = DataReader(self.participant, topic_metrics, qos=best_effort_qos)
         
         # Create writers (for sending to clients)
@@ -351,7 +358,7 @@ class FederatedLearningServer:
         self.writers['command'] = DataWriter(self.participant, topic_command, qos=reliable_qos)
         # Use BestEffort for large model data and chunked transfers
         self.writers['global_model'] = DataWriter(self.participant, topic_global_model, qos=best_effort_qos)
-        self.writers['global_model_chunk'] = DataWriter(self.participant, topic_global_model_chunk, qos=best_effort_qos)
+        self.writers['global_model_chunk'] = DataWriter(self.participant, topic_global_model_chunk, qos=chunk_qos)
         self.writers['status'] = DataWriter(self.participant, topic_status, qos=best_effort_qos)
         
         print("DDS setup complete (Reliable QoS for control, BestEffort for data chunks)\n")

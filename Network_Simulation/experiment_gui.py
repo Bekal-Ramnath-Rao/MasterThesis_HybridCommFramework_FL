@@ -243,6 +243,8 @@ class FLExperimentGUI(QMainWindow):
         self.network_controller = None
         self.log_monitors = []
         self.current_containers = []
+        self.experiment_started_at = None
+        self.current_results_dir = None
         self.init_ui()
         
     def init_ui(self):
@@ -404,6 +406,19 @@ class FLExperimentGUI(QMainWindow):
         ])
         layout.addWidget(protocol_group, row, 0, 1, 2)
         self.protocol_checkboxes = protocol_group.findChildren(QCheckBox)
+        row += 1
+        
+        # Q-learning convergence (unified use case only)
+        ql_conv_group = QGroupBox("🎓 Q-Learning End Condition (Unified Only)")
+        ql_conv_group.setStyleSheet(self.get_group_style())
+        ql_conv_layout = QHBoxLayout()
+        self.use_ql_convergence = QCheckBox("End training when Q-learning value converges (run multiple episodes)")
+        self.use_ql_convergence.setStyleSheet("font-size: 12px; padding: 5px;")
+        self.use_ql_convergence.setToolTip("If unchecked: training ends on accuracy convergence (current behavior). If checked: training runs until Q-values stabilize.")
+        ql_conv_layout.addWidget(self.use_ql_convergence)
+        ql_conv_layout.addStretch()
+        ql_conv_group.setLayout(ql_conv_layout)
+        layout.addWidget(ql_conv_group, row, 0, 1, 2)
         row += 1
         
         # Network Scenarios
@@ -1526,6 +1541,18 @@ class FLExperimentGUI(QMainWindow):
             QTimer.singleShot(100, self.refresh_packet_log_table)
             self.packet_logs_tab = None
 
+        # Tab 6: Q-Learning Logs (unified use case)
+        try:
+            from q_learning_logs_tab import QLearningLogsTab
+            self.q_learning_logs_tab = QLearningLogsTab()
+            self.output_tabs.addTab(self.q_learning_logs_tab, "🎓 Q-Learning")
+        except ImportError as e:
+            ql_fallback = QWidget()
+            ql_layout = QVBoxLayout(ql_fallback)
+            ql_layout.addWidget(QLabel(f"Q-Learning tab unavailable: {e}"))
+            self.output_tabs.addTab(ql_fallback, "🎓 Q-Learning")
+            self.q_learning_logs_tab = None
+
         # Add Docker Build Logs tab
         self.docker_build_log_text = QTextEdit()
         self.docker_build_log_text.setReadOnly(True)
@@ -1952,6 +1979,10 @@ class FLExperimentGUI(QMainWindow):
             cmd_parts.extend(["--compression-algorithm", self.compression_algo.currentText()])
             cmd_parts.extend(["--compression-level", str(self.compression_level.value())])
         
+        # Q-learning convergence (only when rl_unified is selected)
+        if self.use_ql_convergence.isChecked() and "rl_unified" in self.get_selected_protocols():
+            cmd_parts.append("--use-ql-convergence")
+        
         return " ".join(cmd_parts)
     
     def start_experiment(self):
@@ -2021,6 +2052,8 @@ class FLExperimentGUI(QMainWindow):
         
         # Clear all output
         self.clear_all_output()
+        self.experiment_started_at = datetime.now()
+        self.current_results_dir = None
         
         # Update UI
         self.start_button.setEnabled(False)
@@ -2067,6 +2100,9 @@ class FLExperimentGUI(QMainWindow):
                 # Stop the experiment thread
                 self.experiment_thread.stop()
                 self.experiment_thread.wait(5000)  # Wait up to 5 seconds
+
+                # Save final container logs before monitors/containers are stopped
+                self.save_container_logs_snapshot()
                 
                 # Stop monitors
                 self.stop_all_monitors()
@@ -2270,10 +2306,110 @@ class FLExperimentGUI(QMainWindow):
     
     def update_output(self, text):
         """Update output console"""
+        self._extract_results_dir_from_output(text)
         self.output_text.insertPlainText(text)
         self.output_text.verticalScrollBar().setValue(
             self.output_text.verticalScrollBar().maximum()
         )
+
+    def _extract_results_dir_from_output(self, text):
+        """Track results directory from runner stdout."""
+        markers = ("Results Directory:", "Results saved in:")
+        for marker in markers:
+            if marker in text:
+                path_part = text.split(marker, 1)[1].strip()
+                if path_part:
+                    self.current_results_dir = path_part
+                return
+
+    def _get_fallback_results_dir(self):
+        """Best-effort results directory when parser didn't capture it yet."""
+        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        use_case = self.get_selected_use_case()
+
+        if self.baseline_mode.isChecked():
+            candidate = os.path.join(base_dir, "experiment_results_baseline", use_case)
+            return candidate if os.path.isdir(candidate) else None
+
+        candidate_root = os.path.join(base_dir, "experiment_results")
+        if not os.path.isdir(candidate_root):
+            return None
+
+        use_case_prefix = f"{use_case}_"
+        candidates = [
+            os.path.join(candidate_root, d)
+            for d in os.listdir(candidate_root)
+            if d.startswith(use_case_prefix) and os.path.isdir(os.path.join(candidate_root, d))
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=os.path.getmtime)
+
+    def _get_log_capture_dir(self):
+        """Resolve folder where stop-time container logs should be written."""
+        base_results = self.current_results_dir
+        if not base_results or not os.path.isdir(base_results):
+            base_results = self._get_fallback_results_dir()
+
+        if not base_results:
+            base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+            base_results = os.path.join(base_dir, "experiment_results", "manual_stop_logs")
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target = os.path.join(base_results, "container_logs", f"stopped_{stamp}")
+        os.makedirs(target, exist_ok=True)
+        return target
+
+    def save_container_logs_snapshot(self):
+        """Save server/client/broker logs into experiment results on Stop."""
+        try:
+            log_dir = self._get_log_capture_dir()
+            self.output_text.append(f"💾 Saving container logs to: {log_dir}\n")
+
+            ps_cmd = ["docker", "ps", "-a", "--format", "{{.Names}}"]
+            result = subprocess.run(ps_cmd, capture_output=True, text=True, timeout=10)
+            if result.returncode != 0:
+                self.output_text.append("⚠️ Could not list containers for log export\n")
+                return
+
+            all_names = [c.strip() for c in result.stdout.split('\n') if c.strip()]
+            keywords = ("server", "client", "broker", "rabbitmq", "mosquitto")
+            log_targets = [
+                name for name in all_names
+                if name.startswith("fl-") or any(k in name.lower() for k in keywords)
+            ]
+
+            if not log_targets:
+                self.output_text.append("⚠️ No server/client/broker containers found for log export\n")
+                return
+
+            saved = 0
+            for container in sorted(set(log_targets)):
+                safe_name = container.replace("/", "_")
+                out_file = os.path.join(log_dir, f"{safe_name}.log")
+                log_cmd = ["docker", "logs", "--timestamps", container]
+                log_res = subprocess.run(log_cmd, capture_output=True, text=True, timeout=20)
+
+                with open(out_file, "w", encoding="utf-8") as f:
+                    if log_res.stdout:
+                        f.write(log_res.stdout)
+                    if log_res.stderr:
+                        f.write("\n[stderr]\n")
+                        f.write(log_res.stderr)
+                saved += 1
+
+            meta_file = os.path.join(log_dir, "log_capture_metadata.txt")
+            with open(meta_file, "w", encoding="utf-8") as f:
+                f.write(f"captured_at={datetime.now().isoformat()}\n")
+                f.write(f"use_case={self.get_selected_use_case()}\n")
+                f.write(f"containers_saved={saved}\n")
+                f.write("targets=\n")
+                for c in sorted(set(log_targets)):
+                    f.write(f"- {c}\n")
+
+            self.output_text.append(f"✅ Saved logs for {saved} container(s)\n")
+        except Exception as e:
+            self.output_text.append(f"⚠️ Failed to save stop-time logs: {e}\n")
     
     def experiment_completed(self, success, message):
         """Handle experiment completion"""

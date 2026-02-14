@@ -199,18 +199,18 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             if self.training_complete:
                 return federated_learning_pb2.TrainingStatus(
                     should_train=False,
-                    round=self.current_round,
+                    current_round=self.current_round,
                     should_evaluate=False,
-                    training_complete=True
+                    is_complete=True
                 )
             
             # Check if client should start training
             if self.training_started and client_round == 0 and self.current_round == 1:
                 return federated_learning_pb2.TrainingStatus(
                     should_train=True,
-                    round=self.current_round,
+                    current_round=self.current_round,
                     should_evaluate=False,
-                    training_complete=False
+                    is_complete=False
                 )
             
             # Check if client should evaluate (after global model is ready)
@@ -219,26 +219,26 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 if client_id not in self.clients_evaluated:
                     return federated_learning_pb2.TrainingStatus(
                         should_train=False,
-                        round=self.current_round,
+                        current_round=self.current_round,
                         should_evaluate=True,
-                        training_complete=False
+                        is_complete=False
                     )
             
             # Check if client should train next round
             if not self.evaluation_phase and client_round < self.current_round:
                 return federated_learning_pb2.TrainingStatus(
                     should_train=True,
-                    round=self.current_round,
+                    current_round=self.current_round,
                     should_evaluate=False,
-                    training_complete=False
+                    is_complete=False
                 )
             
             # No action needed
             return federated_learning_pb2.TrainingStatus(
                 should_train=False,
-                round=self.current_round,
+                current_round=self.current_round,
                 should_evaluate=False,
-                training_complete=False
+                is_complete=False
             )
     
     def GetGlobalModel(self, request, context):

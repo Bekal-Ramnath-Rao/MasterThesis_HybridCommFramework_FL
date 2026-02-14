@@ -346,9 +346,9 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             if self.training_complete:
                 return federated_learning_pb2.TrainingStatus(
                     should_train=False,
-                    round=self.current_round,
+                    current_round=self.current_round,
                     should_evaluate=False,
-                    training_complete=True
+                    is_complete=True
                 )
 
             # Check if client has already submitted update for current round
@@ -362,17 +362,17 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     print(f"[DEBUG] Telling client {client_id} to train for round {self.current_round}")
                     return federated_learning_pb2.TrainingStatus(
                         should_train=True,
-                        round=self.current_round,
+                        current_round=self.current_round,
                         should_evaluate=False,
-                        training_complete=False
+                        is_complete=False
                     )
 
             print(f"[DEBUG] Telling client {client_id} to wait (evaluation_phase={self.evaluation_phase}, has_submitted={client_has_submitted})")
             return federated_learning_pb2.TrainingStatus(
                 should_train=False,
-                round=self.current_round,
+                current_round=self.current_round,
                 should_evaluate=False,
-                training_complete=False
+                is_complete=False
             )
 
     def GetGlobalModel(self, request, context):

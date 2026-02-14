@@ -289,6 +289,12 @@ class FederatedLearningClient:
             Policy.Reliability.BestEffort,
             Policy.History.KeepLast(50),  # Buffer up to 50 chunks to handle burst losses
         )
+        # Reliable chunk QoS for receiving full global model chunk set.
+        chunk_qos = Qos(
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.History.KeepLast(2048),
+            Policy.Durability.TransientLocal
+        )
         
         # Create topics
         topic_registration = Topic(self.participant, "ClientRegistration", ClientRegistration)
@@ -319,16 +325,16 @@ class FederatedLearningClient:
         self.readers['command'] = DataReader(self.participant, topic_command, qos=reliable_qos)
         # Use BestEffort for chunked model data
         self.readers['global_model'] = DataReader(self.participant, topic_global_model, qos=best_effort_qos)
-        self.readers['global_model_chunk'] = DataReader(self.participant, topic_global_model_chunk, qos=best_effort_qos)
+        self.readers['global_model_chunk'] = DataReader(self.participant, topic_global_model_chunk, qos=chunk_qos)
         self.readers['status'] = DataReader(self.participant, topic_status, qos=best_effort_qos)
         
         # Create writers (for sending to server)
         # Use Reliable QoS for registration and ready signals (critical to ensure server receives them)
         self.writers['registration'] = DataWriter(self.participant, topic_registration, qos=reliable_qos)
         self.writers['ready'] = DataWriter(self.participant, topic_ready, qos=reliable_qos)
-        # Use BestEffort for chunked data and metrics
+        # Use Reliable+deep-history for chunk stream to avoid server-side partial updates.
         self.writers['model_update'] = DataWriter(self.participant, topic_model_update, qos=best_effort_qos)
-        self.writers['model_update_chunk'] = DataWriter(self.participant, topic_model_update_chunk, qos=best_effort_qos)
+        self.writers['model_update_chunk'] = DataWriter(self.participant, topic_model_update_chunk, qos=chunk_qos)
         self.writers['metrics'] = DataWriter(self.participant, topic_metrics, qos=best_effort_qos)
 
         print(f"Client {self.client_id} DDS setup complete (Reliable QoS for control, BestEffort for data)")
@@ -603,10 +609,15 @@ class FederatedLearningClient:
                         self.model.set_weights(weights)
                         print(f"Client {self.client_id} model initialized with server weights")
                         self.current_round = 0
-                        
-                        # Check if there's a pending training command waiting for this model
-                        print(f"Client {self.client_id} checking for pending training commands...")
-                        self.check_commands()
+                        # Start round 1 immediately after initial model is ready to avoid
+                        # missing one-shot start_training command timing.
+                        self.current_round = 1
+                        print(f"Client {self.client_id} starting training for round 1 with initial global model...")
+                        self.train_local_model()
+                        # Training call handles further loop progression.
+                        self.global_model_chunks.clear()
+                        self.global_model_metadata.clear()
+                        return
                     elif round_num == self.current_round:
                         # Updated model after aggregation
                         self.model.set_weights(weights)

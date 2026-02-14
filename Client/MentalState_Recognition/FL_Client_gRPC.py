@@ -399,9 +399,9 @@ class FederatedLearningClient:
                     )
                 )
                 
-                print(f"[DEBUG] Client {self.client_id} - Status: should_train={status.should_train}, round={status.round}, current_round={self.current_round}, training_complete={status.training_complete}")
+                print(f"[DEBUG] Client {self.client_id} - Status: should_train={status.should_train}, current_round={status.current_round}, local_round={self.current_round}, is_complete={status.is_complete}")
                 
-                if status.training_complete:
+                if status.is_complete:
                     print(f"\n{'='*70}")
                     print(f"Client {self.client_id} - Training completed!")
                     print(f"{'='*70}\n")
@@ -414,18 +414,18 @@ class FederatedLearningClient:
                 print(f"[DEBUG] Client {self.client_id} - should_train is True, checking if need to fetch new model...")
                 
                 # If server's round is ahead, fetch new global model first
-                if status.round > self.current_round:
-                    print(f"[DEBUG] Client {self.client_id} - Fetching global model for round {status.round}...")
+                if status.current_round > self.current_round:
+                    print(f"[DEBUG] Client {self.client_id} - Fetching global model for round {status.current_round}...")
                     model_update = self.stub.GetGlobalModel(
                         federated_learning_pb2.ModelRequest(client_id=self.client_id, round=self.current_round)
                     )
                     
-                    print(f"[DEBUG] Client {self.client_id} - Received model update, round={model_update.round}, status.round={status.round}")
+                    print(f"[DEBUG] Client {self.client_id} - Received model update, round={model_update.round}, status.current_round={status.current_round}")
                     
-                    if model_update.round == status.round:
+                    if model_update.round == status.current_round:
                         print(f"[DEBUG] Client {self.client_id} - Model round matches, updating...")
                         self.receive_global_model(model_update)
-                        self.current_round = status.round
+                        self.current_round = status.current_round
                     else:
                         print(f"[DEBUG] Client {self.client_id} - Model round mismatch!")
                         time.sleep(0.5)

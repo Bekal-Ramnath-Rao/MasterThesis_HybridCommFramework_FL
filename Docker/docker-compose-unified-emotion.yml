@@ -94,6 +94,9 @@ services:
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
       - USE_RL_SELECTION=true
+      - USE_QL_CONVERGENCE=${USE_QL_CONVERGENCE:-false}
+      - Q_CONVERGENCE_THRESHOLD=${Q_CONVERGENCE_THRESHOLD:-0.01}
+      - Q_CONVERGENCE_PATIENCE=${Q_CONVERGENCE_PATIENCE:-5}
       - DEFAULT_PROTOCOL=mqtt
       - MQTT_BROKER=mqtt-broker-unified
       - AMQP_BROKER=amqp-broker-unified
@@ -138,6 +141,9 @@ services:
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
       - USE_RL_SELECTION=true
+      - USE_QL_CONVERGENCE=${USE_QL_CONVERGENCE:-false}
+      - Q_CONVERGENCE_THRESHOLD=${Q_CONVERGENCE_THRESHOLD:-0.01}
+      - Q_CONVERGENCE_PATIENCE=${Q_CONVERGENCE_PATIENCE:-5}
       - DEFAULT_PROTOCOL=mqtt
       - MQTT_BROKER=mqtt-broker-unified
       - AMQP_BROKER=amqp-broker-unified

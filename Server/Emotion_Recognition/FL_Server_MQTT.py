@@ -23,6 +23,11 @@ else:
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+# packet_logger lives in scripts/utilities (Docker: /app/scripts/utilities, local: project_root/scripts/utilities)
+_utilities_path = os.path.join(project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+
 print(f"Project root set to: {project_root}")
 from packet_logger import init_db, log_sent_packet, log_received_packet
 

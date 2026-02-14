@@ -164,6 +164,7 @@ class FederatedLearningClient:
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.has_converged = False
+        self.running = True
         self.protocol = None
         self.stream_id = 0
         self.model_ready = asyncio.Event()  # Event to signal model is ready
@@ -408,9 +409,10 @@ class FederatedLearningClient:
         print(f"Client {self.client_id} - Training completed!")
         print("="*70)
         print("\nClient shutting down...")
-        await asyncio.sleep(1)
-        import sys
-        sys.exit(0)
+        await asyncio.sleep(0.5)
+        self.running = False
+        if self.protocol:
+            self.protocol.close()
     
     async def train_local_model(self):
         """Train model on local data and send updates to server"""
@@ -503,9 +505,10 @@ class FederatedLearningClient:
         })
         if self.has_converged:
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
-            await asyncio.sleep(2)
-            import sys
-            sys.exit(0)
+            await asyncio.sleep(0.5)
+            self.running = False
+            if self.protocol:
+                self.protocol.close()
     
     def _update_local_convergence(self, loss: float):
         """Track client-local convergence and disconnect when converged."""
@@ -633,14 +636,9 @@ async def main():
             await client.register_with_server()
             
             print(f"Client {CLIENT_ID} waiting for training commands...")
-            # Keep connection alive
-            try:
-                await asyncio.Future()
-            except Exception as e:
-                print(f"\n[ERROR] Client {CLIENT_ID} - Connection loop error: {e}")
-                import traceback
-                traceback.print_exc()
-                raise
+            # Keep connection alive until client is stopped
+            while client.running:
+                await asyncio.sleep(0.2)
     except ConnectionError as e:
         print(f"\n❌ Connection Error: {e}")
         print(f"Failed to connect to QUIC server at {QUIC_HOST}:{QUIC_PORT}")

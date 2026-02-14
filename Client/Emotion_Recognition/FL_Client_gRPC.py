@@ -218,7 +218,7 @@ class FederatedLearningClient:
                     federated_learning_pb2.StatusRequest(client_id=self.client_id)
                 )
                 
-                if status.training_complete:
+                if status.is_complete:
                     print(f"\n{'='*70}")
                     print(f"Client {self.client_id} - Training completed!")
                     print(f"{'='*70}\n")
@@ -229,22 +229,22 @@ class FederatedLearningClient:
                     continue
                 
                 # Check if we need to start a new round
-                if status.round > self.current_round and not status.should_evaluate:
+                if status.current_round > self.current_round and not status.should_evaluate:
                     # Get new global model
                     model_update = self.stub.GetGlobalModel(
                         federated_learning_pb2.ModelRequest(client_id=self.client_id)
                     )
                     
-                    if model_update.round == status.round:
+                    if model_update.round == status.current_round:
                         self.receive_global_model(model_update)
-                        self.current_round = status.round
+                        self.current_round = status.current_round
                         
                         # Train on local data
                         print(f"\nClient {self.client_id} starting training for round {self.current_round}...")
                         self.train_local_model()
                 
                 # Check if we should evaluate
-                elif status.should_evaluate and status.round == self.current_round:
+                elif status.should_evaluate and status.current_round == self.current_round:
                     print(f"Client {self.client_id} evaluating model for round {self.current_round}...")
                     self.evaluate_model()
                     # Mark that we've evaluated this round by incrementing our counter
@@ -427,14 +427,12 @@ class FederatedLearningClient:
             
             # Send metrics to server
             response = self.stub.SendMetrics(
-                federated_learning_pb2.EvaluationMetrics(
+                federated_learning_pb2.Metrics(
                     client_id=self.client_id,
                     round=self.current_round,
                     num_samples=num_samples,
-                    metrics={
-                        'loss': float(loss),
-                        'accuracy': float(accuracy)
-                    }
+                    loss=float(loss),
+                    accuracy=float(accuracy)
                 )
             )
             

@@ -43,6 +43,7 @@ RUN cd Protocols && \
     cd ..
 
 COPY scripts/utilities/packet_logger.py ./
+COPY scripts/utilities/q_learning_logger.py ./
 # Copy the Client directory
 COPY Client/ ./Client/
 

@@ -322,18 +322,25 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     message=f"Client {client_id} already inactive"
                 )
             
-            # Extract metrics from map
-            metrics = dict(request.metrics)
+            # Proto Metrics has scalar loss/accuracy fields. Keep a safe fallback
+            # if an old client still sends a metrics map message type.
+            if hasattr(request, 'metrics'):
+                metrics = dict(request.metrics)
+                loss_value = float(metrics.get('loss', 0.0))
+                acc_value = float(metrics.get('accuracy', 0.0))
+            else:
+                loss_value = float(getattr(request, 'loss', 0.0))
+                acc_value = float(getattr(request, 'accuracy', 0.0))
             
             self.client_metrics[client_id] = {
-                'loss': metrics.get('loss', 0),
-                'accuracy': metrics.get('accuracy', 0),
+                'loss': loss_value,
+                'accuracy': acc_value,
                 'num_samples': request.num_samples
             }
             self.clients_evaluated.add(client_id)
             
             print(f"Received evaluation metrics from client {client_id}")
-            print(f"  Loss: {metrics.get('loss', 0):.4f}, Accuracy: {metrics.get('accuracy', 0):.4f}")
+            print(f"  Loss: {loss_value:.4f}, Accuracy: {acc_value:.4f}")
             print(f"  Progress: {len(self.clients_evaluated)}/{self.num_clients} clients evaluated")
             
             # Check if all clients evaluated
@@ -351,9 +358,9 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         """Let clients check if training should start"""
         return federated_learning_pb2.TrainingStatus(
             should_train=self.training_started,
-            training_complete=self.training_complete,
-            round=self.current_round,
-            should_evaluate=self.evaluation_phase
+            current_round=self.current_round,
+            should_evaluate=self.evaluation_phase,
+            is_complete=self.training_complete
         )
     
     def start_training(self):

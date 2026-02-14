@@ -21,6 +21,7 @@ import base64
 import time
 import threading
 import asyncio
+import fcntl
 from typing import List, Dict, Sequence, TYPE_CHECKING
 from pathlib import Path
 from concurrent import futures
@@ -98,6 +99,11 @@ else:
 
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
+
+# packet_logger lives in scripts/utilities (Docker: /app/scripts/utilities, local: project_root/scripts/utilities)
+_utilities_path = os.path.join(project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
 
 from packet_logger import init_db, log_sent_packet, log_received_packet
 
@@ -1096,17 +1102,24 @@ class UnifiedFederatedLearningServer:
                 Policy.Durability.TransientLocal
             )
             
-            # Best effort QoS for large data transfers (model chunks)
+            # Best effort QoS for non-critical bulk paths
             best_effort_qos = Qos(
                 Policy.Reliability.BestEffort,
                 Policy.History.KeepLast(1),
+            )
+
+            # Reliable QoS for chunked model transfer to prevent dropped chunks.
+            chunk_qos = Qos(
+                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+                Policy.History.KeepLast(2048),
+                Policy.Durability.TransientLocal
             )
             
             # Create topics and readers for model updates
             update_topic = Topic(self.dds_participant, "ModelUpdate", ModelUpdate)
             update_reader = DataReader(self.dds_participant, update_topic, qos=best_effort_qos)
             update_chunk_topic = Topic(self.dds_participant, "ModelUpdateChunk", ModelUpdateChunk)
-            update_chunk_reader = DataReader(self.dds_participant, update_chunk_topic, qos=best_effort_qos)
+            update_chunk_reader = DataReader(self.dds_participant, update_chunk_topic, qos=chunk_qos)
             
             # Create topics and readers for metrics
             metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
@@ -1116,7 +1129,7 @@ class UnifiedFederatedLearningServer:
             global_model_topic = Topic(self.dds_participant, "GlobalModel", GlobalModel)
             self.dds_writers['global_model'] = DataWriter(self.dds_participant, global_model_topic, qos=best_effort_qos)
             global_model_chunk_topic = Topic(self.dds_participant, "GlobalModelChunk", GlobalModelChunk)
-            self.dds_writers['global_model_chunk'] = DataWriter(self.dds_participant, global_model_chunk_topic, qos=best_effort_qos)
+            self.dds_writers['global_model_chunk'] = DataWriter(self.dds_participant, global_model_chunk_topic, qos=chunk_qos)
             
             command_topic = Topic(self.dds_participant, "TrainingCommand", TrainingCommand)
             self.dds_writers['command'] = DataWriter(self.dds_participant, command_topic, qos=reliable_qos)
@@ -1327,6 +1340,10 @@ class UnifiedFederatedLearningServer:
     def handle_client_registration(self, client_id, protocol):
         """Handle client registration (thread-safe)"""
         with self.lock:
+            existing_protocol = self.registered_clients.get(client_id)
+            if existing_protocol == protocol:
+                print(f"[{protocol.upper()}] Client {client_id} already registered via {protocol} - ignoring duplicate")
+                return
             self.registered_clients[client_id] = protocol
             self.active_clients.add(client_id)
             print(f"[{protocol.upper()}] Client {client_id} registered "
@@ -1357,6 +1374,16 @@ class UnifiedFederatedLearningServer:
                     print("[Server] All clients converged. Stopping training.")
                     self.converged = True
                     self.signal_training_complete()
+                    return
+
+                # If a client converges mid-round, re-check aggregation thresholds
+                # against the reduced active client set so training does not stall.
+                if self.client_updates and len(self.client_updates) >= len(self.active_clients):
+                    print("[Server] Continuing round after convergence: remaining model updates are sufficient.")
+                    self.aggregate_models()
+                elif self.client_metrics and len(self.client_metrics) >= len(self.active_clients):
+                    print("[Server] Continuing round after convergence: remaining metrics are sufficient.")
+                    self.aggregate_metrics()
     
     def handle_client_update(self, data, protocol):
         """Handle client model update (thread-safe)"""
@@ -1535,81 +1562,29 @@ class UnifiedFederatedLearningServer:
     
     def signal_start_training(self):
         """Signal all clients to start training for current round"""
-        # Broadcast to ALL protocols (clients listen to multiple protocols simultaneously)
+        # Unified RL requirement: use gRPC control signaling only.
         for client_id in self.registered_clients.keys():
             if client_id not in self.active_clients:
                 continue
-            message = {'round': self.current_round}
-            
-            # MQTT
-            try:
-                self.send_via_mqtt(client_id, "fl/start_training", message)
-            except Exception as e:
-                pass  # Client may not be listening to this protocol
-            
-            # AMQP
-            try:
-                self.send_via_amqp(client_id, 'start_training', message)
-            except Exception as e:
-                pass
-            
-            # gRPC - set flag for polling
+            # gRPC - set one-shot flag for client polling
             try:
                 self.grpc_should_train[client_id] = True
                 self.grpc_should_evaluate[client_id] = False
-            except Exception as e:
-                pass
-            
-            # DDS
-            try:
-                if DDS_AVAILABLE and 'command' in self.dds_writers:
-                    command = TrainingCommand(
-                        round=self.current_round,
-                        start_training=True,
-                        start_evaluation=False,
-                        training_complete=False
-                    )
-                    self.dds_writers['command'].write(command)
+                print(f"[gRPC] start_training flagged for client {client_id} (round {self.current_round})")
             except Exception as e:
                 pass
     
     def signal_start_evaluation(self):
         """Signal all clients to start evaluation for current round"""
-        # Broadcast to ALL protocols (clients listen to multiple protocols simultaneously)
+        # Unified RL requirement: use gRPC control signaling only.
         for client_id in self.registered_clients.keys():
             if client_id not in self.active_clients:
                 continue
-            message = {'round': self.current_round}
-            
-            # MQTT
-            try:
-                self.send_via_mqtt(client_id, "fl/start_evaluation", message)
-            except Exception as e:
-                pass  # Client may not be listening to this protocol
-            
-            # AMQP
-            try:
-                self.send_via_amqp(client_id, 'start_evaluation', message)
-            except Exception as e:
-                pass
-            
-            # gRPC - set flag for polling
+            # gRPC - set one-shot flag for client polling
             try:
                 self.grpc_should_train[client_id] = False
                 self.grpc_should_evaluate[client_id] = True
-            except Exception as e:
-                pass
-            
-            # DDS
-            try:
-                if DDS_AVAILABLE and 'command' in self.dds_writers:
-                    command = TrainingCommand(
-                        round=self.current_round,
-                        start_training=False,
-                        start_evaluation=True,
-                        training_complete=False
-                    )
-                    self.dds_writers['command'].write(command)
+                print(f"[gRPC] start_evaluation flagged for client {client_id} (round {self.current_round})")
             except Exception as e:
                 pass
     
@@ -1882,31 +1857,38 @@ if GRPC_AVAILABLE:
         def GetGlobalModel(self, request, context):
             """Send global model to client"""
             try:
-                # Round 0 means "give me the latest model" (for polling)
-                if request.round == 0 or request.round == self.server.current_round or request.round == self.server.current_round - 1:
-                    # Send current global model
-                    if self.server.current_round == 0:
-                        # Initial model with config
-                        weights_bytes = pickle.dumps(self.server.global_weights)
-                        model_config_json = json.dumps(self.server.model_config)
-                        
-                        response = federated_learning_pb2.GlobalModel(
-                            round=0,
-                            weights=weights_bytes,
-                            available=True,
-                            model_config=model_config_json
-                        )
-                    else:
-                        # Updated model after aggregation
-                        weights_bytes = pickle.dumps(self.server.global_weights)
-                        
-                        response = federated_learning_pb2.GlobalModel(
-                            round=self.server.current_round,
-                            weights=weights_bytes,
-                            available=True,
-                            model_config=""
-                        )
-                        # Log removed to avoid spam - clients poll every second
+                client_id = request.client_id
+                ready_round = self.server.grpc_model_ready.get(client_id)
+
+                # If this client is marked ready for initial model, always serve round 0
+                # with model_config so first-time model initialization cannot be skipped.
+                if ready_round == 0 and request.round == 0:
+                    weights_bytes = pickle.dumps(self.server.global_weights)
+                    model_config_json = json.dumps(self.server.model_config)
+                    response = federated_learning_pb2.GlobalModel(
+                        round=0,
+                        weights=weights_bytes,
+                        available=True,
+                        model_config=model_config_json
+                    )
+                # Serve a specifically marked ready round for gRPC pull clients.
+                elif ready_round is not None and request.round == 0:
+                    weights_bytes = pickle.dumps(self.server.global_weights)
+                    response = federated_learning_pb2.GlobalModel(
+                        round=ready_round,
+                        weights=weights_bytes,
+                        available=True,
+                        model_config=""
+                    )
+                # Backward-compatible fallback: allow polling latest/current.
+                elif request.round == 0 or request.round == self.server.current_round or request.round == self.server.current_round - 1:
+                    weights_bytes = pickle.dumps(self.server.global_weights)
+                    response = federated_learning_pb2.GlobalModel(
+                        round=self.server.current_round,
+                        weights=weights_bytes,
+                        available=True,
+                        model_config=""
+                    )
                 else:
                     # Client requesting old/future round - not available
                     response = federated_learning_pb2.GlobalModel(
@@ -2127,6 +2109,15 @@ if QUIC_AVAILABLE:
 
 def main():
     """Main function"""
+    # Prevent duplicate unified server instance in the same container/host.
+    lock_path = "/tmp/unified_emotion_server.lock"
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("[Startup] Another unified server instance is already running. Exiting.")
+        return
+
     # Use MIN_CLIENTS (dynamic clients) and configured NUM_ROUNDS.
     # MAX_CLIENTS controls the upper bound of concurrently registered clients.
     server = UnifiedFederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, max_clients=MAX_CLIENTS)

@@ -314,22 +314,22 @@ class FederatedLearningClient:
                     else:
                         raise  # Re-raise other RPC errors
                 
-                if status.training_complete:
+                if status.is_complete:
                     print(f"\nClient {self.client_id} - Training completed!")
                     print("Disconnecting from server...")
                     self.running = False
                     break
                 
                 if status.should_train:
-                    if self.current_round == 0 and status.round == 1:
+                    if self.current_round == 0 and status.current_round == 1:
                         # First training round with initial global model
-                        self.current_round = status.round
-                        print(f"\nClient {self.client_id} starting training for round {status.round} with initial global model...")
+                        self.current_round = status.current_round
+                        print(f"\nClient {self.client_id} starting training for round {status.current_round} with initial global model...")
                         self.train_local_model()
-                    elif status.round > self.current_round:
+                    elif status.current_round > self.current_round:
                         # Subsequent rounds
-                        self.current_round = status.round
-                        print(f"\nClient {self.client_id} starting training for round {status.round}...")
+                        self.current_round = status.current_round
+                        print(f"\nClient {self.client_id} starting training for round {status.current_round}...")
                         self.train_local_model()
                     time.sleep(1)  # Brief pause before checking for evaluation
                 
