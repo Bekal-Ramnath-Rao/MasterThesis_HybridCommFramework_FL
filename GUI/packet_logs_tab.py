@@ -5,12 +5,30 @@ For Unified FL Scenario with Server/Client Packet Visualization
 
 import sys
 import sqlite3
+import os
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, 
                              QTableWidgetItem, QComboBox, QPushButton, QLabel,
-                             QGroupBox, QHeaderView)
+                             QGroupBox, QHeaderView, QFileDialog, QMessageBox)
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QColor
-import os
+
+
+def _shared_data_dir():
+    """Resolve shared_data path (works when GUI runs from project root or Network_Simulation)."""
+    # Prefer project root (where Docker mounts shared_data)
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)  # GUI/packet_logs_tab.py -> project root
+    for base in [project_root, os.getcwd()]:
+        path = os.path.join(base, "shared_data")
+        if os.path.isdir(path):
+            return path
+    # Ensure directory exists at project root so Docker mount has a target
+    path = os.path.join(project_root, "shared_data")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    return path
 
 
 class PacketLogsTab(QWidget):
@@ -30,6 +48,7 @@ class PacketLogsTab(QWidget):
         self.current_node_type = "server"
         self.current_client_id = None
         self.protocol_filter = "All"
+        self._refresh_cycle = 0  # for periodic node list update
         
         self.init_ui()
         self.setup_refresh_timer()
@@ -66,6 +85,11 @@ class PacketLogsTab(QWidget):
         self.auto_refresh_btn.setChecked(True)
         self.auto_refresh_btn.clicked.connect(self.toggle_auto_refresh)
         controls_layout.addWidget(self.auto_refresh_btn)
+        
+        self.download_excel_btn = QPushButton("📥 Download to Excel")
+        self.download_excel_btn.setStyleSheet("padding: 6px 12px; font-weight: bold;")
+        self.download_excel_btn.clicked.connect(self.download_packet_logs_excel)
+        controls_layout.addWidget(self.download_excel_btn)
         
         controls_layout.addStretch()
         layout.addLayout(controls_layout)
@@ -134,14 +158,15 @@ class PacketLogsTab(QWidget):
     def update_node_list(self):
         """Update list of available nodes (server + clients)"""
         self.node_selector.clear()
+        shared = _shared_data_dir()
         
         # Add server
-        if os.path.exists("shared_data/packet_logs_server.db"):
+        if os.path.exists(os.path.join(shared, "packet_logs_server.db")):
             self.node_selector.addItem("Server")
         
         # Add clients (check for client databases)
         for i in range(1, 11):  # Support up to 10 clients
-            client_db = f"shared_data/packet_logs_client_{i}.db"
+            client_db = os.path.join(shared, f"packet_logs_client_{i}.db")
             if os.path.exists(client_db):
                 self.node_selector.addItem(f"Client {i}")
     
@@ -163,18 +188,28 @@ class PacketLogsTab(QWidget):
     
     def get_db_path(self):
         """Get database path for current node"""
+        shared = _shared_data_dir()
         if self.current_node_type == "server":
-            return "shared_data/packet_logs_server.db"
+            return os.path.join(shared, "packet_logs_server.db")
         else:
-            return f"shared_data/packet_logs_client_{self.current_client_id}.db"
+            return os.path.join(shared, f"packet_logs_client_{self.current_client_id}.db")
     
     def refresh_data(self):
         """Refresh packet data from database"""
+        # Periodically refresh node list so new DBs (after experiment start) appear
+        self._refresh_cycle += 1
+        if self._refresh_cycle % 5 == 0:
+            self.update_node_list()
+        
         db_path = self.get_db_path()
         
         if not os.path.exists(db_path):
-            print(f"Database not found: {db_path}")
+            # Log only occasionally to avoid terminal spam (e.g. before containers run)
+            if not getattr(self, "_last_db_missing_log", None) or self._last_db_missing_log != db_path:
+                self._last_db_missing_log = db_path
+                print(f"Packet logs: database not found at {db_path} (run unified experiment to create it)")
             return
+        self._last_db_missing_log = None
         
         try:
             conn = sqlite3.connect(db_path)
@@ -287,6 +322,71 @@ class PacketLogsTab(QWidget):
         else:
             self.refresh_timer.stop()
             self.auto_refresh_btn.setText("Auto-Refresh: OFF")
+
+    def download_packet_logs_excel(self):
+        """Export packet logs from server and all clients to one Excel file with separate sheets."""
+        try:
+            import pandas as pd
+        except ImportError:
+            QMessageBox.warning(self, "Export", "pandas is required. Install with: pip install pandas")
+            return
+        try:
+            from openpyxl import __version__  # noqa: F401
+        except ImportError:
+            QMessageBox.warning(self, "Export", "openpyxl is required for Excel export. Install with: pip install openpyxl")
+            return
+
+        shared = _shared_data_dir()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Packet Logs", "", "Excel (*.xlsx);;All Files (*)"
+        )
+        if not path:
+            return
+        if not path.endswith(".xlsx"):
+            path = path + ".xlsx"
+
+        sheets = {}
+        # Server
+        server_db = os.path.join(shared, "packet_logs_server.db")
+        if os.path.exists(server_db):
+            try:
+                conn = sqlite3.connect(server_db)
+                sent = pd.read_sql_query("SELECT * FROM sent_packets ORDER BY id", conn)
+                recv = pd.read_sql_query("SELECT * FROM received_packets ORDER BY id", conn)
+                conn.close()
+                sent.insert(0, "Type", "Sent")
+                recv.insert(0, "Type", "Received")
+                sheets["Server"] = pd.concat([sent, recv], ignore_index=True)
+            except Exception as e:
+                sheets["Server"] = pd.DataFrame([{"Error": str(e)}])
+
+        # Clients
+        for i in range(1, 11):
+            client_db = os.path.join(shared, f"packet_logs_client_{i}.db")
+            if not os.path.exists(client_db):
+                continue
+            try:
+                conn = sqlite3.connect(client_db)
+                sent = pd.read_sql_query("SELECT * FROM sent_packets ORDER BY id", conn)
+                recv = pd.read_sql_query("SELECT * FROM received_packets ORDER BY id", conn)
+                conn.close()
+                sent.insert(0, "Type", "Sent")
+                recv.insert(0, "Type", "Received")
+                sheets[f"Client {i}"] = pd.concat([sent, recv], ignore_index=True)
+            except Exception as e:
+                sheets[f"Client {i}"] = pd.DataFrame([{"Error": str(e)}])
+
+        if not sheets:
+            QMessageBox.information(self, "Export", "No packet log databases found in shared_data.")
+            return
+
+        try:
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                for name, df in sheets.items():
+                    df.to_excel(writer, sheet_name=name[:31], index=False)
+            QMessageBox.information(self, "Export", f"Saved to:\n{path}\nSheets: {', '.join(sheets.keys())}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
 
 
 # === Integration into Main GUI ===

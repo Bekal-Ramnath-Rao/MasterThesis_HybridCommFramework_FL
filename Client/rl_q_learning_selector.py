@@ -40,7 +40,8 @@ class QLearningProtocolSelector:
         epsilon: float = 1.0,
         epsilon_decay: float = 0.995,
         epsilon_min: float = 0.01,
-        save_path: str = "q_table.pkl"
+        save_path: str = "q_table.pkl",
+        initial_load_path: Optional[str] = None,
     ):
         """
         Initialize Q-Learning Protocol Selector
@@ -51,7 +52,9 @@ class QLearningProtocolSelector:
             epsilon: Initial exploration rate
             epsilon_decay: Decay rate for epsilon
             epsilon_min: Minimum epsilon value
-            save_path: Path to save/load Q-table
+            save_path: Path to save/load Q-table (persistent location recommended)
+            initial_load_path: Optional path to load past experience first (e.g. pretrained .pkl).
+                              If set and file exists, this is tried before save_path.
         """
         self.learning_rate = learning_rate
         self.discount_factor = discount_factor
@@ -59,6 +62,7 @@ class QLearningProtocolSelector:
         self.epsilon_decay = epsilon_decay
         self.epsilon_min = epsilon_min
         self.save_path = save_path
+        self.initial_load_path = initial_load_path
         
         # Initialize Q-table
         # State space: (network, resource, model_size, mobility)
@@ -283,42 +287,48 @@ class QLearningProtocolSelector:
         except Exception as e:
             print(f"[Q-Learning] Error saving Q-table: {e}")
     
+    def _try_load_from_path(self, path: str) -> bool:
+        """Try to load Q-table from given path. Return True if loaded successfully."""
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            with open(path, 'rb') as f:
+                data = pickle.load(f)
+            loaded_q_table = data.get('q_table')
+            expected_shape = (
+                len(self.NETWORK_CONDITIONS),
+                len(self.RESOURCE_LEVELS),
+                len(self.MODEL_SIZES),
+                len(self.MOBILITY_LEVELS),
+                len(self.PROTOCOLS)
+            )
+            if loaded_q_table is None or loaded_q_table.shape != expected_shape:
+                if loaded_q_table is not None:
+                    print(f"[Q-Learning] Q-table shape mismatch at {path}: expected {expected_shape}, got {loaded_q_table.shape}")
+                return False
+            self.q_table = loaded_q_table
+            self.epsilon = data.get('epsilon', self.epsilon)
+            self.episode_count = data.get('episode_count', 0)
+            self.total_rewards = data.get('total_rewards', [])
+            self.protocol_usage = data.get('protocol_usage', self.protocol_usage)
+            self.protocol_success = data.get('protocol_success', self.protocol_success)
+            self.protocol_failures = data.get('protocol_failures', self.protocol_failures)
+            print(f"[Q-Learning] Loaded Q-table from {path} (past experience)")
+            print(f"[Q-Learning] Episodes: {self.episode_count}, Epsilon: {self.epsilon:.4f}")
+            return True
+        except Exception as e:
+            print(f"[Q-Learning] Error loading Q-table from {path}: {e}")
+            return False
+
     def load_q_table(self):
-        """Load Q-table and statistics from disk"""
-        if os.path.exists(self.save_path):
-            try:
-                with open(self.save_path, 'rb') as f:
-                    data = pickle.load(f)
-                
-                loaded_q_table = data.get('q_table')
-                
-                # Check if dimensions match current protocol list
-                expected_shape = (
-                    len(self.NETWORK_CONDITIONS),
-                    len(self.RESOURCE_LEVELS),
-                    len(self.MODEL_SIZES),
-                    len(self.MOBILITY_LEVELS),
-                    len(self.PROTOCOLS)
-                )
-                
-                if loaded_q_table is not None and loaded_q_table.shape == expected_shape:
-                    self.q_table = loaded_q_table
-                    self.epsilon = data.get('epsilon', self.epsilon)
-                    self.episode_count = data.get('episode_count', 0)
-                    self.total_rewards = data.get('total_rewards', [])
-                    self.protocol_usage = data.get('protocol_usage', self.protocol_usage)
-                    self.protocol_success = data.get('protocol_success', self.protocol_success)
-                    self.protocol_failures = data.get('protocol_failures', self.protocol_failures)
-                    
-                    print(f"[Q-Learning] Loaded Q-table from {self.save_path}")
-                    print(f"[Q-Learning] Episodes: {self.episode_count}, Epsilon: {self.epsilon:.4f}")
-                else:
-                    if loaded_q_table is not None:
-                        print(f"[Q-Learning] Q-table shape mismatch: expected {expected_shape}, got {loaded_q_table.shape}")
-                    print(f"[Q-Learning] Starting with fresh Q-table for {len(self.PROTOCOLS)} protocols: {self.PROTOCOLS}")
-            except Exception as e:
-                print(f"[Q-Learning] Error loading Q-table: {e}")
-                print(f"[Q-Learning] Starting with fresh Q-table")
+        """Load Q-table from disk: try initial_load_path (past experience) first, then save_path."""
+        # Try optional pretrained / past-experience path first
+        if self.initial_load_path and self._try_load_from_path(self.initial_load_path):
+            return
+        # Then try default save path (e.g. shared_data or cwd)
+        if self._try_load_from_path(self.save_path):
+            return
+        print(f"[Q-Learning] No existing Q-table found. Starting with fresh Q-table for {len(self.PROTOCOLS)} protocols: {self.PROTOCOLS}")
     
     def get_statistics(self) -> Dict:
         """Get learning statistics"""
@@ -380,6 +390,26 @@ class QLearningProtocolSelector:
     def get_last_q_delta(self) -> float:
         """Return the last Q-update delta (for logging)."""
         return self._q_deltas[-1] if self._q_deltas else 0.0
+
+    def get_last_q_data(self) -> Dict:
+        """
+        Return a dict of last Q-learning step data (for logging/display).
+        Keys: q_delta, epsilon, episode_count, avg_reward_last_100, last_state, last_action, last_reward.
+        """
+        avg_reward = (
+            float(np.mean(self.total_rewards[-100:]))
+            if self.total_rewards else 0.0
+        )
+        data = {
+            'q_delta': self.get_last_q_delta(),
+            'epsilon': self.epsilon,
+            'episode_count': self.episode_count,
+            'avg_reward_last_100': avg_reward,
+            'last_state': self.state_history[-1] if self.state_history else None,
+            'last_action': self.action_history[-1] if self.action_history else None,
+            'last_reward': self.reward_history[-1] if self.reward_history else None,
+        }
+        return data
 
     def check_q_converged(
         self,

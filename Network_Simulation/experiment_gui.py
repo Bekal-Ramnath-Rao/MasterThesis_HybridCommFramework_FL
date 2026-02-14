@@ -271,11 +271,16 @@ class FLExperimentGUI(QMainWindow):
         header = self.create_header()
         main_layout.addWidget(header)
         
+        # Control buttons row (above splitter so they never overlap config scroll)
+        control_row = self.create_control_buttons_row()
+        main_layout.addLayout(control_row)
+        
         # Create splitter for main content
         splitter = QSplitter(Qt.Vertical)
         
-        # Top section: Configuration
+        # Top section: Configuration (minimum height so options are visible)
         config_widget = QWidget()
+        config_widget.setMinimumHeight(360)
         config_layout = QVBoxLayout(config_widget)
         config_layout.setSpacing(10)
         
@@ -289,7 +294,7 @@ class FLExperimentGUI(QMainWindow):
         config_layout.addWidget(self.config_tabs)
         splitter.addWidget(config_widget)
         
-        # Bottom section: Monitoring and Output (NEW!)
+        # Bottom section: Monitoring and Output (no buttons here - they are above)
         monitor_output_widget = self.create_monitoring_output_section()
         splitter.addWidget(monitor_output_widget)
         
@@ -362,13 +367,98 @@ class FLExperimentGUI(QMainWindow):
         
         return header
     
-    def create_basic_config_tab(self):
-        """Create basic configuration tab"""
-        widget = QWidget()
-        layout = QGridLayout(widget)
-        layout.setSpacing(15)
+    def create_control_buttons_row(self):
+        """Create Start/Stop/Apply Network/Clear row - placed above splitter to avoid overlap with config scroll"""
+        control_layout = QHBoxLayout()
+        control_layout.setSpacing(12)
         
-        row = 0
+        self.start_button = QPushButton("▶️ Start Experiment")
+        self.start_button.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                font-size: 16px;
+                font-weight: bold;
+                padding: 12px 30px;
+                border-radius: 8px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #218838; }
+            QPushButton:pressed { background-color: #1e7e34; }
+            QPushButton:disabled { background-color: #6c757d; }
+        """)
+        self.start_button.clicked.connect(self.start_experiment)
+        
+        self.stop_button = QPushButton("⏹️ Stop Experiment")
+        self.stop_button.setStyleSheet("""
+            QPushButton {
+                background-color: #dc3545;
+                color: white;
+                font-size: 16px;
+                font-weight: bold;
+                padding: 12px 30px;
+                border-radius: 8px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #c82333; }
+            QPushButton:pressed { background-color: #bd2130; }
+            QPushButton:disabled { background-color: #6c757d; }
+        """)
+        self.stop_button.clicked.connect(self.stop_experiment)
+        self.stop_button.setEnabled(False)
+        
+        self.apply_network_button = QPushButton("🌐 Apply Network Changes")
+        self.apply_network_button.setStyleSheet("""
+            QPushButton {
+                background-color: #17a2b8;
+                color: white;
+                font-size: 14px;
+                padding: 10px 20px;
+                border-radius: 6px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #138496; }
+        """)
+        self.apply_network_button.clicked.connect(self.apply_network_conditions)
+        
+        self.clear_button = QPushButton("🗑️ Clear All")
+        self.clear_button.setStyleSheet("""
+            QPushButton {
+                background-color: #6c757d;
+                color: white;
+                font-size: 14px;
+                padding: 10px 20px;
+                border-radius: 6px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #5a6268; }
+        """)
+        self.clear_button.clicked.connect(self.clear_all_output)
+        
+        control_layout.addWidget(self.start_button)
+        control_layout.addWidget(self.stop_button)
+        control_layout.addWidget(self.apply_network_button)
+        control_layout.addWidget(self.clear_button)
+        control_layout.addStretch()
+        
+        # Progress bar in same row (compact)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setMaximum(0)
+        self.progress_bar.hide()
+        self.progress_bar.setFixedHeight(24)
+        self.progress_bar.setFixedWidth(120)
+        control_layout.addWidget(self.progress_bar)
+        
+        return control_layout
+    
+    def create_basic_config_tab(self):
+        """Create basic configuration tab - vertically scrollable"""
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setSpacing(15)
+        # Bottom margin so Training Configuration is fully visible when scrolled to end
+        layout.setContentsMargins(10, 10, 10, 80)
         
         # Baseline Mode Selection (NEW!)
         baseline_group = QGroupBox("🎯 Experiment Mode")
@@ -382,8 +472,7 @@ class FLExperimentGUI(QMainWindow):
         baseline_layout.addStretch()
         
         baseline_group.setLayout(baseline_layout)
-        layout.addWidget(baseline_group, row, 0, 1, 2)
-        row += 1
+        layout.addWidget(baseline_group)
         
         # Use Case
         use_case_group = self.create_group("📊 Use Case", [
@@ -391,9 +480,8 @@ class FLExperimentGUI(QMainWindow):
             ("Emotion Recognition", "emotion"),
             ("Temperature Regulation", "temperature")
         ])
-        layout.addWidget(use_case_group, row, 0, 1, 2)
+        layout.addWidget(use_case_group)
         self.use_case_group = use_case_group
-        row += 1
         
         # Protocol Selection
         protocol_group = self.create_checkbox_group("📡 Communication Protocols", [
@@ -404,9 +492,8 @@ class FLExperimentGUI(QMainWindow):
             ("DDS", "dds", False),
             ("🤖 RL-Unified (Dynamic Selection)", "rl_unified", False)
         ])
-        layout.addWidget(protocol_group, row, 0, 1, 2)
+        layout.addWidget(protocol_group)
         self.protocol_checkboxes = protocol_group.findChildren(QCheckBox)
-        row += 1
         
         # Q-learning convergence (unified use case only)
         ql_conv_group = QGroupBox("🎓 Q-Learning End Condition (Unified Only)")
@@ -418,8 +505,7 @@ class FLExperimentGUI(QMainWindow):
         ql_conv_layout.addWidget(self.use_ql_convergence)
         ql_conv_layout.addStretch()
         ql_conv_group.setLayout(ql_conv_layout)
-        layout.addWidget(ql_conv_group, row, 0, 1, 2)
-        row += 1
+        layout.addWidget(ql_conv_group)
         
         # Network Scenarios
         scenario_group = self.create_checkbox_group("🌐 Network Scenarios", [
@@ -433,9 +519,8 @@ class FLExperimentGUI(QMainWindow):
             ("Moderate Congestion", "congested_moderate", False),
             ("Heavy Congestion", "congested_heavy", False)
         ])
-        layout.addWidget(scenario_group, row, 0, 1, 2)
+        layout.addWidget(scenario_group)
         self.scenario_checkboxes = scenario_group.findChildren(QCheckBox)
-        row += 1
         
         # GPU Configuration
         gpu_group = QGroupBox("🖥️ GPU Configuration")
@@ -456,8 +541,7 @@ class FLExperimentGUI(QMainWindow):
         
         gpu_layout.addStretch()
         gpu_group.setLayout(gpu_layout)
-        layout.addWidget(gpu_group, row, 0, 1, 2)
-        row += 1
+        layout.addWidget(gpu_group)
         
         # Training Configuration
         training_group = QGroupBox("🎓 Training Configuration")
@@ -491,17 +575,25 @@ class FLExperimentGUI(QMainWindow):
         training_layout.addWidget(self.min_clients, 1, 3)
         
         training_group.setLayout(training_layout)
-        layout.addWidget(training_group, row, 0, 1, 2)
-        row += 1
+        layout.addWidget(training_group)
         
-        layout.setRowStretch(row, 1)
-        return widget
+        layout.addStretch()
+        
+        # Wrap in scroll area so all options are accessible vertically
+        scroll = QScrollArea()
+        scroll.setWidget(inner)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll.setMinimumHeight(380)
+        return scroll
     
     def create_network_config_tab(self):
-        """Create network configuration tab"""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+        """Create network configuration tab - vertically scrollable"""
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
         layout.setSpacing(15)
+        layout.setContentsMargins(10, 10, 10, 80)
         
         # Network Target Selection (NEW!)
         target_group = QGroupBox("🎯 Network Control Target")
@@ -632,13 +724,20 @@ class FLExperimentGUI(QMainWindow):
         layout.addWidget(congestion_group)
         
         layout.addStretch()
-        return widget
+        scroll = QScrollArea()
+        scroll.setWidget(inner)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll.setMinimumHeight(360)
+        return scroll
     
     def create_advanced_config_tab(self):
-        """Create advanced configuration tab"""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+        """Create advanced configuration tab - vertically scrollable"""
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
         layout.setSpacing(15)
+        layout.setContentsMargins(10, 10, 10, 80)
         
         # Quantization
         quant_group = QGroupBox("🔢 Model Quantization")
@@ -783,14 +882,21 @@ class FLExperimentGUI(QMainWindow):
         layout.addWidget(other_group)
         
         layout.addStretch()
-        return widget
+        scroll = QScrollArea()
+        scroll.setWidget(inner)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll.setMinimumHeight(360)
+        return scroll
     
     def create_docker_build_tab(self):
-        """Create Docker build tab with build button"""
+        """Create Docker build tab with build button - vertically scrollable"""
         import subprocess
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
         layout.setSpacing(15)
+        layout.setContentsMargins(10, 10, 10, 80)
 
         docker_group = QGroupBox("🐳 Docker Image Build Options")
         docker_group.setStyleSheet(self.get_group_style())
@@ -852,13 +958,20 @@ class FLExperimentGUI(QMainWindow):
         layout.addWidget(docker_group)
 
         layout.addStretch()
-        return widget
+        scroll = QScrollArea()
+        scroll.setWidget(inner)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll.setMinimumHeight(360)
+        return scroll
     
     def create_docker_cleanup_tab(self):
-        """Create Docker cleanup tab for removing images"""
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+        """Create Docker cleanup tab for removing images - vertically scrollable"""
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
         layout.setSpacing(15)
+        layout.setContentsMargins(10, 10, 10, 80)
         
         # Single Protocol Images Cleanup
         single_group = QGroupBox("🗑️ Delete Single Protocol Images")
@@ -932,7 +1045,13 @@ class FLExperimentGUI(QMainWindow):
         layout.addWidget(all_group)
         
         layout.addStretch()
-        return widget
+        scroll = QScrollArea()
+        scroll.setWidget(inner)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        scroll.setMinimumHeight(360)
+        return scroll
     
     def cleanup_docker_images(self, use_case, unified=False):
         """Delete Docker images for specific use case"""
@@ -1303,94 +1422,13 @@ class FLExperimentGUI(QMainWindow):
         self.docker_build_thread.start()
 
     def create_monitoring_output_section(self):
-        """Create comprehensive monitoring and output section, with Packet Logs tab"""
+        """Create comprehensive monitoring and output section (buttons are in create_control_buttons_row above)"""
         from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
         widget = QWidget()
         layout = QVBoxLayout(widget)
         layout.setSpacing(10)
 
-        # Control buttons (unchanged)
-        control_layout = QHBoxLayout()
-        
-        self.start_button = QPushButton("▶️ Start Experiment")
-        self.start_button.setStyleSheet("""
-            QPushButton {
-                background-color: #28a745;
-                color: white;
-                font-size: 16px;
-                font-weight: bold;
-                padding: 12px 30px;
-                border-radius: 8px;
-                border: none;
-            }
-            QPushButton:hover { background-color: #218838; }
-            QPushButton:pressed { background-color: #1e7e34; }
-            QPushButton:disabled { background-color: #6c757d; }
-        """)
-        self.start_button.clicked.connect(self.start_experiment)
-        
-        self.stop_button = QPushButton("⏹️ Stop Experiment")
-        self.stop_button.setStyleSheet("""
-            QPushButton {
-                background-color: #dc3545;
-                color: white;
-                font-size: 16px;
-                font-weight: bold;
-                padding: 12px 30px;
-                border-radius: 8px;
-                border: none;
-            }
-            QPushButton:hover { background-color: #c82333; }
-            QPushButton:pressed { background-color: #bd2130; }
-            QPushButton:disabled { background-color: #6c757d; }
-        """)
-        self.stop_button.clicked.connect(self.stop_experiment)
-        self.stop_button.setEnabled(False)
-        
-        self.clear_button = QPushButton("🗑️ Clear All")
-        self.clear_button.setStyleSheet("""
-            QPushButton {
-                background-color: #6c757d;
-                color: white;
-                font-size: 14px;
-                padding: 10px 20px;
-                border-radius: 6px;
-                border: none;
-            }
-            QPushButton:hover { background-color: #5a6268; }
-        """)
-        self.clear_button.clicked.connect(self.clear_all_output)
-        
-        self.apply_network_button = QPushButton("🌐 Apply Network Changes")
-        self.apply_network_button.setStyleSheet("""
-            QPushButton {
-                background-color: #17a2b8;
-                color: white;
-                font-size: 14px;
-                padding: 10px 20px;
-                border-radius: 6px;
-                border: none;
-            }
-            QPushButton:hover { background-color: #138496; }
-        """)
-        self.apply_network_button.clicked.connect(self.apply_network_conditions)
-        
-        control_layout.addWidget(self.start_button)
-        control_layout.addWidget(self.stop_button)
-        control_layout.addWidget(self.apply_network_button)
-        control_layout.addWidget(self.clear_button)
-        control_layout.addStretch()
-        
-        layout.addLayout(control_layout)
-
-        # Progress bar (unchanged)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setMaximum(0)
-        self.progress_bar.hide()
-        layout.addWidget(self.progress_bar)
-        
-        # Tabbed output section
+        # Tabbed output section (Start/Stop/Apply Network/Clear are above the splitter)
         self.output_tabs = QTabWidget()
         
         # Tab 1: Experiment Output

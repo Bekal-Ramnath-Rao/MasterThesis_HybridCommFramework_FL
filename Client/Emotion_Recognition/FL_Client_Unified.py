@@ -311,10 +311,23 @@ class UnifiedFLClient_Emotion:
         # Training configuration
         self.training_config = {"batch_size": 32, "local_epochs": 20}
         
-        # RL Components
+        # RL Components (load from past experience when .pkl exists)
         if USE_RL_SELECTION and QLearningProtocolSelector is not None:
+            # Persist Q-table in shared_data when in Docker so next run loads past experience
+            if os.path.exists("/shared_data"):
+                save_path = f"/shared_data/q_table_emotion_client_{client_id}.pkl"
+            else:
+                save_path = f"q_table_emotion_client_{client_id}.pkl"
+            # Optional: load from pretrained dir first (e.g. scripts/experiments/pretrained_q_tables)
+            initial_load_path = None
+            pretrained_dir = os.getenv("PRETRAINED_Q_TABLE_DIR")
+            if pretrained_dir:
+                candidate = os.path.join(pretrained_dir, f"q_table_emotion_client_{client_id}.pkl")
+                if os.path.exists(candidate):
+                    initial_load_path = candidate
             self.rl_selector = QLearningProtocolSelector(
-                save_path=f"q_table_emotion_client_{client_id}.pkl"
+                save_path=save_path,
+                initial_load_path=initial_load_path,
             )
             self.env_manager = EnvironmentStateManager()
         else:

@@ -9,19 +9,25 @@ import os
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QComboBox, QPushButton, QLabel,
-    QGroupBox, QHeaderView)
+    QGroupBox, QHeaderView, QFileDialog, QMessageBox)
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QColor
 
 
 def _shared_data_dir():
-    """Resolve shared_data path (works from GUI or Network_Simulation)."""
-    cwd = os.getcwd()
-    for base in [cwd, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))]:
+    """Resolve shared_data path (works when GUI runs from project root or Network_Simulation)."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)
+    for base in [project_root, os.getcwd()]:
         path = os.path.join(base, "shared_data")
         if os.path.isdir(path):
             return path
-    return os.path.join(cwd, "shared_data")
+    path = os.path.join(project_root, "shared_data")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    return path
 
 
 class QLearningLogsTab(QWidget):
@@ -52,6 +58,10 @@ class QLearningLogsTab(QWidget):
         self.auto_refresh_btn.setChecked(True)
         self.auto_refresh_btn.clicked.connect(self.toggle_auto_refresh)
         controls.addWidget(self.auto_refresh_btn)
+        self.download_excel_btn = QPushButton("📥 Download to Excel")
+        self.download_excel_btn.setStyleSheet("padding: 6px 12px; font-weight: bold;")
+        self.download_excel_btn.clicked.connect(self.download_q_learning_excel)
+        controls.addWidget(self.download_excel_btn)
         controls.addStretch()
         layout.addLayout(controls)
 
@@ -80,11 +90,13 @@ class QLearningLogsTab(QWidget):
         self.setLayout(layout)
 
     def update_node_list(self):
+        """Always show Client 1 and Client 2 (and any client with existing DB) so user can select before DBs exist."""
         self.node_selector.clear()
         shared = _shared_data_dir()
+        # Always offer Client 1 and Client 2 (typical unified setup), then others if DB exists
         for i in range(1, 11):
             path = os.path.join(shared, f"q_learning_client_{i}.db")
-            if os.path.exists(path):
+            if i <= 2 or os.path.exists(path):
                 self.node_selector.addItem(f"Client {i}")
 
     def on_node_changed(self, text):
@@ -98,7 +110,11 @@ class QLearningLogsTab(QWidget):
     def refresh_data(self):
         db_path = self.get_db_path()
         if not os.path.exists(db_path):
-            self.table.setRowCount(0)
+            self.table.setRowCount(1)
+            self.table.setItem(0, 0, QTableWidgetItem("—"))
+            self.table.setItem(0, 1, QTableWidgetItem("No data yet. Run an RL-unified experiment to populate Q-learning logs for this client."))
+            for c in range(2, self.table.columnCount()):
+                self.table.setItem(0, c, QTableWidgetItem(""))
             self.rows_label.setText("Rows: 0")
             self.episodes_label.setText("Episodes: 0")
             self.converged_label.setText("Converged: No")
@@ -144,6 +160,58 @@ class QLearningLogsTab(QWidget):
         else:
             self.refresh_timer.stop()
             self.auto_refresh_btn.setText("Auto-Refresh: OFF")
+
+    def download_q_learning_excel(self):
+        """Export Q-learning logs from all clients to one Excel file with separate sheets per client."""
+        try:
+            import pandas as pd
+        except ImportError:
+            QMessageBox.warning(self, "Export", "pandas is required. Install with: pip install pandas")
+            return
+        try:
+            from openpyxl import __version__  # noqa: F401
+        except ImportError:
+            QMessageBox.warning(self, "Export", "openpyxl is required for Excel export. Install with: pip install openpyxl")
+            return
+
+        shared = _shared_data_dir()
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Q-Learning Logs", "", "Excel (*.xlsx);;All Files (*)"
+        )
+        if not path:
+            return
+        if not path.endswith(".xlsx"):
+            path = path + ".xlsx"
+
+        sheets = {}
+        for i in range(1, 11):
+            db_path = os.path.join(shared, f"q_learning_client_{i}.db")
+            if not os.path.exists(db_path):
+                continue
+            try:
+                conn = sqlite3.connect(db_path)
+                df = pd.read_sql_query(
+                    """SELECT id, timestamp, round_num, episode, state_network, state_resource,
+                       state_model_size, state_mobility, action, reward, q_delta, epsilon,
+                       avg_reward_last_100, converged FROM q_learning_log ORDER BY id""",
+                    conn
+                )
+                conn.close()
+                sheets[f"Client {i}"] = df
+            except Exception as e:
+                sheets[f"Client {i}"] = pd.DataFrame([{"Error": str(e)}])
+
+        if not sheets:
+            QMessageBox.information(self, "Export", "No Q-learning databases found in shared_data.")
+            return
+
+        try:
+            with pd.ExcelWriter(path, engine="openpyxl") as writer:
+                for name, df in sheets.items():
+                    df.to_excel(writer, sheet_name=name[:31], index=False)
+            QMessageBox.information(self, "Export", f"Saved to:\n{path}\nSheets: {', '.join(sheets.keys())}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
 
 
 if __name__ == "__main__":

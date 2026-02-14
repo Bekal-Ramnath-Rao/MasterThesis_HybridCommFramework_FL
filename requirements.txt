@@ -39,6 +39,7 @@ psutil>=5.9.0
 
 # Configuration and Data Formats
 PyYAML>=6.0.0
+openpyxl>=3.1.0
 
 # SSL/TLS Certificate Generation
 cryptography>=41.0.0

@@ -75,10 +75,21 @@ class UnifiedFLClient_Temperature:
         self.local_epochs = 5
         self.batch_size = 16
         
-        # RL Components
+        # RL Components (load from past experience when .pkl exists)
         if USE_RL_SELECTION:
+            if os.path.exists("/shared_data"):
+                save_path = f"/shared_data/q_table_temperature_client_{client_id}.pkl"
+            else:
+                save_path = f"q_table_temperature_client_{client_id}.pkl"
+            initial_load_path = None
+            pretrained_dir = os.getenv("PRETRAINED_Q_TABLE_DIR")
+            if pretrained_dir:
+                candidate = os.path.join(pretrained_dir, f"q_table_temperature_client_{client_id}.pkl")
+                if os.path.exists(candidate):
+                    initial_load_path = candidate
             self.rl_selector = QLearningProtocolSelector(
-                save_path=f"q_table_temperature_client_{client_id}.pkl"
+                save_path=save_path,
+                initial_load_path=initial_load_path,
             )
             self.env_manager = EnvironmentStateManager()
             self.env_manager.update_model_size('small')  # Temperature (small model)
