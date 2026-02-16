@@ -63,3 +63,85 @@ So: **the Excel file you saved does not replace the .pkl**; it is for analysis a
   - Then use that `.pkl` as the initial Q-table for new runs (by pointing the client’s `save_path` to it or copying it to the client’s run dir).
 
 The current code does **not** build a Q-table from the Excel; it only **loads** an existing `.pkl` Q-table. So today, the Excel is for analysis and record-keeping; the **pre-learned Q-table** that directly helps future runs is the **.pkl** file, and it helps by being loaded at startup as described above.
+
+---
+
+## Evaluating unified (with past experience) vs single-protocol implementation
+
+Once you have learned from past experience (Q-tables saved as `.pkl`, e.g. in `shared_data/` or from a previous run), you can **evaluate** the unified use case (RL-based protocol selection using that experience) against **single-protocol** runs on the same scenario for a fair comparison.
+
+### What you are comparing
+
+| Run type | What it does | Result folder pattern |
+|----------|--------------|------------------------|
+| **Unified (with past experience)** | Clients load existing `.pkl`, use RL to choose protocol each round | `rl_unified_<scenario>` |
+| **Single protocol** | One protocol only (e.g. MQTT or DDS), no RL | `mqtt_<scenario>`, `dds_<scenario>`, etc. |
+
+Use the **same** use case, **same** network scenario(s), and **same** number of rounds (and same GPU/quantization settings if applicable) so the comparison is fair.
+
+### Step 1: Ensure unified runs use past experience
+
+- **Docker (GUI or `run_network_experiments.py`):** The unified compose file mounts `shared_data` at `/shared_data`. Unified clients save and load Q-tables there (`q_table_emotion_client_1.pkl`, etc.). So:
+  - After **one** RL-unified run, the next RL-unified run **automatically** loads from `shared_data/` (no extra step).
+  - To start from a **specific** pretrained set: copy your `.pkl` files into `shared_data/` with names `q_table_emotion_client_1.pkl`, `q_table_emotion_client_2.pkl`, then start the experiment. Alternatively, set env `PRETRAINED_Q_TABLE_DIR` to a path that is mounted in the container and contains those filenames (see Option C in “How to use a pre-learned Q-table” above).
+
+So: for “unified with past experience”, either run unified once and then run again (same setup), or put the desired `.pkl` files in `shared_data/` (or in a mounted dir pointed to by `PRETRAINED_Q_TABLE_DIR`) before starting.
+
+### Step 2: Run unified experiment (with loaded Q-table)
+
+**Via GUI (Network Simulation / Experiment GUI):**
+
+1. Use case: e.g. Emotion (or Mental State / Temperature).
+2. Under **Communication Protocols**, select **🤖 RL-Unified (Dynamic Selection)** only (or include it with others if you want multiple protocol types in one batch).
+3. Select **scenario(s)** (e.g. excellent, good, poor) and **rounds**.
+4. Start experiment. Results go to e.g. `experiment_results/<folder>/rl_unified_<scenario>/`.
+
+**Via CLI:**
+
+```bash
+cd Network_Simulation
+python run_network_experiments.py --use-case emotion --protocols rl_unified \
+  --scenarios excellent good poor --rounds 50
+```
+
+Results are under `experiment_results/` (or `experiment_results_baseline/` if baseline mode) in subdirs like `rl_unified_excellent`, `rl_unified_good`, etc.
+
+### Step 3: Run single-protocol experiments (same scenarios and rounds)
+
+Use the **same** scenarios and rounds as in Step 2, but with one protocol per run.
+
+**Via GUI:**
+
+1. Same use case and scenario(s) as Step 2.
+2. Under **Communication Protocols**, select **only one** protocol (e.g. MQTT, or DDS), **not** RL-Unified.
+3. Same rounds. Start. Repeat for each protocol you want (MQTT, AMQP, gRPC, QUIC, DDS).
+
+**Via CLI (one protocol per call):**
+
+```bash
+# Same scenarios and rounds as unified
+python run_network_experiments.py --use-case emotion --protocols mqtt \
+  --scenarios excellent good poor --rounds 50
+
+python run_network_experiments.py --use-case emotion --protocols dds \
+  --scenarios excellent good poor --rounds 50
+# ... repeat for amqp, grpc, quic as needed
+```
+
+Results will be in subdirs like `mqtt_excellent`, `dds_excellent`, etc., under the same parent folder.
+
+### Step 4: Compare results
+
+- **Same parent folder:** e.g. `experiment_results/emotion_<timestamp>/` contains both `rl_unified_<scenario>` and `mqtt_<scenario>`, `dds_<scenario>`, etc.
+- **Metrics:** Use the JSON/CSV result files in each subdir (e.g. `rl_unified_training_results.json`, `mqtt_training_results.json`) and compare:
+  - Rounds to convergence (if applicable)
+  - Final accuracy / loss
+  - Training time or round trip times (if you collect them)
+- **Scripts:** You can use existing comparison/visualization scripts (e.g. under `Network_Simulation/`: `evaluate_all.py`, `compare_protocols.py`, `visualize_results.py`) by pointing them at that experiment folder so unified and single-protocol runs are compared together.
+
+### Summary checklist
+
+1. **Past experience in place:** Q-tables in `shared_data/` (or loaded via `PRETRAINED_Q_TABLE_DIR`) so unified clients start from learned policy.
+2. **Unified run:** Select RL-Unified, run with chosen scenario(s) and rounds → get `rl_unified_<scenario>`.
+3. **Single-protocol runs:** Same scenario(s) and rounds, one protocol at a time (MQTT, DDS, etc.) → get `mqtt_<scenario>`, `dds_<scenario>`, etc.
+4. **Compare:** Same experiment folder; use result JSONs/CSVs and/or evaluation scripts to compare unified (with past experience) vs each single-protocol implementation.

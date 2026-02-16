@@ -11,7 +11,7 @@ import json
 import os
 import sys
 from datetime import datetime
-from typing import List, Dict
+from typing import List, Dict, Optional
 import argparse
 from pathlib import Path
 
@@ -396,9 +396,13 @@ class ExperimentRunner:
         time.sleep(2)
         return success_count > 0  # At least one container should succeed
     
-    def wait_for_completion(self, protocol: str, timeout: int = 3600):
-        """Wait for FL training to complete and track round trip times"""
-        print(f"\nWaiting for {protocol.upper()} training to complete (timeout: {timeout}s)...")
+    def wait_for_completion(self, protocol: str, timeout: Optional[int] = 3600):
+        """Wait for FL training to complete and track round trip times.
+        When timeout is None, wait indefinitely (used for rl_unified + Q-learning convergence)."""
+        if timeout is None:
+            print(f"\nWaiting for {protocol.upper()} training to complete (no time limit - until Q-learning converges)...")
+        else:
+            print(f"\nWaiting for {protocol.upper()} training to complete (timeout: {timeout}s)...")
         
         # Get server container name
         services = self.service_patterns[self.use_case][protocol]
@@ -421,7 +425,7 @@ class ExperimentRunner:
         ]
 
         start_time = time.time()
-        while time.time() - start_time < timeout:
+        while timeout is None or (time.time() - start_time < timeout):
             # Check if server container is still running
             result = self.run_command([
                 "docker", "ps", "--filter", f"name={server_container}", "--format", "{{.Names}}"
@@ -503,7 +507,8 @@ class ExperimentRunner:
             
             time.sleep(10)  # Check every 10 seconds
         
-        print(f"[WARNING] Training timed out after {timeout}s")
+        if timeout is not None:
+            print(f"[WARNING] Training timed out after {timeout}s")
         return False, round_trip_times
     
     def collect_results(self, protocol: str, scenario: str, round_trip_times: List[float] = None):
@@ -629,19 +634,23 @@ class ExperimentRunner:
         print(f"{'#'*70}\n")
         
         # Adaptive timeout based on network scenario
+        # For rl_unified + Q-learning convergence: no time limit - run until Q-values converge
         # Poor networks need much more time due to retransmissions and delays
-        timeout_map = {
-            "excellent": 3600,      # 1 hour
-            "good": 3600,           # 1 hour
-            "moderate": 5400,       # 1.5 hours
-            "poor": 14400,           # 4 hours
-            "very_poor": 21600,     # 6 hours (300ms latency + 5% loss = very slow)
-            "satellite": 9000,      # 2.5 hours (600ms latency)
-            "congested_light": 5400,   # 1.5 hours
-            "congested_moderate": 7200, # 2 hours
-            "congested_heavy": 9000     # 2.5 hours
-        }
-        timeout = timeout_map.get(scenario, 3600)
+        if protocol == "rl_unified" and self.use_ql_convergence:
+            timeout = None  # No limit; completion determined by Q-learning convergence
+        else:
+            timeout_map = {
+                "excellent": 3600,      # 1 hour
+                "good": 3600,           # 1 hour
+                "moderate": 5400,       # 1.5 hours
+                "poor": 14400,           # 4 hours
+                "very_poor": 21600,     # 6 hours (300ms latency + 5% loss = very slow)
+                "satellite": 9000,      # 2.5 hours (600ms latency)
+                "congested_light": 5400,   # 1.5 hours
+                "congested_moderate": 7200, # 2 hours
+                "congested_heavy": 9000     # 2.5 hours
+            }
+            timeout = timeout_map.get(scenario, 3600)
         
         try:
             # 1. Start containers (includes traffic generators if congestion enabled)
@@ -657,7 +666,10 @@ class ExperimentRunner:
                 print(f"[BASELINE] Skipping network conditions - running with ideal network")
             
             # 3. Wait for completion with adaptive timeout and RTT tracking
-            print(f"[INFO] Using timeout: {timeout}s ({timeout/3600:.1f} hours) for {scenario} network")
+            if timeout is None:
+                print(f"[INFO] No time limit - waiting until Q-learning converges for {scenario} network")
+            else:
+                print(f"[INFO] Using timeout: {timeout}s ({timeout/3600:.1f} hours) for {scenario} network")
             success, round_trip_times = self.wait_for_completion(protocol, timeout=timeout)
             
             if not success:
