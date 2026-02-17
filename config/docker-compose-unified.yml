@@ -62,6 +62,8 @@ services:
       - GRPC_PORT=50051
       - QUIC_HOST=0.0.0.0
       - QUIC_PORT=4433
+      - HTTP3_HOST=0.0.0.0
+      - HTTP3_PORT=4434
       - DDS_DOMAIN_ID=0
       
       # Optional Features
@@ -69,6 +71,7 @@ services:
     ports:
       - "50051:50051"  # gRPC
       - "4433:4433"    # QUIC
+      - "4434:4434"    # HTTP/3
     volumes:
       - ./shared_data:/shared_data
       - ./results:/app/results
@@ -110,6 +113,8 @@ services:
       - GRPC_PORT=50051
       - QUIC_HOST=fl-server-unified
       - QUIC_PORT=4433
+      - HTTP3_HOST=fl-server-unified
+      - HTTP3_PORT=4434
       - DDS_DOMAIN_ID=0
       
       # Training Configuration
@@ -169,6 +174,8 @@ services:
       - GRPC_PORT=50051
       - QUIC_HOST=fl-server-unified
       - QUIC_PORT=4433
+      - HTTP3_HOST=fl-server-unified
+      - HTTP3_PORT=4434
       - DDS_DOMAIN_ID=0
       
       # Training Configuration

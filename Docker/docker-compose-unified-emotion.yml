@@ -49,6 +49,8 @@ services:
       - GRPC_PORT=50051
       - QUIC_HOST=0.0.0.0
       - QUIC_PORT=4433
+      - HTTP3_HOST=0.0.0.0
+      - HTTP3_PORT=4434
       - CONVERGENCE_THRESHOLD=0.001
       - CONVERGENCE_PATIENCE=2
       - MIN_ROUNDS=3
@@ -63,8 +65,9 @@ services:
     networks:
       - fl-network
     ports:
-      - "4433:4433/udp"
-      - "50051:50051"
+      - "4433:4433/udp"  # QUIC
+      - "4434:4434"      # HTTP/3
+      - "50051:50051"    # gRPC
     depends_on:
       - mqtt-broker-unified
       - amqp-broker-unified
@@ -105,6 +108,8 @@ services:
       - GRPC_PORT=50051
       - QUIC_HOST=fl-server-unified-emotion
       - QUIC_PORT=4433
+      - HTTP3_HOST=fl-server-unified-emotion
+      - HTTP3_PORT=4434
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
@@ -152,6 +157,8 @@ services:
       - GRPC_PORT=50051
       - QUIC_HOST=fl-server-unified-emotion
       - QUIC_PORT=4433
+      - HTTP3_HOST=fl-server-unified-emotion
+      - HTTP3_PORT=4434
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}

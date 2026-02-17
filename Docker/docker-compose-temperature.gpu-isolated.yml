@@ -373,6 +373,113 @@ services:
               device_ids: ['1']
 
   # ============================================================================
+  # HTTP/3 Protocol Services
+  # ============================================================================
+  
+  fl-server-http3-temperature:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    environment:
+      - PROTOCOL=HTTP3
+      - USE_CASE=temperature
+      - HTTP3_HOST=0.0.0.0
+      - HTTP3_PORT=4434
+      - NUM_ROUNDS=1000
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "4434:4434"
+    volumes:
+      - ../certs:/app/certs:ro
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+    networks:
+      - temperature_network
+    container_name: fl-server-http3-temperature
+    command: python -u Server/Temperature_Regulation/FL_Server_HTTP3.py
+    # Server runs on CPU to avoid competing for GPU memory with clients
+
+  fl-client-http3-temperature-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - PROTOCOL=HTTP3
+      - USE_CASE=temperature
+      - HTTP3_HOST=fl-server-http3-temperature
+      - HTTP3_PORT=4434
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-http3-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-http3-temperature-1
+    command: python -u Client/Temperature_Regulation/FL_Client_HTTP3.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-http3-temperature-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - PROTOCOL=HTTP3
+      - USE_CASE=temperature
+      - HTTP3_HOST=fl-server-http3-temperature
+      - HTTP3_PORT=4434
+      - CUDA_VISIBLE_DEVICES=1
+      - GPU_DEVICE_ID=1
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-http3-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-http3-temperature-2
+    command: python -u Client/Temperature_Regulation/FL_Client_HTTP3.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['1']
+
+  # ============================================================================
   # DDS Protocol Services
   # ============================================================================
   

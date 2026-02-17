@@ -6,6 +6,7 @@ Reads from shared_data/q_learning_client_{id}.db (same as packet_logger layout).
 import sys
 import sqlite3
 import os
+from datetime import datetime
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QComboBox, QPushButton, QLabel,
@@ -62,6 +63,11 @@ class QLearningLogsTab(QWidget):
         self.download_excel_btn.setStyleSheet("padding: 6px 12px; font-weight: bold;")
         self.download_excel_btn.clicked.connect(self.download_q_learning_excel)
         controls.addWidget(self.download_excel_btn)
+        self.reset_q_table_btn = QPushButton("🔄 Reset Q-Table")
+        self.reset_q_table_btn.setStyleSheet("padding: 6px 12px; font-weight: bold; background-color: #ffcccc;")
+        self.reset_q_table_btn.setToolTip("Reset Q-table to start fresh training. Excel export will be done automatically before reset.")
+        self.reset_q_table_btn.clicked.connect(self.reset_q_table_with_backup)
+        controls.addWidget(self.reset_q_table_btn)
         controls.addStretch()
         layout.addLayout(controls)
 
@@ -212,6 +218,144 @@ class QLearningLogsTab(QWidget):
             QMessageBox.information(self, "Export", f"Saved to:\n{path}\nSheets: {', '.join(sheets.keys())}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
+
+    def reset_q_table_with_backup(self):
+        """Reset Q-table after automatically exporting Excel backup."""
+        # First, check if there's any data to backup
+        shared = _shared_data_dir()
+        has_data = False
+        backup_path = None
+        
+        for i in range(1, 11):
+            db_path = os.path.join(shared, f"q_learning_client_{i}.db")
+            if os.path.exists(db_path):
+                try:
+                    conn = sqlite3.connect(db_path)
+                    cur = conn.cursor()
+                    cur.execute("SELECT COUNT(*) FROM q_learning_log")
+                    count = cur.fetchone()[0]
+                    conn.close()
+                    if count > 0:
+                        has_data = True
+                        break
+                except:
+                    pass
+        
+        if has_data:
+            # Auto-export Excel before resetting
+            reply = QMessageBox.question(
+                self,
+                "Reset Q-Table",
+                "This will reset the Q-table and clear all learned knowledge.\n\n"
+                "An Excel backup will be created automatically before reset.\n\n"
+                "Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.No:
+                return
+            
+            # Auto-export to a timestamped file
+            try:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_path = os.path.join(shared, f"q_learning_backup_{timestamp}.xlsx")
+                
+                # Use the same export logic
+                import pandas as pd
+                from openpyxl import __version__  # noqa: F401
+                
+                sheets = {}
+                for i in range(1, 11):
+                    db_path = os.path.join(shared, f"q_learning_client_{i}.db")
+                    if not os.path.exists(db_path):
+                        continue
+                    try:
+                        conn = sqlite3.connect(db_path)
+                        df = pd.read_sql_query(
+                            """SELECT id, timestamp, round_num, episode, state_network, state_resource,
+                               state_model_size, state_mobility, action, reward, q_delta, epsilon,
+                               avg_reward_last_100, converged FROM q_learning_log ORDER BY id""",
+                            conn
+                        )
+                        conn.close()
+                        if len(df) > 0:
+                            sheets[f"Client {i}"] = df
+                    except Exception as e:
+                        sheets[f"Client {i}"] = pd.DataFrame([{"Error": str(e)}])
+                
+                if sheets:
+                    with pd.ExcelWriter(backup_path, engine="openpyxl") as writer:
+                        for name, df in sheets.items():
+                            df.to_excel(writer, sheet_name=name[:31], index=False)
+                    QMessageBox.information(
+                        self,
+                        "Backup Created",
+                        f"Excel backup saved to:\n{backup_path}\n\nProceeding with Q-table reset..."
+                    )
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "No Data",
+                        "No Q-learning data found to backup. Proceeding with reset anyway..."
+                    )
+            except Exception as e:
+                QMessageBox.warning(
+                    self,
+                    "Backup Warning",
+                    f"Could not create Excel backup: {e}\n\nProceed with reset anyway?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                if QMessageBox.No:
+                    return
+        
+        # Now reset Q-tables for all clients
+        try:
+            import glob
+            
+            # Find all Q-table files
+            q_table_patterns = [
+                os.path.join(shared, "q_table_*.pkl"),
+                os.path.join(os.path.dirname(shared), "q_table_*.pkl"),  # Also check parent dir
+            ]
+            
+            deleted_count = 0
+            for pattern in q_table_patterns:
+                for q_table_path in glob.glob(pattern):
+                    try:
+                        os.remove(q_table_path)
+                        deleted_count += 1
+                        print(f"[Q-Learning] Deleted Q-table: {q_table_path}")
+                    except Exception as e:
+                        print(f"[Q-Learning] Warning: Could not delete {q_table_path}: {e}")
+            
+            if deleted_count > 0:
+                QMessageBox.information(
+                    self,
+                    "Reset Complete",
+                    f"Q-table reset complete!\n\n"
+                    f"Deleted {deleted_count} Q-table file(s).\n"
+                    f"Next experiment will start with fresh Q-table.\n\n"
+                    f"Excel backup saved to: {backup_path if backup_path else 'N/A (no data to backup)'}"
+                )
+            else:
+                QMessageBox.information(
+                    self,
+                    "Reset Complete",
+                    "No Q-table files found to delete.\n"
+                    "Next experiment will start with fresh Q-table."
+                )
+            
+            # Refresh the display
+            self.refresh_data()
+            
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Reset Error",
+                f"Error resetting Q-table: {e}"
+            )
 
 
 if __name__ == "__main__":

@@ -381,6 +381,95 @@ services:
       - fl-quic-network-temp
 
   # ============================================================================
+  # HTTP/3 Protocol Setup (Temperature Regulation)
+  # ============================================================================
+  
+  # HTTP/3 FL Server (Temperature Regulation)
+  fl-server-http3-temp:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-http3-temp
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "4434:4434"
+    environment:
+      - HTTP3_HOST=0.0.0.0
+      - HTTP3_PORT=4434
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Server/Temperature_Regulation/FL_Server_HTTP3.py
+    networks:
+      - fl-http3-network-temp
+    volumes:
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+      - ../certs:/app/certs:ro
+    # GPU reservations moved to overlay file
+
+  # HTTP/3 FL Client 1 (Temperature Regulation)
+  fl-client-http3-temp-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-http3-temp-1
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-http3-temp
+    environment:
+      - HTTP3_HOST=fl-server-http3-temp
+      - HTTP3_PORT=4434
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_HTTP3.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../certs:/app/certs:ro
+    networks:
+      - fl-http3-network-temp
+    # GPU reservations moved to overlay file
+
+  # HTTP/3 FL Client 2 (Temperature Regulation)
+  fl-client-http3-temp-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-http3-temp-2
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-http3-temp
+    environment:
+      - HTTP3_HOST=fl-server-http3-temp
+      - HTTP3_PORT=4434
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_HTTP3.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../certs:/app/certs:ro
+    networks:
+      - fl-http3-network-temp
+    # GPU reservations moved to overlay file
+
+  # ============================================================================
+# ============================================================================
   # DDS Protocol Setup (Temperature Regulation)
   # ============================================================================
   
@@ -638,6 +727,8 @@ networks:
   fl-grpc-network-temp:
     driver: bridge
   fl-quic-network-temp:
+    driver: bridge
+  fl-http3-network-temp:
     driver: bridge
   fl-dds-network-temp:
     driver: bridge

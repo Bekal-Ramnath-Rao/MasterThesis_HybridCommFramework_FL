@@ -56,6 +56,22 @@ except ImportError:
     QuicConnectionProtocol = None
 
 try:
+    import httpx
+    HTTP3_CLIENT_AVAILABLE = True
+except ImportError:
+    HTTP3_CLIENT_AVAILABLE = False
+    httpx = None
+
+try:
+    from aioquic.h3.connection import H3_ALPN, H3Connection
+    from aioquic.h3.events import DataReceived, HeadersReceived, H3Event, StreamReset
+    HTTP3_AVAILABLE = True
+except ImportError:
+    HTTP3_AVAILABLE = False
+    H3Connection = None
+    H3Event = None
+
+try:
     from cyclonedds.domain import DomainParticipant
     from cyclonedds.topic import Topic
     from cyclonedds.pub import DataWriter
@@ -129,6 +145,86 @@ if QuicConnectionProtocol is not None:
                     traceback.print_exc()
 else:
     UnifiedClientQUICProtocol = None
+
+# Define HTTP/3 protocol handler if available
+if HTTP3_AVAILABLE and QuicConnectionProtocol is not None:
+    class UnifiedClientHTTP3Protocol(QuicConnectionProtocol):
+        """HTTP/3 protocol handler for receiving server messages"""
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.client = None  # Set by factory function
+            self._http = None  # H3Connection instance
+            self._stream_buffers = {}  # Instance-specific stream buffers
+        
+        def quic_event_received(self, event):
+            """Handle QUIC events and convert to HTTP/3 events"""
+            # Initialize H3 connection on first event
+            if self._http is None:
+                self._http = H3Connection(self._quic)
+            
+            # Convert QUIC events to HTTP/3 events
+            for h3_event in self._http.handle_event(event):
+                self._handle_h3_event(h3_event)
+        
+        def _handle_h3_event(self, event: H3Event):
+            """Handle HTTP/3 events"""
+            if isinstance(event, HeadersReceived):
+                try:
+                    stream_id = event.stream_id
+                    headers = dict(event.headers)
+                    status = headers.get(b":status", b"").decode()
+                    print(f"[HTTP/3] Client received headers on stream {stream_id}, status: {status}")
+                    
+                    # Initialize buffer for this stream
+                    if stream_id not in self._stream_buffers:
+                        self._stream_buffers[stream_id] = b''
+                except Exception as e:
+                    print(f"[HTTP/3] Client error handling headers: {e}")
+            
+            elif isinstance(event, DataReceived):
+                try:
+                    stream_id = event.stream_id
+                    # Get or create buffer for this stream
+                    if stream_id not in self._stream_buffers:
+                        self._stream_buffers[stream_id] = b''
+                    
+                    # Append new data to buffer
+                    self._stream_buffers[stream_id] += event.data
+                    print(f"[HTTP/3] Client stream {stream_id}: received {len(event.data)} bytes, buffer now {len(self._stream_buffers[stream_id])} bytes")
+                    
+                    # Send flow control updates
+                    self.transmit()
+                    
+                    # If stream ended, process complete message
+                    if event.end_stream:
+                        try:
+                            data_str = self._stream_buffers[stream_id].decode('utf-8')
+                            message = json.loads(data_str)
+                            msg_type = message.get('type', 'unknown')
+                            print(f"[HTTP/3] Client decoded complete message type '{msg_type}' from stream {stream_id}")
+                            
+                            # Handle message asynchronously
+                            if self.client:
+                                asyncio.create_task(self.client._handle_http3_message_async(message))
+                            
+                            # Clear buffer
+                            self._stream_buffers[stream_id] = b''
+                        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                            print(f"[HTTP/3] Client error decoding message: {e}")
+                            self._stream_buffers[stream_id] = b''
+                except Exception as e:
+                    print(f"[HTTP/3] Client error handling data: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            elif isinstance(event, StreamReset):
+                # Stream was reset, clear buffer
+                stream_id = event.stream_id
+                if stream_id in self._stream_buffers:
+                    del self._stream_buffers[stream_id]
+                    print(f"[HTTP/3] Client stream {stream_id} reset, cleared buffer")
+else:
+    UnifiedClientHTTP3Protocol = None
 
 # Detect Docker environment and set project root
 if os.path.exists('/app'):
@@ -422,6 +518,11 @@ class UnifiedFLClient_Emotion:
         self.quic_connection_task = None
         self.quic_loop = None
         self.quic_thread = None
+        # HTTP/3 persistent connection components
+        self.http3_protocol = None
+        self.http3_connection_task = None
+        self.http3_loop = None
+        self.http3_thread = None
         
         # AMQP listener components
         self.amqp_listener_connection = None
@@ -579,6 +680,9 @@ class UnifiedFLClient_Emotion:
         # Start QUIC persistent connection listener only if in available protocols
         if asyncio is not None and connect is not None and (not available_protocols or 'quic' in available_protocols):
             self.start_quic_listener()
+        
+        if HTTP3_AVAILABLE and asyncio is not None and connect is not None and (not available_protocols or 'http3' in available_protocols):
+            self.start_http3_listener()
         
         print("[Client] All protocol listeners started\n")
     
@@ -1025,6 +1129,41 @@ class UnifiedFLClient_Emotion:
             
             print(f"[QUIC] Listener started for client {self.client_id}")
     
+    # =========================================================================
+    # HTTP/3 LISTENER
+    # =========================================================================
+    
+    def start_http3_listener(self):
+        """Start HTTP/3 persistent connection in background thread"""
+        if not HTTP3_AVAILABLE:
+            return
+        
+        if self.http3_thread is None or not self.http3_thread.is_alive():
+            # Start the event loop thread
+            self.http3_thread = threading.Thread(
+                target=self._run_http3_loop,
+                daemon=True,
+                name=f"HTTP3-Client-{self.client_id}"
+            )
+            self.http3_thread.start()
+            
+            # Wait for event loop to be ready
+            max_wait = 2
+            waited = 0
+            while self.http3_loop is None and waited < max_wait:
+                time.sleep(0.1)
+                waited += 0.1
+            
+            # Schedule the connection task in the event loop
+            if self.http3_loop:
+                self.http3_connection_task = asyncio.run_coroutine_threadsafe(
+                    self._http3_connection_loop(),
+                    self.http3_loop
+                )
+                time.sleep(2)  # Wait for connection attempt
+            
+            print(f"[HTTP/3] Listener started for client {self.client_id}")
+    
     def handle_global_model(self, payload):
         """Receive and apply global model from server"""
         try:
@@ -1328,7 +1467,11 @@ class UnifiedFLClient_Emotion:
                 self.measure_network_condition()
 
                 state = self.env_manager.get_current_state()
-                protocol = self.rl_selector.select_protocol(state, training=True)
+                # Use training mode based on USE_QL_CONVERGENCE flag
+                # If False: pure exploitation (use best known protocol)
+                # If True: epsilon-greedy (explore and learn)
+                training_mode = USE_QL_CONVERGENCE
+                protocol = self.rl_selector.select_protocol(state, training=training_mode)
                 
                 print(f"\n[RL Protocol Selection]")
                 print(f"  CPU: {cpu:.1f}%, Memory: {memory:.1f}%")
@@ -1497,7 +1640,7 @@ class UnifiedFLClient_Emotion:
         
         comm_start = time.time()
         success = False
-        protocols_to_try = [protocol, 'amqp', 'mqtt', 'grpc', 'quic', 'dds']  # AMQP second in fallback for testing
+        protocols_to_try = [protocol, 'amqp', 'mqtt', 'grpc', 'quic', 'http3', 'dds']  # AMQP second in fallback for testing
         
         for attempt_protocol in protocols_to_try:
             if success:
@@ -1515,6 +1658,10 @@ class UnifiedFLClient_Emotion:
                 elif attempt_protocol == 'quic' and asyncio is not None and self.quic_protocol is not None:
                     # Only try QUIC if connection is established
                     self._send_via_quic(update_message)
+                    success = True
+                elif attempt_protocol == 'http3' and HTTP3_AVAILABLE and asyncio is not None and self.http3_protocol is not None:
+                    # Only try HTTP/3 if connection is established
+                    self._send_via_http3(update_message)
                     success = True
                 elif attempt_protocol == 'dds' and DDS_AVAILABLE:
                     self._send_via_dds(update_message)
@@ -1572,6 +1719,13 @@ class UnifiedFLClient_Emotion:
                 # QUIC not connected, fallback to MQTT
                 print(f"Client {self.client_id} WARNING: QUIC not connected, falling back to MQTT for metrics")
                 self._send_metrics_via_mqtt(metrics_message)
+            elif protocol == 'http3' and self.http3_protocol is not None:
+                # Only try HTTP/3 if connection is established
+                self._send_metrics_via_http3(metrics_message)
+            elif protocol == 'http3':
+                # HTTP/3 not connected, fallback to MQTT
+                print(f"Client {self.client_id} WARNING: HTTP/3 not connected, falling back to MQTT for metrics")
+                self._send_metrics_via_mqtt(metrics_message)
             elif protocol == 'dds':
                 self._send_metrics_via_dds(metrics_message)
             else:
@@ -1621,6 +1775,8 @@ class UnifiedFLClient_Emotion:
                     if USE_QL_CONVERGENCE and q_converged:
                         self.has_converged = True
                         print(f"[Client {self.client_id}] Q-learning convergence reached at round {self.current_round}")
+                        # Reset epsilon for potential re-exploration if network conditions change
+                        self.rl_selector.reset_epsilon()
                         self._notify_convergence_to_server()
                         self._disconnect_after_convergence()
                         return
@@ -2367,6 +2523,311 @@ class UnifiedFLClient_Emotion:
                     await asyncio.sleep(1)
                 else:
                     raise
+    
+    # =========================================================================
+    # HTTP/3 CLIENT METHODS
+    # =========================================================================
+    
+    async def _ensure_http3_connection(self):
+        """Establish persistent HTTP/3 connection if not already connected"""
+        if self.http3_protocol is not None:
+            return  # Already connected
+        
+        # Start HTTP/3 connection thread if not running
+        if self.http3_thread is None or not self.http3_thread.is_alive():
+            self.http3_thread = threading.Thread(
+                target=self._run_http3_loop,
+                daemon=True,
+                name=f"HTTP3-Client-{self.client_id}"
+            )
+            self.http3_thread.start()
+            
+            # Wait for connection to establish
+            max_wait = 10  # seconds
+            waited = 0
+            while self.http3_protocol is None and waited < max_wait:
+                await asyncio.sleep(0.1)
+                waited += 0.1
+            
+            if self.http3_protocol is None:
+                raise ConnectionError(f"HTTP/3 connection not established after {max_wait}s")
+            
+            print(f"[HTTP/3] Client {self.client_id} connection ready")
+    
+    def _run_http3_loop(self):
+        """Run HTTP/3 event loop in a separate thread"""
+        self.http3_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.http3_loop)
+        try:
+            # Keep loop running indefinitely
+            self.http3_loop.run_forever()
+        except Exception as e:
+            print(f"[HTTP/3] Event loop error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            print(f"[HTTP/3] Event loop stopped for client {self.client_id}")
+    
+    async def _http3_connection_loop(self):
+        """Maintain persistent HTTP/3 connection (runs in background)"""
+        import ssl
+        http3_host = os.getenv("HTTP3_HOST", "localhost")
+        http3_port = int(os.getenv("HTTP3_PORT", "4434"))
+        
+        # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/QUIC/DDS for unbiased comparison
+        config = QuicConfiguration(
+            is_client=True, 
+            alpn_protocols=H3_ALPN,  # HTTP/3 ALPN
+            verify_mode=ssl.CERT_NONE,
+            # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
+            max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
+            max_data=256 * 1024 * 1024,  # 256 MB total connection
+            # FAIR CONFIG: Timeout 600s for very_poor network scenarios
+            idle_timeout=600.0  # 10 minutes
+        )
+        
+        print(f"[HTTP/3] Client {self.client_id} connecting to {http3_host}:{http3_port}...")
+        print(f"[HTTP/3] Configuration: verify_mode=CERT_NONE, idle_timeout=600s")
+        
+        # Create protocol factory that sets client reference
+        def create_protocol(*args, **kwargs):
+            protocol = UnifiedClientHTTP3Protocol(*args, **kwargs)
+            protocol.client = self
+            print(f"[HTTP/3] Client {self.client_id} created protocol instance")
+            return protocol
+        
+        # Retry connection with exponential backoff
+        max_retries = 3
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"[HTTP/3] Client {self.client_id} attempt {attempt + 1}/{max_retries} - calling connect()...")
+                async with connect(
+                    http3_host,
+                    http3_port,
+                    configuration=config,
+                    create_protocol=create_protocol
+                ) as protocol:
+                    self.http3_protocol = protocol
+                    print(f"[HTTP/3] ✓ Client {self.client_id} established persistent connection")
+                    
+                    # Keep connection alive indefinitely
+                    try:
+                        await asyncio.Future()
+                    except asyncio.CancelledError:
+                        print(f"[HTTP/3] Client {self.client_id} connection cancelled")
+                    break  # Connection successful, exit retry loop
+                    
+            except (ConnectionError, OSError, TimeoutError) as e:
+                if attempt < max_retries - 1:
+                    print(f"[HTTP/3] ✗ Client {self.client_id} connection attempt {attempt + 1}/{max_retries} failed: {type(e).__name__}: {e}")
+                    print(f"[HTTP/3] Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    print(f"[HTTP/3] ✗✗✗ Client {self.client_id} connection FAILED after {max_retries} attempts: {type(e).__name__}: {e}")
+                    self.http3_protocol = None
+            except Exception as e:
+                print(f"[HTTP/3] ✗ Client {self.client_id} unexpected connection error: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+                self.http3_protocol = None
+                break
+    
+    async def _handle_http3_message_async(self, message: dict):
+        """Handle HTTP/3 message received from server asynchronously"""
+        msg_type = message.get('type')
+        print(f"[HTTP/3] Client {self.client_id} received message type: {msg_type}")
+        
+        if msg_type == 'global_model':
+            self.on_global_model_received_http3(message)
+        elif msg_type == 'start_training':
+            self.on_start_training_http3(message)
+        elif msg_type == 'start_evaluation':
+            self.on_start_evaluation_http3(message)
+    
+    def on_global_model_received_http3(self, message):
+        """Handle global model received via HTTP/3"""
+        try:
+            round_num = message['round']
+            print(f"[HTTP/3] Client {self.client_id} received global model for round {round_num}")
+            
+            # Deserialize weights
+            if 'quantized_data' in message:
+                compressed_data = pickle.loads(base64.b64decode(message['quantized_data']))
+                weights = self.quantizer.decompress_global_model(compressed_data) if self.quantizer else None
+            else:
+                weights = self.deserialize_weights(message['weights'])
+            
+            self._apply_global_model_weights(
+                round_num=round_num,
+                weights=weights,
+                model_config=message.get('model_config'),
+                source="HTTP/3"
+            )
+            
+            # Set event to signal model is ready
+            if hasattr(self, 'model_received'):
+                self.model_received.set()
+        except Exception as e:
+            print(f"[HTTP/3] Client {self.client_id} error handling global model: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def on_start_training_http3(self, message):
+        """Handle start training signal via HTTP/3"""
+        try:
+            print(f"[HTTP/3] Client {self.client_id} starting training for round {message.get('round', self.current_round + 1)}")
+            
+            log_received_packet(
+                packet_size=len(json.dumps(message)),
+                peer="server",
+                protocol="HTTP/3",
+                round=self.current_round,
+                extra_info="start_training"
+            )
+            
+            # Call the standard training handler
+            self.handle_start_training(json.dumps(message).encode())
+        except Exception as e:
+            print(f"[HTTP/3] Client {self.client_id} error handling start_training: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def on_start_evaluation_http3(self, message):
+        """Handle start evaluation signal via HTTP/3"""
+        try:
+            round_num = message.get('round', self.current_round)
+            print(f"[HTTP/3] Client {self.client_id} starting evaluation for round {round_num}")
+            
+            log_received_packet(
+                packet_size=len(json.dumps(message)),
+                peer="server",
+                protocol="HTTP/3",
+                round=self.current_round,
+                extra_info="start_evaluation"
+            )
+            
+            # Call the standard evaluation handler
+            self.handle_start_evaluation(json.dumps(message).encode())
+        except Exception as e:
+            print(f"[HTTP/3] Client {self.client_id} error handling evaluation signal: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _send_via_http3(self, message: dict):
+        """Send model update via HTTP/3 using persistent connection"""
+        if not HTTP3_AVAILABLE or asyncio is None or connect is None:
+            raise ImportError("HTTP/3 module not available")
+        
+        try:
+            # Check if event loop is available and running
+            if self.http3_loop is None:
+                raise ConnectionError("HTTP/3 event loop not available")
+            
+            if self.http3_loop.is_closed():
+                raise ConnectionError("HTTP/3 event loop is closed")
+            
+            # Check if protocol is connected
+            if self.http3_protocol is None:
+                raise ConnectionError("HTTP/3 protocol not connected")
+            
+            # Add 'type' field for server to identify message type
+            http3_message = {**message, 'type': 'update'}
+            
+            payload = json.dumps(http3_message)
+            payload_size_mb = len(payload) / (1024 * 1024)
+            print(f"Client {self.client_id} sending via HTTP/3 - size: {payload_size_mb:.2f} MB")
+            
+            # Use persistent connection directly via run_coroutine_threadsafe
+            future = asyncio.run_coroutine_threadsafe(
+                self._do_http3_send(payload),
+                self.http3_loop
+            )
+            future.result(timeout=15)  # Wait for send to complete
+            
+            log_sent_packet(
+                packet_size=len(payload),
+                peer="server",
+                protocol="HTTP/3",
+                round=self.current_round,
+                extra_info="model_update"
+            )
+            
+            print(f"Client {self.client_id} sent model update for round {self.current_round} via HTTP/3")
+        except Exception as e:
+            print(f"Client {self.client_id} ERROR sending via HTTP/3: {e}")
+            raise
+    
+    def _send_metrics_via_http3(self, message: dict):
+        """Send metrics via HTTP/3 using persistent connection"""
+        if not HTTP3_AVAILABLE or asyncio is None or connect is None:
+            raise ImportError("HTTP/3 module not available")
+        
+        try:
+            # Check if event loop is available and running
+            if self.http3_loop is None:
+                raise ConnectionError("HTTP/3 event loop not available")
+            
+            if self.http3_loop.is_closed():
+                raise ConnectionError("HTTP/3 event loop is closed")
+            
+            # Check if protocol is connected
+            if self.http3_protocol is None:
+                raise ConnectionError("HTTP/3 protocol not connected")
+            
+            # Add 'type' field for server to identify message type
+            http3_message = {**message, 'type': 'metrics'}
+            
+            payload = json.dumps(http3_message)
+            
+            # Use persistent connection directly via run_coroutine_threadsafe
+            future = asyncio.run_coroutine_threadsafe(
+                self._do_http3_send(payload),
+                self.http3_loop
+            )
+            future.result(timeout=15)  # Wait for send to complete
+            
+            log_sent_packet(
+                packet_size=len(payload),
+                peer="server",
+                protocol="HTTP/3",
+                round=self.current_round,
+                extra_info="metrics"
+            )
+        except Exception as e:
+            print(f"Client {self.client_id} ERROR sending metrics via HTTP/3: {e}")
+            raise
+    
+    async def _do_http3_send(self, payload: str):
+        """Actually send data via HTTP/3 (runs in HTTP/3 thread's event loop)"""
+        if self.http3_protocol is None:
+            raise ConnectionError("HTTP/3 protocol not connected")
+        
+        # Ensure HTTP connection is initialized
+        if self.http3_protocol._http is None:
+            self.http3_protocol._http = H3Connection(self.http3_protocol._quic)
+        
+        # Get next available stream ID
+        stream_id = self.http3_protocol._quic.get_next_available_stream_id(is_unidirectional=False)
+        
+        # Prepare JSON payload
+        payload_bytes = payload.encode('utf-8')
+        
+        # Send HTTP/3 request
+        headers = [
+            (b":method", b"POST"),
+            (b":path", b"/fl/message"),
+            (b":scheme", b"https"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload_bytes)).encode()),
+        ]
+        self.http3_protocol._http.send_headers(stream_id=stream_id, headers=headers)
+        self.http3_protocol._http.send_data(stream_id=stream_id, data=payload_bytes, end_stream=True)
+        self.http3_protocol.transmit()
+        
+        print(f"[HTTP/3] Client {self.client_id} sent data on stream {stream_id} ({len(payload_bytes)} bytes)")
     
     def _send_via_dds(self, message: dict):
         """Send model update via DDS with chunking (matching standalone)"""

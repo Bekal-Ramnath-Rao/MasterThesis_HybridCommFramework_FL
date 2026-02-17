@@ -91,6 +91,18 @@ except ImportError:
     DDS_AVAILABLE = False
     print("Warning: cyclonedds not available, DDS disabled")
 
+try:
+    from aioquic.h3.connection import H3_ALPN, H3Connection, Setting
+    from aioquic.h3.events import DataReceived, HeadersReceived, H3Event
+    from aioquic.quic.events import StreamReset
+    HTTP3_AVAILABLE = True
+except ImportError as e:
+    HTTP3_AVAILABLE = False
+    print(f"Warning: aioquic H3 not available, HTTP/3 disabled (ImportError: {e})")
+except Exception as e:
+    HTTP3_AVAILABLE = False
+    print(f"Warning: aioquic H3 not available, HTTP/3 disabled (Unexpected error: {type(e).__name__}: {e})")
+
 # Detect Docker environment and set project root accordingly
 if os.path.exists('/app'):
     project_root = '/app'
@@ -137,6 +149,8 @@ AMQP_PORT = int(os.getenv("AMQP_PORT", "5672"))
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
 QUIC_HOST = os.getenv("QUIC_HOST", '0.0.0.0')
 QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
+HTTP3_HOST = os.getenv("HTTP3_HOST", '0.0.0.0')
+HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
 # FAIR CONFIG: 64 KB chunks for better DDS performance in poor networks
 CHUNK_SIZE = 64 * 1024  # 64KB chunks
@@ -253,7 +267,9 @@ class UnifiedFederatedLearningServer:
         self.amqp_send_channel = None
         self.grpc_server = None
         self.quic_server = None
-        self.quic_clients = {}  # Maps client_id -> QuicConnectionProtocol for sending responses
+        self.quic_clients = {}  # Maps client_id -> QuicConnectionProtocol (one connection per client; supports both clients using QUIC)
+        self.http3_server = None
+        self.http3_clients = {}  # Maps client_id -> HTTP3ServerProtocol (one connection per client)
         self.dds_participant = None
         self.dds_writers = {}
         self.dds_readers = {}
@@ -291,6 +307,7 @@ class UnifiedFederatedLearningServer:
         print(f"  - AMQP: {'✓' if AMQP_AVAILABLE else '✗'}")
         print(f"  - gRPC: {'✓' if GRPC_AVAILABLE else '✗'}")
         print(f"  - QUIC: {'✓' if QUIC_AVAILABLE else '✗'}")
+        print(f"  - HTTP/3: {'✓' if HTTP3_AVAILABLE else '✗'}")
         print(f"  - DDS: {'✓' if DDS_AVAILABLE else '✗'}")
         print(f"{'='*70}\n")
     
@@ -648,7 +665,7 @@ class UnifiedFederatedLearningServer:
             traceback.print_exc()
     
     def send_quic_message(self, client_id, message):
-        """Send message to client via QUIC stream"""
+        """Send message to client via QUIC stream. Supports multiple QUIC clients (each has own connection in quic_clients)."""
         if client_id not in self.quic_clients:
             print(f"[QUIC] Warning: No QUIC protocol reference for client {client_id}")
             print(f"[QUIC] Available QUIC clients: {list(self.quic_clients.keys())}")
@@ -910,6 +927,224 @@ class UnifiedFederatedLearningServer:
             await asyncio.Future()  # Run forever
         except Exception as e:
             print(f"[QUIC] Server error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # =========================================================================
+    # HTTP/3 PROTOCOL HANDLERS
+    # =========================================================================
+    
+    def start_http3_server(self):
+        """Start HTTP/3 protocol handler"""
+        if not HTTP3_AVAILABLE:
+            return
+        
+        try:
+            # Run HTTP/3 server in asyncio event loop
+            def run_http3():
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    print(f"[HTTP/3] Starting server on {HTTP3_HOST}:{HTTP3_PORT}")
+                    # Run the HTTP/3 server coroutine directly
+                    loop.run_until_complete(self._run_http3_server())
+                except Exception as e:
+                    print(f"[HTTP/3] Thread error: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            http3_thread = threading.Thread(target=run_http3, daemon=True)
+            http3_thread.start()
+            
+            # Wait a bit for server to actually start listening
+            time.sleep(3)
+            print(f"[HTTP/3] Server initialized on {HTTP3_HOST}:{HTTP3_PORT}")
+        except Exception as e:
+            print(f"[HTTP/3] Failed to start: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    async def _run_http3_server(self):
+        """Async HTTP/3 server"""
+        try:
+            # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/QUIC/DDS for unbiased comparison
+            configuration = QuicConfiguration(
+                is_client=False,
+                alpn_protocols=H3_ALPN,
+                # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
+                max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
+                max_data=256 * 1024 * 1024,  # 256 MB total connection
+                # FAIR CONFIG: Timeout 600s for very_poor network scenarios
+                idle_timeout=600.0,  # 10 minutes
+                max_datagram_frame_size=65536,  # 64 KB frames
+            )
+            
+            # Generate self-signed certificate for HTTP/3 (reuse QUIC cert generation logic)
+            import ssl
+            from cryptography import x509
+            from cryptography.x509.oid import NameOID, ExtensionOID
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.asymmetric import rsa
+            from cryptography.hazmat.primitives import serialization
+            import datetime
+            import ipaddress
+            
+            # Generate private key
+            private_key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=2048,
+            )
+            
+            # Generate certificate
+            subject = issuer = x509.Name([
+                x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+                x509.NameAttribute(NameOID.ORGANIZATION_NAME, "FL Server"),
+                x509.NameAttribute(NameOID.COMMON_NAME, "localhost"),
+            ])
+            
+            # Build SubjectAltName extension with multiple addresses
+            san_list = [
+                x509.DNSName("localhost"),
+                x509.DNSName("fl-server-unified-emotion"),
+                x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+                x509.IPAddress(ipaddress.IPv4Address("0.0.0.0")),
+            ]
+            
+            cert = x509.CertificateBuilder().subject_name(
+                subject
+            ).issuer_name(
+                issuer
+            ).public_key(
+                private_key.public_key()
+            ).serial_number(
+                x509.random_serial_number()
+            ).not_valid_before(
+                datetime.datetime.utcnow()
+            ).not_valid_after(
+                datetime.datetime.utcnow() + datetime.timedelta(days=365)
+            ).add_extension(
+                x509.SubjectAlternativeName(san_list),
+                critical=False
+            ).sign(private_key, hashes.SHA256())
+            
+            # Save to temp files
+            cert_path = "/tmp/http3_cert.pem"
+            key_path = "/tmp/http3_key.pem"
+            
+            with open(cert_path, "wb") as f:
+                f.write(cert.public_bytes(serialization.Encoding.PEM))
+            
+            with open(key_path, "wb") as f:
+                f.write(private_key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.TraditionalOpenSSL,
+                    encryption_algorithm=serialization.NoEncryption()
+                ))
+            
+            configuration.load_cert_chain(cert_path, key_path)
+            
+            print(f"[HTTP/3] Server configuration complete:")
+            print(f"[HTTP/3]   - Host: {HTTP3_HOST}:{HTTP3_PORT}")
+            print(f"[HTTP/3]   - Certificate: {cert_path}")
+            print(f"[HTTP/3]   - ALPN: {H3_ALPN}")
+            print(f"[HTTP/3]   - Max stream data: 128 MB")
+            print(f"[HTTP/3]   - Idle timeout: 600s")
+            
+            # Create protocol factory that sets server reference
+            def create_protocol(*args, **kwargs):
+                protocol = HTTP3ServerProtocol(*args, **kwargs)
+                protocol.server = self
+                print(f"[HTTP/3] Server created protocol instance for new connection")
+                return protocol
+            
+            print(f"[HTTP/3] Server starting serve() on {HTTP3_HOST}:{HTTP3_PORT}")
+            await serve(
+                HTTP3_HOST,
+                HTTP3_PORT,
+                configuration=configuration,
+                create_protocol=create_protocol,
+            )
+            print(f"[HTTP/3] ✓ Server serve() completed, now running indefinitely")
+            print(f"[HTTP/3] Server is ready to accept connections")
+            # Keep server running indefinitely
+            await asyncio.Future()  # Run forever
+        except Exception as e:
+            print(f"[HTTP/3] Server error: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    async def handle_http3_message(self, message, protocol):
+        """Handle incoming HTTP/3 messages asynchronously"""
+        try:
+            msg_type = message.get('type')
+            client_id = message.get('client_id', 'unknown')
+            
+            # Store HTTP/3 protocol reference for ANY message (not just registration)
+            if client_id and client_id != 'unknown':
+                self.http3_clients[client_id] = protocol
+                print(f"[HTTP/3] Stored protocol reference for client {client_id}")
+            
+            # Use asyncio.to_thread to call synchronous methods from async context
+            # This ensures thread-safe execution of methods with locks
+            loop = asyncio.get_event_loop()
+            
+            if msg_type == 'register':
+                await loop.run_in_executor(None, self.handle_client_registration, client_id, 'http3')
+                print(f"[HTTP/3] Received registration from client {client_id}")
+            elif msg_type == 'update':
+                await loop.run_in_executor(None, self.handle_client_update, message, 'http3')
+                print(f"[HTTP/3] Received update from client {client_id}")
+            elif msg_type == 'metrics':
+                await loop.run_in_executor(None, self.handle_client_metrics, message, 'http3')
+                print(f"[HTTP/3] Received metrics from client {client_id}")
+        except Exception as e:
+            print(f"[HTTP/3] Error handling message: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def send_http3_message(self, client_id, message):
+        """Send message to client via HTTP/3 stream. Supports multiple HTTP/3 clients."""
+        if client_id not in self.http3_clients:
+            print(f"[HTTP/3] Warning: No HTTP/3 protocol reference for client {client_id}")
+            print(f"[HTTP/3] Available HTTP/3 clients: {list(self.http3_clients.keys())}")
+            return
+        
+        try:
+            protocol = self.http3_clients[client_id]
+            # Ensure HTTP connection is initialized
+            if protocol._http is None:
+                protocol._http = H3Connection(protocol._quic)
+            
+            # Get next available stream ID (bidirectional for server push)
+            stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
+            
+            # Prepare JSON payload
+            payload = json.dumps(message).encode('utf-8')
+            
+            # Send headers (server push)
+            headers = [
+                (b":status", b"200"),
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(payload)).encode()),
+            ]
+            protocol._http.send_headers(stream_id=stream_id, headers=headers)
+            
+            # Send data
+            protocol._http.send_data(stream_id=stream_id, data=payload, end_stream=True)
+            protocol.transmit()
+            
+            msg_type = message.get('type')
+            print(f"[HTTP/3] Sent {msg_type} to client {client_id} on stream {stream_id} ({len(payload)} bytes)")
+            
+            log_sent_packet(
+                packet_size=len(payload),
+                peer=f"http3_client_{client_id}",
+                protocol="HTTP/3",
+                round=self.current_round,
+                extra_info=msg_type
+            )
+        except Exception as e:
+            print(f"[HTTP/3] Error sending message to client {client_id}: {e}")
             import traceback
             traceback.print_exc()
     
@@ -1542,6 +1777,17 @@ class UnifiedFederatedLearningServer:
                     self.send_quic_message(client_id, message)
                     print(f"[QUIC] Sent initial model to client {client_id}")
                     
+                elif protocol == 'http3':
+                    # Send via HTTP/3 stream
+                    message = {
+                        'type': 'global_model',
+                        'round': 0,
+                        weights_key: weights_data,
+                        'model_config': self.model_config
+                    }
+                    self.send_http3_message(client_id, message)
+                    print(f"[HTTP/3] Sent initial model to client {client_id}")
+                    
                 elif protocol == 'grpc':
                     # Mark initial model as ready for gRPC client to pull
                     self.grpc_model_ready[client_id] = 0
@@ -1628,6 +1874,16 @@ class UnifiedFederatedLearningServer:
                     }
                     self.send_quic_message(client_id, message)
                     print(f"[QUIC] Sent global model to client {client_id}")
+                    
+                elif protocol == 'http3':
+                    # Send via HTTP/3 stream
+                    message = {
+                        'type': 'global_model',
+                        'round': self.current_round,
+                        weights_key: weights_data
+                    }
+                    self.send_http3_message(client_id, message)
+                    print(f"[HTTP/3] Sent global model to client {client_id}")
                     
                 elif protocol == 'grpc':
                     # gRPC uses pull model - mark model as ready for this client
@@ -1791,6 +2047,7 @@ class UnifiedFederatedLearningServer:
         
         self.start_grpc_server()
         self.start_quic_server()
+        self.start_http3_server()
         self.start_dds_server()
         
         print("\n[Server] All protocol handlers started")
@@ -2024,6 +2281,130 @@ if GRPC_AVAILABLE:
                     is_complete=True
                 )
 
+
+# =========================================================================
+# HTTP/3 Protocol Handler
+# =========================================================================
+
+if HTTP3_AVAILABLE:
+    class HTTP3ServerProtocol(QuicConnectionProtocol):
+        """HTTP/3 protocol handler (supports multiple clients)"""
+        
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.server = None  # Set by factory function
+            self._http = None  # H3Connection instance
+            self._stream_buffers = {}  # Buffer data per stream ID (instance-specific)
+            print(f"[HTTP/3] Protocol instance created")
+        
+        def quic_event_received(self, event):
+            """Handle QUIC events and convert to HTTP/3 events"""
+            # Initialize H3 connection on first event
+            if self._http is None:
+                self._http = H3Connection(self._quic)
+            
+            # Convert QUIC events to HTTP/3 events
+            for h3_event in self._http.handle_event(event):
+                self._handle_h3_event(h3_event)
+        
+        def _handle_h3_event(self, event: H3Event):
+            """Handle HTTP/3 events"""
+            if isinstance(event, HeadersReceived):
+                try:
+                    stream_id = event.stream_id
+                    headers = dict(event.headers)
+                    method = headers.get(b":method", b"").decode()
+                    path = headers.get(b":path", b"").decode()
+                    
+                    print(f"[HTTP/3] Received {method} request on stream {stream_id}, path: {path}")
+                    
+                    # Initialize buffer for this stream
+                    if stream_id not in self._stream_buffers:
+                        self._stream_buffers[stream_id] = b''
+                    
+                    # Handle POST requests (client sending data)
+                    if method == "POST":
+                        content_length = int(headers.get(b"content-length", b"0"))
+                        print(f"[HTTP/3] Expecting {content_length} bytes on stream {stream_id}")
+                    
+                except Exception as e:
+                    print(f"[HTTP/3] Error handling headers: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            elif isinstance(event, DataReceived):
+                try:
+                    stream_id = event.stream_id
+                    # Get or create buffer for this stream
+                    if stream_id not in self._stream_buffers:
+                        self._stream_buffers[stream_id] = b''
+                    
+                    # Append new data to buffer
+                    self._stream_buffers[stream_id] += event.data
+                    print(f"[HTTP/3] Stream {stream_id}: received {len(event.data)} bytes, buffer now {len(self._stream_buffers[stream_id])} bytes")
+                    
+                    # Send flow control updates to allow more data
+                    self.transmit()
+                    
+                    # If stream ended, process complete message
+                    if event.end_stream:
+                        try:
+                            data_str = self._stream_buffers[stream_id].decode('utf-8')
+                            message = json.loads(data_str)
+                            msg_type = message.get('type', 'unknown')
+                            client_id = message.get('client_id', 'unknown')
+                            print(f"[HTTP/3] Decoded complete message type '{msg_type}' from stream {stream_id}")
+                            
+                            log_received_packet(
+                                packet_size=len(data_str),
+                                peer=f"http3_client_{client_id}",
+                                protocol="HTTP/3",
+                                round=message.get('round', 0),
+                                extra_info=msg_type
+                            )
+                            
+                            # Send HTTP/3 response
+                            response_headers = [
+                                (b":status", b"200"),
+                                (b"content-type", b"application/json"),
+                            ]
+                            response_body = json.dumps({"status": "ok"}).encode('utf-8')
+                            self._http.send_headers(stream_id=stream_id, headers=response_headers)
+                            self._http.send_data(stream_id=stream_id, data=response_body, end_stream=True)
+                            self.transmit()
+                            
+                            # Handle message asynchronously
+                            if self.server:
+                                asyncio.create_task(self.server.handle_http3_message(message, self))
+                            
+                            # Clear buffer
+                            self._stream_buffers[stream_id] = b''
+                        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                            print(f"[HTTP/3] Error decoding message: {e}")
+                            # Send error response
+                            try:
+                                error_headers = [
+                                    (b":status", b"400"),
+                                    (b"content-type", b"text/plain"),
+                                ]
+                                error_body = f"Error: {str(e)}".encode('utf-8')
+                                self._http.send_headers(stream_id=stream_id, headers=error_headers)
+                                self._http.send_data(stream_id=stream_id, data=error_body, end_stream=True)
+                                self.transmit()
+                            except:
+                                pass
+                            self._stream_buffers[stream_id] = b''
+                except Exception as e:
+                    print(f"[HTTP/3] Error handling data: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            elif isinstance(event, StreamReset):
+                # Stream was reset, clear buffer
+                stream_id = event.stream_id
+                if stream_id in self._stream_buffers:
+                    del self._stream_buffers[stream_id]
+                    print(f"[HTTP/3] Stream {stream_id} reset, cleared buffer")
 
 # =========================================================================
 # QUIC Protocol Handler

@@ -489,6 +489,7 @@ class FLExperimentGUI(QMainWindow):
             ("AMQP", "amqp", False),
             ("gRPC", "grpc", False),
             ("QUIC", "quic", False),
+            ("HTTP/3", "http3", False),
             ("DDS", "dds", False),
             ("🤖 RL-Unified (Dynamic Selection)", "rl_unified", False)
         ])

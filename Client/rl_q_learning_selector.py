@@ -25,7 +25,7 @@ class QLearningProtocolSelector:
     """
     
     # Protocol actions
-    PROTOCOLS = ['mqtt', 'amqp', 'grpc', 'quic', 'dds']
+    PROTOCOLS = ['mqtt', 'amqp', 'grpc', 'quic', 'http3', 'dds']
     
     # Environment state dimensions
     NETWORK_CONDITIONS = ['excellent', 'good', 'moderate', 'poor', 'very_poor']
@@ -128,7 +128,8 @@ class QLearningProtocolSelector:
             # Explore: random action
             action_idx = np.random.randint(len(self.PROTOCOLS))
         else:
-            # Exploit: best known action
+            # Exploit: best known action (uses learned Q-table)
+            # When training=False, this always uses the learned Q-table for inference
             action_idx = np.argmax(self.q_table[state_idx])
         
         protocol = self.PROTOCOLS[action_idx]
@@ -168,8 +169,9 @@ class QLearningProtocolSelector:
         reward = 10.0  # Base reward for success
         
         # 1. Communication time reward (faster is better)
-        # Normalize: 0-5 seconds -> reward 5 to 0
-        time_reward = max(0, 5.0 - communication_time)
+        # Normalize: 0-3600 seconds (1 hour) -> reward 5 to 0
+        # This allows differentiation even in poor/very_poor network conditions
+        time_reward = max(0, 5.0 - (communication_time / 720.0))
         reward += time_reward
         
         # 2. Convergence time reward (faster is better)
@@ -252,6 +254,11 @@ class QLearningProtocolSelector:
         """Decay exploration rate"""
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
+    
+    def reset_epsilon(self):
+        """Reset epsilon to initial value (1.0) for re-exploration"""
+        self.epsilon = 1.0
+        print(f"[Q-Learning] Epsilon reset to {self.epsilon:.4f} for re-exploration")
     
     def end_episode(self):
         """Mark end of episode and update statistics"""
@@ -432,6 +439,47 @@ class QLearningProtocolSelector:
         """Reset episode history"""
         self.state_history = []
         self.action_history = []
+    
+    def reset_q_table(self):
+        """
+        Reset Q-table to initial state (all zeros) and reset statistics.
+        This clears all learned knowledge and starts fresh.
+        Useful when new protocols are added (e.g., HTTP/3) or starting new training.
+        """
+        # Reset Q-table to zeros
+        state_space_size = (
+            len(self.NETWORK_CONDITIONS),
+            len(self.RESOURCE_LEVELS),
+            len(self.MODEL_SIZES),
+            len(self.MOBILITY_LEVELS)
+        )
+        self.q_table = np.zeros(state_space_size + (len(self.PROTOCOLS),))
+        
+        # Reset epsilon to initial value
+        self.epsilon = 1.0
+        
+        # Reset statistics
+        self.episode_count = 0
+        self.total_rewards = []
+        self.protocol_usage = {p: 0 for p in self.PROTOCOLS}
+        self.protocol_success = {p: 0 for p in self.PROTOCOLS}
+        self.protocol_failures = {p: 0 for p in self.PROTOCOLS}
+        
+        # Reset history
+        self.state_history = []
+        self.action_history = []
+        self.reward_history = []
+        self._q_deltas = []
+        
+        # Delete saved Q-table file if it exists
+        if os.path.exists(self.save_path):
+            try:
+                os.remove(self.save_path)
+                print(f"[Q-Learning] Deleted existing Q-table file: {self.save_path}")
+            except Exception as e:
+                print(f"[Q-Learning] Warning: Could not delete Q-table file {self.save_path}: {e}")
+        
+        print(f"[Q-Learning] Q-table reset complete. Starting fresh with {len(self.PROTOCOLS)} protocols: {self.PROTOCOLS}")
 
 
 class EnvironmentStateManager:

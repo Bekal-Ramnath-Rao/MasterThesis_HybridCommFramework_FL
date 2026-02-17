@@ -349,7 +349,7 @@ services:
       - ../certs:/app/certs
     networks:
       - fl-quic-network
-    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
+# GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # QUIC FL Client 2 (Emotion Recognition)
   fl-client-quic-emotion-2:
@@ -377,6 +377,94 @@ services:
       - ../certs:/app/certs
     networks:
       - fl-quic-network
+# GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
+
+  # ============================================================================
+  # HTTP/3 Protocol Setup (Emotion Recognition)
+  # ============================================================================
+  
+  # HTTP/3 FL Server (Emotion Recognition)
+  fl-server-http3-emotion:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    container_name: fl-server-http3-emotion
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - "4434:4434"
+    environment:
+      - HTTP3_HOST=0.0.0.0
+      - HTTP3_PORT=4434
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Server/Emotion_Recognition/FL_Server_HTTP3.py
+    networks:
+      - fl-http3-network
+    volumes:
+      - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
+      - ../certs:/app/certs:ro
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
+
+  # HTTP/3 FL Client 1 (Emotion Recognition)
+  fl-client-http3-emotion-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-http3-emotion-1
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-http3-emotion
+    environment:
+      - HTTP3_HOST=fl-server-http3-emotion
+      - HTTP3_PORT=4434
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Emotion_Recognition/FL_Client_HTTP3.py
+    volumes:
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../certs:/app/certs:ro
+    networks:
+      - fl-http3-network
+    # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
+
+  # HTTP/3 FL Client 2 (Emotion Recognition)
+  fl-client-http3-emotion-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-http3-emotion-2
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-http3-emotion
+    environment:
+      - HTTP3_HOST=fl-server-http3-emotion
+      - HTTP3_PORT=4434
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Emotion_Recognition/FL_Client_HTTP3.py
+    volumes:
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+      - ../certs:/app/certs:ro
+    networks:
+      - fl-http3-network
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # ============================================================================
@@ -479,6 +567,7 @@ services:
       - fl-amqp-network
       - fl-grpc-network
       - fl-quic-network
+      - fl-http3-network
       - fl-dds-network
     command: >
       sh -c "
@@ -505,6 +594,7 @@ services:
       - fl-amqp-network
       - fl-grpc-network
       - fl-quic-network
+      - fl-http3-network
       - fl-dds-network
     command: >
       sh -c "
@@ -529,6 +619,7 @@ services:
       - fl-amqp-network
       - fl-grpc-network
       - fl-quic-network
+      - fl-http3-network
       - fl-dds-network
     command: >
       sh -c "
@@ -553,6 +644,7 @@ services:
       - fl-amqp-network
       - fl-grpc-network
       - fl-quic-network
+      - fl-http3-network
       - fl-dds-network
     command: >
       sh -c "
@@ -576,6 +668,7 @@ services:
       - fl-amqp-network
       - fl-grpc-network
       - fl-quic-network
+      - fl-http3-network
       - fl-dds-network
     command:
       - /bin/sh
@@ -631,6 +724,8 @@ networks:
   fl-grpc-network:
     driver: bridge
   fl-quic-network:
+    driver: bridge
+  fl-http3-network:
     driver: bridge
   fl-dds-network:
     driver: bridge

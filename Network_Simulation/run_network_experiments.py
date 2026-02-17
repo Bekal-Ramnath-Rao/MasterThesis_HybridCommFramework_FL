@@ -38,6 +38,14 @@ class ExperimentRunner:
         # quantization_params expected to be a dict of simple string values
         self.quantization_params = quantization_params or {}
         
+        # Map use_case values to actual Server directory names
+        self.use_case_dir_map = {
+            "emotion": "Emotion_Recognition",
+            "mentalstate": "MentalState_Recognition",
+            "temperature": "Temperature_Regulation"
+        }
+        self.use_case_dir = self.use_case_dir_map.get(use_case, f"{use_case.title()}_Recognition")
+        
         # Print quantization status
         if self.use_quantization:
             print(f"\n{'='*70}")
@@ -90,7 +98,7 @@ class ExperimentRunner:
                 self.enable_congestion = False
         
         # Define protocols to test
-        self.protocols = ["mqtt", "amqp", "grpc", "quic", "dds", "rl_unified"]
+        self.protocols = ["mqtt", "amqp", "grpc", "quic", "http3", "dds", "rl_unified"]
         
         # Define network scenarios to test
         self.network_scenarios = [
@@ -153,6 +161,7 @@ class ExperimentRunner:
                 "amqp": [broker_amqp, "fl-server-amqp-emotion", "fl-client-amqp-emotion-1", "fl-client-amqp-emotion-2"],
                 "grpc": ["fl-server-grpc-emotion", "fl-client-grpc-emotion-1", "fl-client-grpc-emotion-2"],
                 "quic": ["fl-server-quic-emotion", "fl-client-quic-emotion-1", "fl-client-quic-emotion-2"],
+                "http3": ["fl-server-http3-emotion", "fl-client-http3-emotion-1", "fl-client-http3-emotion-2"],
                 "dds": ["fl-server-dds-emotion", "fl-client-dds-emotion-1", "fl-client-dds-emotion-2"],
                 "rl_unified": ["fl-server-unified-emotion", "fl-client-unified-emotion-1", "fl-client-unified-emotion-2"]
             },
@@ -161,6 +170,7 @@ class ExperimentRunner:
                 "amqp": ["rabbitmq-mental", "fl-server-amqp-mental", "fl-client-amqp-mental-1", "fl-client-amqp-mental-2"],
                 "grpc": ["fl-server-grpc-mental", "fl-client-grpc-mental-1", "fl-client-grpc-mental-2"],
                 "quic": ["fl-server-quic-mental", "fl-client-quic-mental-1", "fl-client-quic-mental-2"],
+                "http3": ["fl-server-http3-mental", "fl-client-http3-mental-1", "fl-client-http3-mental-2"],
                 "dds": ["fl-server-dds-mental", "fl-client-dds-mental-1", "fl-client-dds-mental-2"],
                 "rl_unified": ["fl-server-unified-mental", "fl-client-unified-mental-1", "fl-client-unified-mental-2"]
             },
@@ -169,6 +179,7 @@ class ExperimentRunner:
                 "amqp": ["rabbitmq-temp", "fl-server-amqp-temp", "fl-client-amqp-temp-1", "fl-client-amqp-temp-2"],
                 "grpc": ["fl-server-grpc-temp", "fl-client-grpc-temp-1", "fl-client-grpc-temp-2"],
                 "quic": ["fl-server-quic-temp", "fl-client-quic-temp-1", "fl-client-quic-temp-2"],
+                "http3": ["fl-server-http3-temp", "fl-client-http3-temp-1", "fl-client-http3-temp-2"],
                 "dds": ["fl-server-dds-temp", "fl-client-dds-temp-1", "fl-client-dds-temp-2"],
                 "rl_unified": ["fl-server-unified-temp", "fl-client-unified-temp-1", "fl-client-unified-temp-2"]
             }
@@ -206,7 +217,7 @@ class ExperimentRunner:
             print("STARTING RL-UNIFIED MODE")
             print("="*70)
             print("Using unified docker-compose file with all protocol brokers")
-            print("Server will handle: MQTT, AMQP, gRPC, QUIC, DDS")
+            print("Server will handle: MQTT, AMQP, gRPC, QUIC, HTTP/3, DDS")
             print("Clients will use RL-based Q-Learning to select protocol")
             if self.use_ql_convergence:
                 print("End condition: Q-learning convergence (multiple episodes)")
@@ -476,7 +487,7 @@ class ExperimentRunner:
 
             # Check if training has reached the target number of rounds
             # by examining the results file content (not just existence)
-            results_dir = f"/app/Server/{self.use_case.title()}_Recognition/results"
+            results_dir = f"/app/Server/{self.use_case_dir}/results"
             expected_json = f"{protocol}_training_results.json"
             
             # Read the results file content to check if expected rounds are complete
@@ -576,7 +587,7 @@ class ExperimentRunner:
                 # Try to copy from server container
                 self.run_command([
                     "docker", "cp",
-                    f"{server_container}:/app/Server/{self.use_case.title()}_Recognition/results/{result_file}",
+                    f"{server_container}:/app/Server/{self.use_case_dir}/results/{result_file}",
                     os.path.join(exp_dir, result_file)
                 ], check=False)
             except:
@@ -774,7 +785,7 @@ def main():
                        help="Use case to run experiments for")
     parser.add_argument("--protocols", "-p",
                        nargs="+",
-                       choices=["mqtt", "amqp", "grpc", "quic", "dds", "rl_unified"],
+                       choices=["mqtt", "amqp", "grpc", "quic", "http3", "dds", "rl_unified"],
                        help="Specific protocols to test (default: all). Use 'rl_unified' for RL-based dynamic protocol selection")
     parser.add_argument("--scenarios", "-s",
                        nargs="+",
@@ -797,7 +808,7 @@ def main():
     parser.add_argument("--single", action="store_true",
                        help="Run single experiment (requires --protocol and --scenario)")
     parser.add_argument("--protocol",
-                       choices=["mqtt", "amqp", "grpc", "quic", "dds", "rl_unified"],
+                       choices=["mqtt", "amqp", "grpc", "quic", "http3", "dds", "rl_unified"],
                        help="Protocol for single experiment (use 'rl_unified' for RL-based selection)")
     parser.add_argument("--scenario",
                        choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
