@@ -183,6 +183,7 @@ class FederatedLearningClient:
                 (b":method", b"POST"),
                 (b":path", b"/fl/message"),
                 (b":scheme", b"https"),
+                (b":authority", HTTP3_HOST.encode('utf-8')),  # Required HTTP/3 pseudo-header
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(payload)).encode()),
             ]

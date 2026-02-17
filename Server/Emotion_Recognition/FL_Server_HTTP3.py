@@ -24,7 +24,7 @@ except ImportError:
 
 from aioquic.asyncio import QuicConnectionProtocol, serve
 from aioquic.quic.configuration import QuicConfiguration
-from aioquic.quic.events import QuicEvent, StreamReset
+from aioquic.quic.events import QuicEvent, StreamReset, StreamDataReceived
 from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import DataReceived, HeadersReceived, H3Event
 
@@ -48,19 +48,73 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
         self.server = None
         self._http = None  # H3Connection instance
         self._stream_buffers = {}  # Buffer for incomplete messages
+        self._stream_content_lengths = {}  # Track expected content length per stream
     
     def quic_event_received(self, event: QuicEvent):
         """Handle QUIC events and convert to HTTP/3 events"""
-        # Initialize H3 connection on first event
-        if self._http is None:
-            self._http = H3Connection(self._quic)
-        
-        # Convert QUIC events to HTTP/3 events
-        for h3_event in self._http.handle_event(event):
-            self._handle_h3_event(h3_event)
+        try:
+            event_type = type(event).__name__
+            
+            # Log all QUIC events for debugging (especially stream events)
+            if event_type in ['ConnectionIdIssued', 'ConnectionTerminated', 'StreamReset', 'StreamDataReceived', 'DatagramFrameReceived', 'StreamCreated', 'ConnectionEstablished', 'ProtocolNegotiated']:
+                print(f"[HTTP/3] QUIC event: {event_type}")
+                if hasattr(event, 'stream_id'):
+                    print(f"  Stream ID: {event.stream_id}")
+                if hasattr(event, 'data') and event.data:
+                    print(f"  Data size: {len(event.data)} bytes")
+                if event_type == 'ConnectionTerminated':
+                    if hasattr(event, 'error_code'):
+                        print(f"  Error code: {event.error_code}")
+                    if hasattr(event, 'reason_phrase'):
+                        print(f"  Reason: {event.reason_phrase}")
+                if event_type == 'ProtocolNegotiated':
+                    if hasattr(event, ' alpn_protocol'):
+                        print(f"  ALPN Protocol: {event.alpn_protocol}")
+            
+            # Also log StreamDataReceived events (these contain the actual HTTP/3 request data)
+            if event_type == 'StreamDataReceived':
+                print(f"[HTTP/3] Received stream data: stream_id={event.stream_id}, size={len(event.data)} bytes, end_stream={event.end_stream}")
+            
+            # Initialize H3 connection on first event (but only if ALPN is negotiated)
+            # For HTTP/3, we should wait for ProtocolNegotiated event, but H3Connection can be initialized earlier
+            if self._http is None:
+                # Check if ALPN is negotiated (H3_ALPN should be in the negotiated protocol)
+                try:
+                    # Initialize H3 connection - it will handle ALPN validation internally
+                    print(f"[HTTP/3] Initializing H3Connection for new client")
+                    self._http = H3Connection(self._quic)
+                except Exception as init_error:
+                    print(f"[HTTP/3] Error initializing H3Connection: {init_error}")
+                    import traceback
+                    traceback.print_exc()
+                    return
+            
+            # Convert QUIC events to HTTP/3 events
+            if self._http is not None:
+                try:
+                    h3_events = self._http.handle_event(event)
+                    if h3_events:
+                        print(f"[HTTP/3] Generated {len(h3_events)} H3 event(s) from QUIC event {event_type}")
+                        for h3_event in h3_events:
+                            self._handle_h3_event(h3_event)
+                    elif event_type not in ['ConnectionIdIssued', 'ConnectionTerminated', 'ConnectionEstablished']:
+                        # Log if we're not generating H3 events from important QUIC events
+                        print(f"[HTTP/3] No H3 events generated from {event_type}")
+                except Exception as h3_error:
+                    print(f"[HTTP/3] Error converting QUIC event to H3: {h3_error}")
+                    import traceback
+                    traceback.print_exc()
+        except Exception as e:
+            print(f"[HTTP/3] Error in quic_event_received: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _handle_h3_event(self, event: H3Event):
         """Handle HTTP/3 events"""
+        event_type = type(event).__name__
+        stream_id = getattr(event, 'stream_id', 'N/A')
+        print(f"[HTTP/3] H3 event: {event_type}, stream_id: {stream_id}, server: {self.server is not None}")
+        
         if isinstance(event, HeadersReceived):
             try:
                 stream_id = event.stream_id
@@ -77,6 +131,7 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                 # Handle POST requests (client sending data)
                 if method == "POST":
                     content_length = int(headers.get(b"content-length", b"0"))
+                    self._stream_content_lengths[stream_id] = content_length
                     print(f"[HTTP/3] Expecting {content_length} bytes on stream {stream_id}")
             except Exception as e:
                 print(f"[HTTP/3] Error handling headers: {e}")
@@ -96,31 +151,40 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                 # Send flow control updates to allow more data
                 self.transmit()
                 
-                # If stream ended, process complete message
-                if event.end_stream:
+                # Check if we've received all expected data (HTTP/3 DataReceived doesn't have end_stream)
+                expected_length = self._stream_content_lengths.get(stream_id, 0)
+                received_length = len(self._stream_buffers[stream_id])
+                
+                # Process message when we've received all expected data
+                if expected_length > 0 and received_length >= expected_length:
                     try:
                         data_str = self._stream_buffers[stream_id].decode('utf-8')
                         message = json.loads(data_str)
                         msg_type = message.get('type', 'unknown')
                         client_id = message.get('client_id', 'unknown')
-                        print(f"[HTTP/3] Decoded complete message type '{msg_type}' from stream {stream_id}")
+                        print(f"[HTTP/3] Decoded complete message type '{msg_type}' from client {client_id} on stream {stream_id}")
                         
                         # Send HTTP/3 response
+                        response_body = json.dumps({"status": "ok"}).encode('utf-8')
                         response_headers = [
                             (b":status", b"200"),
                             (b"content-type", b"application/json"),
+                            (b"content-length", str(len(response_body)).encode()),
                         ]
-                        response_body = json.dumps({"status": "ok"}).encode('utf-8')
                         self._http.send_headers(stream_id=stream_id, headers=response_headers)
                         self._http.send_data(stream_id=stream_id, data=response_body, end_stream=True)
                         self.transmit()
                         
                         # Handle message asynchronously
                         if self.server:
+                            print(f"[HTTP/3] Processing message type '{msg_type}' from client {client_id}")
                             asyncio.create_task(self.server.handle_message(message, self))
+                        else:
+                            print(f"[HTTP/3] ERROR: Server reference is None!")
                         
-                        # Clear buffer
+                        # Clear buffer and content length tracking
                         self._stream_buffers[stream_id] = b''
+                        self._stream_content_lengths.pop(stream_id, None)
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
                         print(f"[HTTP/3] Error decoding message: {e}")
                         # Send error response
@@ -130,23 +194,28 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                                 (b"content-type", b"text/plain"),
                             ]
                             error_body = f"Error: {str(e)}".encode('utf-8')
+                            error_headers = [
+                                (b":status", b"400"),
+                                (b"content-type", b"text/plain"),
+                                (b"content-length", str(len(error_body)).encode()),
+                            ]
                             self._http.send_headers(stream_id=stream_id, headers=error_headers)
                             self._http.send_data(stream_id=stream_id, data=error_body, end_stream=True)
                             self.transmit()
                         except:
                             pass
                         self._stream_buffers[stream_id] = b''
+                        self._stream_content_lengths.pop(stream_id, None)
             except Exception as e:
                 print(f"[HTTP/3] Error handling data: {e}")
                 import traceback
                 traceback.print_exc()
         
-        elif isinstance(event, StreamReset):
-            # Stream was reset, clear buffer
-            stream_id = event.stream_id
-            if stream_id in self._stream_buffers:
-                del self._stream_buffers[stream_id]
-                print(f"[HTTP/3] Stream {stream_id} reset, cleared buffer")
+        # Note: StreamReset is a QUIC event, not an H3Event, so it won't appear here
+        # Stream resets are handled automatically by the QUIC layer
+        
+        # Clean up tracking if stream is reset (handled at QUIC level)
+        # We'll clean up buffers when we detect connection issues
 
 
 class FederatedLearningServer:
@@ -254,31 +323,46 @@ class FederatedLearningServer:
     
     async def send_message(self, client_id, message):
         """Send message to client via HTTP/3 stream with improved transmission for poor networks"""
-        if client_id in self.registered_clients:
-            protocol = self.registered_clients[client_id]
-            # Ensure HTTP connection is initialized
-            if protocol._http is None:
-                protocol._http = H3Connection(protocol._quic)
+        if client_id not in self.registered_clients:
+            print(f"[ERROR] Client {client_id} not in registered_clients. Available: {list(self.registered_clients.keys())}")
+            return
             
-            # Get next available stream ID (bidirectional for server push)
+        protocol = self.registered_clients[client_id]
+        # Ensure HTTP connection is initialized
+        if protocol._http is None:
+            print(f"[HTTP/3] Initializing H3Connection for client {client_id}")
+            protocol._http = H3Connection(protocol._quic)
+        
+        # Get next available stream ID (bidirectional for server push)
+        try:
             stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
-            
-            # Prepare JSON payload
-            payload = json.dumps(message).encode('utf-8')
-            
-            # Send headers (server push)
-            headers = [
-                (b":status", b"200"),
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(payload)).encode()),
-            ]
+        except Exception as e:
+            print(f"[ERROR] Failed to get stream ID for client {client_id}: {e}")
+            return
+        
+        # Prepare JSON payload
+        payload = json.dumps(message).encode('utf-8')
+        
+        # Send headers (server push)
+        headers = [
+            (b":status", b"200"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+        ]
+        
+        try:
             protocol._http.send_headers(stream_id=stream_id, headers=headers)
             protocol._http.send_data(stream_id=stream_id, data=payload, end_stream=True)
             protocol.transmit()
             
             msg_type = message.get('type')
             msg_size_mb = len(payload) / (1024 * 1024)
-            print(f"Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(payload)} bytes = {msg_size_mb:.2f} MB)")
+            print(f"[HTTP/3] Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(payload)} bytes = {msg_size_mb:.2f} MB)")
+        except Exception as e:
+            print(f"[ERROR] Failed to send message to client {client_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            return
             
             # Multiple transmit calls for large messages (improved for poor networks)
             if len(payload) > 1_000_000:  # > 1MB
@@ -315,9 +399,11 @@ class FederatedLearningServer:
     async def handle_client_registration(self, message, protocol):
         """Handle client registration"""
         client_id = message['client_id']
+        print(f"[HTTP/3] Processing registration for client {client_id}")
         self.registered_clients[client_id] = protocol  # Store protocol reference
         self.active_clients.add(client_id)
         print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
+        print(f"[DEBUG] Registered clients: {list(self.registered_clients.keys())}")
         
         # Update total client count if more clients join
         if len(self.registered_clients) > self.num_clients:
@@ -763,6 +849,7 @@ async def main():
         protocol = FederatedLearningServerProtocol(*args, **kwargs)
         protocol.server = server
         server.protocol = protocol
+        print(f"[HTTP/3] New protocol instance created for incoming connection")
         return protocol
     
     print(f"✓ Starting HTTP/3 server on {HTTP3_HOST}:{HTTP3_PORT}...")
