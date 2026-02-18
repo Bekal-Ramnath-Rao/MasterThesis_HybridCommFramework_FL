@@ -81,6 +81,9 @@ class QLearningProtocolSelector:
         self.protocol_success = {p: 0 for p in self.PROTOCOLS}
         self.protocol_failures = {p: 0 for p in self.PROTOCOLS}
 
+        # Track last scenario for epsilon reset detection
+        self.last_scenario = None
+        
         # Load existing Q-table if available (will reset if dimensions don't match)
         self.load_q_table()
         
@@ -255,10 +258,15 @@ class QLearningProtocolSelector:
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
     
-    def reset_epsilon(self):
+    def reset_epsilon(self, scenario: str = None):
         """Reset epsilon to initial value (1.0) for re-exploration"""
+        old_epsilon = self.epsilon
         self.epsilon = 1.0
-        print(f"[Q-Learning] Epsilon reset to {self.epsilon:.4f} for re-exploration")
+        if scenario:
+            self.last_scenario = scenario
+        print(f"[Q-Learning] Epsilon reset from {old_epsilon:.4f} to {self.epsilon:.4f} for re-exploration")
+        if scenario:
+            print(f"[Q-Learning] Tracking scenario: {scenario}")
     
     def end_episode(self):
         """Mark end of episode and update statistics"""
@@ -284,7 +292,8 @@ class QLearningProtocolSelector:
             'total_rewards': self.total_rewards,
             'protocol_usage': self.protocol_usage,
             'protocol_success': self.protocol_success,
-            'protocol_failures': self.protocol_failures
+            'protocol_failures': self.protocol_failures,
+            'last_scenario': getattr(self, 'last_scenario', None)  # Track last scenario
         }
         
         try:
@@ -320,8 +329,11 @@ class QLearningProtocolSelector:
             self.protocol_usage = data.get('protocol_usage', self.protocol_usage)
             self.protocol_success = data.get('protocol_success', self.protocol_success)
             self.protocol_failures = data.get('protocol_failures', self.protocol_failures)
+            self.last_scenario = data.get('last_scenario', None)  # Load last scenario
             print(f"[Q-Learning] Loaded Q-table from {path} (past experience)")
             print(f"[Q-Learning] Episodes: {self.episode_count}, Epsilon: {self.epsilon:.4f}")
+            if self.last_scenario:
+                print(f"[Q-Learning] Last scenario: {self.last_scenario}")
             return True
         except Exception as e:
             print(f"[Q-Learning] Error loading Q-table from {path}: {e}")

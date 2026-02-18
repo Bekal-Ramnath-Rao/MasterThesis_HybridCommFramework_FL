@@ -664,6 +664,41 @@ class ExperimentRunner:
             timeout = timeout_map.get(scenario, 3600)
         
         try:
+            # 0. Reset epsilon for Q-learning when starting a new experiment/scenario
+            # This ensures re-exploration for each new network scenario
+            if protocol == "rl_unified":
+                print(f"\n{'='*70}")
+                print(f"[Q-Learning] Preparing epsilon reset for new experiment: {scenario}")
+                print(f"{'='*70}")
+                
+                # Set environment variable to signal epsilon reset
+                os.environ["RESET_EPSILON"] = "true"
+                
+                # Create a flag file in shared_data for containers to check
+                # This ensures the reset signal persists even if env vars aren't passed through
+                # Use absolute path to ensure we're writing to the correct location
+                project_root = Path(__file__).parent.parent
+                shared_data_path = project_root / "shared_data"
+                shared_data_path.mkdir(exist_ok=True)
+                
+                # Create flag file with scenario identifier and timestamp
+                reset_flag_file = shared_data_path / "reset_epsilon_flag.txt"
+                try:
+                    import time
+                    timestamp = time.time()
+                    with open(reset_flag_file, 'w') as f:
+                        f.write(f"scenario={scenario}\n")
+                        f.write(f"timestamp={timestamp}\n")
+                        f.write(f"reset_epsilon=1.0\n")
+                    print(f"[Q-Learning] ✓ Created reset flag file: {reset_flag_file}")
+                    print(f"[Q-Learning]   Scenario: {scenario}")
+                    print(f"[Q-Learning]   All clients will reset epsilon to 1.0 on initialization")
+                except Exception as e:
+                    print(f"[Q-Learning] ✗ Warning: Could not create reset flag file: {e}")
+                    print(f"[Q-Learning]   Epsilon reset may not work properly")
+                
+                print(f"{'='*70}\n")
+            
             # 1. Start containers (includes traffic generators if congestion enabled)
             if not self.start_containers(protocol, scenario, congestion_level):
                 print(f"[ERROR] Failed to start containers for {protocol}")
@@ -700,6 +735,19 @@ class ExperimentRunner:
             
             # 6. Stop containers
             self.stop_containers(protocol)
+            
+            # 7. Clean up epsilon reset flag file after experiment completes
+            # (This ensures next experiment creates a fresh flag)
+            if protocol == "rl_unified":
+                project_root = Path(__file__).parent.parent
+                shared_data_path = project_root / "shared_data"
+                reset_flag_file = shared_data_path / "reset_epsilon_flag.txt"
+                try:
+                    if reset_flag_file.exists():
+                        reset_flag_file.unlink()
+                        print(f"[Q-Learning] Cleaned up reset flag file after experiment completion")
+                except Exception as e:
+                    print(f"[Q-Learning] Warning: Could not clean up reset flag file: {e}")
             
             print(f"\n[OK] Experiment completed: {protocol.upper()} - {scenario.upper()}\n")
             return True

@@ -425,6 +425,74 @@ class UnifiedFLClient_Emotion:
                 save_path=save_path,
                 initial_load_path=initial_load_path,
             )
+            
+            # Reset epsilon if RESET_EPSILON environment variable is set OR reset flag file exists
+            # This handles both new experiments and late-joining clients
+            should_reset = False
+            reset_flag_file = None
+            scenario_info = None
+            
+            # Check environment variable first
+            if os.getenv("RESET_EPSILON", "false").lower() == "true":
+                should_reset = True
+                print(f"[Client {client_id}] RESET_EPSILON environment variable detected")
+                # Clear the environment variable so it doesn't reset again
+                os.environ["RESET_EPSILON"] = "false"
+            
+            # Check reset flag file (for Docker containers where env vars might not be passed)
+            # Check both Docker path (/shared_data) and local path
+            flag_paths = [
+                "/shared_data/reset_epsilon_flag.txt",  # Docker container path
+                "./shared_data/reset_epsilon_flag.txt",  # Local development path
+                os.path.join(os.path.dirname(__file__), "..", "..", "shared_data", "reset_epsilon_flag.txt")  # Alternative local path
+            ]
+            
+            for check_path in flag_paths:
+                if os.path.exists(check_path):
+                    reset_flag_file = check_path
+                    should_reset = True
+                    # Read scenario info from flag file
+                    try:
+                        with open(check_path, 'r') as f:
+                            content = f.read()
+                            # Parse scenario info
+                            for line in content.split('\n'):
+                                if line.startswith('scenario='):
+                                    scenario_info = line.split('=', 1)[1]
+                    except Exception as e:
+                        print(f"[Client {client_id}] Warning: Could not read flag file content: {e}")
+                    break
+            
+            # Check if we need to reset based on scenario change
+            if should_reset:
+                # Check if this is a new scenario (avoid resetting multiple times for same scenario)
+                last_scenario = getattr(self.rl_selector, 'last_scenario', None)
+                if scenario_info and scenario_info == last_scenario:
+                    print(f"[Client {client_id}] Already reset epsilon for scenario '{scenario_info}', skipping reset")
+                    should_reset = False
+                else:
+                    print(f"\n{'='*70}")
+                    print(f"[Client {client_id}] 🔄 RESETTING EPSILON TO 1.0")
+                    if scenario_info:
+                        print(f"[Client {client_id}]   New experiment scenario: {scenario_info}")
+                        if last_scenario:
+                            print(f"[Client {client_id}]   Previous scenario: {last_scenario}")
+                    print(f"[Client {client_id}]   Current epsilon before reset: {self.rl_selector.epsilon:.4f}")
+                    self.rl_selector.reset_epsilon(scenario=scenario_info)
+                    print(f"[Client {client_id}]   ✓ Epsilon reset to: {self.rl_selector.epsilon:.4f}")
+                    print(f"{'='*70}\n")
+                    
+                    # Save Q-table immediately to persist the reset and scenario tracking
+                    try:
+                        self.rl_selector.save_q_table()
+                    except Exception as e:
+                        print(f"[Client {client_id}] Warning: Could not save Q-table after epsilon reset: {e}")
+                
+                # Note: We DON'T delete the flag file here because:
+                # 1. Late-joining clients also need to reset epsilon
+                # 2. The flag file will be overwritten/cleaned when next experiment starts
+                # 3. Scenario tracking prevents multiple resets for the same scenario
+            
             self.env_manager = EnvironmentStateManager()
         else:
             self.rl_selector = None
@@ -1775,8 +1843,8 @@ class UnifiedFLClient_Emotion:
                     if USE_QL_CONVERGENCE and q_converged:
                         self.has_converged = True
                         print(f"[Client {self.client_id}] Q-learning convergence reached at round {self.current_round}")
-                        # Reset epsilon for potential re-exploration if network conditions change
-                        self.rl_selector.reset_epsilon()
+                        # NOTE: Do NOT reset epsilon here - epsilon should be reset when starting a NEW experiment/scenario
+                        # Epsilon reset happens at experiment start (via environment variable or experiment runner)
                         self._notify_convergence_to_server()
                         self._disconnect_after_convergence()
                         return

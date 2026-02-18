@@ -1579,10 +1579,23 @@ class UnifiedFederatedLearningServer:
             if existing_protocol == protocol:
                 print(f"[{protocol.upper()}] Client {client_id} already registered via {protocol} - ignoring duplicate")
                 return
+            
+            # Check if this is a late-joining client (training already started)
+            is_late_join = self.training_started
+            
             self.registered_clients[client_id] = protocol
             self.active_clients.add(client_id)
-            print(f"[{protocol.upper()}] Client {client_id} registered "
-                  f"({len(self.registered_clients)}/{self.num_clients})")
+            
+            if is_late_join:
+                print(f"[{protocol.upper()}] ⚡ LATE-JOINING Client {client_id} registered during training (round {self.current_round})")
+                print(f"[{protocol.upper()}]   Active clients: {len(self.active_clients)}/{self.num_clients}")
+                # Send current global model to late-joining client
+                if self.global_weights is not None:
+                    print(f"[{protocol.upper()}]   Sending current global model to late-joining client {client_id}")
+                    # The client will receive the model via its protocol handler
+            else:
+                print(f"[{protocol.upper()}] Client {client_id} registered "
+                      f"({len(self.registered_clients)}/{self.num_clients})")
             
             if not self.training_started and len(self.registered_clients) >= self.min_clients:
                 self.training_started = True
@@ -1730,7 +1743,7 @@ class UnifiedFederatedLearningServer:
             
             # Wait for all active clients only
             if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
-                print(f"[{protocol.upper()}] All {self.num_clients} metrics received! Triggering aggregate_metrics()")
+                print(f"[{protocol.upper()}] All {len(self.active_clients)} active client(s) metrics received! Triggering aggregate_metrics()")
                 self.aggregate_metrics()
     
     def distribute_initial_model(self):
@@ -1959,6 +1972,15 @@ class UnifiedFederatedLearningServer:
         """Aggregate client evaluation metrics"""
         if not self.client_metrics:
             return
+        
+        # Check if we still have active clients before aggregating
+        if len(self.active_clients) == 0:
+            print("[Server] No active clients remaining. Stopping training.")
+            self.converged = True
+            self.save_results()
+            self.signal_training_complete()
+            return
+        
         total_samples = sum(m['num_samples'] for m in self.client_metrics.values())
         
         # Weighted average
@@ -1972,14 +1994,20 @@ class UnifiedFederatedLearningServer:
         print(f"\nRound {self.current_round} Results:")
         print(f"  Avg Loss: {avg_loss:.4f}")
         print(f"  Avg Accuracy: {avg_accuracy:.4f}")
+        print(f"  Active clients: {len(self.active_clients)}/{self.num_clients}")
         
         # Clear metrics
         self.client_metrics.clear()
         
-        # Continue to next round
+        # Continue to next round ONLY if we still have active clients
         self.current_round += 1
         
-        if self.current_round <= self.num_rounds:
+        if len(self.active_clients) == 0:
+            print("[Server] All clients converged. Stopping training.")
+            self.converged = True
+            self.save_results()
+            self.signal_training_complete()
+        elif self.current_round <= self.num_rounds:
             time.sleep(1)
             self.signal_start_training()
         else:
