@@ -45,6 +45,9 @@ Dataset/
 *.xlsx
 *.xls
 
+# Database Files
+*.db
+
 # Model Files
 *.h5
 *.pkl

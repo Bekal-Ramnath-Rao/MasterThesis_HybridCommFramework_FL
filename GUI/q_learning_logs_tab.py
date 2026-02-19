@@ -6,6 +6,7 @@ Reads from shared_data/q_learning_client_{id}.db (same as packet_logger layout).
 import sys
 import sqlite3
 import os
+import glob
 from datetime import datetime
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
@@ -247,6 +248,8 @@ class QLearningLogsTab(QWidget):
                 self,
                 "Reset Q-Table",
                 "This will reset the Q-table and clear all learned knowledge.\n\n"
+                "It will also delete Q-learning database files:\n"
+                "• q_learning_*.db\n\n"
                 "An Excel backup will be created automatically before reset.\n\n"
                 "Continue?",
                 QMessageBox.Yes | QMessageBox.No,
@@ -300,51 +303,115 @@ class QLearningLogsTab(QWidget):
                         "No Q-learning data found to backup. Proceeding with reset anyway..."
                     )
             except Exception as e:
-                QMessageBox.warning(
+                backup_reply = QMessageBox.warning(
                     self,
                     "Backup Warning",
                     f"Could not create Excel backup: {e}\n\nProceed with reset anyway?",
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.No
                 )
-                if QMessageBox.No:
+                if backup_reply == QMessageBox.No:
                     return
-        
-        # Now reset Q-tables for all clients
-        try:
-            import glob
+        else:
+            # No data to backup, but still ask for confirmation to delete databases
+            reply = QMessageBox.question(
+                self,
+                "Reset Q-Table",
+                "This will reset the Q-table and delete Q-learning database files:\n"
+                "• q_learning_*.db\n\n"
+                "Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
             
+            if reply == QMessageBox.No:
+                return
+        
+        # Now reset Q-tables and database files for all clients
+        try:
             # Find all Q-table files
             q_table_patterns = [
                 os.path.join(shared, "q_table_*.pkl"),
                 os.path.join(os.path.dirname(shared), "q_table_*.pkl"),  # Also check parent dir
             ]
             
-            deleted_count = 0
+            # Find all Q-learning database files to delete (only Q-learning, not packet logs)
+            db_patterns = [
+                os.path.join(shared, 'q_learning_*.db'),
+                os.path.join(shared, 'q_learning.db')
+            ]
+            
+            deleted_q_tables = []
+            deleted_databases = []
+            failed_deletions = []
+            
+            # Delete Q-table pickle files
             for pattern in q_table_patterns:
                 for q_table_path in glob.glob(pattern):
                     try:
                         os.remove(q_table_path)
-                        deleted_count += 1
+                        deleted_q_tables.append(os.path.basename(q_table_path))
                         print(f"[Q-Learning] Deleted Q-table: {q_table_path}")
                     except Exception as e:
+                        failed_deletions.append((os.path.basename(q_table_path), str(e)))
                         print(f"[Q-Learning] Warning: Could not delete {q_table_path}: {e}")
             
-            if deleted_count > 0:
+            # Delete database files
+            for pattern in db_patterns:
+                for db_file in glob.glob(pattern):
+                    try:
+                        os.remove(db_file)
+                        deleted_databases.append(os.path.basename(db_file))
+                        print(f"[Q-Learning] Deleted database: {db_file}")
+                    except Exception as e:
+                        failed_deletions.append((os.path.basename(db_file), str(e)))
+                        print(f"[Q-Learning] Warning: Could not delete {db_file}: {e}")
+            
+            # Show summary message
+            total_deleted = len(deleted_q_tables) + len(deleted_databases)
+            if total_deleted > 0:
+                message = f"Reset complete!\n\n"
+                if deleted_q_tables:
+                    message += f"Deleted {len(deleted_q_tables)} Q-table file(s):\n"
+                    for f in deleted_q_tables[:5]:  # Show first 5
+                        message += f"  • {f}\n"
+                    if len(deleted_q_tables) > 5:
+                        message += f"  ... and {len(deleted_q_tables) - 5} more\n"
+                    message += "\n"
+                if deleted_databases:
+                    message += f"Deleted {len(deleted_databases)} database file(s):\n"
+                    for f in deleted_databases[:5]:  # Show first 5
+                        message += f"  • {f}\n"
+                    if len(deleted_databases) > 5:
+                        message += f"  ... and {len(deleted_databases) - 5} more\n"
+                    message += "\n"
+                message += f"Next experiment will start with fresh Q-table and databases.\n\n"
+                if backup_path:
+                    message += f"Excel backup saved to:\n{backup_path}"
+                
                 QMessageBox.information(
                     self,
                     "Reset Complete",
-                    f"Q-table reset complete!\n\n"
-                    f"Deleted {deleted_count} Q-table file(s).\n"
-                    f"Next experiment will start with fresh Q-table.\n\n"
-                    f"Excel backup saved to: {backup_path if backup_path else 'N/A (no data to backup)'}"
+                    message
                 )
             else:
                 QMessageBox.information(
                     self,
                     "Reset Complete",
-                    "No Q-table files found to delete.\n"
-                    "Next experiment will start with fresh Q-table."
+                    "No Q-table or database files found to delete.\n"
+                    "Next experiment will start with fresh Q-table and databases."
+                )
+            
+            if failed_deletions:
+                failed_msg = f"Failed to delete {len(failed_deletions)} file(s):\n"
+                for fname, err in failed_deletions[:5]:
+                    failed_msg += f"  • {fname}: {err}\n"
+                if len(failed_deletions) > 5:
+                    failed_msg += f"  ... and {len(failed_deletions) - 5} more\n"
+                QMessageBox.warning(
+                    self,
+                    "Some Files Failed",
+                    failed_msg
                 )
             
             # Refresh the display
@@ -354,7 +421,7 @@ class QLearningLogsTab(QWidget):
             QMessageBox.critical(
                 self,
                 "Reset Error",
-                f"Error resetting Q-table: {e}"
+                f"Error resetting Q-table and databases: {e}"
             )
 
 

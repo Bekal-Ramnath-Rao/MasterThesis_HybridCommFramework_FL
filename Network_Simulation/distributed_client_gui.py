@@ -9,6 +9,7 @@ import os
 import json
 import subprocess
 import threading
+import glob
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
@@ -101,6 +102,10 @@ class DistributedClientGUI(QMainWindow):
         # Control Buttons
         control_layout = self.create_control_buttons()
         main_layout.addLayout(control_layout)
+        
+        # Database Management
+        db_group = self.create_database_management()
+        main_layout.addWidget(db_group)
         
         # Status and Logs
         log_group = self.create_log_section()
@@ -211,6 +216,16 @@ class DistributedClientGUI(QMainWindow):
         self.gpu_enabled.setStyleSheet("padding: 5px; font-size: 12px;")
         layout.addWidget(self.gpu_enabled, 3, 0, 1, 2)
         
+        # Q-Learning Convergence Training (only for RL-Unified)
+        self.ql_convergence_enabled = QCheckBox("Train until Q-value converges (RL-Unified only)")
+        self.ql_convergence_enabled.setStyleSheet("padding: 5px; font-size: 12px;")
+        self.ql_convergence_enabled.setToolTip("When enabled, training continues until Q-learning values converge instead of accuracy-based convergence")
+        layout.addWidget(self.ql_convergence_enabled, 4, 0, 1, 2)
+        
+        # Update checkbox state when protocol mode changes
+        self.protocol_mode.currentIndexChanged.connect(self.update_ql_convergence_visibility)
+        self.update_ql_convergence_visibility()
+        
         group.setLayout(layout)
         return group
     
@@ -317,6 +332,46 @@ class DistributedClientGUI(QMainWindow):
         layout.addStretch()
         
         return layout
+    
+    def create_database_management(self):
+        """Create database management section"""
+        group = QGroupBox("🗄️ Database Management")
+        group.setStyleSheet(self.get_group_style())
+        layout = QHBoxLayout()
+        
+        self.reset_db_btn = QPushButton("🗑️ Reset Databases")
+        self.reset_db_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #ff6b6b;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 10px 20px;
+                border-radius: 6px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #ee5a6f; }
+            QPushButton:pressed { background-color: #dc4a5f; }
+        """)
+        self.reset_db_btn.clicked.connect(self.reset_databases)
+        self.reset_db_btn.setToolTip("Delete all packet_logs and q_learning database files from shared_data directory")
+        
+        info_label = QLabel("This will delete all existing database files (packet_logs_*.db and q_learning_*.db)")
+        info_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
+        
+        layout.addWidget(self.reset_db_btn)
+        layout.addWidget(info_label)
+        layout.addStretch()
+        
+        group.setLayout(layout)
+        return group
+    
+    def update_ql_convergence_visibility(self):
+        """Update Q-learning convergence checkbox visibility based on protocol mode"""
+        is_rl_unified = (self.protocol_mode.currentData() == "rl_unified")
+        self.ql_convergence_enabled.setEnabled(is_rl_unified)
+        if not is_rl_unified:
+            self.ql_convergence_enabled.setChecked(False)
     
     def create_log_section(self):
         """Create log and status section"""
@@ -469,6 +524,9 @@ class DistributedClientGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Please enter server IP address!")
             return
         
+        # Determine if using unified or single protocol
+        is_unified = (protocol == "rl_unified")
+        
         # Confirm
         reply = QMessageBox.question(
             self,
@@ -479,7 +537,8 @@ class DistributedClientGUI(QMainWindow):
             f"Use Case: {use_case}\n"
             f"Protocol: {protocol}\n"
             f"Network: {network_scenario}\n"
-            f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n\n"
+            f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
+            f"Q-Learning Convergence: {'Enabled' if (is_unified and self.ql_convergence_enabled.isChecked()) else 'Disabled'}\n\n"
             f"Continue?",
             QMessageBox.Yes | QMessageBox.No
         )
@@ -489,9 +548,6 @@ class DistributedClientGUI(QMainWindow):
         
         # Build docker run command
         container_name = f"fl-client-{client_id}-distributed"
-        
-        # Determine if using unified or single protocol
-        is_unified = (protocol == "rl_unified")
         
         # Build image name - Use client-1 image as template for distributed clients
         # (The numbered images are identical, just built separately for docker-compose)
@@ -570,6 +626,13 @@ class DistributedClientGUI(QMainWindow):
                 "-e", "USE_RL_SELECTION=true",
                 "-e", "ENABLE_METRICS=true"
             ])
+            # Add Q-learning convergence option if enabled
+            if self.ql_convergence_enabled.isChecked():
+                cmd.extend([
+                    "-e", "USE_QL_CONVERGENCE=true",
+                    "-e", "Q_CONVERGENCE_THRESHOLD=0.01",
+                    "-e", "Q_CONVERGENCE_PATIENCE=5"
+                ])
         else:
             cmd.extend([
                 "-e", f"PROTOCOL={protocol.upper()}"
@@ -863,6 +926,83 @@ class DistributedClientGUI(QMainWindow):
         # Run in background thread
         thread = threading.Thread(target=run_rebuild, daemon=True)
         thread.start()
+    
+    def reset_databases(self):
+        """Reset/delete all database files"""
+        reply = QMessageBox.question(
+            self,
+            "Reset Databases",
+            "This will delete ALL database files:\n\n"
+            "- packet_logs_server.db\n"
+            "- packet_logs_client_*.db\n"
+            "- q_learning_client_*.db\n\n"
+            "This action cannot be undone!\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply == QMessageBox.No:
+            return
+        
+        # Find shared_data directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        shared_data_dir = os.path.join(os.path.dirname(script_dir), 'shared_data')
+        
+        if not os.path.exists(shared_data_dir):
+            QMessageBox.warning(
+                self,
+                "Directory Not Found",
+                f"shared_data directory not found at:\n{shared_data_dir}\n\n"
+                f"Databases may not have been created yet."
+            )
+            return
+        
+        deleted_files = []
+        failed_files = []
+        
+        # Find and delete all database files
+        db_patterns = [
+            os.path.join(shared_data_dir, 'packet_logs_*.db'),
+            os.path.join(shared_data_dir, 'q_learning_*.db'),
+            os.path.join(shared_data_dir, 'q_learning.db'),
+            os.path.join(shared_data_dir, 'packet_logs.db')
+        ]
+        
+        for pattern in db_patterns:
+            for db_file in glob.glob(pattern):
+                try:
+                    os.remove(db_file)
+                    deleted_files.append(os.path.basename(db_file))
+                    self.log_text.append(f"✅ Deleted: {os.path.basename(db_file)}\n")
+                except Exception as e:
+                    failed_files.append((os.path.basename(db_file), str(e)))
+                    self.log_text.append(f"❌ Failed to delete {os.path.basename(db_file)}: {str(e)}\n")
+        
+        if deleted_files:
+            QMessageBox.information(
+                self,
+                "Databases Reset",
+                f"Successfully deleted {len(deleted_files)} database file(s):\n\n"
+                + "\n".join(deleted_files[:10])  # Show first 10 files
+                + (f"\n... and {len(deleted_files) - 10} more" if len(deleted_files) > 10 else "")
+            )
+            self.log_text.append(f"\n✅ Database reset complete. Deleted {len(deleted_files)} file(s).\n\n")
+        else:
+            QMessageBox.information(
+                self,
+                "No Databases Found",
+                "No database files found to delete.\n\n"
+                "Databases are created when containers start running."
+            )
+        
+        if failed_files:
+            QMessageBox.warning(
+                self,
+                "Some Files Failed",
+                f"Failed to delete {len(failed_files)} file(s).\n\n"
+                "Check logs for details."
+            )
     
     def closeEvent(self, event):
         """Handle window close"""

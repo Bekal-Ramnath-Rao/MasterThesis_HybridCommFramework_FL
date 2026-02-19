@@ -2439,6 +2439,11 @@ if HTTP3_AVAILABLE:
 # =========================================================================
 
 if QUIC_AVAILABLE:
+    def _parse_quic_message(message_data: bytes):
+        """Parse JSON message in thread (avoids blocking event loop on large payloads)."""
+        data_str = message_data.decode('utf-8')
+        return json.loads(data_str)
+
     class QUICServerProtocol(QuicConnectionProtocol):
         """QUIC protocol handler (supports multiple clients)"""
         
@@ -2447,6 +2452,26 @@ if QUIC_AVAILABLE:
             self.server = None  # Set by factory function
             self._stream_buffers = {}  # Buffer data per stream ID (instance-specific)
             print(f"[QUIC] Protocol instance created")
+        
+        async def _process_parsed_message(self, message_data: bytes, stream_id: int):
+            """Parse message in executor (non-blocking) and dispatch. Prevents event loop
+            blocking from large JSON parsing, which was causing the second client's QUIC
+            update to never be received when both clients sent updates simultaneously."""
+            try:
+                loop = asyncio.get_event_loop()
+                message = await loop.run_in_executor(None, _parse_quic_message, message_data)
+                print(f"[QUIC] Decoded message type '{message.get('type')}' from stream {stream_id}")
+                log_received_packet(
+                    packet_size=len(message_data),
+                    peer=f"quic_client_{message.get('client_id', 'unknown')}",
+                    protocol="QUIC",
+                    round=message.get('round', 0),
+                    extra_info=message.get('type', 'unknown')
+                )
+                if self.server:
+                    await self.server.handle_quic_message(message, self)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                print(f"[QUIC] Error decoding message: {e}")
         
         def quic_event_received(self, event):
             """Handle QUIC events"""
@@ -2464,49 +2489,19 @@ if QUIC_AVAILABLE:
                     self.transmit()
                     
                     # Try to decode complete messages (delimited by newline)
+                    # NOTE: Schedule parsing in executor - json.loads on ~12MB blocks the
+                    # event loop and prevents processing the second client's packets.
                     while b'\n' in self._stream_buffers[stream_id]:
                         message_data, self._stream_buffers[stream_id] = self._stream_buffers[stream_id].split(b'\n', 1)
                         if message_data:
-                            try:
-                                data_str = message_data.decode('utf-8')
-                                message = json.loads(data_str)
-                                print(f"[QUIC] Decoded message type '{message.get('type')}' from stream {stream_id}")
-                                
-                                log_received_packet(
-                                    packet_size=len(data_str),
-                                    peer=f"quic_client_{message.get('client_id', 'unknown')}",
-                                    protocol="QUIC",
-                                    round=message.get('round', 0),
-                                    extra_info=message.get('type', 'unknown')
-                                )
-                                
-                                # Handle message asynchronously
-                                if self.server:
-                                    asyncio.create_task(self.server.handle_quic_message(message, self))
-                            except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                                print(f"[QUIC] Error decoding message: {e}")
+                            asyncio.create_task(self._process_parsed_message(message_data, stream_id))
                     
                     # If stream ended and buffer has remaining data, try to process it
                     if event.end_stream and self._stream_buffers[stream_id]:
                         print(f"[QUIC] Stream {stream_id} ended with {len(self._stream_buffers[stream_id])} bytes remaining")
-                        try:
-                            data_str = self._stream_buffers[stream_id].decode('utf-8')
-                            message = json.loads(data_str)
-                            print(f"[QUIC] Decoded end-of-stream message type '{message.get('type')}'")
-                            
-                            log_received_packet(
-                                packet_size=len(data_str),
-                                peer=f"quic_client_{message.get('client_id', 'unknown')}",
-                                protocol="QUIC",
-                                round=message.get('round', 0),
-                                extra_info=message.get('type', 'unknown')
-                            )
-                            
-                            if self.server:
-                                asyncio.create_task(self.server.handle_quic_message(message, self))
-                            self._stream_buffers[stream_id] = b''
-                        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                            print(f"[QUIC] Error decoding remaining buffer: {e}")
+                        message_data = self._stream_buffers[stream_id]
+                        self._stream_buffers[stream_id] = b''
+                        asyncio.create_task(self._process_parsed_message(message_data, stream_id))
                 except Exception as e:
                     print(f"[QUIC] Error handling event: {e}")
                     import traceback
