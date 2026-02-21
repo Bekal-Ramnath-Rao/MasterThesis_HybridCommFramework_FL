@@ -34,11 +34,15 @@ services:
       - CUDA_VISIBLE_DEVICES=0,1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.4
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - mqtt-broker
     networks:
       - temperature_network
     container_name: fl-server-mqtt-temperature
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-mqtt-temperature.pcap & python -u Server/Temperature_Regulation/FL_Server_MQTT.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -61,12 +65,16 @@ services:
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - mqtt-broker
       - fl-server-mqtt-temperature
     networks:
       - temperature_network
     container_name: fl-client-mqtt-temperature-1
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-mqtt-temperature-1.pcap & python -u Client/Temperature_Regulation/FL_Client_MQTT.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -89,12 +97,16 @@ services:
       - GPU_DEVICE_ID=1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - mqtt-broker
       - fl-server-mqtt-temperature
     networks:
       - temperature_network
     container_name: fl-client-mqtt-temperature-2
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-mqtt-temperature-2.pcap & python -u Client/Temperature_Regulation/FL_Client_MQTT.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -133,11 +145,15 @@ services:
       - CUDA_VISIBLE_DEVICES=0,1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.4
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - amqp-broker
     networks:
       - temperature_network
     container_name: fl-server-amqp-temperature
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-amqp-temperature.pcap & python -u Server/Temperature_Regulation/FL_Server_AMQP.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -160,12 +176,16 @@ services:
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - amqp-broker
       - fl-server-amqp-temperature
     networks:
       - temperature_network
     container_name: fl-client-amqp-temperature-1
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-amqp-temperature-1.pcap & python -u Client/Temperature_Regulation/FL_Client_AMQP.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -188,12 +208,16 @@ services:
       - GPU_DEVICE_ID=1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - amqp-broker
       - fl-server-amqp-temperature
     networks:
       - temperature_network
     container_name: fl-client-amqp-temperature-2
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-amqp-temperature-2.pcap & python -u Client/Temperature_Regulation/FL_Client_AMQP.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -220,11 +244,15 @@ services:
       - CUDA_VISIBLE_DEVICES=0,1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.4
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     ports:
       - "50051:50051"
     networks:
       - temperature_network
     container_name: fl-server-grpc-temperature
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-grpc-temperature.pcap & python -u Server/Temperature_Regulation/FL_Server_gRPC.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -247,11 +275,15 @@ services:
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - fl-server-grpc-temperature
     networks:
       - temperature_network
     container_name: fl-client-grpc-temperature-1
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-grpc-temperature-1.pcap & python -u Client/Temperature_Regulation/FL_Client_gRPC.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -274,11 +306,15 @@ services:
       - GPU_DEVICE_ID=1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - fl-server-grpc-temperature
     networks:
       - temperature_network
     container_name: fl-client-grpc-temperature-2
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-grpc-temperature-2.pcap & python -u Client/Temperature_Regulation/FL_Client_gRPC.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -305,11 +341,15 @@ services:
       - CUDA_VISIBLE_DEVICES=0,1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.4
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     ports:
       - "4433:4433/udp"
     networks:
       - temperature_network
     container_name: fl-server-quic-temperature
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-quic-temperature.pcap & python -u Server/Temperature_Regulation/FL_Server_QUIC.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -332,11 +372,15 @@ services:
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - fl-server-quic-temperature
     networks:
       - temperature_network
     container_name: fl-client-quic-temperature-1
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-quic-temperature-1.pcap & python -u Client/Temperature_Regulation/FL_Client_QUIC.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -359,11 +403,15 @@ services:
       - GPU_DEVICE_ID=1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - fl-server-quic-temperature
     networks:
       - temperature_network
     container_name: fl-client-quic-temperature-2
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-quic-temperature-2.pcap & python -u Client/Temperature_Regulation/FL_Client_QUIC.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -394,17 +442,19 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     ports:
       - "4434:4434"
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../certs:/app/certs:ro
       - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
     networks:
       - temperature_network
     container_name: fl-server-http3-temperature
-    command: python -u Server/Temperature_Regulation/FL_Server_HTTP3.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-http3-temperature.pcap & python -u Server/Temperature_Regulation/FL_Server_HTTP3.py"]
     # Server runs on CPU to avoid competing for GPU memory with clients
 
   fl-client-http3-temperature-1:
@@ -427,6 +477,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     depends_on:
@@ -434,7 +485,9 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-http3-temperature-1
-    command: python -u Client/Temperature_Regulation/FL_Client_HTTP3.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-http3-temperature-1.pcap & python -u Client/Temperature_Regulation/FL_Client_HTTP3.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -463,6 +516,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     depends_on:
@@ -470,7 +524,9 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-http3-temperature-2
-    command: python -u Client/Temperature_Regulation/FL_Client_HTTP3.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-http3-temperature-2.pcap & python -u Client/Temperature_Regulation/FL_Client_HTTP3.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -496,11 +552,15 @@ services:
       - CUDA_VISIBLE_DEVICES=0,1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.4
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     networks:
       - temperature_network
     container_name: fl-server-dds-temperature
     cap_add:
       - NET_ADMIN
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-dds-temperature.pcap & python -u Server/Temperature_Regulation/FL_Server_DDS.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -522,6 +582,7 @@ services:
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - fl-server-dds-temperature
     networks:
@@ -529,6 +590,9 @@ services:
     container_name: fl-client-dds-temperature-1
     cap_add:
       - NET_ADMIN
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-dds-temperature-1.pcap & python -u Client/Temperature_Regulation/FL_Client_DDS.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:
@@ -550,6 +614,7 @@ services:
       - GPU_DEVICE_ID=1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - fl-server-dds-temperature
     networks:
@@ -557,6 +622,9 @@ services:
     container_name: fl-client-dds-temperature-2
     cap_add:
       - NET_ADMIN
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-dds-temperature-2.pcap & python -u Client/Temperature_Regulation/FL_Client_DDS.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     deploy:
       resources:
         reservations:

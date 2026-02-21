@@ -91,6 +91,13 @@ class LogMonitor(QThread):
                     break
                 if line:
                     self.log_update.emit(self.log_type, line)
+        except Exception as e:
+            self.log_update.emit(self.log_type, f"Log Error: {str(e)}\n")
+
+    def stop(self):
+        self.running = False
+        if self.process:
+            self.process.terminate()
 
 
 class GenerateExcelLogsWorker(QThread):
@@ -120,15 +127,6 @@ class GenerateExcelLogsWorker(QThread):
             self.finished.emit(False, "", "Generate Excel logs timed out (10 min).")
         except Exception as e:
             self.finished.emit(False, "", str(e))
-
-                    
-        except Exception as e:
-            self.log_update.emit(self.log_type, f"Log Error: {str(e)}\n")
-    
-    def stop(self):
-        self.running = False
-        if self.process:
-            self.process.terminate()
 
 
 class NetworkController(QThread):

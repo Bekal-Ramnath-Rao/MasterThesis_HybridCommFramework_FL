@@ -38,16 +38,18 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/Emotion_Recognition/packet_logger.db:/app/Server/Emotion_Recognition/packet_logger.db
     depends_on:
       - mqtt-broker
     networks:
       - emotion_network
     container_name: fl-server-mqtt-emotion
-    command: python -u Server/Emotion_Recognition/FL_Server_MQTT.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-mqtt-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_MQTT.py"]
     # Server does not need GPU resources - only aggregates models
 
   fl-client-mqtt-emotion-1:
@@ -78,7 +80,7 @@ services:
     networks:
       - emotion_network
     container_name: fl-client-mqtt-emotion-1
-    command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-mqtt-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_MQTT.py"]
     deploy:
       resources:
         reservations:
@@ -87,6 +89,7 @@ services:
               driver: nvidia
               device_ids: ['0']
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/packet_logger.db:/app/Client/Emotion_Recognition/packet_logger.db
 
   fl-client-mqtt-emotion-2:
@@ -109,6 +112,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     depends_on:
@@ -117,7 +121,7 @@ services:
     networks:
       - emotion_network
     container_name: fl-client-mqtt-emotion-2
-    command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-mqtt-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_MQTT.py"]
     deploy:
       resources:
         reservations:
@@ -126,6 +130,7 @@ services:
               driver: nvidia
               device_ids: ['0']
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/packet_logger.db:/app/Client/Emotion_Recognition/packet_logger.db
 
   # ============================================================================
@@ -164,6 +169,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     depends_on:
@@ -171,7 +177,9 @@ services:
     networks:
       - emotion_network
     container_name: fl-server-amqp-emotion
-    command: python -u Server/Emotion_Recognition/FL_Server_AMQP.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-amqp-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_AMQP.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     # Server does not need GPU resources - only aggregates models
 
   fl-client-amqp-emotion-1:
@@ -204,7 +212,7 @@ services:
     networks:
       - emotion_network
     container_name: fl-client-amqp-emotion-1
-    command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-amqp-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_AMQP.py"]
     deploy:
       resources:
         reservations:
@@ -212,6 +220,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../experiment_results:/app/experiment_results
 
   fl-client-amqp-emotion-2:
     build:
@@ -243,7 +253,7 @@ services:
     networks:
       - emotion_network
     container_name: fl-client-amqp-emotion-2
-    command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-amqp-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_AMQP.py"]
     deploy:
       resources:
         reservations:
@@ -251,6 +261,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../experiment_results:/app/experiment_results
 
   # ============================================================================
   # gRPC Protocol Services
@@ -273,6 +285,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     ports:
@@ -280,7 +293,9 @@ services:
     networks:
       - emotion_network
     container_name: fl-server-grpc-emotion
-    command: python -u Server/Emotion_Recognition/FL_Server_gRPC.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-grpc-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_gRPC.py"]
+    volumes:
+      - ../experiment_results:/app/experiment_results
     # Server does not need GPU resources - only aggregates models
 
   fl-client-grpc-emotion-1:
@@ -303,6 +318,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     depends_on:
@@ -310,7 +326,7 @@ services:
     networks:
       - emotion_network
     container_name: fl-client-grpc-emotion-1
-    command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-grpc-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_gRPC.py"]
     deploy:
       resources:
         reservations:
@@ -318,6 +334,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../experiment_results:/app/experiment_results
 
   fl-client-grpc-emotion-2:
     build:
@@ -339,6 +357,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     depends_on:
@@ -346,7 +365,7 @@ services:
     networks:
       - emotion_network
     container_name: fl-client-grpc-emotion-2
-    command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-grpc-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_gRPC.py"]
     deploy:
       resources:
         reservations:
@@ -354,6 +373,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../experiment_results:/app/experiment_results
 
   # ============================================================================
   # QUIC Protocol Services
@@ -376,16 +397,18 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     ports:
       - "4433:4433/udp"
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../certs:/app/certs:ro
     networks:
       - emotion_network
     container_name: fl-server-quic-emotion
-    command: python -u Server/Emotion_Recognition/FL_Server_QUIC.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-quic-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_QUIC.py"]
     # Server runs on CPU to avoid competing for GPU memory with clients
 
   fl-client-quic-emotion-1:
@@ -408,6 +431,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     depends_on:
@@ -415,7 +439,7 @@ services:
     networks:
       - emotion_network
     container_name: fl-client-quic-emotion-1
-    command: python -u Client/Emotion_Recognition/FL_Client_QUIC.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-quic-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_QUIC.py"]
     deploy:
       resources:
         reservations:
@@ -423,6 +447,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../experiment_results:/app/experiment_results
 
   fl-client-quic-emotion-2:
     build:
@@ -444,6 +470,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     depends_on:
@@ -451,7 +478,7 @@ services:
     networks:
       - emotion_network
     container_name: fl-client-quic-emotion-2
-    command: python -u Client/Emotion_Recognition/FL_Client_QUIC.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-quic-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_QUIC.py"]
     deploy:
       resources:
         reservations:
@@ -459,6 +486,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../experiment_results:/app/experiment_results
 
   # ============================================================================
   # HTTP/3 Protocol Services
@@ -482,17 +511,19 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     ports:
       - "4434:4434"
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../certs:/app/certs:ro
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
     networks:
       - emotion_network
     container_name: fl-server-http3-emotion
-    command: python -u Server/Emotion_Recognition/FL_Server_HTTP3.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-http3-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_HTTP3.py"]
     # Server runs on CPU to avoid competing for GPU memory with clients
 
   fl-client-http3-emotion-1:
@@ -515,6 +546,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     depends_on:
@@ -522,7 +554,7 @@ services:
     networks:
       - emotion_network
     container_name: fl-client-http3-emotion-1
-    command: python -u Client/Emotion_Recognition/FL_Client_HTTP3.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-http3-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_HTTP3.py"]
     deploy:
       resources:
         reservations:
@@ -530,6 +562,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../experiment_results:/app/experiment_results
 
   fl-client-http3-emotion-2:
     build:
@@ -551,6 +585,7 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     cap_add:
       - NET_ADMIN
     depends_on:
@@ -558,7 +593,7 @@ services:
     networks:
       - emotion_network
     container_name: fl-client-http3-emotion-2
-    command: python -u Client/Emotion_Recognition/FL_Client_HTTP3.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-http3-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_HTTP3.py"]
     deploy:
       resources:
         reservations:
@@ -566,6 +601,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../experiment_results:/app/experiment_results
 
   # ============================================================================
   # DDS Protocol Services
@@ -590,15 +627,17 @@ services:
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
       - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     networks:
       - emotion_network
     container_name: fl-server-dds-emotion
     cap_add:
       - NET_ADMIN
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
       - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
-    command: bash -c "sleep 10 && python -u Server/Emotion_Recognition/FL_Server_DDS.py"
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-dds-emotion.pcap & sleep 10 && python -u Server/Emotion_Recognition/FL_Server_DDS.py"]
     # Server does not need GPU resources - only aggregates models
 
   fl-client-dds-emotion-1:
@@ -621,6 +660,7 @@ services:
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
       - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - fl-server-dds-emotion
     networks:
@@ -629,9 +669,10 @@ services:
     cap_add:
       - NET_ADMIN
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
-    command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-dds-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_DDS.py"]
     deploy:
       resources:
         reservations:
@@ -660,6 +701,7 @@ services:
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
       - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     depends_on:
       - fl-server-dds-emotion
     networks:
@@ -668,9 +710,10 @@ services:
     cap_add:
       - NET_ADMIN
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
-    command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-dds-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_DDS.py"]
     deploy:
       resources:
         reservations:
