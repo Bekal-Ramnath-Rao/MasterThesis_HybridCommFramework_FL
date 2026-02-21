@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     iproute2 \
     cmake \
     git \
+    tcpdump \
     && rm -rf /var/lib/apt/lists/*
 
 # Install CycloneDDS C library from source

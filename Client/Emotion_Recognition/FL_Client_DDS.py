@@ -682,6 +682,9 @@ class FederatedLearningClient:
         print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
         time.sleep(delay)
         
+        payload_bytes = len(serialized_weights)
+        send_start_ts = time.time()
+        send_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
         # Send model update to server using chunking
         self.send_model_update_chunked(
             self.current_round,
@@ -690,7 +693,9 @@ class FederatedLearningClient:
             float(final_loss),
             float(final_accuracy)
         )
-        
+        if send_start_cpu is not None:
+            O_send = time.perf_counter() - send_start_cpu
+            print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={payload_bytes} send_start_ts={send_start_ts:.9f}")
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
         print(f"Training metrics - Loss: {final_loss:.4f}, Accuracy: {final_accuracy:.4f}")
         

@@ -617,20 +617,30 @@ class FederatedLearningClient:
             "metrics": metrics
         }
         
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            send_start_ts = time.time()
+            send_start_cpu = time.perf_counter()
+            update_message["diagnostic_send_start_ts"] = send_start_ts
+        
         # Introduce random delay before sending model update
         delay = random.uniform(0.5, 3.0)  # Random delay between 0.5 and 3.0 seconds
         print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
         time.sleep(delay)
         
+        payload = json.dumps(update_message)
         # Publish with retry logic
         if self.publish_with_retry(
             exchange=EXCHANGE_CLIENT_UPDATES,
             routing_key='client.update',
-            body=json.dumps(update_message),
+            body=payload,
             properties=pika.BasicProperties(delivery_mode=2)
         ):
+            if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+                send_end_cpu = time.perf_counter()
+                O_send = send_end_cpu - send_start_cpu
+                print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={len(payload)} send_start_ts={send_start_ts:.9f}")
             log_sent_packet(
-                packet_size=len(json.dumps(update_message)),
+                packet_size=len(payload),
                 peer=EXCHANGE_CLIENT_UPDATES,
                 protocol="AMQP",
                 round=self.current_round,

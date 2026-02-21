@@ -383,6 +383,9 @@ class FederatedLearningClient:
                 "val_accuracy": float(history.history["val_accuracy"][-1])
             }
             
+            send_start_ts = time.time()
+            send_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
+            
             # Random delay before sending
             delay = random.uniform(0.5, 3.0)
             print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
@@ -403,6 +406,10 @@ class FederatedLearningClient:
                     }
                 )
             )
+            
+            if send_start_cpu is not None:
+                O_send = time.perf_counter() - send_start_cpu
+                print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={len(serialized_weights)} send_start_ts={send_start_ts:.9f}")
             
             if response.success:
                 print(f"Client {self.client_id} successfully sent update for round {self.current_round}")

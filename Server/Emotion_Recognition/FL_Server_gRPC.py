@@ -191,6 +191,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
     
     def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        do_aggregate_metrics = False
+        do_aggregate_updates = False
         with self.lock:
             if client_id in self.active_clients:
                 self.active_clients.remove(client_id)
@@ -204,6 +206,16 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     self.evaluation_phase = False
                     self.converged = True
                     print("All clients converged. Ending training.")
+                else:
+                    # Re-check: remaining active clients may have already sent metrics/updates
+                    if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
+                        do_aggregate_metrics = True
+                    if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
+                        do_aggregate_updates = True
+        if do_aggregate_metrics:
+            threading.Thread(target=self.aggregate_metrics).start()
+        if do_aggregate_updates:
+            threading.Thread(target=self.aggregate_updates).start()
 
     def GetTrainingConfig(self, request, context):
         """Send training configuration to client"""
@@ -247,6 +259,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
     
     def SendModelUpdate(self, request, context):
         """Receive model update from client"""
+        recv_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
         with self.lock:
             client_id = request.client_id
             round_num = request.round
@@ -275,6 +288,11 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     weights = self.deserialize_weights(request.weights)
             else:
                 weights = None
+            
+            if recv_start_cpu is not None:
+                O_recv = time.perf_counter() - recv_start_cpu
+                recv_end_ts = time.time()
+                print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={recv_end_ts:.9f}")
             
             # Extract metrics from map
             metrics = dict(request.metrics)

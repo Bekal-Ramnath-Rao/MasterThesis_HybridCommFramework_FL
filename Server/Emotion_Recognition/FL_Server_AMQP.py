@@ -301,9 +301,18 @@ class FederatedLearningServer:
                 self.plot_results()
                 self.save_results()
                 self.stop()
+                return
+            # Re-check: remaining active clients may have already sent metrics/updates
+            if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
+                self.aggregate_metrics()
+                self.continue_training()
+                return
+            if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
+                self.aggregate_models()
     
     def on_client_update(self, ch, method, properties, body):
         """Handle model update from client"""
+        recv_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
         log_received_packet(
             packet_size=len(body),
             peer=EXCHANGE_CLIENT_UPDATES,
@@ -338,6 +347,12 @@ class FederatedLearningServer:
                     print(f"Received and decompressed update from client {client_id}")
                 else:
                     weights = self.deserialize_weights(data['weights'])
+                
+                if recv_start_cpu is not None:
+                    O_recv = time.perf_counter() - recv_start_cpu
+                    recv_end_ts = time.time()
+                    send_start_ts = data.get("diagnostic_send_start_ts", recv_end_ts)
+                    print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={send_start_ts:.9f}")
                 
                 self.client_updates[client_id] = {
                     'weights': weights,

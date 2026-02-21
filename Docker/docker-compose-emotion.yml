@@ -32,16 +32,18 @@ services:
       - MQTT_BROKER=mqtt-broker
       - MQTT_PORT=1883
       - NUM_CLIENTS=2
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Server/Emotion_Recognition/FL_Server_MQTT.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-server-mqtt-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_MQTT.py"]
     networks:
       - fl-mqtt-network
     volumes:
+      - ./fl-network-logs:/logs
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
@@ -61,13 +63,15 @@ services:
       - MQTT_PORT=1883
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-mqtt-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_MQTT.py"]
     volumes:
+      - ./fl-network-logs:/logs
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-mqtt-network
@@ -94,8 +98,9 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-mqtt-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_MQTT.py"]
     volumes:
+      - ./fl-network-logs:/logs
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-mqtt-network
@@ -138,16 +143,18 @@ services:
       - AMQP_HOST=rabbitmq
       - AMQP_PORT=5672
       - NUM_CLIENTS=2
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Server/Emotion_Recognition/FL_Server_AMQP.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-server-amqp-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_AMQP.py"]
     networks:
       - fl-amqp-network
     volumes:
+      - ./fl-network-logs:/logs
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
@@ -166,13 +173,15 @@ services:
       - AMQP_PORT=5672
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-amqp-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_AMQP.py"]
     volumes:
+      - ./fl-network-logs:/logs
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-amqp-network
@@ -198,8 +207,9 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-amqp-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_AMQP.py"]
     volumes:
+      - ./fl-network-logs:/logs
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-amqp-network
@@ -222,16 +232,18 @@ services:
     environment:
       - GRPC_PORT=50051
       - NUM_CLIENTS=2
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Server/Emotion_Recognition/FL_Server_gRPC.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-server-grpc-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_gRPC.py"]
     networks:
       - fl-grpc-network
     volumes:
+      - ./fl-network-logs:/logs
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
@@ -250,13 +262,15 @@ services:
       - GRPC_PORT=50051
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-grpc-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_gRPC.py"]
     volumes:
+      - ./fl-network-logs:/logs
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../certs:/app/certs
     networks:
@@ -283,8 +297,9 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-grpc-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_gRPC.py"]
     volumes:
+      - ./fl-network-logs:/logs
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../certs:/app/certs
     networks:
@@ -309,16 +324,18 @@ services:
       - QUIC_HOST=0.0.0.0
       - QUIC_PORT=4433
       - NUM_CLIENTS=2
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Server/Emotion_Recognition/FL_Server_QUIC.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-server-quic-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_QUIC.py"]
     networks:
       - fl-quic-network
     volumes:
+      - ./fl-network-logs:/logs
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
       - ../certs:/app/certs
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
@@ -338,13 +355,15 @@ services:
       - QUIC_PORT=4433
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Emotion_Recognition/FL_Client_QUIC.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-quic-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_QUIC.py"]
     volumes:
+      - ./fl-network-logs:/logs
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../certs:/app/certs
     networks:
@@ -371,8 +390,9 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Emotion_Recognition/FL_Client_QUIC.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-quic-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_QUIC.py"]
     volumes:
+      - ./fl-network-logs:/logs
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../certs:/app/certs
     networks:
@@ -397,16 +417,18 @@ services:
       - HTTP3_HOST=0.0.0.0
       - HTTP3_PORT=4434
       - NUM_CLIENTS=2
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Server/Emotion_Recognition/FL_Server_HTTP3.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-server-http3-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_HTTP3.py"]
     networks:
       - fl-http3-network
     volumes:
+      - ./fl-network-logs:/logs
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
       - ../certs:/app/certs:ro
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
@@ -431,8 +453,9 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Emotion_Recognition/FL_Client_HTTP3.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-http3-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_HTTP3.py"]
     volumes:
+      - ./fl-network-logs:/logs
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../certs:/app/certs:ro
     networks:
@@ -459,8 +482,9 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Emotion_Recognition/FL_Client_HTTP3.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-http3-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_HTTP3.py"]
     volumes:
+      - ./fl-network-logs:/logs
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../certs:/app/certs:ro
     networks:
@@ -482,7 +506,8 @@ services:
     environment:
       - DDS_DOMAIN_ID=0
       - NUM_CLIENTS=2
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
@@ -512,6 +537,7 @@ services:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
       - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}

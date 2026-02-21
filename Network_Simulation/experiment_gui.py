@@ -435,7 +435,26 @@ class FLExperimentGUI(QMainWindow):
         """)
         self.clear_button.clicked.connect(self.clear_all_output)
         
+        self.diagnostic_pipeline_button = QPushButton("📊 Run Diagnostic Pipeline")
+        self.diagnostic_pipeline_button.setStyleSheet("""
+            QPushButton {
+                background-color: #6f42c1;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 12px 24px;
+                border-radius: 8px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #5a32a3; }
+            QPushButton:pressed { background-color: #4c2d8a; }
+            QPushButton:disabled { background-color: #6c757d; }
+        """)
+        self.diagnostic_pipeline_button.setToolTip("Run empirical overhead, network extraction, and analytical model for ONE selected protocol (MQTT, AMQP, gRPC, QUIC, or DDS). Single-protocol FL runs separately.")
+        self.diagnostic_pipeline_button.clicked.connect(self.start_diagnostic_pipeline)
+        
         control_layout.addWidget(self.start_button)
+        control_layout.addWidget(self.diagnostic_pipeline_button)
         control_layout.addWidget(self.stop_button)
         control_layout.addWidget(self.apply_network_button)
         control_layout.addWidget(self.clear_button)
@@ -1592,6 +1611,31 @@ class FLExperimentGUI(QMainWindow):
             self.output_tabs.addTab(ql_fallback, "🎓 Q-Learning")
             self.q_learning_logs_tab = None
 
+        # Tab: Diagnostic Pipeline Results (beside Q-Learning; filled when Run Diagnostic Pipeline completes)
+        from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
+        diag_tab = QWidget()
+        diag_layout = QVBoxLayout(diag_tab)
+        diag_layout.addWidget(QLabel("Diagnostic pipeline results (Empirical Overhead, Network Extraction, Analytical Model). Run \"Run Diagnostic Pipeline\" to populate."))
+        self.diagnostic_results_table = QTableWidget()
+        self.diagnostic_results_table.setColumnCount(8)
+        self.diagnostic_results_table.setHorizontalHeaderLabels([
+            "Client", "Protocol", "O_app (s)", "O_broker", "Loss (p)", "T_actual (s)", "T_calc (s)", "Error %"
+        ])
+        self.diagnostic_results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.diagnostic_results_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.diagnostic_results_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #222831;
+                color: #eee;
+                gridline-color: #444;
+                font-size: 12px;
+            }
+            QTableWidget::item { padding: 6px; }
+            QHeaderView::section { background-color: #393e46; color: #00adb5; padding: 8px; }
+        """)
+        diag_layout.addWidget(self.diagnostic_results_table)
+        self.output_tabs.addTab(diag_tab, "📊 Diagnostic Results")
+
         # Add Docker Build Logs tab
         self.docker_build_log_text = QTextEdit()
         self.docker_build_log_text.setReadOnly(True)
@@ -2089,6 +2133,64 @@ class FLExperimentGUI(QMainWindow):
         if reply == QMessageBox.No:
             return
         
+        self._run_command_common(command)
+    
+    def start_diagnostic_pipeline(self):
+        """Run diagnostic pipeline for the single selected protocol (separate from normal FL run)."""
+        protocols = self.get_selected_protocols()
+        pipeline_protocols = ["mqtt", "amqp", "grpc", "quic", "dds"]
+        if len(protocols) != 1:
+            QMessageBox.warning(
+                self,
+                "Diagnostic Pipeline",
+                "Please select exactly ONE protocol for the diagnostic pipeline.\n\n"
+                "Supported: MQTT, AMQP, gRPC, QUIC, DDS."
+            )
+            return
+        protocol = protocols[0].lower()
+        if protocol not in pipeline_protocols:
+            QMessageBox.warning(
+                self,
+                "Diagnostic Pipeline",
+                f"Diagnostic pipeline supports only: MQTT, AMQP, gRPC, QUIC, DDS.\n"
+                f"Selected: {protocol}. RL-Unified and HTTP/3 are not supported."
+            )
+            return
+        scenarios = self.get_selected_scenarios()
+        if len(scenarios) != 1:
+            QMessageBox.warning(
+                self,
+                "Diagnostic Pipeline",
+                "Please select exactly ONE network scenario for the diagnostic pipeline.\n\n"
+                "Phase 1 uses a clean channel (no losses). Phases 2–4 use the selected scenario."
+            )
+            return
+        scenario = scenarios[0].lower()
+        use_case = self.get_selected_use_case()
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = os.path.join(base_dir, "Network_Simulation", "diagnostic_pipeline.py")
+        command = f"python3 {script} --protocol {protocol} --use-case {use_case} --scenario {scenario}"
+        if self.gpu_enabled.isChecked():
+            command += " --enable-gpu"
+        reply = QMessageBox.question(
+            self,
+            "Run Diagnostic Pipeline",
+            f"Run diagnostic pipeline for:\n\n"
+            f"  Protocol: {protocol.upper()}\n"
+            f"  Use Case: {use_case}\n"
+            f"  Network scenario (Phases 2–4): {scenario}\n"
+            f"  GPU: {'Enabled (fallback to CPU if unavailable)' if self.gpu_enabled.isChecked() else 'Disabled'}\n\n"
+            f"  Phase 1: Calibration with NO channel losses (protocol & broker overhead only).\n"
+            f"  Phases 2–4: Apply scenario '{scenario}' → extract tc → lossy round → table.\n\n"
+            f"Continue?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.No:
+            return
+        self._run_command_common(command)
+    
+    def _run_command_common(self, command):
+        """Shared logic to run a command in the experiment thread."""
         # Clear all output
         self.clear_all_output()
         self.experiment_started_at = datetime.now()
@@ -2096,6 +2198,8 @@ class FLExperimentGUI(QMainWindow):
         
         # Update UI
         self.start_button.setEnabled(False)
+        if hasattr(self, 'diagnostic_pipeline_button'):
+            self.diagnostic_pipeline_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.progress_bar.show()
         self.statusBar().showMessage("🚀 Experiment running...")
@@ -2338,7 +2442,8 @@ class FLExperimentGUI(QMainWindow):
         self.dashboard_text.clear()
         self.server_log_text.clear()
         self.client_log_text.clear()
-        
+        if hasattr(self, "_diag_json_buffer"):
+            self._diag_json_buffer = ""
         # Add informative message
         self.server_log_text.append("📋 Server logs cleared. Waiting for new experiment to start...\n")
         self.client_log_text.append("📋 Client logs cleared. Waiting for new experiment to start...\n")
@@ -2346,10 +2451,58 @@ class FLExperimentGUI(QMainWindow):
     def update_output(self, text):
         """Update output console"""
         self._extract_results_dir_from_output(text)
+        # Parse diagnostic pipeline JSON (may arrive in one chunk or split across chunks)
+        if "FL_DIAG_TABLE_JSON|" in text:
+            json_str = text.split("FL_DIAG_TABLE_JSON|", 1)[1]
+            if not hasattr(self, "_diag_json_buffer"):
+                self._diag_json_buffer = ""
+            self._diag_json_buffer = json_str
+        elif getattr(self, "_diag_json_buffer", None):
+            self._diag_json_buffer += text
+        else:
+            self._diag_json_buffer = ""
+        if getattr(self, "_diag_json_buffer", None):
+            buf = self._diag_json_buffer.strip()
+            if buf:
+                try:
+                    summary = json.loads(buf)
+                    self.update_diagnostic_results_table(summary)
+                    self._diag_json_buffer = ""
+                except json.JSONDecodeError:
+                    # May be split across chunks or have trailing text; try first line only
+                    first_line = buf.split("\n")[0].strip()
+                    if first_line:
+                        try:
+                            summary = json.loads(first_line)
+                            self.update_diagnostic_results_table(summary)
+                            self._diag_json_buffer = ""
+                        except json.JSONDecodeError:
+                            pass
         self.output_text.insertPlainText(text)
         self.output_text.verticalScrollBar().setValue(
             self.output_text.verticalScrollBar().maximum()
         )
+
+    def update_diagnostic_results_table(self, summary):
+        """Populate the Diagnostic Results tab from pipeline summary (list of dicts, one per client)."""
+        if not hasattr(self, "diagnostic_results_table"):
+            return
+        from PyQt5.QtWidgets import QTableWidgetItem
+        rows = summary if isinstance(summary, list) else [summary]
+        self.diagnostic_results_table.setRowCount(len(rows))
+        for row_idx, r in enumerate(rows):
+            self.diagnostic_results_table.setItem(row_idx, 0, QTableWidgetItem(str(r.get("client_id", row_idx + 1))))
+            self.diagnostic_results_table.setItem(row_idx, 1, QTableWidgetItem(str(r.get("protocol", ""))))
+            self.diagnostic_results_table.setItem(row_idx, 2, QTableWidgetItem(f"{r.get('O_app', 0):.6f}"))
+            self.diagnostic_results_table.setItem(row_idx, 3, QTableWidgetItem(f"{r.get('O_broker', 0):.6f}"))
+            self.diagnostic_results_table.setItem(row_idx, 4, QTableWidgetItem(f"{r.get('p', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 5, QTableWidgetItem(f"{r.get('T_actual', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 6, QTableWidgetItem(f"{r.get('T_calc', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 7, QTableWidgetItem(f"{r.get('error_pct', 0):.2f}%"))
+        for i in range(self.output_tabs.count()):
+            if self.output_tabs.tabText(i) == "📊 Diagnostic Results":
+                self.output_tabs.setCurrentIndex(i)
+                break
 
     def _extract_results_dir_from_output(self, text):
         """Track results directory from runner stdout."""
@@ -2453,6 +2606,17 @@ class FLExperimentGUI(QMainWindow):
     def experiment_completed(self, success, message):
         """Handle experiment completion"""
         self.update_output(f"\n\n{message}\n")
+        # Fallback: if diagnostic pipeline ran but table wasn't updated (e.g. chunking), parse from full output
+        full = self.output_text.toPlainText()
+        if "FL_DIAG_TABLE_JSON|" in full and hasattr(self, "diagnostic_results_table"):
+            try:
+                json_str = full.split("FL_DIAG_TABLE_JSON|", 1)[1].strip()
+                json_str = json_str.split("\n")[0].strip()
+                if json_str:
+                    summary = json.loads(json_str)
+                    self.update_diagnostic_results_table(summary)
+            except (json.JSONDecodeError, IndexError):
+                pass
         self.stop_all_monitors()
         self.reset_ui()
         
@@ -2466,6 +2630,8 @@ class FLExperimentGUI(QMainWindow):
     def reset_ui(self):
         """Reset UI after experiment"""
         self.start_button.setEnabled(True)
+        if hasattr(self, 'diagnostic_pipeline_button'):
+            self.diagnostic_pipeline_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.progress_bar.hide()
         if self.statusBar().currentMessage().startswith("🚀"):

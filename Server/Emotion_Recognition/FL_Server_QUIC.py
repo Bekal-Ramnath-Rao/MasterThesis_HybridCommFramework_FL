@@ -306,9 +306,13 @@ class FederatedLearningServer:
                 # If remaining active clients already sent metrics, do not stall.
                 await self.aggregate_metrics()
                 await self.continue_training()
+            elif len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
+                # If remaining active clients already sent updates, aggregate and continue.
+                await self.aggregate_models()
     
     async def handle_client_update(self, message):
         """Handle model update from client"""
+        recv_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
         client_id = message['client_id']
         round_num = message['round']
         if client_id not in self.active_clients:
@@ -341,6 +345,12 @@ class FederatedLearningServer:
                     return
                 dt = time.time() - start_t
                 #print(f"[DEBUG] Deserialized weights from client {client_id} in {dt:.2f}s")
+            
+            if recv_start_cpu is not None:
+                O_recv = time.perf_counter() - recv_start_cpu
+                recv_end_ts = time.time()
+                send_start_ts = message.get("diagnostic_send_start_ts", recv_end_ts)
+                print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={send_start_ts:.9f}")
             
             self.client_updates[client_id] = {
                 'weights': weights,

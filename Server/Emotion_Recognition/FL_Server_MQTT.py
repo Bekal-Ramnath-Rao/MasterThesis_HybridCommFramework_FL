@@ -383,9 +383,19 @@ class FederatedLearningServer:
                 print("All clients converged. Ending training.")
                 self.convergence_time = time.time() - self.start_time if self.start_time else 0
                 self._send_training_complete_and_exit()
+                return
+            # Re-check: remaining active clients may have already sent metrics/updates
+            if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
+                self.aggregate_metrics()
+                self.continue_training()
+                return
+            active_in_round = self.round_participants & self.active_clients
+            if len(self.client_updates) >= len(active_in_round) and len(active_in_round) > 0:
+                self.aggregate_models()
     
     def handle_client_update(self, payload):
         """Handle model update from client"""
+        recv_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
         data = json.loads(payload.decode())
         client_id = data['client_id']
         round_num = data['round']
@@ -414,6 +424,12 @@ class FederatedLearningServer:
             else:
                 # Standard deserialization
                 weights = self.deserialize_weights(data['weights'])
+            
+            if recv_start_cpu is not None:
+                O_recv = time.perf_counter() - recv_start_cpu
+                recv_end_ts = time.time()
+                send_start_ts = data.get("diagnostic_send_start_ts", recv_end_ts)
+                print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={send_start_ts:.9f}")
             
             self.client_updates[client_id] = {
                 'weights': weights,

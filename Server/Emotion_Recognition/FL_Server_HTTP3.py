@@ -446,6 +446,9 @@ class FederatedLearningServer:
                 # If remaining active clients already sent metrics, do not stall.
                 await self.aggregate_metrics()
                 await self.continue_training()
+            elif len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
+                # If remaining active clients already sent updates, aggregate and continue.
+                await self.aggregate_models()
     
     async def handle_client_update(self, message):
         """Handle model update from client"""

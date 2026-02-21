@@ -647,6 +647,7 @@ class FederatedLearningServer:
                     # Only process if we have all chunks and client is active
                     if (len(reassembled_data) > 0 and client_id not in self.client_updates
                             and client_id in self.active_clients):
+                        recv_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
                         # Decompress or deserialize client weights
                         if self.quantization_handler is not None:
                             try:
@@ -658,7 +659,10 @@ class FederatedLearningServer:
                                 weights = self.deserialize_weights(reassembled_data)
                         else:
                             weights = self.deserialize_weights(reassembled_data)
-                        
+                        if recv_start_cpu is not None:
+                            O_recv = time.perf_counter() - recv_start_cpu
+                            recv_end_ts = time.time()
+                            print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={recv_end_ts:.9f}")
                         metadata = self.model_update_metadata[client_id]
                         self.client_updates[client_id] = {
                             'weights': weights,

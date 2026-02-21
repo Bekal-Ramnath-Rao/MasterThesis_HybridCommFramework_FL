@@ -505,6 +505,12 @@ class FederatedLearningClient:
                 "metrics": metrics
             }
         
+        # Diagnostic pipeline: high-precision timing for O_send (serialize + send)
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            send_start_ts = time.time()
+            send_start_cpu = time.perf_counter()
+            update_message["diagnostic_send_start_ts"] = send_start_ts
+        
         # FAIR FIX: Removed random delay - this was causing unfair comparison with other protocols
         # Other protocols don't have random delays, so MQTT shouldn't either
         
@@ -529,6 +535,11 @@ class FederatedLearningClient:
             if result.rc == mqtt.MQTT_ERR_NO_CONN:
                 raise Exception("MQTT not connected")
             result.wait_for_publish(timeout=5)
+            
+            if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+                send_end_cpu = time.perf_counter()
+                O_send = send_end_cpu - send_start_cpu
+                print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={len(payload)} send_start_ts={send_start_ts:.9f}")
             
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
                 print(f"Client {self.client_id} sent model update for round {self.current_round}")
