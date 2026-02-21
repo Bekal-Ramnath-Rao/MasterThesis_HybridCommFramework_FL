@@ -39,11 +39,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-server-mqtt-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_MQTT.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-mqtt-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_MQTT.py"]
     networks:
       - fl-mqtt-network
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
@@ -69,9 +70,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-mqtt-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_MQTT.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-mqtt-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_MQTT.py"]
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-mqtt-network
@@ -98,9 +100,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-mqtt-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_MQTT.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-mqtt-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_MQTT.py"]
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-mqtt-network
@@ -150,11 +153,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-server-amqp-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_AMQP.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-amqp-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_AMQP.py"]
     networks:
       - fl-amqp-network
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
@@ -179,9 +183,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-amqp-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_AMQP.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-amqp-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_AMQP.py"]
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-amqp-network
@@ -207,9 +212,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-amqp-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_AMQP.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-amqp-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_AMQP.py"]
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
       - fl-amqp-network
@@ -239,11 +245,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-server-grpc-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_gRPC.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-grpc-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_gRPC.py"]
     networks:
       - fl-grpc-network
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
@@ -268,9 +275,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-grpc-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_gRPC.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-grpc-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_gRPC.py"]
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../certs:/app/certs
     networks:
@@ -297,9 +305,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-grpc-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_gRPC.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-grpc-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_gRPC.py"]
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../certs:/app/certs
     networks:
@@ -331,11 +340,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-server-quic-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_QUIC.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-quic-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_QUIC.py"]
     networks:
       - fl-quic-network
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
       - ../certs:/app/certs
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
@@ -361,9 +371,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-quic-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_QUIC.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-quic-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_QUIC.py"]
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../certs:/app/certs
     networks:
@@ -390,9 +401,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-quic-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_QUIC.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-quic-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_QUIC.py"]
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../certs:/app/certs
     networks:
@@ -424,11 +436,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-server-http3-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_HTTP3.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-http3-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_HTTP3.py"]
     networks:
       - fl-http3-network
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
       - ../certs:/app/certs:ro
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
@@ -453,9 +466,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-http3-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_HTTP3.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-http3-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_HTTP3.py"]
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../certs:/app/certs:ro
     networks:
@@ -482,9 +496,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-http3-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_HTTP3.py"]
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-http3-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_HTTP3.py"]
     volumes:
-      - ./fl-network-logs:/logs
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../certs:/app/certs:ro
     networks:
@@ -514,10 +529,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Server/Emotion_Recognition/FL_Server_DDS.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-dds-emotion.pcap & python -u Server/Emotion_Recognition/FL_Server_DDS.py"]
     networks:
       - fl-dds-network
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
       - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
@@ -543,8 +560,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-dds-emotion-1.pcap & python -u Client/Emotion_Recognition/FL_Client_DDS.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     networks:
@@ -571,8 +590,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-dds-emotion-2.pcap & python -u Client/Emotion_Recognition/FL_Client_DDS.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
       - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     networks:

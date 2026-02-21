@@ -38,10 +38,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Server/MentalState_Recognition/FL_Server_MQTT.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-mqtt-mental.pcap & python -u Server/MentalState_Recognition/FL_Server_MQTT.py"]
     networks:
       - fl-mqtt-network
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/MentalState_Recognition/results:/app/Server/MentalState_Recognition/results
   # MQTT FL Client 1 (Mental State Recognition)
   fl-client-mqtt-mental-1:
@@ -64,8 +66,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/MentalState_Recognition/FL_Client_MQTT.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-mqtt-mental-1.pcap & python -u Client/MentalState_Recognition/FL_Client_MQTT.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
     networks:
       - fl-mqtt-network
@@ -91,8 +95,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/MentalState_Recognition/FL_Client_MQTT.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-mqtt-mental-2.pcap & python -u Client/MentalState_Recognition/FL_Client_MQTT.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
     networks:
       - fl-mqtt-network
@@ -134,10 +140,12 @@ services:
       - AMQP_PORT=5672
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
-    command: python -u Server/MentalState_Recognition/FL_Server_AMQP.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-amqp-mental.pcap & python -u Server/MentalState_Recognition/FL_Server_AMQP.py"]
     networks:
       - fl-amqp-network
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/MentalState_Recognition/results:/app/Server/MentalState_Recognition/results
   # AMQP FL Client 1 (Mental State Recognition)
   fl-client-amqp-mental-1:
@@ -154,8 +162,10 @@ services:
       - AMQP_PORT=5672
       - CLIENT_ID=0
       - NUM_CLIENTS=2
-    command: python -u Client/MentalState_Recognition/FL_Client_AMQP.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-amqp-mental-1.pcap & python -u Client/MentalState_Recognition/FL_Client_AMQP.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
     networks:
       - fl-amqp-network
@@ -175,8 +185,10 @@ services:
       - AMQP_PORT=5672
       - CLIENT_ID=1
       - NUM_CLIENTS=2
-    command: python -u Client/MentalState_Recognition/FL_Client_AMQP.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-amqp-mental-2.pcap & python -u Client/MentalState_Recognition/FL_Client_AMQP.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
     networks:
       - fl-amqp-network
@@ -199,10 +211,12 @@ services:
       - GRPC_PORT=50051
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
-    command: python -u Server/MentalState_Recognition/FL_Server_gRPC.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-grpc-mental.pcap & python -u Server/MentalState_Recognition/FL_Server_gRPC.py"]
     networks:
       - fl-grpc-network
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/MentalState_Recognition/results:/app/Server/MentalState_Recognition/results
 
   # gRPC FL Client 1 (Mental State Recognition)
@@ -220,8 +234,10 @@ services:
       - GRPC_PORT=50051
       - CLIENT_ID=0
       - NUM_CLIENTS=2
-    command: python -u Client/MentalState_Recognition/FL_Client_gRPC.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-grpc-mental-1.pcap & python -u Client/MentalState_Recognition/FL_Client_gRPC.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
       - ../certs:/app/certs
     networks:
@@ -242,8 +258,10 @@ services:
       - GRPC_PORT=50051
       - CLIENT_ID=1
       - NUM_CLIENTS=2
-    command: python -u Client/MentalState_Recognition/FL_Client_gRPC.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-grpc-mental-2.pcap & python -u Client/MentalState_Recognition/FL_Client_gRPC.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
       - ../certs:/app/certs
     networks:
@@ -268,10 +286,12 @@ services:
       - QUIC_PORT=4433
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
-    command: python -u Server/MentalState_Recognition/FL_Server_QUIC.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-quic-mental.pcap & python -u Server/MentalState_Recognition/FL_Server_QUIC.py"]
     networks:
       - fl-quic-network
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/MentalState_Recognition/results:/app/Server/MentalState_Recognition/results
       - ../certs:/app/certs
 
@@ -290,8 +310,10 @@ services:
       - QUIC_PORT=4433
       - CLIENT_ID=0
       - NUM_CLIENTS=2
-    command: python -u Client/MentalState_Recognition/FL_Client_QUIC.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-quic-mental-1.pcap & python -u Client/MentalState_Recognition/FL_Client_QUIC.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
       - ../certs:/app/certs
     networks:
@@ -312,8 +334,10 @@ services:
       - QUIC_PORT=4433
       - CLIENT_ID=1
       - NUM_CLIENTS=2
-    command: python -u Client/MentalState_Recognition/FL_Client_QUIC.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-quic-mental-2.pcap & python -u Client/MentalState_Recognition/FL_Client_QUIC.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
       - ../certs:/app/certs
     networks:
@@ -343,10 +367,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Server/MentalState_Recognition/FL_Server_HTTP3.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-http3-mental.pcap & python -u Server/MentalState_Recognition/FL_Server_HTTP3.py"]
     networks:
       - fl-http3-network
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/MentalState_Recognition/results:/app/Server/MentalState_Recognition/results
       - ../certs:/app/certs:ro
     # GPU reservations moved to overlay file
@@ -371,8 +397,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/MentalState_Recognition/FL_Client_HTTP3.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-http3-mental-1.pcap & python -u Client/MentalState_Recognition/FL_Client_HTTP3.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
       - ../certs:/app/certs:ro
     networks:
@@ -399,8 +427,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/MentalState_Recognition/FL_Client_HTTP3.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-http3-mental-2.pcap & python -u Client/MentalState_Recognition/FL_Client_HTTP3.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
       - ../certs:/app/certs:ro
     networks:
@@ -425,10 +455,12 @@ services:
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
       - CYCLONEDDS_URI=file:///app/cyclonedds-mentalstate.xml
-    command: python -u Server/MentalState_Recognition/FL_Server_DDS.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-dds-mental.pcap & python -u Server/MentalState_Recognition/FL_Server_DDS.py"]
     networks:
       - fl-dds-network
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/MentalState_Recognition/results:/app/Server/MentalState_Recognition/results
       - ../config/cyclonedds-mentalstate.xml:/app/cyclonedds-mentalstate.xml:ro
 
@@ -447,8 +479,10 @@ services:
       - CLIENT_ID=0
       - NUM_CLIENTS=2
       - CYCLONEDDS_URI=file:///app/cyclonedds-mentalstate.xml
-    command: python -u Client/MentalState_Recognition/FL_Client_DDS.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-dds-mental-1.pcap & python -u Client/MentalState_Recognition/FL_Client_DDS.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
       - ../config/cyclonedds-mentalstate.xml:/app/cyclonedds-mentalstate.xml:ro
     networks:
@@ -469,8 +503,10 @@ services:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
       - CYCLONEDDS_URI=file:///app/cyclonedds-mentalstate.xml
-    command: python -u Client/MentalState_Recognition/FL_Client_DDS.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-dds-mental-2.pcap & python -u Client/MentalState_Recognition/FL_Client_DDS.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/MentalState_Recognition/Dataset:/app/Client/MentalState_Recognition/Dataset
       - ../config/cyclonedds-mentalstate.xml:/app/cyclonedds-mentalstate.xml:ro
     networks:

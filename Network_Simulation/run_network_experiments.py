@@ -211,6 +211,13 @@ class ExperimentRunner:
     def start_containers(self, protocol: str, scenario: str = "excellent", congestion_level: str = "none"):
         """Start Docker containers for a specific protocol with staged startup"""
         
+        # Set FL_EXPERIMENT_SUBDIR so containers write pcaps to the same folder as server/client logs
+        result_suffix = f"{scenario}_congestion_{congestion_level}" if congestion_level != "none" else scenario
+        experiment_subdir = f"{os.path.basename(self.results_dir)}/{protocol}_{result_suffix}"
+        os.environ["FL_EXPERIMENT_SUBDIR"] = experiment_subdir
+        exp_dir = os.path.join(self.results_dir, f"{protocol}_{result_suffix}")
+        os.makedirs(exp_dir, exist_ok=True)
+        
         # Check if rl_unified is selected - use unified compose file
         if protocol == "rl_unified":
             print("\n" + "="*70)

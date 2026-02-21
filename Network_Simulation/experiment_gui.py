@@ -91,6 +91,36 @@ class LogMonitor(QThread):
                     break
                 if line:
                     self.log_update.emit(self.log_type, line)
+
+
+class GenerateExcelLogsWorker(QThread):
+    """Background thread to run generate_excel_logs.py."""
+    finished = pyqtSignal(bool, str, str)  # success, stdout, stderr
+
+    def __init__(self, experiment_folder=None, parent=None):
+        super().__init__(parent)
+        self.experiment_folder = experiment_folder
+
+    def run(self):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script = os.path.join(script_dir, "generate_excel_logs.py")
+        cmd = [sys.executable, script]
+        if self.experiment_folder:
+            cmd.append(self.experiment_folder)
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,
+                cwd=os.path.dirname(script_dir),
+            )
+            self.finished.emit(result.returncode == 0, result.stdout or "", result.stderr or "")
+        except subprocess.TimeoutExpired:
+            self.finished.emit(False, "", "Generate Excel logs timed out (10 min).")
+        except Exception as e:
+            self.finished.emit(False, "", str(e))
+
                     
         except Exception as e:
             self.log_update.emit(self.log_type, f"Log Error: {str(e)}\n")
@@ -453,11 +483,27 @@ class FLExperimentGUI(QMainWindow):
         self.diagnostic_pipeline_button.setToolTip("Run empirical overhead, network extraction, and analytical model for ONE selected protocol (MQTT, AMQP, gRPC, QUIC, or DDS). Single-protocol FL runs separately.")
         self.diagnostic_pipeline_button.clicked.connect(self.start_diagnostic_pipeline)
         
+        self.generate_excel_button = QPushButton("📗 Generate Excel Logs")
+        self.generate_excel_button.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                font-size: 14px;
+                padding: 10px 20px;
+                border-radius: 6px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #218838; }
+        """)
+        self.generate_excel_button.setToolTip("Generate Excel workbook from pcap files (server, client1, client2) in the latest or selected experiment folder. Requires tshark, pandas, openpyxl.")
+        self.generate_excel_button.clicked.connect(self.generate_excel_logs)
+        
         control_layout.addWidget(self.start_button)
         control_layout.addWidget(self.diagnostic_pipeline_button)
         control_layout.addWidget(self.stop_button)
         control_layout.addWidget(self.apply_network_button)
         control_layout.addWidget(self.clear_button)
+        control_layout.addWidget(self.generate_excel_button)
         control_layout.addStretch()
         
         # Progress bar in same row (compact)
@@ -2602,6 +2648,47 @@ class FLExperimentGUI(QMainWindow):
             self.output_text.append(f"✅ Saved logs for {saved} container(s)\n")
         except Exception as e:
             self.output_text.append(f"⚠️ Failed to save stop-time logs: {e}\n")
+
+    def generate_excel_logs(self):
+        """Run generate_excel_logs.py to create Excel from pcap files in experiment folder."""
+        # Resolve folder: use current results dir or latest under experiment_results
+        folder = self.current_results_dir
+        if not folder or not os.path.isdir(folder):
+            folder = self._get_fallback_results_dir()
+        # Optional: if folder is an experiment root (e.g. emotion_20260128), script will find latest subfolder with pcaps
+        if self.generate_excel_button.isEnabled() is False:
+            return  # already running
+        self.generate_excel_button.setEnabled(False)
+        self.statusBar().showMessage("📗 Generating Excel from pcaps...")
+        self._excel_worker = GenerateExcelLogsWorker(experiment_folder=folder)
+        self._excel_worker.finished.connect(self._on_generate_excel_finished)
+        self._excel_worker.start()
+
+    def _on_generate_excel_finished(self, success, stdout, stderr):
+        self.generate_excel_button.setEnabled(True)
+        self.statusBar().showMessage("Ready to run experiments")
+        # Switch to Experiment Output tab
+        for i in range(self.output_tabs.count()):
+            if self.output_tabs.tabText(i) == "📊 Experiment Output":
+                self.output_tabs.setCurrentIndex(i)
+                break
+        self.output_text.append("\n📗 Generate Excel Logs\n")
+        self.output_text.append(stdout)
+        if stderr:
+            self.output_text.append(stderr)
+        self.output_text.append("\n")
+        if success:
+            QMessageBox.information(
+                self,
+                "Excel Logs Generated",
+                "Network metrics Excel file was created successfully.\n\nCheck the experiment folder for fl_network_metrics_<foldername>.xlsx",
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "Generate Excel Logs",
+                "Failed to generate Excel file.\n\nEnsure tshark (Wireshark), pandas, and openpyxl are installed.\nCheck the Experiment Output tab for details.",
+            )
     
     def experiment_completed(self, success, message):
         """Handle experiment completion"""

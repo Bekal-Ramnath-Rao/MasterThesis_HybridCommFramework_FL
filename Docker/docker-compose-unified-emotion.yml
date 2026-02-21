@@ -57,6 +57,7 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     volumes:
       - ../Server/Emotion_Recognition:/app/Server/Emotion_Recognition
       - ../experiment_results:/app/results
@@ -73,7 +74,7 @@ services:
       - amqp-broker-unified
     cap_add:
       - NET_ADMIN
-    command: python3 Server/Emotion_Recognition/FL_Server_Unified.py
+    command: ["sh", "-c", "mkdir -p /app/results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/results/$FL_EXPERIMENT_SUBDIR/fl-server-unified-emotion.pcap & python3 Server/Emotion_Recognition/FL_Server_Unified.py"]
     deploy:
       resources:
         reservations:
@@ -113,6 +114,7 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
       - ../shared_data:/shared_data
@@ -126,7 +128,7 @@ services:
       - amqp-broker-unified
     cap_add:
       - NET_ADMIN
-    command: python3 Client/Emotion_Recognition/FL_Client_Unified.py
+    command: ["sh", "-c", "mkdir -p /app/results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/results/$FL_EXPERIMENT_SUBDIR/fl-client-unified-emotion-1.pcap & python3 Client/Emotion_Recognition/FL_Client_Unified.py"]
     deploy:
       resources:
         reservations:
@@ -162,6 +164,7 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
       - ../shared_data:/shared_data
@@ -175,7 +178,7 @@ services:
       - amqp-broker-unified
     cap_add:
       - NET_ADMIN
-    command: python3 Client/Emotion_Recognition/FL_Client_Unified.py
+    command: ["sh", "-c", "mkdir -p /app/results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/results/$FL_EXPERIMENT_SUBDIR/fl-client-unified-emotion-2.pcap & python3 Client/Emotion_Recognition/FL_Client_Unified.py"]
     deploy:
       resources:
         reservations:

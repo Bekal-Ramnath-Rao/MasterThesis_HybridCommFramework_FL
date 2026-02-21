@@ -51,6 +51,7 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     volumes:
       - ../Server/Temperature_Regulation:/app/Server/Temperature_Regulation
       - ../experiment_results:/app/results
@@ -62,7 +63,7 @@ services:
       - amqp-broker-unified
     cap_add:
       - NET_ADMIN
-    command: python3 Server/Temperature_Regulation/FL_Server_Unified.py
+    command: ["sh", "-c", "mkdir -p /app/results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/results/$FL_EXPERIMENT_SUBDIR/fl-server-unified-temperature.pcap & python3 Server/Temperature_Regulation/FL_Server_Unified.py"]
     deploy:
       resources:
         reservations:
@@ -96,6 +97,7 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     volumes:
       - ../Client/Temperature_Regulation:/app/Client/Temperature_Regulation
       - ../experiment_results:/app/results
@@ -108,7 +110,7 @@ services:
       - amqp-broker-unified
     cap_add:
       - NET_ADMIN
-    command: python3 Client/Temperature_Regulation/FL_Client_Unified.py
+    command: ["sh", "-c", "mkdir -p /app/results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/results/$FL_EXPERIMENT_SUBDIR/fl-client-unified-temperature-1.pcap & python3 Client/Temperature_Regulation/FL_Client_Unified.py"]
     deploy:
       resources:
         reservations:
@@ -138,6 +140,7 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
     volumes:
       - ../Client/Temperature_Regulation:/app/Client/Temperature_Regulation
       - ../experiment_results:/app/results
@@ -150,7 +153,7 @@ services:
       - amqp-broker-unified
     cap_add:
       - NET_ADMIN
-    command: python3 Client/Temperature_Regulation/FL_Client_Unified.py
+    command: ["sh", "-c", "mkdir -p /app/results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/results/$FL_EXPERIMENT_SUBDIR/fl-client-unified-temperature-2.pcap & python3 Client/Temperature_Regulation/FL_Client_Unified.py"]
     deploy:
       resources:
         reservations:

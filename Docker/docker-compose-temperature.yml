@@ -49,10 +49,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Server/Temperature_Regulation/FL_Server_MQTT.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-mqtt-temp.pcap & python -u Server/Temperature_Regulation/FL_Server_MQTT.py"]
     networks:
       - fl-mqtt-network-temp
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
 
   # MQTT FL Client 1 (Temperature Regulation)
@@ -76,8 +78,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-mqtt-temp-1.pcap & python -u Client/Temperature_Regulation/FL_Client_MQTT.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
     networks:
       - fl-mqtt-network-temp
@@ -103,8 +107,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-mqtt-temp-2.pcap & python -u Client/Temperature_Regulation/FL_Client_MQTT.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
     networks:
       - fl-mqtt-network-temp
@@ -154,10 +160,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Server/Temperature_Regulation/FL_Server_AMQP.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-amqp-temp.pcap & python -u Server/Temperature_Regulation/FL_Server_AMQP.py"]
     networks:
       - fl-amqp-network-temp
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
 
   # AMQP FL Client 1 (Temperature Regulation)
@@ -180,8 +188,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-amqp-temp-1.pcap & python -u Client/Temperature_Regulation/FL_Client_AMQP.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
     networks:
       - fl-amqp-network-temp
@@ -206,8 +216,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-amqp-temp-2.pcap & python -u Client/Temperature_Regulation/FL_Client_AMQP.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
     networks:
       - fl-amqp-network-temp
@@ -235,10 +247,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Server/Temperature_Regulation/FL_Server_gRPC.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-grpc-temp.pcap & python -u Server/Temperature_Regulation/FL_Server_gRPC.py"]
     networks:
       - fl-grpc-network-temp
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
 
   # gRPC FL Client 1 (Temperature Regulation)
@@ -261,8 +275,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-grpc-temp-1.pcap & python -u Client/Temperature_Regulation/FL_Client_gRPC.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
       - ../certs:/app/certs
     networks:
@@ -288,8 +304,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-grpc-temp-2.pcap & python -u Client/Temperature_Regulation/FL_Client_gRPC.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
       - ../certs:/app/certs
     networks:
@@ -319,10 +337,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Server/Temperature_Regulation/FL_Server_QUIC.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-quic-temp.pcap & python -u Server/Temperature_Regulation/FL_Server_QUIC.py"]
     networks:
       - fl-quic-network-temp
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
       - ../certs:/app/certs
 
@@ -346,8 +366,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-quic-temp-1.pcap & python -u Client/Temperature_Regulation/FL_Client_QUIC.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
       - ../certs:/app/certs
     networks:
@@ -373,8 +395,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-quic-temp-2.pcap & python -u Client/Temperature_Regulation/FL_Client_QUIC.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
       - ../certs:/app/certs
     networks:
@@ -404,10 +428,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Server/Temperature_Regulation/FL_Server_HTTP3.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-server-http3-temp.pcap & python -u Server/Temperature_Regulation/FL_Server_HTTP3.py"]
     networks:
       - fl-http3-network-temp
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
       - ../certs:/app/certs:ro
     # GPU reservations moved to overlay file
@@ -432,8 +458,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Temperature_Regulation/FL_Client_HTTP3.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-http3-temp-1.pcap & python -u Client/Temperature_Regulation/FL_Client_HTTP3.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
       - ../certs:/app/certs:ro
     networks:
@@ -460,8 +488,10 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-    command: python -u Client/Temperature_Regulation/FL_Client_HTTP3.py
+      - FL_EXPERIMENT_SUBDIR=${FL_EXPERIMENT_SUBDIR:-network_captures}
+    command: ["sh", "-c", "mkdir -p /app/experiment_results/$FL_EXPERIMENT_SUBDIR && tcpdump -i any -w /app/experiment_results/$FL_EXPERIMENT_SUBDIR/fl-client-http3-temp-2.pcap & python -u Client/Temperature_Regulation/FL_Client_HTTP3.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
       - ../certs:/app/certs:ro
     networks:
@@ -491,10 +521,11 @@ services:
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
       - CYCLONEDDS_URI=file:///app/cyclonedds-temperature.xml
-    command: python -u Server/Temperature_Regulation/FL_Server_DDS.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-server-dds-temp.pcap & python -u Server/Temperature_Regulation/FL_Server_DDS.py"]
     networks:
       - fl-dds-network-temp
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
       - ../config/cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
 
@@ -518,8 +549,9 @@ services:
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
       - CYCLONEDDS_URI=file:///app/cyclonedds-temperature.xml
-    command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-dds-temp-1.pcap & python -u Client/Temperature_Regulation/FL_Client_DDS.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
       - ../config/cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
     networks:
@@ -545,8 +577,9 @@ services:
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
       - CYCLONEDDS_URI=file:///app/cyclonedds-temperature.xml
-    command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
+    command: ["sh", "-c", "tcpdump -i any -w /logs/fl-client-dds-temp-2.pcap & python -u Client/Temperature_Regulation/FL_Client_DDS.py"]
     volumes:
+      - ../experiment_results:/app/experiment_results
       - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
       - ../config/cyclonedds-temperature.xml:/app/cyclonedds-temperature.xml:ro
     networks:
