@@ -393,11 +393,14 @@ def run_pipeline(
             sender_containers = [sender_container] if isinstance(sender_container, str) else list(sender_container or [])
         services = [receiver_container] + sender_containers
         if protocol in ("mqtt", "amqp"):
-            broker = "mqtt-broker" if protocol == "mqtt" else "rabbitmq"
-            if use_case == "mentalstate":
-                broker = "mqtt-broker-mental" if protocol == "mqtt" else "rabbitmq-mental"
-            elif use_case == "temperature":
-                broker = "mqtt-broker-temp" if protocol == "mqtt" else "rabbitmq-temp"
+            # GPU compose uses "amqp-broker" for AMQP; CPU compose uses "rabbitmq" (or -mental/-temp)
+            if protocol == "mqtt":
+                broker = "mqtt-broker" if use_case == "emotion" else ("mqtt-broker-mental" if use_case == "mentalstate" else "mqtt-broker-temp")
+            else:
+                if enable_gpu:
+                    broker = "amqp-broker"  # GPU compose service name for all use cases
+                else:
+                    broker = "rabbitmq" if use_case == "emotion" else ("rabbitmq-mental" if use_case == "mentalstate" else "rabbitmq-temp")
             services = [broker, receiver_container] + sender_containers
 
     env = os.environ.copy()
@@ -417,11 +420,22 @@ def run_pipeline(
         print("          GPU compose failed (nvidia-docker or GPU not available). Falling back to CPU...")
         run_cmd(["docker", "compose", "-f", compose_file, "down"], check=False, cwd=PROJECT_ROOT)
         compose_file = str(docker_dir / f"docker-compose-{use_case}.yml")
-        run_cmd(
+        # CPU compose uses different broker service names (e.g. rabbitmq vs amqp-broker)
+        if protocol in ("mqtt", "amqp"):
+            broker_cpu = "mqtt-broker" if protocol == "mqtt" else "rabbitmq"
+            if use_case == "mentalstate":
+                broker_cpu = "mqtt-broker-mental" if protocol == "mqtt" else "rabbitmq-mental"
+            elif use_case == "temperature":
+                broker_cpu = "mqtt-broker-temp" if protocol == "mqtt" else "rabbitmq-temp"
+            services = [broker_cpu, receiver_container] + sender_containers
+        result = run_cmd(
             ["docker", "compose", "-f", compose_file, "up", "-d"] + list(services),
             env=env,
             cwd=PROJECT_ROOT,
+            check=False,
         )
+        if result.returncode != 0:
+            raise RuntimeError("Failed to start containers after GPU fallback. Check docker compose and network.")
     elif result.returncode != 0:
         raise RuntimeError("Failed to start containers. Check docker compose and network.")
     time.sleep(15)
@@ -434,13 +448,15 @@ def run_pipeline(
     print("          Sender tc cleared for calibration (no losses).")
 
     # Wait for first round to complete (calibration – no losses); need both clients' timings
+    n_expected = len(sender_containers)
     for _ in range(120):
         time.sleep(2)
         cal_list = parse_fl_diag_from_logs_multi(sender_containers, receiver_container, 0)
-        if cal_list and len(cal_list) >= 1 and any(c.get("T_total", 0) > 0 for c in cal_list):
+        n_ready = sum(1 for c in (cal_list or []) if c.get("T_total", 0) > 0)
+        if cal_list and len(cal_list) >= n_expected and n_ready >= n_expected:
             break
     else:
-        print("[WARNING] No calibration timing found in logs; using defaults.")
+        print("[WARNING] No calibration timing for all clients in logs; using available or defaults.")
         cal_list = [
             {"client_id": 1, "O_send": 0.0, "O_recv": 0.0, "T_total": 0.0, "payload_bytes": 0, "S_bits": 0},
             {"client_id": 2, "O_send": 0.0, "O_recv": 0.0, "T_total": 0.0, "payload_bytes": 0, "S_bits": 0},
@@ -487,14 +503,18 @@ def run_pipeline(
     RTT_eff = D_tc + J
     time.sleep(2)
 
-    # Phase 3: Lossy round – get T_actual per client
+    # Phase 3: Lossy round – get T_actual per client (cap 90*2s so we don't block long after FL finished)
     print("[Phase 3] Waiting for lossy round (round 2) under selected scenario...")
     lossy_list = []
-    for _ in range(120):
+    phase3_max_wait = 90
+    for iteration in range(phase3_max_wait):
         time.sleep(2)
         lossy_list = parse_fl_diag_from_logs_multi(sender_containers, receiver_container, 1)
-        if lossy_list and any(c.get("T_total", 0) > 0 for c in lossy_list):
+        n_ready = sum(1 for c in (lossy_list or []) if c.get("T_total", 0) > 0)
+        if lossy_list and len(lossy_list) >= n_expected and n_ready >= n_expected:
             break
+        if iteration == phase3_max_wait - 1:
+            print(f"          Proceeding after {phase3_max_wait * 2}s (training may have finished; using available data).")
     if not lossy_list or len(lossy_list) < len(cal_list):
         lossy_list = [{"client_id": i + 1, "T_total": cal_list[i].get("T_total", 0)} if i < len(cal_list) else {"client_id": i + 1, "T_total": 0} for i in range(max(2, len(cal_list)))]
 

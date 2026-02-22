@@ -2498,12 +2498,28 @@ class FLExperimentGUI(QMainWindow):
         )
 
     def update_diagnostic_results_table(self, summary):
-        """Populate the Diagnostic Results tab from pipeline summary (list of dicts, one per client).
-        Always replaces table with latest run data (no append); includes protocol and network scenario."""
+        """Update Diagnostic Results tab: merge by (protocol, scenario).
+        - Same protocol + same scenario: replace those rows with the new run.
+        - Same protocol + different scenario, or different protocol: append new rows."""
         if not hasattr(self, "diagnostic_results_table"):
             return
         from PyQt5.QtWidgets import QTableWidgetItem
-        rows = summary if isinstance(summary, list) else [summary]
+        if not hasattr(self, "_diagnostic_results_cache"):
+            self._diagnostic_results_cache = []
+        new_rows = summary if isinstance(summary, list) else [summary]
+        # Keys (protocol, scenario) that this run is updating
+        updated_keys = set()
+        for r in new_rows:
+            updated_keys.add((str(r.get("protocol", "")).strip(), str(r.get("scenario", "")).strip()))
+        # Remove existing rows that match any (protocol, scenario) we are updating
+        self._diagnostic_results_cache = [
+            row for row in self._diagnostic_results_cache
+            if (str(row.get("protocol", "")).strip(), str(row.get("scenario", "")).strip()) not in updated_keys
+        ]
+        # Append new rows
+        self._diagnostic_results_cache.extend(new_rows)
+        # Render full table
+        rows = self._diagnostic_results_cache
         self.diagnostic_results_table.setRowCount(len(rows))
         for row_idx, r in enumerate(rows):
             self.diagnostic_results_table.setItem(row_idx, 0, QTableWidgetItem(str(r.get("client_id", row_idx + 1))))

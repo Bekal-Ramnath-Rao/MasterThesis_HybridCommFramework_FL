@@ -290,6 +290,12 @@ class FederatedLearningClient:
                 self.channel.exchange_declare(exchange=EXCHANGE_BROADCAST, exchange_type='fanout', durable=True)
                 self.channel.exchange_declare(exchange=EXCHANGE_CLIENT_UPDATES, exchange_type='direct', durable=True)
                 
+                # Re-setup consumer so start_consuming() can be called again on this channel
+                queue_broadcast = f"fl.client.{self.client_id}.broadcast"
+                self.channel.queue_declare(queue=queue_broadcast, durable=False, exclusive=True, auto_delete=True)
+                self.channel.queue_bind(exchange=EXCHANGE_BROADCAST, queue=queue_broadcast)
+                self.channel.basic_consume(queue=queue_broadcast, on_message_callback=self.on_broadcast_message, auto_ack=True)
+                
                 print(f"Client {self.client_id} reconnected successfully")
                 return True
                 
@@ -716,21 +722,44 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} ERROR: Failed to send evaluation metrics")
     
     def start(self):
-        """Start consuming messages"""
+        """Start consuming messages. Restarts consuming after connection loss if reconnect() was used from a callback."""
         print(f"\nClient {self.client_id} waiting for messages...")
         self.consuming = True
-        try:
-            self.channel.start_consuming()
-        except KeyboardInterrupt:
-            print(f"\nClient {self.client_id} stopping...")
-            self.stop()
+        while self.consuming:
+            try:
+                self.channel.start_consuming()
+            except KeyboardInterrupt:
+                print(f"\nClient {self.client_id} stopping...")
+                self.stop()
+                break
+            except (pika.exceptions.ConnectionWrongStateError, pika.exceptions.AMQPConnectionError, ConnectionResetError) as e:
+                if not self.consuming:
+                    break
+                # Connection was lost (e.g. during publish); may have reconnected from callback
+                if self.connection and not self.connection.is_closed:
+                    # Reconnected from callback; consumer already set up on new channel
+                    continue
+                if self.reconnect():
+                    continue
+                raise
+            except Exception as e:
+                if not self.consuming:
+                    break
+                raise
     
     def stop(self):
         """Stop consuming and close connection"""
-        if self.consuming:
-            self.channel.stop_consuming()
-        if self.connection and not self.connection.is_closed:
-            self.connection.close()
+        self.consuming = False
+        try:
+            if self.channel and self.connection and not self.connection.is_closed:
+                self.channel.stop_consuming()
+        except Exception:
+            pass
+        try:
+            if self.connection and not self.connection.is_closed:
+                self.connection.close()
+        except Exception:
+            pass
         print(f"Client {self.client_id} disconnected")
 
 

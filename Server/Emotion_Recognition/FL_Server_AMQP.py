@@ -506,6 +506,34 @@ class FederatedLearningServer:
         )
         print("Start training signal sent successfully\n")
     
+    def send_current_model_to_client(self, client_id):
+        """Send current global model to a single client (e.g. late joiner). Uses broadcast so the client receives it."""
+        if self.global_weights is None or self.model_config is None:
+            return
+        if self.quantization_handler is not None:
+            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
+            msg = {
+                "message_type": "global_model",
+                "round": self.current_round,
+                "quantized_data": serialized,
+                "model_config": self.model_config
+            }
+        else:
+            msg = {
+                "message_type": "global_model",
+                "round": self.current_round,
+                "weights": self.serialize_weights(self.global_weights),
+                "model_config": self.model_config
+            }
+        self.channel.basic_publish(
+            exchange=EXCHANGE_BROADCAST,
+            routing_key='',
+            body=json.dumps(msg),
+            properties=pika.BasicProperties(delivery_mode=2)
+        )
+        print(f"Current global model (round {self.current_round}) sent to client {client_id} (broadcast)")
+    
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
