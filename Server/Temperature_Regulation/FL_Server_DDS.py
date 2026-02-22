@@ -258,8 +258,9 @@ class FederatedLearningServer:
                 model_config_json=model_config if chunk_id == 0 else ""  # Only send config with first chunk
             )
             self.writers['global_model_chunk'].write(chunk)
-            print(f"  Sent chunk {chunk_id + 1}/{total_chunks} ({len(chunk_data)} bytes)")
-            time.sleep(0.05)  # Small delay between chunks
+            # Aligned with unified: Reliable QoS handles delivery, no artificial delay needed
+            if (chunk_id + 1) % 20 == 0:
+                print(f"  Sent {chunk_id + 1}/{total_chunks} chunks")
     
     def setup_dds(self):
         """Initialize DDS participant, topics, readers, and writers"""

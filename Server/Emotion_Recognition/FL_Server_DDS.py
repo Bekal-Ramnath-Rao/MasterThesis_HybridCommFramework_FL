@@ -282,14 +282,9 @@ class FederatedLearningServer:
                 model_config_json=model_config if chunk_id == 0 else ""  # Only send config with first chunk
             )
             self.writers['global_model_chunk'].write(chunk)
-            
-            # CRITICAL: Pacing for BestEffort QoS to prevent UDP buffer overflow
-            # Without this, chunks are sent faster than the network can deliver them
-            time.sleep(0.01)  # 10ms between chunks = ~100 chunks/sec max throughput
-            
+            # Aligned with unified: Reliable QoS handles delivery, no artificial delay needed
             if (chunk_id + 1) % 20 == 0:  # Progress update every 20 chunks
                 print(f"  Sent {chunk_id + 1}/{total_chunks} chunks")
-                time.sleep(0.1)  # Extra pause every 20 chunks for buffer drain
     
     def setup_dds(self):
         """Initialize DDS participant, topics, readers, and writers"""
@@ -306,11 +301,10 @@ class FederatedLearningServer:
             Policy.Durability.TransientLocal,
         )
 
-        # Best effort QoS for large data transfers (model chunks)
-        # Increased history buffer to handle burst packet loss
+        # Best effort QoS for large data transfers (aligned with unified DDS)
         best_effort_qos = Qos(
             Policy.Reliability.BestEffort,
-            Policy.History.KeepLast(50),  # Buffer up to 50 chunks to handle burst losses
+            Policy.History.KeepLast(1),
         )
         # Reliable chunk QoS for large initial model transfer.
         # KeepLast must exceed total chunk count (~144 for current model).

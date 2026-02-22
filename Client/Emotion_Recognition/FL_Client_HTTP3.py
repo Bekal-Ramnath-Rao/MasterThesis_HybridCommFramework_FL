@@ -547,14 +547,23 @@ class FederatedLearningClient:
             weights_key = 'weights'
         
         # Send model update to server
-        await self.send_message({
+        update_message = {
             'type': 'model_update',
             'client_id': self.client_id,
             'round': self.current_round,
             weights_key: weights_data,
             'num_samples': num_samples,
             'metrics': metrics
-        })
+        }
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            send_start_ts = time.time()
+            send_start_cpu = time.perf_counter()
+            update_message["diagnostic_send_start_ts"] = send_start_ts
+        await self.send_message(update_message)
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            O_send = time.perf_counter() - send_start_cpu
+            payload_bytes = len(json.dumps(update_message).encode('utf-8'))
+            print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={payload_bytes} send_start_ts={send_start_ts:.9f}")
     
     async def evaluate_model(self):
         """Evaluate model on validation data and send metrics to server"""

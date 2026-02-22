@@ -448,6 +448,7 @@ services:
       - HTTP3_PORT=4434
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -477,6 +478,7 @@ services:
       - HTTP3_PORT=4434
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -495,7 +497,7 @@ services:
   # DDS Protocol Setup (Emotion Recognition)
   # ============================================================================
   
-  # DDS FL Server (Emotion Recognition)
+  # DDS FL Server (Emotion Recognition) - no CYCLONEDDS_URI to match unified (default config)
   fl-server-dds-emotion:
     build:
       context: ..
@@ -508,7 +510,6 @@ services:
       - NUM_CLIENTS=2
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
-      - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -519,7 +520,6 @@ services:
       - fl-dds-network
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
-      - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # DDS FL Client 1 (Emotion Recognition)
@@ -536,7 +536,6 @@ services:
       - DDS_DOMAIN_ID=0
       - CLIENT_ID=1
       - NUM_CLIENTS=2
-      - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
@@ -546,7 +545,6 @@ services:
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     networks:
       - fl-dds-network
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
@@ -565,7 +563,6 @@ services:
       - DDS_DOMAIN_ID=0
       - CLIENT_ID=2
       - NUM_CLIENTS=2
-      - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -574,7 +571,6 @@ services:
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     networks:
       - fl-dds-network
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml

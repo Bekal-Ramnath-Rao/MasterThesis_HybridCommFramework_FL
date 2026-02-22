@@ -105,8 +105,9 @@ class FederatedLearningServer:
             else:
                 print("Server: Quantization disabled")
         
-        # Initialize global model
-        self.initialize_global_model()
+        # Global model is initialized after connect() so RabbitMQ queues exist before clients send
+        self.global_weights = None
+        self.model_config = None
         
         # Training configuration
         # Training configuration broadcast to AMQP clients
@@ -810,7 +811,9 @@ if __name__ == "__main__":
     server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
     try:
+        # Connect first so registration queue exists before clients send (avoids lost registrations)
         server.connect()
+        server.initialize_global_model()
         server.start()
     except KeyboardInterrupt:
         print("\nServer shutting down...")

@@ -240,8 +240,10 @@ class FederatedLearningClient:
                 
                 print(f"Client {self.client_id} connected to RabbitMQ broker")
                 
-                # Send registration message
-                self.send_registration()
+                # Send registration a few times so server receives it even if it wasn't ready on first send
+                for _ in range(3):
+                    self.send_registration()
+                    time.sleep(2)
                 
                 return True
                 

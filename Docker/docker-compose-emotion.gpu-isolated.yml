@@ -29,7 +29,8 @@ services:
       - USE_CASE=emotion
       - MQTT_BROKER=mqtt-broker
       - MQTT_PORT=1883
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
@@ -57,6 +58,7 @@ services:
     environment:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - PROTOCOL=MQTT
       - USE_CASE=emotion
       - MQTT_BROKER=mqtt-broker
@@ -96,6 +98,7 @@ services:
     environment:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - PROTOCOL=MQTT
       - USE_CASE=emotion
       - MQTT_BROKER=mqtt-broker
@@ -155,7 +158,8 @@ services:
       - AMQP_PORT=5672
       - AMQP_USER=guest
       - AMQP_PASSWORD=guest
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
@@ -181,6 +185,7 @@ services:
     environment:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - PROTOCOL=AMQP
       - USE_CASE=emotion
       - AMQP_HOST=amqp-broker
@@ -220,6 +225,7 @@ services:
     environment:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - PROTOCOL=AMQP
       - USE_CASE=emotion
       - AMQP_HOST=amqp-broker
@@ -264,7 +270,8 @@ services:
       - PROTOCOL=gRPC
       - USE_CASE=emotion
       - GRPC_PORT=50051
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
@@ -290,6 +297,7 @@ services:
     environment:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - PROTOCOL=gRPC
       - USE_CASE=emotion
       - GRPC_HOST=fl-server-grpc-emotion
@@ -326,6 +334,7 @@ services:
     environment:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - PROTOCOL=gRPC
       - USE_CASE=emotion
       - GRPC_HOST=fl-server-grpc-emotion
@@ -367,7 +376,8 @@ services:
       - PROTOCOL=QUIC
       - USE_CASE=emotion
       - QUIC_PORT=4433
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - TF_FORCE_GPU_ALLOW_GROWTH=true
@@ -395,6 +405,7 @@ services:
     environment:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - PROTOCOL=QUIC
       - USE_CASE=emotion
       - QUIC_HOST=fl-server-quic-emotion
@@ -431,6 +442,7 @@ services:
     environment:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - PROTOCOL=QUIC
       - USE_CASE=emotion
       - QUIC_HOST=fl-server-quic-emotion
@@ -473,7 +485,8 @@ services:
       - USE_CASE=emotion
       - HTTP3_HOST=0.0.0.0
       - HTTP3_PORT=4434
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
@@ -502,6 +515,7 @@ services:
     environment:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - PROTOCOL=HTTP3
       - USE_CASE=emotion
       - HTTP3_HOST=fl-server-http3-emotion
@@ -538,6 +552,7 @@ services:
     environment:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - PROTOCOL=HTTP3
       - USE_CASE=emotion
       - HTTP3_HOST=fl-server-http3-emotion
@@ -578,7 +593,8 @@ services:
     environment:
       - PROTOCOL=DDS
       - USE_CASE=emotion
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
@@ -589,7 +605,6 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-      - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
     networks:
       - emotion_network
     container_name: fl-server-dds-emotion
@@ -597,7 +612,6 @@ services:
       - NET_ADMIN
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
-      - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     command: bash -c "sleep 10 && python -u Server/Emotion_Recognition/FL_Server_DDS.py"
     # Server does not need GPU resources - only aggregates models
 
@@ -608,6 +622,7 @@ services:
     environment:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - PROTOCOL=DDS
       - USE_CASE=emotion
       - CUDA_VISIBLE_DEVICES=0
@@ -620,7 +635,6 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-      - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
     depends_on:
       - fl-server-dds-emotion
     networks:
@@ -630,7 +644,6 @@ services:
       - NET_ADMIN
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     deploy:
       resources:
@@ -647,6 +660,7 @@ services:
     environment:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - PROTOCOL=DDS
       - USE_CASE=emotion
       - CUDA_VISIBLE_DEVICES=0
@@ -659,7 +673,6 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
-      - CYCLONEDDS_URI=file:///app/cyclonedds-emotion.xml
     depends_on:
       - fl-server-dds-emotion
     networks:
@@ -669,7 +682,6 @@ services:
       - NET_ADMIN
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-      - ../config/cyclonedds-emotion.xml:/app/cyclonedds-emotion.xml:ro
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
     deploy:
       resources:

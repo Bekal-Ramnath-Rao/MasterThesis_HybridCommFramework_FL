@@ -32,6 +32,7 @@ SERVICE_PATTERNS = {
         "amqp": (["fl-client-amqp-emotion-1", "fl-client-amqp-emotion-2"], "fl-server-amqp-emotion"),
         "grpc": (["fl-client-grpc-emotion-1", "fl-client-grpc-emotion-2"], "fl-server-grpc-emotion"),
         "quic": (["fl-client-quic-emotion-1", "fl-client-quic-emotion-2"], "fl-server-quic-emotion"),
+        "http3": (["fl-client-http3-emotion-1", "fl-client-http3-emotion-2"], "fl-server-http3-emotion"),
         "dds": (["fl-client-dds-emotion-1", "fl-client-dds-emotion-2"], "fl-server-dds-emotion"),
     },
     "mentalstate": {
@@ -39,6 +40,7 @@ SERVICE_PATTERNS = {
         "amqp": (["fl-client-amqp-mental-1", "fl-client-amqp-mental-2"], "fl-server-amqp-mental"),
         "grpc": (["fl-client-grpc-mental-1", "fl-client-grpc-mental-2"], "fl-server-grpc-mental"),
         "quic": (["fl-client-quic-mental-1", "fl-client-quic-mental-2"], "fl-server-quic-mental"),
+        "http3": (["fl-client-http3-mental-1", "fl-client-http3-mental-2"], "fl-server-http3-mental"),
         "dds": (["fl-client-dds-mental-1", "fl-client-dds-mental-2"], "fl-server-dds-mental"),
     },
     "temperature": {
@@ -46,6 +48,7 @@ SERVICE_PATTERNS = {
         "amqp": (["fl-client-amqp-temp-1", "fl-client-amqp-temp-2"], "fl-server-amqp-temp"),
         "grpc": (["fl-client-grpc-temp-1", "fl-client-grpc-temp-2"], "fl-server-grpc-temp"),
         "quic": (["fl-client-quic-temp-1", "fl-client-quic-temp-2"], "fl-server-quic-temp"),
+        "http3": (["fl-client-http3-temp-1", "fl-client-http3-temp-2"], "fl-server-http3-temp"),
         "dds": (["fl-client-dds-temp-1", "fl-client-dds-temp-2"], "fl-server-dds-temp"),
     },
 }
@@ -60,54 +63,85 @@ def run_cmd(cmd, check=True, env=None, cwd=None):
 
 
 def extract_tc_params(sender_container: str) -> dict:
-    """Phase 2: Run docker exec <container> tc qdisc show dev eth0 and extract B, p, D_tc, J."""
+    """Phase 2: Run docker exec <container> tc qdisc show dev eth0 and extract B, p, D_tc, J.
+    B must be in bits per second. If no bandwidth limit is found (e.g. unconstrained Docker bridge),
+    B is strictly float('inf') so that S/B = 0. Never return B=0 or B=1 (would explode S/B).
+    """
     result = run_cmd(
         ["docker", "exec", sender_container, "tc", "qdisc", "show", "dev", "eth0"],
         check=False,
     )
     out = (result.stdout or "") + (result.stderr or "")
-    B_bps = float("inf")  # default no limit
+    B_candidates = []  # collect all rates; use max so main link rate wins over burst/small rates
     p = 0.0
     D_tc = 0.0
     J = 0.0
 
-    # netem: delay 50.0ms 10.0ms loss 1%  -> D_tc=50e-3, J=10e-3, p=0.01
-    # tbf: rate 20mbit -> B
-    # htb: rate 20mbit in class
+    # tc output: rate 100Mbit -> 100e6 bps, rate 1000mbit -> 1e9 bps (regex is case-insensitive)
+    # netem: delay 50.0ms 10.0ms loss 1%
+    # tbf: rate 20mbit burst 32kbit -> we only match "rate <num><unit>"; take max so link rate wins
     for line in out.splitlines():
-        # rate 20mbit or rate 1000mbit
-        m = re.search(r"rate\s+(\d+(?:\.\d+)?)\s*(\w+)", line, re.I)
+        m = re.search(r"rate\s+(\d+(?:\.\d+)?)\s*(\w*)", line, re.I)
         if m:
-            val, unit = float(m.group(1)), (m.group(2) or "").lower()
+            val = float(m.group(1))
+            unit = (m.group(2) or "").strip().lower()
+            # 100Mbit / 100mbit -> 100 * 1e6 = 100000000 bps
             if "gbit" in unit or "gibit" in unit:
-                B_bps = val * 1e9
+                bps = val * 1e9
             elif "mbit" in unit or "mibit" in unit:
-                B_bps = val * 1e6
+                bps = val * 1e6
             elif "kbit" in unit or "kibit" in unit:
-                B_bps = val * 1e3
+                bps = val * 1e3
+            elif "bit" in unit or not unit:
+                bps = val  # raw bps if "bit" or no unit
             else:
-                B_bps = val
+                bps = val
+            B_candidates.append(bps)
             continue
-        # delay 50.0ms 10.0ms -> first is latency, second is jitter
-        m = re.search(r"delay\s+(\d+(?:\.\d+)?)\s*(\w+)", line, re.I)
+        # delay 500.0ms 10.0ms or delay 500000us 10000us -> D_tc and J in seconds
+        # tc output e.g.: "delay 500.0ms 10.0ms loss 1% rate 100Mbit"
+        m = re.search(r"delay\s+([\d.]+)\s*(\w*)", line, re.I)
         if m:
-            D_val, D_unit = float(m.group(1)), (m.group(2) or "").lower()
-            if "ms" in D_unit:
-                D_tc = D_val / 1000.0
-            else:
-                D_tc = D_val
-            # optional jitter: delay 50.0ms 10.0ms (second number on same line)
-            m2 = re.search(r"delay\s+\d+(?:\.\d+)?\s*\S+\s+(\d+(?:\.\d+)?)\s*(\w+)", line, re.I)
+            raw_val, raw_unit = (m.group(1) or "").strip(), (m.group(2) or "").strip().lower()
+            if raw_val:
+                D_val = float(raw_val)
+                # Convert to seconds: us/usec -> *0.000001, ms -> *0.001, s -> *1
+                if "usec" in raw_unit or ("us" in raw_unit and "ms" not in raw_unit):
+                    D_tc = D_val * 0.000001
+                elif "ms" in raw_unit:
+                    D_tc = D_val * 0.001
+                elif "s" in raw_unit and "ms" not in raw_unit and "us" not in raw_unit:
+                    D_tc = D_val
+                elif not raw_unit and D_val > 1000:
+                    D_tc = D_val * 0.000001  # no unit + large value: assume microseconds
+                else:
+                    D_tc = D_val * 0.001  # assume ms if unknown
+            # Jitter: second number on same line (e.g. delay 500.0ms 10.0ms)
+            m2 = re.search(r"delay\s+[\d.]+\s*\S+\s+([\d.]+)\s*(\w*)", line, re.I)
             if m2:
-                J_val, J_unit = float(m2.group(1)), (m2.group(2) or "").lower()
-                J = J_val / 1000.0 if "ms" in J_unit else J_val
+                j_raw, j_unit = (m2.group(1) or "").strip(), (m2.group(2) or "").strip().lower()
+                if j_raw:
+                    J_val = float(j_raw)
+                    if "usec" in j_unit or ("us" in j_unit and "ms" not in j_unit):
+                        J = J_val * 0.000001
+                    elif "ms" in j_unit:
+                        J = J_val * 0.001
+                    elif "s" in j_unit and "ms" not in j_unit and "us" not in j_unit:
+                        J = J_val
+                    elif not j_unit and J_val > 1000:
+                        J = J_val * 0.000001
+                    else:
+                        J = J_val * 0.001
             continue
-        # loss 1% or loss 0.5%
         m = re.search(r"loss\s+(\d+(?:\.\d+)?)\s*%?", line, re.I)
         if m:
             p = float(m.group(1)) / 100.0
             continue
 
+    # No rate found (e.g. no tc applied) -> B must be inf so S/B = 0. Never 0 or 1.
+    B_bps = max(B_candidates) if B_candidates else float("inf")
+    if B_bps <= 0 or not math.isfinite(B_bps):
+        B_bps = float("inf")
     return {"B": B_bps, "p": p, "D_tc": D_tc, "J": J}
 
 
@@ -294,7 +328,7 @@ def parse_fl_diag_from_logs_multi(
         s_list = server_lines_per_client.get(client_id, [])
         r_idx = min(round_index, len(client_vals_list) - 1, len(s_list) - 1)
         if r_idx < 0:
-            results.append({"client_id": client_id, "O_send": 0.0, "O_recv": 0.0, "T_total": 0.0, "payload_bytes": 0, "S_bits": 0})
+            results.append({"client_id": client_id, "O_send": 0.0, "O_recv": 0.0, "T_total": 0.0, "payload_bytes": 0, "S_bits": int(0)})
             continue
         c = client_vals_list[r_idx]
         s = s_list[r_idx]
@@ -309,8 +343,8 @@ def parse_fl_diag_from_logs_multi(
             "O_send": O_send,
             "O_recv": O_recv,
             "T_total": T_total,
-            "payload_bytes": payload_bytes,
-            "S_bits": payload_bytes * 8,
+            "payload_bytes": int(payload_bytes),
+            "S_bits": int(payload_bytes) * 8,  # bits; ensure integer
         })
     return results
 
@@ -334,8 +368,8 @@ def run_pipeline(
     use_case = use_case.lower()
     protocol = protocol.lower()
     scenario = (scenario or "excellent").lower()
-    if protocol not in ("mqtt", "amqp", "grpc", "quic", "dds"):
-        raise ValueError("Protocol must be one of: mqtt, amqp, grpc, quic, dds")
+    if protocol not in ("mqtt", "amqp", "grpc", "quic", "http3", "dds"):
+        raise ValueError("Protocol must be one of: mqtt, amqp, grpc, quic, http3, dds")
 
     # Import here to avoid circular deps and to use same scenarios as GUI/network_simulator
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -414,10 +448,10 @@ def run_pipeline(
 
     # O_broker once (from first client) for broker-based protocols
     cal0 = cal_list[0] if cal_list else {}
-    S_bits = cal0.get("S_bits", 0)
+    S_bits = int(cal0.get("S_bits", 0))  # bits (payload_bytes * 8 from FL_DIAG)
     if payload_file and os.path.isfile(payload_file):
-        S_bits = 8 * os.path.getsize(payload_file)
-    if protocol in ("grpc", "quic", "dds"):
+        S_bits = int(8 * os.path.getsize(payload_file))
+    if protocol in ("grpc", "quic", "http3", "dds"):
         O_broker = 0.0
     else:
         B_bridge = B_BRIDGE_BPS
@@ -439,11 +473,17 @@ def run_pipeline(
     print("[Phase 2] Extracting tc parameters from sender container...")
     tc = extract_tc_params(sender_containers[0])
     B, p, D_tc, J = tc["B"], tc["p"], tc["D_tc"], tc["J"]
-    if B == float("inf") and p == 0 and D_tc == 0 and J == 0:
+    # No bandwidth in tc (unconstrained Docker bridge) -> use scenario B so S/B is well-defined
+    if B == float("inf"):
         B = _scenario_bandwidth_bps(conditions)
-        p = _scenario_loss_decimal(conditions)
-        D_tc, J = _scenario_delay_jitter_sec(conditions)
-        print(f"          Using scenario-derived params: B={B}, p={p}, D_tc={D_tc}, J={J}")
+        if p == 0 and D_tc == 0 and J == 0:
+            p = _scenario_loss_decimal(conditions)
+            D_tc, J = _scenario_delay_jitter_sec(conditions)
+        print(f"          No tc rate found; using scenario-derived B={B} bps, p={p}, D_tc={D_tc}, J={J}")
+    elif B != float("inf") and (B < 1e6 or B <= 0) and conditions.get("bandwidth"):
+        # Extracted B too small or invalid (e.g. burst 32kbit); use scenario bandwidth
+        B = _scenario_bandwidth_bps(conditions)
+        print(f"          Using scenario bandwidth (extracted B was {tc['B']:.0f} bps): B={B}")
     RTT_eff = D_tc + J
     time.sleep(2)
 
@@ -458,6 +498,12 @@ def run_pipeline(
     if not lossy_list or len(lossy_list) < len(cal_list):
         lossy_list = [{"client_id": i + 1, "T_total": cal_list[i].get("T_total", 0)} if i < len(cal_list) else {"client_id": i + 1, "T_total": 0} for i in range(max(2, len(cal_list)))]
 
+    # Safe transfer time: S_bits/B in seconds; S/inf = 0, avoid division by zero
+    def transfer_time_bits_bps(S_bits_val, B_val):
+        if B_val is None or B_val <= 0 or not math.isfinite(B_val):
+            return 0.0
+        return float(S_bits_val) / float(B_val)
+
     # Per-client summaries
     summaries = []
     for i, cal in enumerate(cal_list):
@@ -465,20 +511,29 @@ def run_pipeline(
         O_send = cal.get("O_send", 0.0)
         O_recv = cal.get("O_recv", 0.0)
         O_app = O_send + O_recv + O_broker
-        S_bits_c = cal.get("S_bits", S_bits)
+        # S in bits: from FL_DIAG payload_bytes * 8 (ensure int)
+        S_bits_c = int(cal.get("S_bits", S_bits))
         lossy_c = next((x for x in lossy_list if x.get("client_id") == cid), lossy_list[i] if i < len(lossy_list) else {})
         T_actual = lossy_c.get("T_total", 0.0)
         if protocol in ("mqtt", "amqp", "grpc"):
-            B_eff = B if p == 0 else min(B, MSS_BITS / (RTT_eff * math.sqrt(p)))
-            T_calc = (1.5 * RTT_eff) + (S_bits_c / B_eff) + O_app
-        elif protocol == "quic":
-            T_calc = (1 * RTT_eff) + (S_bits_c / B) + (p * (S_bits_c / MSS_BITS) * RTT_eff) + O_app
+            B_eff = B if p == 0 else min(B, MSS_BITS / (RTT_eff * math.sqrt(p))) if RTT_eff and p else B
         else:
-            T_calc = (S_bits_c / B) + (p * (S_bits_c / MSS_BITS) * (RTT_eff + T_REPAIR)) + O_app
+            B_eff = B
+        # DEBUG: values used in T_calc (user-requested)
+        print(f"DEBUG -> S: {S_bits_c} bits | B: {B} bps | RTT_eff: {RTT_eff} s | Loss (p): {p} | O_app: {O_app} s")
+        transfer_s = transfer_time_bits_bps(S_bits_c, B_eff)
+        if protocol in ("mqtt", "amqp", "grpc"):
+            T_calc = (1.5 * RTT_eff) + transfer_s + O_app
+        elif protocol in ("quic", "http3"):
+            # HTTP/3 is QUIC-based; same analytical formula
+            T_calc = (1 * RTT_eff) + transfer_time_bits_bps(S_bits_c, B) + (p * (S_bits_c / MSS_BITS) * RTT_eff) + O_app
+        else:
+            T_calc = transfer_time_bits_bps(S_bits_c, B) + (p * (S_bits_c / MSS_BITS) * (RTT_eff + T_REPAIR)) + O_app
         error_pct = 100.0 * (T_actual - T_calc) / T_actual if T_actual else 0.0
         summaries.append({
             "client_id": cid,
             "protocol": protocol.upper(),
+            "scenario": scenario,
             "O_app": O_app,
             "O_broker": O_broker,
             "p": p,
@@ -492,15 +547,17 @@ def run_pipeline(
 
 
 def print_table(summaries: list):
-    """Phase 4: Print formatted terminal table (one row per client)."""
+    """Phase 4: Print formatted terminal table (one row per client), including protocol and network scenario."""
     print()
-    sep = "+--------+----------+----------------+----------------+----------+----------------+----------------+----------+"
+    sep = "+--------+----------+-------------+----------------+----------------+----------+----------------+----------------+----------+"
     print(sep)
-    print("| Client | Protocol | O_app (s)      | O_broker       | Loss (p) | T_actual (s)    | T_calc (s)     | Error %  |")
+    print("| Client | Protocol | Scenario    | O_app (s)      | O_broker       | Loss (p) | T_actual (s)    | T_calc (s)     | Error %  |")
     print(sep)
     for r in summaries:
-        print("| {:^6} | {:^8} | {:>14.6f} | {:>14.6f} | {:>8.4f} | {:>14.4f} | {:>14.4f} | {:>7} |".format(
-            r.get("client_id", 0), r["protocol"], r["O_app"], r["O_broker"], r["p"],
+        scen = (r.get("scenario", "") or "")[:12]
+        print("| {:^6} | {:^8} | {:^11} | {:>14.6f} | {:>14.6f} | {:>8.4f} | {:>14.4f} | {:>14.4f} | {:>7} |".format(
+            r.get("client_id", 0), r["protocol"], scen,
+            r["O_app"], r["O_broker"], r["p"],
             r["T_actual"], r["T_calc"], f"{r['error_pct']:.2f}%"))
     print(sep)
     print()
@@ -511,7 +568,7 @@ def main():
         description="Diagnostic pipeline: Empirical overhead, network extraction, analytical model (single protocol).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--protocol", "-p", required=True, choices=["mqtt", "amqp", "grpc", "quic", "dds"])
+    parser.add_argument("--protocol", "-p", required=True, choices=["mqtt", "amqp", "grpc", "quic", "http3", "dds"])
     parser.add_argument("--use-case", "-u", default="emotion", choices=["emotion", "mentalstate", "temperature"])
     parser.add_argument(
         "--scenario", "-s",
@@ -546,6 +603,15 @@ def main():
     print_table(summary)
     # Emit JSON line for GUI to display in Diagnostic Results tab (flush so it is not buffered)
     print("FL_DIAG_TABLE_JSON|" + json.dumps(summary), flush=True)
+    # Also write to file so GUI can load reliably when experiment completes (fallback if stdout is lost)
+    out_dir = PROJECT_ROOT / "shared_data"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / "diagnostic_results_latest.json"
+    try:
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+    except Exception as e:
+        print(f"Warning: could not write {out_file}: {e}", flush=True)
 
 
 if __name__ == "__main__":

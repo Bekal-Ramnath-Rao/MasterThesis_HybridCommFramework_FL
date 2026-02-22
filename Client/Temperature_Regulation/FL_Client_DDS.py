@@ -279,8 +279,9 @@ class FederatedLearningClient:
                 mape=mape
             )
             self.writers['model_update_chunk'].write(chunk)
-            print(f"  Sent chunk {chunk_id + 1}/{total_chunks} ({len(chunk_data)} bytes)")
-            time.sleep(0.05)  # Small delay between chunks
+            # Aligned with unified: Reliable QoS handles delivery, no artificial delay needed
+            if (chunk_id + 1) % 20 == 0:
+                print(f"  Sent {chunk_id + 1}/{total_chunks} chunks")
     
     def setup_dds(self):
         """Initialize DDS participant, topics, readers, and writers"""
