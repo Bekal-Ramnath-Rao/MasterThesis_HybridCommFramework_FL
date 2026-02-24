@@ -552,6 +552,11 @@ class FLExperimentGUI(QMainWindow):
         self.gpu_enabled.setStyleSheet("font-size: 13px; padding: 5px;")
         gpu_layout.addWidget(self.gpu_enabled)
         
+        self.host_network_enabled = QCheckBox("Use host network (docker-compose *.host-network.yml)")
+        self.host_network_enabled.setToolTip("Use network_mode: host for containers; matches normal experiments using host network. Diagnostic pipeline will use host-network compose and apply tc on host.")
+        self.host_network_enabled.setStyleSheet("font-size: 13px; padding: 5px;")
+        gpu_layout.addWidget(self.host_network_enabled)
+        
         gpu_layout.addWidget(QLabel("GPU Count:"))
         self.gpu_count = QSpinBox()
         self.gpu_count.setRange(0, 8)
@@ -562,6 +567,11 @@ class FLExperimentGUI(QMainWindow):
         gpu_layout.addStretch()
         gpu_group.setLayout(gpu_layout)
         layout.addWidget(gpu_group)
+        # Info: GPU uses Docker bridge unless host network is selected
+        self.gpu_network_info = QLabel("ℹ️ GPU acceleration uses Docker bridge (docker-compose *.gpu-isolated.yml) by default. Check \"Use host network\" only if you need network_mode: host.")
+        self.gpu_network_info.setWordWrap(True)
+        self.gpu_network_info.setStyleSheet("color: #555; font-size: 11px; padding: 4px 0;")
+        layout.addWidget(self.gpu_network_info)
         
         # Training Configuration
         training_group = QGroupBox("🎓 Training Configuration")
@@ -949,6 +959,23 @@ class FLExperimentGUI(QMainWindow):
         self.build_btn_emotion.clicked.connect(self.build_docker_images_emotion)
         docker_layout.addWidget(self.build_btn_emotion)
 
+        # Host-network build buttons (all use cases – high-performance, no bridge)
+        host_label = QLabel("🌐 Host Network Build (recommended for experiments)")
+        host_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #16a085; margin-top: 8px;")
+        docker_layout.addWidget(host_label)
+        self.build_btn_temp_host = QPushButton("🐳 Build Docker Images (Temperature) [Host Network]")
+        self.build_btn_temp_host.setStyleSheet("font-size: 14px; padding: 8px; background-color: #16a085; color: white; border-radius: 6px;")
+        self.build_btn_temp_host.clicked.connect(self.build_docker_images_temperature_host)
+        docker_layout.addWidget(self.build_btn_temp_host)
+        self.build_btn_mental_host = QPushButton("🐳 Build Docker Images (Mental State) [Host Network]")
+        self.build_btn_mental_host.setStyleSheet("font-size: 14px; padding: 8px; background-color: #16a085; color: white; border-radius: 6px;")
+        self.build_btn_mental_host.clicked.connect(self.build_docker_images_mentalstate_host)
+        docker_layout.addWidget(self.build_btn_mental_host)
+        self.build_btn_emotion_host = QPushButton("🐳 Build Docker Images (Emotion) [Host Network]")
+        self.build_btn_emotion_host.setStyleSheet("font-size: 14px; padding: 8px; background-color: #16a085; color: white; border-radius: 6px;")
+        self.build_btn_emotion_host.clicked.connect(self.build_docker_images_emotion_host)
+        docker_layout.addWidget(self.build_btn_emotion_host)
+
         # Add separator
         separator = QLabel("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         separator.setStyleSheet("color: #95a5a6; font-size: 10px; margin: 10px 0;")
@@ -973,6 +1000,23 @@ class FLExperimentGUI(QMainWindow):
         self.build_btn_unified_emotion.setStyleSheet("font-size: 15px; padding: 10px; background-color: #e74c3c; color: white; border-radius: 6px;")
         self.build_btn_unified_emotion.clicked.connect(self.build_docker_images_unified_emotion)
         docker_layout.addWidget(self.build_btn_unified_emotion)
+
+        # Unified host-network build buttons
+        unified_host_label = QLabel("🌐 Unified Host Network Build")
+        unified_host_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #c0392b; margin-top: 8px;")
+        docker_layout.addWidget(unified_host_label)
+        self.build_btn_unified_temp_host = QPushButton("🤖 Build Unified Images (Temperature) [Host Network]")
+        self.build_btn_unified_temp_host.setStyleSheet("font-size: 14px; padding: 8px; background-color: #c0392b; color: white; border-radius: 6px;")
+        self.build_btn_unified_temp_host.clicked.connect(self.build_docker_images_unified_temperature_host)
+        docker_layout.addWidget(self.build_btn_unified_temp_host)
+        self.build_btn_unified_mental_host = QPushButton("🤖 Build Unified Images (Mental State) [Host Network]")
+        self.build_btn_unified_mental_host.setStyleSheet("font-size: 14px; padding: 8px; background-color: #c0392b; color: white; border-radius: 6px;")
+        self.build_btn_unified_mental_host.clicked.connect(self.build_docker_images_unified_mentalstate_host)
+        docker_layout.addWidget(self.build_btn_unified_mental_host)
+        self.build_btn_unified_emotion_host = QPushButton("🤖 Build Unified Images (Emotion) [Host Network]")
+        self.build_btn_unified_emotion_host.setStyleSheet("font-size: 14px; padding: 8px; background-color: #c0392b; color: white; border-radius: 6px;")
+        self.build_btn_unified_emotion_host.clicked.connect(self.build_docker_images_unified_emotion_host)
+        docker_layout.addWidget(self.build_btn_unified_emotion_host)
 
         docker_group.setLayout(docker_layout)
         layout.addWidget(docker_group)
@@ -1440,6 +1484,94 @@ class FLExperimentGUI(QMainWindow):
                 self.docker_build_log_text.append(f"\n❌ Unified Docker build failed (Emotion), code {returncode}")
         self.docker_build_thread.build_finished.connect(on_build_finished)
         self.docker_build_thread.start()
+
+    def _build_compose(self, compose_file, btn_attr, msg_ok, msg_fail, label):
+        """Shared helper to run docker compose build and wire log/button state."""
+        use_cache = self.use_cache.isChecked()
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        full_compose_path = os.path.join(base_dir, compose_file)
+        cmd = ["docker", "compose", "-f", full_compose_path, "build"]
+        if not use_cache:
+            cmd.append("--no-cache")
+        self.statusBar().showMessage(f"🐳 Building Docker images ({label})...")
+        btn = getattr(self, btn_attr, None)
+        if btn:
+            btn.setEnabled(False)
+        self.docker_build_log_text.clear()
+        self.output_tabs.setCurrentWidget(self.docker_build_log_text)
+        self.docker_build_thread = DockerBuildThread(cmd, base_dir)
+        self.docker_build_thread.log_update.connect(self.docker_build_log_text.append)
+        def on_finish(success, returncode):
+            if btn:
+                btn.setEnabled(True)
+            if success and returncode == 0:
+                self.statusBar().showMessage(msg_ok)
+                self.docker_build_log_text.append(f"\n✅ {msg_ok}")
+            else:
+                self.statusBar().showMessage(msg_fail)
+                self.docker_build_log_text.append(f"\n❌ {msg_fail}, code {returncode}")
+        self.docker_build_thread.build_finished.connect(on_finish)
+        self.docker_build_thread.start()
+
+    def build_docker_images_emotion_host(self):
+        """Build Docker images for Emotion use case (host network)."""
+        self._build_compose(
+            "Docker/docker-compose-emotion.host-network.yml",
+            "build_btn_emotion_host",
+            "Docker images built successfully (Emotion) [Host Network]",
+            "Docker build failed (Emotion) [Host Network]",
+            "Emotion Host Network",
+        )
+
+    def build_docker_images_temperature_host(self):
+        """Build Docker images for Temperature use case (host network)."""
+        self._build_compose(
+            "Docker/docker-compose-temperature.host-network.yml",
+            "build_btn_temp_host",
+            "Docker images built successfully (Temperature) [Host Network]",
+            "Docker build failed (Temperature) [Host Network]",
+            "Temperature Host Network",
+        )
+
+    def build_docker_images_mentalstate_host(self):
+        """Build Docker images for Mental State use case (host network)."""
+        self._build_compose(
+            "Docker/docker-compose-mentalstate.host-network.yml",
+            "build_btn_mental_host",
+            "Docker images built successfully (Mental State) [Host Network]",
+            "Docker build failed (Mental State) [Host Network]",
+            "Mental State Host Network",
+        )
+
+    def build_docker_images_unified_emotion_host(self):
+        """Build Unified Docker images for Emotion (host network)."""
+        self._build_compose(
+            "Docker/docker-compose-unified-emotion.host-network.yml",
+            "build_btn_unified_emotion_host",
+            "Unified Docker images built successfully (Emotion) [Host Network]",
+            "Unified Docker build failed (Emotion) [Host Network]",
+            "Unified Emotion Host Network",
+        )
+
+    def build_docker_images_unified_temperature_host(self):
+        """Build Unified Docker images for Temperature (host network)."""
+        self._build_compose(
+            "Docker/docker-compose-unified-temperature.host-network.yml",
+            "build_btn_unified_temp_host",
+            "Unified Docker images built successfully (Temperature) [Host Network]",
+            "Unified Docker build failed (Temperature) [Host Network]",
+            "Unified Temperature Host Network",
+        )
+
+    def build_docker_images_unified_mentalstate_host(self):
+        """Build Unified Docker images for Mental State (host network)."""
+        self._build_compose(
+            "Docker/docker-compose-unified-mentalstate.host-network.yml",
+            "build_btn_unified_mental_host",
+            "Unified Docker images built successfully (Mental State) [Host Network]",
+            "Unified Docker build failed (Mental State) [Host Network]",
+            "Unified Mental State Host Network",
+        )
 
     def create_monitoring_output_section(self):
         """Create comprehensive monitoring and output section (buttons are in create_control_buttons_row above)"""
@@ -2014,6 +2146,10 @@ class FLExperimentGUI(QMainWindow):
         if self.gpu_enabled.isChecked():
             cmd_parts.append("--enable-gpu")
         
+        # Host network: when unchecked, GPU uses Docker bridge (*.gpu-isolated.yml)
+        if self.host_network_enabled.isChecked():
+            cmd_parts.append("--host-network")
+        
         # Baseline mode flag
         if self.baseline_mode.isChecked():
             cmd_parts.append("--baseline")
@@ -2172,6 +2308,8 @@ class FLExperimentGUI(QMainWindow):
         command = f"python3 {script} --protocol {protocol} --use-case {use_case} --scenario {scenario}"
         if self.gpu_enabled.isChecked():
             command += " --enable-gpu"
+        if self.host_network_enabled.isChecked():
+            command += " --host-network"
         reply = QMessageBox.question(
             self,
             "Run Diagnostic Pipeline",
@@ -2179,7 +2317,8 @@ class FLExperimentGUI(QMainWindow):
             f"  Protocol: {protocol.upper()}\n"
             f"  Use Case: {use_case}\n"
             f"  Network scenario (Phases 2–4): {scenario}\n"
-            f"  GPU: {'Enabled (fallback to CPU if unavailable)' if self.gpu_enabled.isChecked() else 'Disabled'}\n\n"
+            f"  GPU: {'Enabled (fallback to CPU if unavailable)' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
+            f"  Host network: {'Yes (docker-compose *.host-network.yml)' if self.host_network_enabled.isChecked() else 'No'}\n\n"
             f"  Phase 1: Calibration with NO channel losses (protocol & broker overhead only).\n"
             f"  Phases 2–4: Apply scenario '{scenario}' → extract tc → lossy round → table.\n\n"
             f"Continue?",

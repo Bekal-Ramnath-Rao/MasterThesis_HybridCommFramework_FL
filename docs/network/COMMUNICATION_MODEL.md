@@ -3,6 +3,8 @@
 ## Date: 2026-02-11
 ## Purpose: Calculate transmission time for federated learning model updates across all protocols
 
+**Analytical formulas (diagnostic pipeline):** For the exact **T_calc** formulas implemented per protocol (MQTT, AMQP, gRPC, QUIC, HTTP/3, DDS), including TLS 1.3 for QUIC/HTTP3, see **[COMMUNICATION_MODEL_FORMULAS.md](COMMUNICATION_MODEL_FORMULAS.md)**.
+
 ---
 
 ## Table of Contents

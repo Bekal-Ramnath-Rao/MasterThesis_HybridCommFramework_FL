@@ -21,18 +21,35 @@ if sys.platform == 'win32':
     sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
     sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
 
+# Load .env from this directory so FL_SUDO_PASSWORD is set (for host tc). .env is gitignored.
+_env_path = Path(__file__).resolve().parent / ".env"
+if _env_path.exists():
+    try:
+        with open(_env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line and line.split("=", 1)[0].strip() == "FL_SUDO_PASSWORD":
+                    key, _, val = line.partition("=")
+                    os.environ[key.strip()] = val.strip().strip("'\"").strip()
+                    break
+    except Exception:
+        pass
+
 
 class ExperimentRunner:
     """Automates running FL experiments across different network conditions"""
     
     def __init__(self, use_case: str = "emotion", num_rounds: int = 10, enable_congestion: bool = False,
                  use_quantization: bool = False, quantization_params: Dict[str, str] = None, enable_gpu: bool = False,
-                 baseline_mode: bool = False, use_ql_convergence: bool = False):
+                 use_host_network: bool = False, baseline_mode: bool = False, use_ql_convergence: bool = False):
         self.use_case = use_case
         self.num_rounds = num_rounds
         self.enable_congestion = enable_congestion
         self.use_quantization = use_quantization
         self.enable_gpu = enable_gpu
+        self.use_host_network = use_host_network
         self.baseline_mode = baseline_mode
         self.use_ql_convergence = use_ql_convergence
         # quantization_params expected to be a dict of simple string values
@@ -116,44 +133,55 @@ class ExperimentRunner:
         # Docker compose file mapping (relative to project root)
         docker_dir = project_root / "Docker"
         
-        # Use GPU-isolated files when GPU is enabled, otherwise use standard files
-        if enable_gpu:
+        # GPU acceleration uses Docker bridge by default (docker-compose *.gpu-isolated.yml).
+        # Host network (docker-compose *.host-network.yml) is optional for both GPU and non-GPU.
+        if use_host_network:
+            # Host network mode: containers share host network (network_mode: host)
+            self.compose_files = {
+                "emotion": str(docker_dir / "docker-compose-emotion.host-network.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-mentalstate.host-network.yml"),
+                "temperature": str(docker_dir / "docker-compose-temperature.host-network.yml")
+            }
+            self.unified_compose_files = {
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.host-network.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.host-network.yml"),
+                "temperature": str(docker_dir / "docker-compose-unified-temperature.host-network.yml")
+            }
+            self.gpu_overlay_files = {}
+        elif enable_gpu:
+            # GPU + Docker bridge: use gpu-isolated compose (bridge network, no host mode)
             self.compose_files = {
                 "emotion": str(docker_dir / "docker-compose-emotion.gpu-isolated.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-mentalstate.gpu-isolated.yml"),
                 "temperature": str(docker_dir / "docker-compose-temperature.gpu-isolated.yml")
             }
-            # Unified compose files for RL-based protocol selection
             self.unified_compose_files = {
                 "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.yml"),
                 "temperature": str(docker_dir / "docker-compose-unified-temperature.yml")
             }
-            # No overlay files needed with GPU-isolated (they are standalone)
             self.gpu_overlay_files = {}
         else:
+            # Non-GPU + Docker bridge: standard compose files
             self.compose_files = {
                 "emotion": str(docker_dir / "docker-compose-emotion.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-mentalstate.yml"),
                 "temperature": str(docker_dir / "docker-compose-temperature.yml")
             }
-            # Unified compose files for RL-based protocol selection (non-GPU)
             self.unified_compose_files = {
                 "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.yml"),
                 "temperature": str(docker_dir / "docker-compose-unified-temperature.yml")
             }
-            # GPU overlay files (not used when enable_gpu=False)
             self.gpu_overlay_files = {
                 "emotion": str(docker_dir / "docker-compose-emotion.gpu.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-mentalstate.gpu.yml"),
                 "temperature": str(docker_dir / "docker-compose-temperature.gpu.yml")
             }
         
-        # Service name patterns
-        # Note: Use different broker names for GPU-isolated vs standard compose files
-        broker_mqtt = "mqtt-broker" if enable_gpu else "mqtt-broker"
-        broker_amqp = "amqp-broker" if enable_gpu else "rabbitmq"
+        # Service name patterns (broker names differ: host/gpu-isolated use amqp-broker, standard bridge uses rabbitmq)
+        broker_mqtt = "mqtt-broker"
+        broker_amqp = "amqp-broker" if (use_host_network or enable_gpu) else "rabbitmq"
         
         self.service_patterns = {
             "emotion": {
@@ -266,8 +294,9 @@ class ExperimentRunner:
         print(f"\n{'='*70}")
         print(f"Starting containers for {protocol.upper()} protocol...")
         print(f"Network Scenario: {scenario.upper()}")
+        print(f"Network mode: {'Host (docker-compose *.host-network.yml)' if self.use_host_network else 'Docker bridge'}")
         if self.enable_gpu:
-            print(f"GPU Acceleration: ENABLED (2x RTX 3080)")
+            print(f"GPU Acceleration: ENABLED (Docker bridge: *.gpu-isolated.yml)" if not self.use_host_network else "GPU Acceleration: ENABLED (host network)")
         if self.enable_congestion and congestion_level != "none":
             print(f"Congestion Level: {congestion_level.upper()}")
         print(f"{'='*70}")
@@ -345,6 +374,14 @@ class ExperimentRunner:
     def stop_containers(self, protocol: str):
         """Stop Docker containers for a specific protocol"""
         
+        # Reset host tc if we applied it for host-network mode
+        if getattr(self, "_host_network_sim", None) is not None:
+            try:
+                self._host_network_sim.reset_host_network()
+            except Exception as e:
+                print(f"[WARNING] Could not reset host network conditions: {e}")
+            self._host_network_sim = None
+
         # Use unified compose file for rl_unified
         if protocol == "rl_unified":
             compose_file = self.unified_compose_files[self.use_case]
@@ -364,7 +401,39 @@ class ExperimentRunner:
         time.sleep(5)
     
     def apply_network_scenario(self, scenario: str, protocol: str):
-        """Apply network conditions using network_simulator.py"""
+        """Apply network conditions using network_simulator.py.
+        With network_mode: host, per-container tc is not available; we apply the scenario
+        to the host's default interface so delay/loss still affect all host-network traffic."""
+        import sys
+        from pathlib import Path
+        parent_dir = str(Path(__file__).parent.parent)
+        if parent_dir not in sys.path:
+            sys.path.insert(0, parent_dir)
+        from network_simulator import NetworkSimulator
+
+        compose_file = self.unified_compose_files[self.use_case] if protocol == "rl_unified" else self.compose_files[self.use_case]
+        if "host-network" in compose_file:
+            print(f"\n{'='*70}")
+            print(f"Applying network scenario: {scenario.upper()} (host-network mode)")
+            print(f"{'='*70}")
+            sim = NetworkSimulator(verbose=True)
+            if scenario not in sim.NETWORK_SCENARIOS:
+                print(f"[WARNING] Unknown scenario: {scenario}, skipping")
+                print(f"{'='*70}\n")
+                return True
+            conditions = sim.NETWORK_SCENARIOS[scenario]
+            if sim.apply_network_conditions_host(conditions):
+                print(f"[INFO] Applied scenario '{scenario}' to host default interface.")
+                print(f"[INFO] Server and all clients share this link (delay/loss apply to both).")
+                self._host_network_sim = sim  # reset in stop_containers
+            else:
+                print(f"[WARNING] Could not apply host tc (permission denied).")
+                print(f"[INFO] When prompted, enter your sudo password; or run from a terminal: sudo python3 run_network_experiments.py ...")
+                print(f"[INFO] Experiment continues without latency/loss simulation.")
+                self._host_network_sim = None
+            print(f"{'='*70}\n")
+            return True
+
         print(f"\n{'='*70}")
         print(f"Applying network scenario: {scenario.upper()}")
         print(f"{'='*70}")
@@ -373,13 +442,6 @@ class ExperimentRunner:
         services = self.service_patterns[self.use_case][protocol]
         
         # Apply network conditions to each container individually
-        import sys
-        from pathlib import Path
-        # Add parent directory to path to import network_simulator
-        parent_dir = str(Path(__file__).parent.parent)
-        if parent_dir not in sys.path:
-            sys.path.insert(0, parent_dir)
-        from network_simulator import NetworkSimulator
         sim = NetworkSimulator(verbose=True)
         
         if scenario not in sim.NETWORK_SCENARIOS:
@@ -876,6 +938,8 @@ def main():
                 help="Set QUANTIZATION_PER_CHANNEL=1 if per-channel quantization should be used")
     parser.add_argument("--enable-gpu", "-g", action="store_true",
                 help="Enable GPU acceleration using NVIDIA runtime (requires nvidia-docker)")
+    parser.add_argument("--host-network", action="store_true",
+                help="Use docker-compose *.host-network.yml (network_mode: host). If not set, GPU uses Docker bridge (*.gpu-isolated.yml).")
     parser.add_argument("--baseline", "-b", action="store_true",
                 help="Baseline mode: Run without network conditions and save to baseline folder")
     parser.add_argument("--use-ql-convergence", action="store_true",
@@ -911,6 +975,7 @@ def main():
                             use_quantization=args.use_quantization,
                             quantization_params=quant_params,
                             enable_gpu=args.enable_gpu,
+                            use_host_network=args.host_network,
                             baseline_mode=args.baseline,
                             use_ql_convergence=args.use_ql_convergence)
     

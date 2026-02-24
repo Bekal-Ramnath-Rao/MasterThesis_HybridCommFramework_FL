@@ -5,6 +5,7 @@ import base64
 import time
 import os
 import asyncio
+import socket
 import sys
 from typing import Dict, Optional
 import matplotlib.pyplot as plt
@@ -28,8 +29,8 @@ from aioquic.quic.events import QuicEvent, StreamReset, StreamDataReceived
 from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import DataReceived, HeadersReceived, H3Event
 
-# Server Configuration
-HTTP3_HOST = os.getenv("HTTP3_HOST", "fl-server-http3-emotion")
+# Server Configuration (use 0.0.0.0 for host network mode; 127.0.0.1 for local only)
+HTTP3_HOST = os.getenv("HTTP3_HOST", "0.0.0.0")
 HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
 # Dynamic client configuration
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
@@ -42,6 +43,9 @@ CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 
+QUIC_SOCKET_BUFFER_BYTES = 7_500_000  # 7.5MB for SO_RCVBUF/SO_SNDBUF (poor network)
+
+
 class FederatedLearningServerProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -49,6 +53,17 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
         self._http = None  # H3Connection instance
         self._stream_buffers = {}  # Buffer for incomplete messages
         self._stream_content_lengths = {}  # Track expected content length per stream
+
+    def connection_made(self, transport):
+        super().connection_made(transport)
+        sock = transport.get_extra_info("socket")
+        if sock:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, QUIC_SOCKET_BUFFER_BYTES)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, QUIC_SOCKET_BUFFER_BYTES)
+                print(f"[HTTP/3] UDP socket buffers set to {QUIC_SOCKET_BUFFER_BYTES // 1_000_000}MB")
+            except OSError as e:
+                print(f"[HTTP/3] Could not set socket buffers: {e}")
     
     def quic_event_received(self, event: QuicEvent):
         """Handle QUIC events and convert to HTTP/3 events"""
@@ -827,17 +842,17 @@ async def main():
     
     server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
-    # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/QUIC/DDS for unbiased comparison
+    # QUIC config: cubic congestion, 60s idle; 128 MB flow control (aligned with MQTT/gRPC for fair FL comparison)
+    HTTP3_MAX_DATA_BYTES = 128 * 1024 * 1024  # 128 MB
     configuration = QuicConfiguration(
         is_client=False,
         alpn_protocols=H3_ALPN,
-        # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
-        max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
-        max_data=256 * 1024 * 1024,  # 256 MB total connection
-        # FAIR CONFIG: Timeout 600s for very_poor network scenarios
-        idle_timeout=600.0,  # 10 minutes
-        max_datagram_frame_size=65536,  # 64 KB frames
-        initial_rtt=0.15,  # Account for network latency
+        congestion_control_algorithm="cubic",
+        idle_timeout=60.0,
+        max_data=HTTP3_MAX_DATA_BYTES,
+        max_stream_data=HTTP3_MAX_DATA_BYTES,
+        max_datagram_frame_size=65536,
+        initial_rtt=0.15,
     )
     
     # Check if certificates exist in the certs directory

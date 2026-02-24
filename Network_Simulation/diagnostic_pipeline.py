@@ -25,6 +25,12 @@ MSS_BITS = 11680
 T_REPAIR = 0.005  # seconds
 B_BRIDGE_BPS = 10_000_000_000  # 10 Gbps
 
+# TLS 1.3 (QUIC/HTTP3) encryption overhead – CPU-bound
+# One-time handshake crypto (key exchange + cert verify); typical 1–5 ms on modern CPU
+O_TLS_HANDSHAKE_S = float(os.environ.get("O_TLS_HANDSHAKE_S", "0.003"))
+# Per-byte crypto time for encrypt+decrypt (AES-GCM); typical ~10–50 ns/byte → 1e-8–5e-8 s/byte
+K_TLS_SEC_PER_BYTE = float(os.environ.get("K_TLS_SEC_PER_BYTE", "2e-8"))
+
 # Protocol -> (sender containers list, receiver container) per use_case – both clients for FL rounds
 SERVICE_PATTERNS = {
     "emotion": {
@@ -356,6 +362,7 @@ def run_pipeline(
     receiver_container: str,
     scenario: str = "excellent",
     enable_gpu: bool = False,
+    use_host_network: bool = False,
     payload_file: str = None,
     compose_file: str = None,
     services: list = None,
@@ -364,6 +371,7 @@ def run_pipeline(
     Phase 1: Calibration with NO channel losses (protocol/broker overhead only).
     Phases 2-4: Use the user-selected network scenario from the GUI.
     When enable_gpu is True, use GPU compose if available; otherwise fall back to CPU (same as single-protocol).
+    When use_host_network is True, use docker-compose-{use_case}.host-network.yml (network_mode: host).
     """
     use_case = use_case.lower()
     protocol = protocol.lower()
@@ -380,7 +388,14 @@ def run_pipeline(
 
     docker_dir = PROJECT_ROOT / "Docker"
     if compose_file is None:
-        if enable_gpu:
+        if use_host_network:
+            compose_file = str(docker_dir / f"docker-compose-{use_case}.host-network.yml")
+            if not os.path.isfile(compose_file):
+                raise FileNotFoundError(
+                    f"Host-network compose not found: {compose_file}. "
+                    "Ensure Docker/docker-compose-<use-case>.host-network.yml exists."
+                )
+        elif enable_gpu:
             compose_file = str(docker_dir / f"docker-compose-{use_case}.gpu-isolated.yml")
         else:
             compose_file = str(docker_dir / f"docker-compose-{use_case}.yml")
@@ -409,14 +424,15 @@ def run_pipeline(
 
     # Phase 1: Calibration – NO channel losses. Protocol and broker overhead only (perfect/unshaped channel).
     print("[Phase 1] Calibration: measuring protocol & broker overhead with NO channel losses (clean channel)...")
-    print("          Starting both clients for FL rounds (GPU={})...".format("yes" if enable_gpu else "CPU"))
+    print("          Starting both clients for FL rounds (GPU={}, network={})...".format(
+        "yes" if enable_gpu else "CPU", "host" if use_host_network else "bridge"))
     result = run_cmd(
         ["docker", "compose", "-f", compose_file, "up", "-d"] + list(services),
         env=env,
         cwd=PROJECT_ROOT,
         check=False,
     )
-    if result.returncode != 0 and enable_gpu:
+    if result.returncode != 0 and enable_gpu and not use_host_network:
         print("          GPU compose failed (nvidia-docker or GPU not available). Falling back to CPU...")
         run_cmd(["docker", "compose", "-f", compose_file, "down"], check=False, cwd=PROJECT_ROOT)
         compose_file = str(docker_dir / f"docker-compose-{use_case}.yml")
@@ -480,26 +496,44 @@ def run_pipeline(
     # Phase 2: Apply user-selected network scenario to both sender containers
     print(f"[Phase 2] Applying user-selected network scenario: {scenario}...")
     conditions = sim.NETWORK_SCENARIOS[scenario]
-    for sc in sender_containers:
-        try:
-            sim.apply_network_conditions(sc, conditions)
-        except Exception as e:
-            print(f"          WARNING: Could not apply scenario to {sc}: {e}")
-    print(f"          Applied to both clients: {conditions.get('name', scenario)}")
-    print("[Phase 2] Extracting tc parameters from sender container...")
-    tc = extract_tc_params(sender_containers[0])
-    B, p, D_tc, J = tc["B"], tc["p"], tc["D_tc"], tc["J"]
-    # No bandwidth in tc (unconstrained Docker bridge) -> use scenario B so S/B is well-defined
-    if B == float("inf"):
+    host_mode = sim.is_host_network_mode(sender_containers[0])
+    if host_mode:
+        print(f"          Containers use network_mode: host; applying scenario to host interface.")
+        if sim.apply_network_conditions_host(conditions):
+            print(f"          Host tc applied; T_actual will reflect scenario (delay/loss/bandwidth).")
+        else:
+            print(f"          WARNING: Could not apply host tc (sudo may be required). T_actual will be unshaped.")
+        # In host mode we use scenario parameters for T_calc (no per-container tc to read)
         B = _scenario_bandwidth_bps(conditions)
-        if p == 0 and D_tc == 0 and J == 0:
+        p = _scenario_loss_decimal(conditions)
+        D_tc, J = _scenario_delay_jitter_sec(conditions)
+        print(f"          Using scenario-derived B={B} bps, p={p}, D_tc={D_tc}, J={J} (host mode).")
+    else:
+        for sc in sender_containers:
+            try:
+                sim.apply_network_conditions(sc, conditions)
+            except Exception as e:
+                print(f"          WARNING: Could not apply scenario to {sc}: {e}")
+        print(f"          Applied to both clients: {conditions.get('name', scenario)}")
+        print("[Phase 2] Extracting tc parameters from sender container...")
+        tc = extract_tc_params(sender_containers[0])
+        B, p, D_tc, J = tc["B"], tc["p"], tc["D_tc"], tc["J"]
+        # No bandwidth in tc (unconstrained Docker bridge) -> use scenario B so S/B is well-defined
+        if B == float("inf"):
+            B = _scenario_bandwidth_bps(conditions)
+            if p == 0 and D_tc == 0 and J == 0:
+                p = _scenario_loss_decimal(conditions)
+                D_tc, J = _scenario_delay_jitter_sec(conditions)
+            print(f"          No tc rate found; using scenario-derived B={B} bps, p={p}, D_tc={D_tc}, J={J}")
+        elif B != float("inf") and (B < 1e6 or B <= 0) and conditions.get("bandwidth"):
+            # Extracted B too small or invalid (e.g. burst 32kbit); use scenario bandwidth
+            B = _scenario_bandwidth_bps(conditions)
+            print(f"          Using scenario bandwidth (extracted B was {tc['B']:.0f} bps): B={B}")
+        # If tc did not report loss/delay/jitter (e.g. netem format), use scenario so T_calc matches scenario
+        if p == 0 and D_tc == 0 and J == 0 and (conditions.get("loss") or conditions.get("latency")):
             p = _scenario_loss_decimal(conditions)
             D_tc, J = _scenario_delay_jitter_sec(conditions)
-        print(f"          No tc rate found; using scenario-derived B={B} bps, p={p}, D_tc={D_tc}, J={J}")
-    elif B != float("inf") and (B < 1e6 or B <= 0) and conditions.get("bandwidth"):
-        # Extracted B too small or invalid (e.g. burst 32kbit); use scenario bandwidth
-        B = _scenario_bandwidth_bps(conditions)
-        print(f"          Using scenario bandwidth (extracted B was {tc['B']:.0f} bps): B={B}")
+            print(f"          Tc had no loss/delay; using scenario p={p}, D_tc={D_tc}, J={J} for analytical model.")
     RTT_eff = D_tc + J
     time.sleep(2)
 
@@ -539,14 +573,20 @@ def run_pipeline(
             B_eff = B if p == 0 else min(B, MSS_BITS / (RTT_eff * math.sqrt(p))) if RTT_eff and p else B
         else:
             B_eff = B
+        # TLS 1.3 (QUIC/HTTP3 only): handshake + per-byte encrypt/decrypt CPU time
+        O_TLS = 0.0
+        if protocol in ("quic", "http3"):
+            O_TLS = O_TLS_HANDSHAKE_S + (K_TLS_SEC_PER_BYTE * (S_bits_c / 8.0))
         # DEBUG: values used in T_calc (user-requested)
-        print(f"DEBUG -> S: {S_bits_c} bits | B: {B} bps | RTT_eff: {RTT_eff} s | Loss (p): {p} | O_app: {O_app} s")
+        debug_extra = f" | O_TLS: {O_TLS:.6f} s" if protocol in ("quic", "http3") else ""
+        print(f"DEBUG -> S: {S_bits_c} bits | B: {B} bps | RTT_eff: {RTT_eff} s | Loss (p): {p} | O_app: {O_app} s{debug_extra}")
         transfer_s = transfer_time_bits_bps(S_bits_c, B_eff)
         if protocol in ("mqtt", "amqp", "grpc"):
             T_calc = (1.5 * RTT_eff) + transfer_s + O_app
         elif protocol in ("quic", "http3"):
-            # HTTP/3 is QUIC-based; same analytical formula
-            T_calc = (1 * RTT_eff) + transfer_time_bits_bps(S_bits_c, B) + (p * (S_bits_c / MSS_BITS) * RTT_eff) + O_app
+            # HTTP/3 is QUIC-based; same analytical formula + TLS 1.3 encryption (CPU) overhead
+            # T_calc = 1*RTT_eff + (S/B) + p*(S/MSS)*RTT_eff + O_app + O_TLS
+            T_calc = (1 * RTT_eff) + transfer_time_bits_bps(S_bits_c, B) + (p * (S_bits_c / MSS_BITS) * RTT_eff) + O_app + O_TLS
         else:
             T_calc = transfer_time_bits_bps(S_bits_c, B) + (p * (S_bits_c / MSS_BITS) * (RTT_eff + T_REPAIR)) + O_app
         error_pct = 100.0 * (T_actual - T_calc) / T_actual if T_actual else 0.0
@@ -562,6 +602,12 @@ def run_pipeline(
             "error_pct": error_pct,
         })
 
+    # If we applied tc on the host (host network mode), clear it before tearing down
+    if host_mode:
+        try:
+            sim.reset_host_network()
+        except Exception as e:
+            print(f"          WARNING: Could not reset host tc: {e}")
     run_cmd(["docker", "compose", "-f", compose_file, "down"], check=False, cwd=PROJECT_ROOT)
     return summaries
 
@@ -599,6 +645,8 @@ def main():
     )
     parser.add_argument("--enable-gpu", "-g", action="store_true",
                         help="Use GPU for clients if available (same as single-protocol); fall back to CPU if GPU unavailable")
+    parser.add_argument("--host-network", action="store_true",
+                        help="Use docker-compose-<use-case>.host-network.yml (network_mode: host); matches normal experiments using host network")
     parser.add_argument("--sender-container", help="Override sender (client) container name")
     parser.add_argument("--receiver-container", help="Override receiver (server) container name")
     parser.add_argument("--payload-file", help="Path to payload file for S (bits); else from calibration run")
@@ -618,9 +666,21 @@ def main():
         receiver_container=receiver,
         scenario=args.scenario,
         enable_gpu=args.enable_gpu,
+        use_host_network=args.host_network,
         payload_file=args.payload_file,
     )
     print_table(summary)
+    # If scenario is degraded but T_actual is similar across clients and close to calibration, network may not be shaped
+    if summary and args.scenario not in ("excellent",):
+        t_actuals = [r["T_actual"] for r in summary if r.get("T_actual")]
+        if t_actuals and max(t_actuals) - min(t_actuals) < 0.5 and t_actuals[0] < 15:
+            print(
+                "NOTE: T_actual shows little variation and is relatively low for a degraded scenario.\n"
+                "  Possible causes: (1) Host network + loopback — tc on eth0 does not shape 127.0.0.1 traffic;\n"
+                "  (2) tc not applied (e.g. host mode without sudo, or per-container tc skipped).\n"
+                "  Run with bridge (no --host-network) to see scenario effects, or apply tc on the interface used by FL traffic.",
+                flush=True,
+            )
     # Emit JSON line for GUI to display in Diagnostic Results tab (flush so it is not buffered)
     print("FL_DIAG_TABLE_JSON|" + json.dumps(summary), flush=True)
     # Also write to file so GUI can load reliably when experiment completes (fallback if stdout is lost)

@@ -7,6 +7,7 @@ using whichever protocol they selected via RL.
 """
 
 import os
+import socket
 import sys
 
 # Configure GPU before importing TensorFlow
@@ -154,6 +155,8 @@ HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
 # FAIR CONFIG: 64 KB chunks for better DDS performance in poor networks
 CHUNK_SIZE = 64 * 1024  # 64KB chunks
+# FAIR CONFIG: QUIC/HTTP3 flow control aligned with MQTT/gRPC (128 MB) for unbiased FL round comparison
+QUIC_HTTP3_MAX_DATA_BYTES = 128 * 1024 * 1024  # 128 MB
 
 # DDS Data Structures (must be defined at module level for Python 3.8)
 if DDS_AVAILABLE:
@@ -824,16 +827,15 @@ class UnifiedFederatedLearningServer:
     async def _run_quic_server(self):
         """Async QUIC server"""
         try:
-            # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/DDS for unbiased comparison
+            # QUIC config: cubic congestion, 60s idle; flow control 128 MB (aligned with MQTT/gRPC for fair comparison)
             configuration = QuicConfiguration(
                 is_client=False,
                 alpn_protocols=["fl"],
-                # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
-                max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
-                max_data=256 * 1024 * 1024,  # 256 MB total connection
-                # FAIR CONFIG: Timeout 600s for very_poor network scenarios
-                idle_timeout=600.0,  # 10 minutes
-                max_datagram_frame_size=65536,  # 64 KB frames
+                congestion_control_algorithm="cubic",
+                idle_timeout=60.0,
+                max_data=QUIC_HTTP3_MAX_DATA_BYTES,
+                max_stream_data=QUIC_HTTP3_MAX_DATA_BYTES,
+                max_datagram_frame_size=65536,
             )
             
             # Generate self-signed certificate for QUIC
@@ -904,7 +906,7 @@ class UnifiedFederatedLearningServer:
             print(f"[QUIC]   - Host: {QUIC_HOST}:{QUIC_PORT}")
             print(f"[QUIC]   - Certificate: {cert_path}")
             print(f"[QUIC]   - ALPN: fl")
-            print(f"[QUIC]   - Max stream data: 50 MB")
+            print(f"[QUIC]   - Max stream data: {QUIC_HTTP3_MAX_DATA_BYTES // (1024*1024)} MB")
             print(f"[QUIC]   - Idle timeout: 3600s")
             
             # Create protocol factory that sets server reference
@@ -967,16 +969,15 @@ class UnifiedFederatedLearningServer:
     async def _run_http3_server(self):
         """Async HTTP/3 server"""
         try:
-            # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/QUIC/DDS for unbiased comparison
+            # QUIC config: cubic congestion, 60s idle; flow control 128 MB (aligned with MQTT/gRPC for fair comparison)
             configuration = QuicConfiguration(
                 is_client=False,
                 alpn_protocols=H3_ALPN,
-                # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
-                max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
-                max_data=256 * 1024 * 1024,  # 256 MB total connection
-                # FAIR CONFIG: Timeout 600s for very_poor network scenarios
-                idle_timeout=600.0,  # 10 minutes
-                max_datagram_frame_size=65536,  # 64 KB frames
+                congestion_control_algorithm="cubic",
+                idle_timeout=60.0,
+                max_data=QUIC_HTTP3_MAX_DATA_BYTES,
+                max_stream_data=QUIC_HTTP3_MAX_DATA_BYTES,
+                max_datagram_frame_size=65536,
             )
             
             # Generate self-signed certificate for HTTP/3 (reuse QUIC cert generation logic)
@@ -1047,7 +1048,7 @@ class UnifiedFederatedLearningServer:
             print(f"[HTTP/3]   - Host: {HTTP3_HOST}:{HTTP3_PORT}")
             print(f"[HTTP/3]   - Certificate: {cert_path}")
             print(f"[HTTP/3]   - ALPN: {H3_ALPN}")
-            print(f"[HTTP/3]   - Max stream data: 128 MB")
+            print(f"[HTTP/3]   - Max stream data: {QUIC_HTTP3_MAX_DATA_BYTES // (1024*1024)} MB")
             print(f"[HTTP/3]   - Idle timeout: 600s")
             
             # Create protocol factory that sets server reference
@@ -2444,6 +2445,8 @@ if QUIC_AVAILABLE:
         data_str = message_data.decode('utf-8')
         return json.loads(data_str)
 
+    QUIC_SOCKET_BUFFER_BYTES = 7_500_000  # 7.5MB for SO_RCVBUF/SO_SNDBUF (poor network)
+
     class QUICServerProtocol(QuicConnectionProtocol):
         """QUIC protocol handler (supports multiple clients)"""
         
@@ -2452,6 +2455,17 @@ if QUIC_AVAILABLE:
             self.server = None  # Set by factory function
             self._stream_buffers = {}  # Buffer data per stream ID (instance-specific)
             print(f"[QUIC] Protocol instance created")
+
+        def connection_made(self, transport):
+            super().connection_made(transport)
+            sock = transport.get_extra_info("socket")
+            if sock:
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, QUIC_SOCKET_BUFFER_BYTES)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, QUIC_SOCKET_BUFFER_BYTES)
+                    print(f"[QUIC] UDP socket buffers set to {QUIC_SOCKET_BUFFER_BYTES // 1_000_000}MB")
+                except OSError as e:
+                    print(f"[QUIC] Could not set socket buffers: {e}")
         
         async def _process_parsed_message(self, message_data: bytes, stream_id: int):
             """Parse message in executor (non-blocking) and dispatch. Prevents event loop

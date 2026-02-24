@@ -43,8 +43,9 @@ RUN cd Protocols && \
     python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. federated_learning.proto && \
     cd ..
 
-# Copy the Server directory
+# Copy the Server directory and scripts (DDS discovery server)
 COPY scripts/utilities/packet_logger.py ./
+COPY scripts/dds_discovery_server.py ./scripts/
 COPY Server/ ./Server/
 
 # Copy Client/Compression_Technique for quantization support (needed by Server)

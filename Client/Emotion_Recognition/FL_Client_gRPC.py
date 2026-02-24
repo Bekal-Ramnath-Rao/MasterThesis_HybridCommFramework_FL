@@ -391,6 +391,15 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
             time.sleep(delay)
             
+            # Build metrics for server (include diagnostic_send_start_ts for pipeline T_actual)
+            metrics_for_server = {
+                'loss': metrics['loss'],
+                'accuracy': metrics['accuracy'],
+                'val_loss': metrics['val_loss'],
+                'val_accuracy': metrics['val_accuracy']
+            }
+            if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+                metrics_for_server['diagnostic_send_start_ts'] = send_start_ts
             # Send update to server
             response = self.stub.SendModelUpdate(
                 federated_learning_pb2.ModelUpdate(
@@ -398,12 +407,7 @@ class FederatedLearningClient:
                     round=self.current_round,
                     weights=serialized_weights,
                     num_samples=num_samples,
-                    metrics={
-                        'loss': metrics['loss'],
-                        'accuracy': metrics['accuracy'],
-                        'val_loss': metrics['val_loss'],
-                        'val_accuracy': metrics['val_accuracy']
-                    }
+                    metrics=metrics_for_server
                 )
             )
             

@@ -292,7 +292,9 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             if recv_start_cpu is not None:
                 O_recv = time.perf_counter() - recv_start_cpu
                 recv_end_ts = time.time()
-                print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={recv_end_ts:.9f}")
+                metrics_pre = dict(request.metrics)
+                send_start_ts = metrics_pre.get("diagnostic_send_start_ts", recv_end_ts)
+                print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={send_start_ts:.9f}")
             
             # Extract metrics from map
             metrics = dict(request.metrics)

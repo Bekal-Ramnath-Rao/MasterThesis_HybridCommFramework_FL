@@ -600,19 +600,17 @@ async def main():
     # Create client
     client = FederatedLearningClient(CLIENT_ID, NUM_CLIENTS, train_generator, validation_generator)
     
-    # Configure QUIC with large stream data limits for model weights
-    # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/DDS for unbiased comparison
+    # QUIC config: cubic congestion, 60s idle; 128 MB flow control (aligned with server for fair FL comparison)
+    QUIC_MAX_DATA_BYTES = 128 * 1024 * 1024  # 128 MB
     configuration = QuicConfiguration(
         is_client=True,
         alpn_protocols=["fl"],
-        # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
-        max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
-        max_data=256 * 1024 * 1024,  # 256 MB total connection
-        # FAIR CONFIG: Timeout 600s for very_poor network scenarios
-        idle_timeout=600.0,  # 10 minutes
-        max_datagram_frame_size=65536,  # 64 KB frames
-        # Poor network adjustments
-        initial_rtt=0.15,  # 150ms (account for 100ms latency + jitter)
+        congestion_control_algorithm="cubic",
+        idle_timeout=60.0,
+        max_data=QUIC_MAX_DATA_BYTES,
+        max_stream_data=QUIC_MAX_DATA_BYTES,
+        max_datagram_frame_size=65536,
+        initial_rtt=0.15,
     )
     
     # Load CA certificate for verification (optional - set verify_mode to False for testing)

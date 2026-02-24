@@ -2236,16 +2236,16 @@ class UnifiedFLClient_Emotion:
         quic_host = os.getenv("QUIC_HOST", "localhost")
         quic_port = int(os.getenv("QUIC_PORT", "4433"))
         
-        # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/DDS for unbiased comparison
+        # QUIC config: cubic congestion, 60s idle; 128 MB flow control (aligned with server for fair FL comparison)
+        QUIC_MAX_DATA_BYTES = 128 * 1024 * 1024  # 128 MB
         config = QuicConfiguration(
-            is_client=True, 
-            alpn_protocols=["fl"],  # CRITICAL: Must match server's ALPN
+            is_client=True,
+            alpn_protocols=["fl"],
             verify_mode=ssl.CERT_NONE,
-            # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
-            max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
-            max_data=256 * 1024 * 1024,  # 256 MB total connection
-            # FAIR CONFIG: Timeout 600s for very_poor network scenarios
-            idle_timeout=600.0  # 10 minutes
+            congestion_control_algorithm="cubic",
+            idle_timeout=60.0,
+            max_data=QUIC_MAX_DATA_BYTES,
+            max_stream_data=QUIC_MAX_DATA_BYTES,
         )
         
         print(f"[QUIC] Client {self.client_id} connecting to {quic_host}:{quic_port}...")
