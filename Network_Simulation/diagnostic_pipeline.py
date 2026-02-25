@@ -362,7 +362,7 @@ def run_pipeline(
     receiver_container: str,
     scenario: str = "excellent",
     enable_gpu: bool = False,
-    use_host_network: bool = False,
+    network_mode: str = "gpu",
     payload_file: str = None,
     compose_file: str = None,
     services: list = None,
@@ -370,8 +370,7 @@ def run_pipeline(
     """Execute full diagnostic pipeline and return summary dict.
     Phase 1: Calibration with NO channel losses (protocol/broker overhead only).
     Phases 2-4: Use the user-selected network scenario from the GUI.
-    When enable_gpu is True, use GPU compose if available; otherwise fall back to CPU (same as single-protocol).
-    When use_host_network is True, use docker-compose-{use_case}.host-network.yml (network_mode: host).
+    network_mode: gpu (Docker bridge), host (*.host-network.yml, tc on host), host_macvlan (*.macvlan.yml, per-container tc).
     """
     use_case = use_case.lower()
     protocol = protocol.lower()
@@ -386,15 +385,21 @@ def run_pipeline(
     if scenario not in sim.NETWORK_SCENARIOS:
         raise ValueError(f"Unknown scenario: {scenario}. Choose from: {list(sim.NETWORK_SCENARIOS.keys())}")
 
+    network_mode = (network_mode or "gpu").lower().strip()
+    if network_mode not in ("gpu", "host", "host_macvlan"):
+        network_mode = "gpu"
     docker_dir = PROJECT_ROOT / "Docker"
     if compose_file is None:
-        if use_host_network:
+        if network_mode == "host":
             compose_file = str(docker_dir / f"docker-compose-{use_case}.host-network.yml")
             if not os.path.isfile(compose_file):
-                raise FileNotFoundError(
-                    f"Host-network compose not found: {compose_file}. "
-                    "Ensure Docker/docker-compose-<use-case>.host-network.yml exists."
-                )
+                raise FileNotFoundError(f"Host-network compose not found: {compose_file}")
+        elif network_mode == "host_macvlan":
+            compose_file = str(docker_dir / f"docker-compose-{use_case}.macvlan.yml")
+            if not os.path.isfile(compose_file):
+                raise FileNotFoundError(f"Macvlan compose not found: {compose_file}")
+            if not sim.ensure_macvlan_network():
+                raise RuntimeError("Failed to create macvlan network for host_macvlan mode")
         elif enable_gpu:
             compose_file = str(docker_dir / f"docker-compose-{use_case}.gpu-isolated.yml")
         else:
@@ -412,8 +417,8 @@ def run_pipeline(
             if protocol == "mqtt":
                 broker = "mqtt-broker" if use_case == "emotion" else ("mqtt-broker-mental" if use_case == "mentalstate" else "mqtt-broker-temp")
             else:
-                if enable_gpu:
-                    broker = "amqp-broker"  # GPU compose service name for all use cases
+                if enable_gpu or network_mode in ("host", "host_macvlan"):
+                    broker = "amqp-broker"
                 else:
                     broker = "rabbitmq" if use_case == "emotion" else ("rabbitmq-mental" if use_case == "mentalstate" else "rabbitmq-temp")
             services = [broker, receiver_container] + sender_containers
@@ -424,15 +429,17 @@ def run_pipeline(
 
     # Phase 1: Calibration – NO channel losses. Protocol and broker overhead only (perfect/unshaped channel).
     print("[Phase 1] Calibration: measuring protocol & broker overhead with NO channel losses (clean channel)...")
+    net_label = {"gpu": "bridge", "host": "host (tc on host)", "host_macvlan": "macvlan (per-container tc)"}.get(network_mode, "bridge")
     print("          Starting both clients for FL rounds (GPU={}, network={})...".format(
-        "yes" if enable_gpu else "CPU", "host" if use_host_network else "bridge"))
+        "yes" if enable_gpu else "CPU", net_label))
+    compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"] + list(services)
     result = run_cmd(
-        ["docker", "compose", "-f", compose_file, "up", "-d"] + list(services),
+        compose_cmd,
         env=env,
         cwd=PROJECT_ROOT,
         check=False,
     )
-    if result.returncode != 0 and enable_gpu and not use_host_network:
+    if result.returncode != 0 and enable_gpu and network_mode == "gpu":
         print("          GPU compose failed (nvidia-docker or GPU not available). Falling back to CPU...")
         run_cmd(["docker", "compose", "-f", compose_file, "down"], check=False, cwd=PROJECT_ROOT)
         compose_file = str(docker_dir / f"docker-compose-{use_case}.yml")
@@ -496,7 +503,7 @@ def run_pipeline(
     # Phase 2: Apply user-selected network scenario to both sender containers
     print(f"[Phase 2] Applying user-selected network scenario: {scenario}...")
     conditions = sim.NETWORK_SCENARIOS[scenario]
-    host_mode = sim.is_host_network_mode(sender_containers[0])
+    host_mode = network_mode == "host"  # only apply tc on host when using host-network compose
     if host_mode:
         print(f"          Containers use network_mode: host; applying scenario to host interface.")
         if sim.apply_network_conditions_host(conditions):
@@ -602,7 +609,7 @@ def run_pipeline(
             "error_pct": error_pct,
         })
 
-    # If we applied tc on the host (host network mode), clear it before tearing down
+    # If we had applied tc on the host (legacy host mode), clear it. With macvlan we use per-container tc only.
     if host_mode:
         try:
             sim.reset_host_network()
@@ -645,8 +652,8 @@ def main():
     )
     parser.add_argument("--enable-gpu", "-g", action="store_true",
                         help="Use GPU for clients if available (same as single-protocol); fall back to CPU if GPU unavailable")
-    parser.add_argument("--host-network", action="store_true",
-                        help="Use docker-compose-<use-case>.host-network.yml (network_mode: host); matches normal experiments using host network")
+    parser.add_argument("--network-mode", choices=["gpu", "host", "host_macvlan"], default="gpu",
+                        help="gpu=Docker bridge (per-container tc), host=host network (tc on host), host_macvlan=macvlan (per-container tc)")
     parser.add_argument("--sender-container", help="Override sender (client) container name")
     parser.add_argument("--receiver-container", help="Override receiver (server) container name")
     parser.add_argument("--payload-file", help="Path to payload file for S (bits); else from calibration run")
@@ -666,7 +673,7 @@ def main():
         receiver_container=receiver,
         scenario=args.scenario,
         enable_gpu=args.enable_gpu,
-        use_host_network=args.host_network,
+        network_mode=args.network_mode,
         payload_file=args.payload_file,
     )
     print_table(summary)
@@ -678,7 +685,7 @@ def main():
                 "NOTE: T_actual shows little variation and is relatively low for a degraded scenario.\n"
                 "  Possible causes: (1) Host network + loopback — tc on eth0 does not shape 127.0.0.1 traffic;\n"
                 "  (2) tc not applied (e.g. host mode without sudo, or per-container tc skipped).\n"
-                "  Run with bridge (no --host-network) to see scenario effects, or apply tc on the interface used by FL traffic.",
+                "  Run with --network-mode gpu or host_macvlan to see scenario effects, or apply tc on the interface used by FL traffic.",
                 flush=True,
             )
     # Emit JSON line for GUI to display in Diagnostic Results tab (flush so it is not buffered)

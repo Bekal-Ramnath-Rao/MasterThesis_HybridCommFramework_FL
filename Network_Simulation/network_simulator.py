@@ -14,6 +14,14 @@ from typing import Dict, List
 # Optional: set FL_SUDO_PASSWORD in environment to run host 'tc' without typing password.
 # Example (do NOT commit .env): echo 'FL_SUDO_PASSWORD=yourpassword' >> .env && source .env
 # Or for one run: FL_SUDO_PASSWORD=yourpassword python3 run_network_experiments.py ...
+#
+# Macvlan (when using host-network mode for experiments/diagnostics): set FL_MACVLAN_PARENT
+# to the host interface to use (e.g. eno2). If unset, the host's default route interface is used.
+
+MACVLAN_NETWORK_NAME = "fl-macvlan"
+MACVLAN_SUBNET = os.environ.get("FL_MACVLAN_SUBNET", "192.168.254.0/24")
+MACVLAN_GATEWAY = os.environ.get("FL_MACVLAN_GATEWAY", "192.168.254.1")
+
 
 class NetworkSimulator:
     """Simulates various network conditions on Docker containers using tc (traffic control)"""
@@ -170,6 +178,71 @@ class NetworkSimulator:
             return "eth0"
         except Exception:
             return "eth0"
+
+    def get_macvlan_parent_interface(self) -> str:
+        """Return the host interface to use as macvlan parent (e.g. eno2). Uses FL_MACVLAN_PARENT if set."""
+        return os.environ.get("FL_MACVLAN_PARENT", "").strip() or self.get_host_default_interface()
+
+    def ensure_macvlan_network(
+        self,
+        parent_interface: str = None,
+        network_name: str = None,
+        subnet: str = None,
+        gateway: str = None,
+    ) -> bool:
+        """Create Docker macvlan network if it does not exist. Used when running experiments/diagnostics
+        in 'host network' mode so tc can be applied per container instead of on the host interface.
+        Returns True if the network exists or was created, False on failure."""
+        parent_interface = parent_interface or self.get_macvlan_parent_interface()
+        network_name = network_name or MACVLAN_NETWORK_NAME
+        subnet = subnet or MACVLAN_SUBNET
+        gateway = gateway or MACVLAN_GATEWAY
+        try:
+            r = subprocess.run(
+                ["docker", "network", "inspect", network_name],
+                capture_output=True, text=True, timeout=10
+            )
+            if r.returncode == 0:
+                self.log(f"Macvlan network '{network_name}' already exists")
+                return True
+            self.log(f"Creating macvlan network '{network_name}' (parent={parent_interface}, subnet={subnet}, gateway={gateway})")
+            r = subprocess.run(
+                [
+                    "docker", "network", "create", "-d", "macvlan",
+                    "-o", f"parent={parent_interface}",
+                    "--subnet", subnet,
+                    "--gateway", gateway,
+                    network_name,
+                ],
+                capture_output=True, text=True, timeout=15
+            )
+            if r.returncode != 0:
+                print(f"[ERROR] Failed to create macvlan network: {r.stderr or r.stdout}")
+                return False
+            print(f"[INFO] Created macvlan network '{network_name}' on {parent_interface}")
+            return True
+        except Exception as e:
+            print(f"[ERROR] ensure_macvlan_network: {e}")
+            return False
+
+    def remove_macvlan_network(self, network_name: str = None) -> bool:
+        """Remove the Docker macvlan network. Optional cleanup after experiments."""
+        network_name = network_name or MACVLAN_NETWORK_NAME
+        try:
+            r = subprocess.run(
+                ["docker", "network", "rm", network_name],
+                capture_output=True, text=True, timeout=10
+            )
+            if r.returncode == 0:
+                self.log(f"Removed macvlan network '{network_name}'")
+                return True
+            if "no such network" in (r.stderr or "").lower():
+                return True
+            self.log(f"Could not remove network '{network_name}': {r.stderr}")
+            return False
+        except Exception as e:
+            self.log(f"remove_macvlan_network: {e}")
+            return False
 
     def apply_network_conditions_host(self, conditions: Dict[str, str]) -> bool:
         """Apply network scenario to the host's default interface (for network_mode: host).

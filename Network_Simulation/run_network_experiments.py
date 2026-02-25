@@ -43,13 +43,15 @@ class ExperimentRunner:
     
     def __init__(self, use_case: str = "emotion", num_rounds: int = 10, enable_congestion: bool = False,
                  use_quantization: bool = False, quantization_params: Dict[str, str] = None, enable_gpu: bool = False,
-                 use_host_network: bool = False, baseline_mode: bool = False, use_ql_convergence: bool = False):
+                 network_mode: str = "gpu", baseline_mode: bool = False, use_ql_convergence: bool = False):
         self.use_case = use_case
         self.num_rounds = num_rounds
         self.enable_congestion = enable_congestion
         self.use_quantization = use_quantization
         self.enable_gpu = enable_gpu
-        self.use_host_network = use_host_network
+        self.network_mode = (network_mode or "gpu").lower().strip()
+        if self.network_mode not in ("gpu", "host", "host_macvlan"):
+            self.network_mode = "gpu"
         self.baseline_mode = baseline_mode
         self.use_ql_convergence = use_ql_convergence
         # quantization_params expected to be a dict of simple string values
@@ -133,10 +135,9 @@ class ExperimentRunner:
         # Docker compose file mapping (relative to project root)
         docker_dir = project_root / "Docker"
         
-        # GPU acceleration uses Docker bridge by default (docker-compose *.gpu-isolated.yml).
-        # Host network (docker-compose *.host-network.yml) is optional for both GPU and non-GPU.
-        if use_host_network:
-            # Host network mode: containers share host network (network_mode: host)
+        # Three network modes: gpu (Docker bridge), host (tc on host), host_macvlan (macvlan, per-container tc)
+        if self.network_mode == "host":
+            # Host network: *.host-network.yml (network_mode: host); tc applied on host interface
             self.compose_files = {
                 "emotion": str(docker_dir / "docker-compose-emotion.host-network.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-mentalstate.host-network.yml"),
@@ -148,6 +149,23 @@ class ExperimentRunner:
                 "temperature": str(docker_dir / "docker-compose-unified-temperature.host-network.yml")
             }
             self.gpu_overlay_files = {}
+            self.macvlan_overlay_files = {}
+            self.macvlan_overlay_unified = None
+        elif self.network_mode == "host_macvlan":
+            # Host + macvlan: *.macvlan.yml (external fl-macvlan); tc applied per container
+            self.compose_files = {
+                "emotion": str(docker_dir / "docker-compose-emotion.macvlan.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-mentalstate.macvlan.yml"),
+                "temperature": str(docker_dir / "docker-compose-temperature.macvlan.yml")
+            }
+            self.unified_compose_files = {
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.macvlan.yml"),
+                "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.macvlan.yml"),
+                "temperature": str(docker_dir / "docker-compose-unified-temperature.macvlan.yml")
+            }
+            self.gpu_overlay_files = {}
+            self.macvlan_overlay_files = {}
+            self.macvlan_overlay_unified = None
         elif enable_gpu:
             # GPU + Docker bridge: use gpu-isolated compose (bridge network, no host mode)
             self.compose_files = {
@@ -161,6 +179,8 @@ class ExperimentRunner:
                 "temperature": str(docker_dir / "docker-compose-unified-temperature.yml")
             }
             self.gpu_overlay_files = {}
+            self.macvlan_overlay_files = {}
+            self.macvlan_overlay_unified = None
         else:
             # Non-GPU + Docker bridge: standard compose files
             self.compose_files = {
@@ -178,10 +198,12 @@ class ExperimentRunner:
                 "mentalstate": str(docker_dir / "docker-compose-mentalstate.gpu.yml"),
                 "temperature": str(docker_dir / "docker-compose-temperature.gpu.yml")
             }
+            self.macvlan_overlay_files = {}
+            self.macvlan_overlay_unified = None
         
         # Service name patterns (broker names differ: host/gpu-isolated use amqp-broker, standard bridge uses rabbitmq)
         broker_mqtt = "mqtt-broker"
-        broker_amqp = "amqp-broker" if (use_host_network or enable_gpu) else "rabbitmq"
+        broker_amqp = "amqp-broker" if (self.network_mode in ("host", "host_macvlan") or enable_gpu) else "rabbitmq"
         
         self.service_patterns = {
             "emotion": {
@@ -259,7 +281,14 @@ class ExperimentRunner:
             else:
                 os.environ["USE_QL_CONVERGENCE"] = "false"
             
-            # For unified mode, start all services together
+            # host_macvlan: ensure fl-macvlan network exists before up
+            if self.network_mode == "host_macvlan":
+                import sys
+                sys.path.insert(0, str(Path(__file__).parent))
+                from network_simulator import NetworkSimulator
+                sim = NetworkSimulator(verbose=True)
+                if not sim.ensure_macvlan_network():
+                    raise RuntimeError("Failed to create macvlan network for host_macvlan mode")
             compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"]
             
             print(f"Starting unified FL system for {self.use_case}...")
@@ -285,18 +314,25 @@ class ExperimentRunner:
         # Regular protocol handling (existing code)
         compose_file = self.compose_files[self.use_case]
         
-        # Build compose command (no overlay needed with GPU-isolated files)
+        # host_macvlan: ensure fl-macvlan network exists before up
+        if self.network_mode == "host_macvlan":
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent))
+            from network_simulator import NetworkSimulator
+            sim = NetworkSimulator(verbose=True)
+            if not sim.ensure_macvlan_network():
+                raise RuntimeError("Failed to create macvlan network for host_macvlan mode")
         compose_cmd_base = ["docker", "compose", "-f", compose_file]
-        # Note: GPU-isolated files are standalone, no overlay needed
         
         services = self.service_patterns[self.use_case][protocol]
         
+        mode_label = {"gpu": "GPU (Docker bridge)", "host": "Host network (tc on host)", "host_macvlan": "Host + macvlan (per-container tc)"}.get(self.network_mode, "GPU (Docker bridge)")
         print(f"\n{'='*70}")
         print(f"Starting containers for {protocol.upper()} protocol...")
         print(f"Network Scenario: {scenario.upper()}")
-        print(f"Network mode: {'Host (docker-compose *.host-network.yml)' if self.use_host_network else 'Docker bridge'}")
+        print(f"Network mode: {mode_label}")
         if self.enable_gpu:
-            print(f"GPU Acceleration: ENABLED (Docker bridge: *.gpu-isolated.yml)" if not self.use_host_network else "GPU Acceleration: ENABLED (host network)")
+            print(f"GPU Acceleration: ENABLED")
         if self.enable_congestion and congestion_level != "none":
             print(f"Congestion Level: {congestion_level.upper()}")
         print(f"{'='*70}")
@@ -391,9 +427,7 @@ class ExperimentRunner:
         
         print(f"\nStopping containers for {protocol.upper()} protocol...")
         
-        # Build compose command (no overlay needed with GPU-isolated files)
         cmd = ["docker", "compose", "-f", compose_file, "down"]
-        # Note: GPU-isolated files are standalone, no overlay needed
         
         self.run_command(cmd, check=False)
         
@@ -401,9 +435,7 @@ class ExperimentRunner:
         time.sleep(5)
     
     def apply_network_scenario(self, scenario: str, protocol: str):
-        """Apply network conditions using network_simulator.py.
-        With network_mode: host, per-container tc is not available; we apply the scenario
-        to the host's default interface so delay/loss still affect all host-network traffic."""
+        """Apply network conditions: host mode = tc on host interface; gpu/host_macvlan = per-container tc."""
         import sys
         from pathlib import Path
         parent_dir = str(Path(__file__).parent.parent)
@@ -411,63 +443,42 @@ class ExperimentRunner:
             sys.path.insert(0, parent_dir)
         from network_simulator import NetworkSimulator
 
-        compose_file = self.unified_compose_files[self.use_case] if protocol == "rl_unified" else self.compose_files[self.use_case]
-        if "host-network" in compose_file:
-            print(f"\n{'='*70}")
-            print(f"Applying network scenario: {scenario.upper()} (host-network mode)")
-            print(f"{'='*70}")
-            sim = NetworkSimulator(verbose=True)
-            if scenario not in sim.NETWORK_SCENARIOS:
-                print(f"[WARNING] Unknown scenario: {scenario}, skipping")
-                print(f"{'='*70}\n")
-                return True
-            conditions = sim.NETWORK_SCENARIOS[scenario]
-            if sim.apply_network_conditions_host(conditions):
-                print(f"[INFO] Applied scenario '{scenario}' to host default interface.")
-                print(f"[INFO] Server and all clients share this link (delay/loss apply to both).")
-                self._host_network_sim = sim  # reset in stop_containers
-            else:
-                print(f"[WARNING] Could not apply host tc (permission denied).")
-                print(f"[INFO] When prompted, enter your sudo password; or run from a terminal: sudo python3 run_network_experiments.py ...")
-                print(f"[INFO] Experiment continues without latency/loss simulation.")
-                self._host_network_sim = None
-            print(f"{'='*70}\n")
-            return True
-
         print(f"\n{'='*70}")
         print(f"Applying network scenario: {scenario.upper()}")
         print(f"{'='*70}")
         
-        # Get actual container names for this protocol
-        services = self.service_patterns[self.use_case][protocol]
-        
-        # Apply network conditions to each container individually
         sim = NetworkSimulator(verbose=True)
-        
         if scenario not in sim.NETWORK_SCENARIOS:
             print(f"[WARNING] Unknown scenario: {scenario}, skipping network simulation")
-            return True  # Don't fail the experiment
-        
+            return True
         conditions = sim.NETWORK_SCENARIOS[scenario]
-        
-        # Apply to all containers EXCEPT brokers (brokers should be reliable infrastructure)
-        # Only apply to FL clients and servers
+        services = self.service_patterns[self.use_case][protocol]
+
+        if self.network_mode == "host":
+            # Host network: apply tc on host default interface (affects all containers)
+            if sim.apply_network_conditions_host(conditions):
+                print(f"[INFO] Applied scenario '{scenario}' to host interface (all containers share it).")
+                self._host_network_sim = sim
+            else:
+                print(f"[WARNING] Could not apply host tc (sudo may be required). Experiment continues without shaping.")
+                self._host_network_sim = None
+            print(f"{'='*70}\n")
+            return True
+
+        # gpu or host_macvlan: per-container tc
         success_count = 0
         for container in services:
-            # Skip brokers - they represent reliable infrastructure
             if 'broker' in container.lower() or 'rabbitmq' in container.lower() or 'server' in container.lower():
                 print(f"[INFO] Skipping network conditions for broker/server: {container} (infrastructure)")
                 continue
-            
             try:
                 if sim.apply_network_conditions(container, conditions):
                     success_count += 1
             except Exception as e:
                 print(f"[WARNING] Failed to apply conditions to {container}: {e}")
-        
         print(f"\nApplied network conditions to {success_count}/{len(services)} containers")
         time.sleep(2)
-        return success_count > 0  # At least one container should succeed
+        return success_count > 0
     
     def wait_for_completion(self, protocol: str, timeout: Optional[int] = 3600):
         """Wait for FL training to complete and track round trip times.
@@ -938,8 +949,8 @@ def main():
                 help="Set QUANTIZATION_PER_CHANNEL=1 if per-channel quantization should be used")
     parser.add_argument("--enable-gpu", "-g", action="store_true",
                 help="Enable GPU acceleration using NVIDIA runtime (requires nvidia-docker)")
-    parser.add_argument("--host-network", action="store_true",
-                help="Use docker-compose *.host-network.yml (network_mode: host). If not set, GPU uses Docker bridge (*.gpu-isolated.yml).")
+    parser.add_argument("--network-mode", choices=["gpu", "host", "host_macvlan"], default="gpu",
+                help="Network mode: gpu=Docker bridge (*.gpu-isolated.yml, per-container tc), host=host network (*.host-network.yml, tc on host), host_macvlan=macvlan (*.macvlan.yml, per-container tc)")
     parser.add_argument("--baseline", "-b", action="store_true",
                 help="Baseline mode: Run without network conditions and save to baseline folder")
     parser.add_argument("--use-ql-convergence", action="store_true",
@@ -975,7 +986,7 @@ def main():
                             use_quantization=args.use_quantization,
                             quantization_params=quant_params,
                             enable_gpu=args.enable_gpu,
-                            use_host_network=args.host_network,
+                            network_mode=args.network_mode,
                             baseline_mode=args.baseline,
                             use_ql_convergence=args.use_ql_convergence)
     

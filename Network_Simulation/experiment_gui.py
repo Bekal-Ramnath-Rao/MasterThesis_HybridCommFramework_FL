@@ -552,10 +552,20 @@ class FLExperimentGUI(QMainWindow):
         self.gpu_enabled.setStyleSheet("font-size: 13px; padding: 5px;")
         gpu_layout.addWidget(self.gpu_enabled)
         
-        self.host_network_enabled = QCheckBox("Use host network (docker-compose *.host-network.yml)")
-        self.host_network_enabled.setToolTip("Use network_mode: host for containers; matches normal experiments using host network. Diagnostic pipeline will use host-network compose and apply tc on host.")
-        self.host_network_enabled.setStyleSheet("font-size: 13px; padding: 5px;")
-        gpu_layout.addWidget(self.host_network_enabled)
+        # Network mode: 3 options for experiments and diagnostic pipeline
+        gpu_layout.addWidget(QLabel("Network mode:"))
+        self.network_mode_group = QButtonGroup(self)
+        self.network_mode_gpu = QRadioButton("1. GPU (Docker bridge)")
+        self.network_mode_gpu.setToolTip("Use docker-compose *.gpu-isolated.yml (or standard). Tc applied per container.")
+        self.network_mode_gpu.setChecked(True)
+        self.network_mode_host = QRadioButton("2. Host network (tc on host)")
+        self.network_mode_host.setToolTip("Use docker-compose *.host-network.yml (network_mode: host). Tc applied on host interface (e.g. eno2); affects all containers.")
+        self.network_mode_host_macvlan = QRadioButton("3. Host + macvlan (per-container tc)")
+        self.network_mode_host_macvlan.setToolTip("Use docker-compose *.macvlan.yml. Creates fl-macvlan network; tc applied inside each container. Set FL_MACVLAN_PARENT (e.g. eno2) for parent interface.")
+        for r in (self.network_mode_gpu, self.network_mode_host, self.network_mode_host_macvlan):
+            r.setStyleSheet("font-size: 12px; padding: 2px;")
+            self.network_mode_group.addButton(r)
+            gpu_layout.addWidget(r)
         
         gpu_layout.addWidget(QLabel("GPU Count:"))
         self.gpu_count = QSpinBox()
@@ -567,8 +577,11 @@ class FLExperimentGUI(QMainWindow):
         gpu_layout.addStretch()
         gpu_group.setLayout(gpu_layout)
         layout.addWidget(gpu_group)
-        # Info: GPU uses Docker bridge unless host network is selected
-        self.gpu_network_info = QLabel("ℹ️ GPU acceleration uses Docker bridge (docker-compose *.gpu-isolated.yml) by default. Check \"Use host network\" only if you need network_mode: host.")
+        self.gpu_network_info = QLabel(
+            "ℹ️ 1=GPU bridge (*.gpu-isolated.yml, per-container tc). "
+            "2=Host network (*.host-network.yml, tc on host). "
+            "3=Macvlan (*.macvlan.yml, per-container tc)."
+        )
         self.gpu_network_info.setWordWrap(True)
         self.gpu_network_info.setStyleSheet("color: #555; font-size: 11px; padding: 4px 0;")
         layout.addWidget(self.gpu_network_info)
@@ -975,6 +988,23 @@ class FLExperimentGUI(QMainWindow):
         self.build_btn_emotion_host.setStyleSheet("font-size: 14px; padding: 8px; background-color: #16a085; color: white; border-radius: 6px;")
         self.build_btn_emotion_host.clicked.connect(self.build_docker_images_emotion_host)
         docker_layout.addWidget(self.build_btn_emotion_host)
+
+        # Macvlan build buttons (per-container tc, fl-macvlan network)
+        macvlan_label = QLabel("🔗 Macvlan Build (per-container tc, *.macvlan.yml)")
+        macvlan_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #8e44ad; margin-top: 8px;")
+        docker_layout.addWidget(macvlan_label)
+        self.build_btn_temp_macvlan = QPushButton("🐳 Build Docker Images (Temperature) [Macvlan]")
+        self.build_btn_temp_macvlan.setStyleSheet("font-size: 14px; padding: 8px; background-color: #8e44ad; color: white; border-radius: 6px;")
+        self.build_btn_temp_macvlan.clicked.connect(self.build_docker_images_temperature_macvlan)
+        docker_layout.addWidget(self.build_btn_temp_macvlan)
+        self.build_btn_mental_macvlan = QPushButton("🐳 Build Docker Images (Mental State) [Macvlan]")
+        self.build_btn_mental_macvlan.setStyleSheet("font-size: 14px; padding: 8px; background-color: #8e44ad; color: white; border-radius: 6px;")
+        self.build_btn_mental_macvlan.clicked.connect(self.build_docker_images_mentalstate_macvlan)
+        docker_layout.addWidget(self.build_btn_mental_macvlan)
+        self.build_btn_emotion_macvlan = QPushButton("🐳 Build Docker Images (Emotion) [Macvlan]")
+        self.build_btn_emotion_macvlan.setStyleSheet("font-size: 14px; padding: 8px; background-color: #8e44ad; color: white; border-radius: 6px;")
+        self.build_btn_emotion_macvlan.clicked.connect(self.build_docker_images_emotion_macvlan)
+        docker_layout.addWidget(self.build_btn_emotion_macvlan)
 
         # Add separator
         separator = QLabel("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -1541,6 +1571,36 @@ class FLExperimentGUI(QMainWindow):
             "Docker images built successfully (Mental State) [Host Network]",
             "Docker build failed (Mental State) [Host Network]",
             "Mental State Host Network",
+        )
+
+    def build_docker_images_emotion_macvlan(self):
+        """Build Docker images for Emotion use case (macvlan)."""
+        self._build_compose(
+            "Docker/docker-compose-emotion.macvlan.yml",
+            "build_btn_emotion_macvlan",
+            "Docker images built successfully (Emotion) [Macvlan]",
+            "Docker build failed (Emotion) [Macvlan]",
+            "Emotion Macvlan",
+        )
+
+    def build_docker_images_temperature_macvlan(self):
+        """Build Docker images for Temperature use case (macvlan)."""
+        self._build_compose(
+            "Docker/docker-compose-temperature.macvlan.yml",
+            "build_btn_temp_macvlan",
+            "Docker images built successfully (Temperature) [Macvlan]",
+            "Docker build failed (Temperature) [Macvlan]",
+            "Temperature Macvlan",
+        )
+
+    def build_docker_images_mentalstate_macvlan(self):
+        """Build Docker images for Mental State use case (macvlan)."""
+        self._build_compose(
+            "Docker/docker-compose-mentalstate.macvlan.yml",
+            "build_btn_mental_macvlan",
+            "Docker images built successfully (Mental State) [Macvlan]",
+            "Docker build failed (Mental State) [Macvlan]",
+            "Mental State Macvlan",
         )
 
     def build_docker_images_unified_emotion_host(self):
@@ -2146,9 +2206,9 @@ class FLExperimentGUI(QMainWindow):
         if self.gpu_enabled.isChecked():
             cmd_parts.append("--enable-gpu")
         
-        # Host network: when unchecked, GPU uses Docker bridge (*.gpu-isolated.yml)
-        if self.host_network_enabled.isChecked():
-            cmd_parts.append("--host-network")
+        # Network mode: gpu | host | host_macvlan
+        mode = "host_macvlan" if self.network_mode_host_macvlan.isChecked() else ("host" if self.network_mode_host.isChecked() else "gpu")
+        cmd_parts.extend(["--network-mode", mode])
         
         # Baseline mode flag
         if self.baseline_mode.isChecked():
@@ -2260,7 +2320,8 @@ class FLExperimentGUI(QMainWindow):
             f"Protocols: {', '.join(self.get_selected_protocols())}\n"
             f"Scenarios: {', '.join(self.get_selected_scenarios())}\n"
             f"Rounds: {self.rounds_spinbox.value()}\n"
-            f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n\n"
+            f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
+            f"Network: {'Host + macvlan' if self.network_mode_host_macvlan.isChecked() else ('Host (tc on host)' if self.network_mode_host.isChecked() else 'GPU (Docker bridge)')}\n\n"
             f"Command:\n{command}\n\n"
             f"This may take a long time. Continue?",
             QMessageBox.Yes | QMessageBox.No
@@ -2308,8 +2369,9 @@ class FLExperimentGUI(QMainWindow):
         command = f"python3 {script} --protocol {protocol} --use-case {use_case} --scenario {scenario}"
         if self.gpu_enabled.isChecked():
             command += " --enable-gpu"
-        if self.host_network_enabled.isChecked():
-            command += " --host-network"
+        mode = "host_macvlan" if self.network_mode_host_macvlan.isChecked() else ("host" if self.network_mode_host.isChecked() else "gpu")
+        command += f" --network-mode {mode}"
+        mode_label = "Host + macvlan (per-container tc)" if mode == "host_macvlan" else ("Host network (tc on host)" if mode == "host" else "GPU (Docker bridge)")
         reply = QMessageBox.question(
             self,
             "Run Diagnostic Pipeline",
@@ -2318,7 +2380,7 @@ class FLExperimentGUI(QMainWindow):
             f"  Use Case: {use_case}\n"
             f"  Network scenario (Phases 2–4): {scenario}\n"
             f"  GPU: {'Enabled (fallback to CPU if unavailable)' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
-            f"  Host network: {'Yes (docker-compose *.host-network.yml)' if self.host_network_enabled.isChecked() else 'No'}\n\n"
+            f"  Network mode: {mode_label}\n\n"
             f"  Phase 1: Calibration with NO channel losses (protocol & broker overhead only).\n"
             f"  Phases 2–4: Apply scenario '{scenario}' → extract tc → lossy round → table.\n\n"
             f"Continue?",

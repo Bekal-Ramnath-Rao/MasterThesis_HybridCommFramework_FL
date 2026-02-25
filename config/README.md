@@ -9,6 +9,11 @@ This directory contains configuration files for various components of the system
 - `cyclonedds-emotion.xml` - CycloneDDS configuration for emotion recognition
 - `cyclonedds-mentalstate.xml` - CycloneDDS configuration for mental state recognition
 - `cyclonedds-temperature.xml` - CycloneDDS configuration for temperature regulation
+- **DDS MACVLAN (static peers, no multicast):** `cyclonedds-server.xml`, `cyclonedds-client1.xml`, `cyclonedds-client2.xml` — used by `Docker/docker-compose-emotion.macvlan.yml`. **Replace placeholders with macvlan IPs** before starting:
+  - Get IPs: `docker inspect fl-server-dds-emotion | grep IPAddress`, same for `fl-client-dds-emotion-1`, `fl-client-dds-emotion-2` (after first `up` or from network plan).
+  - In `cyclonedds-server.xml`: replace `CLIENT1_IP`, `CLIENT2_IP` with client container IPs.
+  - In `cyclonedds-client1.xml` and `cyclonedds-client2.xml`: replace `SERVER_IP` with server container IP.
+  - Then: `docker-compose down && docker-compose up`, wait 10s, then verify with `docker exec fl-server-dds-emotion netstat -ulnp | grep 74` and client registration in logs.
 
 ### MQTT Configuration
 - `mosquitto.conf` - Mosquitto MQTT broker configuration

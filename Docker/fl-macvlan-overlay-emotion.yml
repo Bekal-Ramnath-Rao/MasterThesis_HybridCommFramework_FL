@@ -1,0 +1,11 @@
+# Overlay: use external macvlan network for Emotion FL (replaces bridge).
+# Use with: docker compose -f docker-compose-emotion.gpu-isolated.yml -f fl-macvlan-overlay-emotion.yml ...
+# Or: docker compose -f docker-compose-emotion.yml -f fl-macvlan-overlay-emotion.yml ...
+# Create the network first: see Network_Simulation/network_simulator.py ensure_macvlan_network().
+networks:
+  emotion_network:
+    external: true
+    name: fl-macvlan
+  fl-mqtt-network:
+    external: true
+    name: fl-macvlan

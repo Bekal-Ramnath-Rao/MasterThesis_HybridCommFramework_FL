@@ -1,0 +1,10 @@
+# Overlay: use external macvlan network for Temperature FL (replaces bridge).
+# Use with: docker compose -f docker-compose-temperature.gpu-isolated.yml -f fl-macvlan-overlay-temperature.yml ...
+# Or: docker compose -f docker-compose-temperature.yml -f fl-macvlan-overlay-temperature.yml ...
+networks:
+  temperature_network:
+    external: true
+    name: fl-macvlan
+  fl-mqtt-network-temp:
+    external: true
+    name: fl-macvlan
