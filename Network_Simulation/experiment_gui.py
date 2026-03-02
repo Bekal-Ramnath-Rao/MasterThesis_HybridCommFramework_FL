@@ -1865,11 +1865,11 @@ class FLExperimentGUI(QMainWindow):
             self.output_tabs.addTab(ql_fallback, "🎓 Q-Learning")
             self.q_learning_logs_tab = None
 
-        # Tab: Diagnostic Pipeline Results (beside Q-Learning; filled when Run Diagnostic Pipeline completes)
+        # Tab: Diagnostic Pipeline Results (database-backed; filled when Run Diagnostic Pipeline completes)
         from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
         diag_tab = QWidget()
         diag_layout = QVBoxLayout(diag_tab)
-        diag_layout.addWidget(QLabel("Diagnostic pipeline results (Empirical Overhead, Network Extraction, Analytical Model). Only \"Run Diagnostic Pipeline\" fills this tab — \"Start Experiment\" does not."))
+        diag_layout.addWidget(QLabel("Diagnostic pipeline results (Empirical Overhead, Network Extraction, Analytical Model). Data is stored in a database; new runs update by (Protocol, Scenario)."))
         self.diagnostic_results_table = QTableWidget()
         self.diagnostic_results_table.setColumnCount(9)
         self.diagnostic_results_table.setHorizontalHeaderLabels([
@@ -1889,6 +1889,10 @@ class FLExperimentGUI(QMainWindow):
         """)
         diag_layout.addWidget(self.diagnostic_results_table)
         self.output_tabs.addTab(diag_tab, "📊 Diagnostic Results")
+        # Initialize diagnostic DB and load existing data (including current diagnostic_results_latest.json)
+        self._init_diagnostic_db()
+        self._seed_diagnostic_db_from_json_if_present()
+        self._load_diagnostic_results_table_from_db()
 
         # Add Docker Build Logs tab
         self.docker_build_log_text = QTextEdit()
@@ -2928,38 +2932,145 @@ class FLExperimentGUI(QMainWindow):
             self.output_text.verticalScrollBar().maximum()
         )
 
-    def update_diagnostic_results_table(self, summary):
-        """Update Diagnostic Results tab: merge by (protocol, scenario).
-        - Same protocol + same scenario: replace those rows with the new run.
-        - Different (protocol, scenario): keep existing rows and append new ones.
-        - Table accumulates all protocol × scenario results; only re-run overwrites."""
+    def _diagnostic_db_path(self):
+        """Path to SQLite database for diagnostic results (shared_data/diagnostic_results.db)."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        shared = os.path.join(base_dir, "shared_data")
+        os.makedirs(shared, exist_ok=True)
+        return os.path.join(shared, "diagnostic_results.db")
+
+    def _init_diagnostic_db(self):
+        """Create diagnostic_results table if it does not exist."""
+        import sqlite3
+        path = self._diagnostic_db_path()
+        try:
+            conn = sqlite3.connect(path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS diagnostic_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_id INTEGER NOT NULL,
+                    protocol TEXT NOT NULL,
+                    scenario TEXT NOT NULL,
+                    O_app REAL NOT NULL DEFAULT 0,
+                    O_broker REAL NOT NULL DEFAULT 0,
+                    p REAL NOT NULL DEFAULT 0,
+                    T_actual REAL NOT NULL DEFAULT 0,
+                    T_calc REAL NOT NULL DEFAULT 0,
+                    error_pct REAL NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            if hasattr(self, "output_text"):
+                self.output_text.append(f"[Diagnostic DB] Could not init DB: {e}\n")
+
+    def _seed_diagnostic_db_from_json_if_present(self):
+        """If shared_data/diagnostic_results_latest.json exists, load it and upsert into DB (replace by protocol+scenario)."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        diag_file = os.path.join(base_dir, "shared_data", "diagnostic_results_latest.json")
+        if not os.path.isfile(diag_file):
+            return
+        try:
+            with open(diag_file, "r", encoding="utf-8") as f:
+                summary = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return
+        if summary is not None:
+            rows = summary if isinstance(summary, list) else [summary]
+            self._save_diagnostic_results_to_db(rows)
+
+    def _save_diagnostic_results_to_db(self, new_rows):
+        """Persist diagnostic rows to DB: for each (protocol, scenario) in new_rows, delete existing then insert.
+        Same protocol+scenario overwrite; new combos add new entries."""
+        if not new_rows:
+            return
+        import sqlite3
+        path = self._diagnostic_db_path()
+        try:
+            conn = sqlite3.connect(path)
+            # Unique (protocol, scenario) pairs in this batch
+            seen = set()
+            for r in new_rows:
+                proto = str(r.get("protocol", "")).strip()
+                scen = str(r.get("scenario", "")).strip()
+                key = (proto.lower(), scen.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                conn.execute(
+                    "DELETE FROM diagnostic_results WHERE LOWER(TRIM(protocol)) = ? AND LOWER(TRIM(scenario)) = ?",
+                    (proto.lower(), scen.lower()),
+                )
+            for r in new_rows:
+                conn.execute(
+                    """INSERT INTO diagnostic_results (client_id, protocol, scenario, O_app, O_broker, p, T_actual, T_calc, error_pct)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        int(r.get("client_id", 0)),
+                        str(r.get("protocol", "")),
+                        str(r.get("scenario", "")),
+                        float(r.get("O_app", 0)),
+                        float(r.get("O_broker", 0)),
+                        float(r.get("p", 0)),
+                        float(r.get("T_actual", 0)),
+                        float(r.get("T_calc", 0)),
+                        float(r.get("error_pct", 0)),
+                    ),
+                )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            if hasattr(self, "output_text"):
+                self.output_text.append(f"[Diagnostic DB] Save failed: {e}\n")
+
+    def _load_diagnostic_results_from_db(self):
+        """Load all rows from diagnostic_results table; return list of dicts for table display."""
+        import sqlite3
+        path = self._diagnostic_db_path()
+        if not os.path.isfile(path):
+            return []
+        try:
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                "SELECT client_id, protocol, scenario, O_app, O_broker, p, T_actual, T_calc, error_pct FROM diagnostic_results ORDER BY UPPER(protocol), LOWER(scenario), client_id"
+            )
+            rows = [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()]
+            conn.close()
+            return rows
+        except Exception:
+            return []
+
+    def _load_diagnostic_results_table_from_db(self):
+        """Populate Diagnostic Results tab from database."""
         if not hasattr(self, "diagnostic_results_table"):
             return
         from PyQt5.QtWidgets import QTableWidgetItem
-        if not hasattr(self, "_diagnostic_results_cache"):
-            self._diagnostic_results_cache = []
+        rows = self._load_diagnostic_results_from_db()
+        self.diagnostic_results_table.setRowCount(len(rows))
+        for row_idx, r in enumerate(rows):
+            self.diagnostic_results_table.setItem(row_idx, 0, QTableWidgetItem(str(r.get("client_id", row_idx + 1))))
+            self.diagnostic_results_table.setItem(row_idx, 1, QTableWidgetItem(str(r.get("protocol", ""))))
+            self.diagnostic_results_table.setItem(row_idx, 2, QTableWidgetItem(str(r.get("scenario", ""))))
+            self.diagnostic_results_table.setItem(row_idx, 3, QTableWidgetItem(f"{r.get('O_app', 0):.6f}"))
+            self.diagnostic_results_table.setItem(row_idx, 4, QTableWidgetItem(f"{r.get('O_broker', 0):.6f}"))
+            self.diagnostic_results_table.setItem(row_idx, 5, QTableWidgetItem(f"{r.get('p', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 6, QTableWidgetItem(f"{r.get('T_actual', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 7, QTableWidgetItem(f"{r.get('T_calc', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 8, QTableWidgetItem(f"{r.get('error_pct', 0):.2f}%"))
+
+    def update_diagnostic_results_table(self, summary):
+        """Update Diagnostic Results: save to DB (overwrite by protocol+scenario, add new), then reload table from DB."""
+        if not hasattr(self, "diagnostic_results_table"):
+            return
+        from PyQt5.QtWidgets import QTableWidgetItem
         new_rows = summary if isinstance(summary, list) else [summary]
-        # Normalize keys to lowercase so AMQP/amqp and Excellent/excellent match
-        def key(r):
-            return (str(r.get("protocol", "")).strip().lower(), str(r.get("scenario", "")).strip().lower())
-        updated_keys = set(key(r) for r in new_rows)
-        # Remove existing rows that match any (protocol, scenario) we are updating
-        self._diagnostic_results_cache = [
-            row for row in self._diagnostic_results_cache
-            if key(row) not in updated_keys
-        ]
-        # Append new rows (so table has all protocols × scenarios; repeat run overwrites only that combo)
-        self._diagnostic_results_cache.extend(new_rows)
-        # Sort by protocol then scenario then client_id for consistent display (e.g. 5 protocols × 6 scenarios)
-        self._diagnostic_results_cache.sort(
-            key=lambda r: (
-                str(r.get("protocol", "")).upper(),
-                str(r.get("scenario", "")).lower(),
-                int(r.get("client_id", 0)),
-            )
-        )
-        # Render full table
-        rows = self._diagnostic_results_cache
+        # 1. Persist: same (protocol, scenario) overwrite; new (protocol, scenario) add
+        self._save_diagnostic_results_to_db(new_rows)
+        # 2. Load full table from DB and render
+        rows = self._load_diagnostic_results_from_db()
         self.diagnostic_results_table.setRowCount(len(rows))
         for row_idx, r in enumerate(rows):
             self.diagnostic_results_table.setItem(row_idx, 0, QTableWidgetItem(str(r.get("client_id", row_idx + 1))))

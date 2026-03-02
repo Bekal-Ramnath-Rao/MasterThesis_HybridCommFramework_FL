@@ -579,10 +579,14 @@ class NativeExperimentRunner:
             print("[INFO] Do not interrupt (Ctrl+C/Stop) until the server finishes all rounds.")
             if self.apply_tc_after_round_1:
                 # Phase 1: round 1 runs without tc. After round 1 complete, apply tc so round 2 send is affected.
+                # No timeout: wait indefinitely (FL_DIAG_ROUND1_WAIT_SEC=0 or unset). Set to positive for a limit.
                 client_log_paths = [log_dir / f"client_{i}.log" for i in range(1, self.num_clients + 1)]
                 poll_interval = 2
-                deadline = time.monotonic() + 600  # 10 min max wait for round 1
-                while time.monotonic() < deadline and server_proc.poll() is None:
+                round1_wait_sec = int(os.environ.get("FL_DIAG_ROUND1_WAIT_SEC", "0"))
+                deadline = (time.monotonic() + round1_wait_sec) if round1_wait_sec > 0 else None  # None = no limit
+                if deadline is None:
+                    print("[INFO] Waiting for round 1 completion (no timeout; set FL_DIAG_ROUND1_WAIT_SEC>0 for a limit).")
+                while (deadline is None or time.monotonic() < deadline) and server_proc.poll() is None:
                     counts = []
                     for path in client_log_paths:
                         try:

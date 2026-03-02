@@ -684,17 +684,21 @@ def run_pipeline(
 
     # Phase 3: Wait for Round 2 to fully complete: client finishes training → sends update → server receives.
     # T_actual = recv_end_ts − send_start_ts (client send to server receive for round index 2). Do not tear down until we have this.
-    # Round 2 training (e.g. 20 epochs) can take several minutes; default 20 min to allow completion.
+    # FL_DIAG_PHASE3_WAIT=0 or negative = no timeout (wait indefinitely). Positive = max iterations (each 2s).
     try:
-        phase3_max_wait = int(os.environ.get("FL_DIAG_PHASE3_WAIT", "600"))  # iterations; 600*2s = 20 min default
+        phase3_max_wait = int(os.environ.get("FL_DIAG_PHASE3_WAIT", "600"))  # 600*2s = 20 min default; 0 = no limit
     except (ValueError, TypeError):
         phase3_max_wait = 600
-    phase3_max_wait = max(phase3_max_wait, 90)
-    # T_actual uses round index 2 (third round). Require >= 3 FL_DIAG lines per client so we don't
-    # break on round index 0 or 1 (parser fallback would give wrong T_actual).
-    print(f"[Phase 3] Waiting for Round 2 to complete (client finishes training → sends → server receives). T_actual = recv_end_ts − send_start_ts. Will wait up to {phase3_max_wait * 2}s...")
+    no_timeout = phase3_max_wait <= 0
+    if no_timeout:
+        phase3_max_wait = None
+        print("[Phase 3] Waiting for Round 2 to complete (no timeout; set FL_DIAG_PHASE3_WAIT>0 for a limit).")
+    else:
+        phase3_max_wait = max(phase3_max_wait, 90)
+        print(f"[Phase 3] Waiting for Round 2 to complete. Will wait up to {phase3_max_wait * 2}s (FL_DIAG_PHASE3_WAIT=0 for no limit)...")
     lossy_list = []
-    for iteration in range(phase3_max_wait):
+    iteration = 0
+    while no_timeout or iteration < phase3_max_wait:
         time.sleep(2)
         lossy_list = parse_fl_diag_from_logs_multi(sender_containers, receiver_container, 2)  # round index 2 = third round
         round_counts = count_docker_fl_diag_rounds(sender_containers)
@@ -703,8 +707,9 @@ def run_pipeline(
         if lossy_list and len(lossy_list) >= n_expected and n_ready >= n_expected and has_round2_data:
             print(f"          Round 2 complete for all {n_expected} clients (train→send→receive) after {(iteration + 1) * 2}s.")
             break
-        if iteration == phase3_max_wait - 1:
-            print(f"          Timeout after {phase3_max_wait * 2}s. Set FL_DIAG_PHASE3_WAIT higher (e.g. 900 for 30 min) if Round 2 was still training.")
+        if not no_timeout and iteration == phase3_max_wait - 1:
+            print(f"          Timeout after {phase3_max_wait * 2}s. Set FL_DIAG_PHASE3_WAIT=0 for no timeout, or higher (e.g. 900) for 30 min.")
+        iteration += 1
     if not lossy_list or len(lossy_list) < len(cal_list):
         lossy_list = [{"client_id": i + 1, "T_total": cal_list[i].get("T_total", 0)} if i < len(cal_list) else {"client_id": i + 1, "T_total": 0} for i in range(max(2, len(cal_list)))]
     # Require round index 2 for T_actual; otherwise parser used an earlier round
