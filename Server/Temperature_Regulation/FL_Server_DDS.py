@@ -386,22 +386,12 @@ class FederatedLearningServer:
         if not hasattr(self, '_reg_check_count'):
             self._reg_check_count = 0
         self._reg_check_count += 1
-
-        if self._reg_check_count % 20 == 1:
-            print(f"[DEBUG] check_registrations called (count={self._reg_check_count}), samples received: {len(samples)}")
-
-        # Debug: log how many samples received
-        if len(samples) > 0:
-            print(f"[DEBUG] *** RECEIVED {len(samples)} REGISTRATION SAMPLES ***")
         
         for sample in samples:
             # Some DDS implementations may emit InvalidSample entries; guard against those
             if not sample or not hasattr(sample, 'client_id'):
-                # Debug: show what we're skipping
-                print(f"[DEBUG] Skipping invalid registration sample: {type(sample).__name__}")
                 continue
             client_id = sample.client_id
-            print(f"[DEBUG] Processing registration from client {client_id}")
             if client_id not in self.registered_clients:
                 self.registered_clients.add(client_id)
                 self.active_clients.add(client_id)

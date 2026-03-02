@@ -106,9 +106,6 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             # Append new data to buffer
             self._stream_buffers[event.stream_id] += event.data
             buffer_size = len(self._stream_buffers[event.stream_id])
-            # Reduced logging - only show progress for large messages (every 100KB)
-            if buffer_size % (100 * 1024) < len(event.data):
-                print(f"[DEBUG] Client stream {event.stream_id}: ~{buffer_size // 1024}KB received")
             
             # Send flow control updates to allow more data (critical for poor networks)
             self.transmit()
@@ -120,8 +117,6 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
                     try:
                         data = message_data.decode('utf-8')
                         message = json.loads(data)
-                        msg_type = message.get('type', 'unknown')
-                        print(f"[DEBUG] Client decoded message from stream {event.stream_id}: type={msg_type}, size={len(message_data)} bytes")
                         if self.client:
                             asyncio.create_task(self.client.handle_message(message))
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -129,12 +124,9 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             
             # If stream ended and buffer has remaining data, try to process it
             if event.end_stream and self._stream_buffers[event.stream_id]:
-                print(f"[DEBUG] Client stream {event.stream_id} ended with {len(self._stream_buffers[event.stream_id])} bytes remaining")
                 try:
                     data = self._stream_buffers[event.stream_id].decode('utf-8')
                     message = json.loads(data)
-                    msg_type = message.get('type', 'unknown')
-                    print(f"[DEBUG] Client decoded end-of-stream message: type={msg_type}")
                     if self.client:
                         asyncio.create_task(self.client.handle_message(message))
                     self._stream_buffers[event.stream_id] = b''

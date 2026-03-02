@@ -257,7 +257,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         model = build_model()
         self.global_weights = model.get_weights()
         print(f"Model initialized with {len(self.global_weights)} weight layers")
-        print(f"[DEBUG] Global weights initialized: {self.global_weights is not None}")
 
     def load_test_data(self):
         """Load and prepare test data for evaluation"""
@@ -296,10 +295,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
     def RegisterClient(self, request, context):
         """Handle client registration"""
-        print(f"[DEBUG] RegisterClient called - Received registration request from client {request.client_id}")
         with self.lock:
             client_id = request.client_id
-            print(f"[DEBUG] Acquired lock. Processing client {client_id}")
             self.registered_clients.add(client_id)
             self.active_clients.add(client_id)
             print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
@@ -307,7 +304,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         # Update total client count if more clients join
         if len(self.registered_clients) > self.num_clients:
             self.update_client_count(len(self.registered_clients))
-            print(f"[DEBUG] Currently registered clients: {sorted(self.registered_clients)}")
 
             if len(self.registered_clients) == self.num_clients and not self.training_started:
                 print("\nAll clients registered. Distributing initial global model...\n")
@@ -341,8 +337,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             client_id = request.client_id
             client_round = request.current_round
 
-            print(f"[DEBUG] CheckTrainingStatus - Client {client_id}, client_round={client_round}, server_round={self.current_round}, training_started={self.training_started}")
-
             if self.training_complete:
                 return federated_learning_pb2.TrainingStatus(
                     should_train=False,
@@ -359,7 +353,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             # 2. Client is at current round but hasn't submitted update yet
             if self.training_started and not self.evaluation_phase:
                 if client_round < self.current_round or (client_round == self.current_round and not client_has_submitted):
-                    print(f"[DEBUG] Telling client {client_id} to train for round {self.current_round}")
                     return federated_learning_pb2.TrainingStatus(
                         should_train=True,
                         current_round=self.current_round,
@@ -367,7 +360,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                         is_complete=False
                     )
 
-            print(f"[DEBUG] Telling client {client_id} to wait (evaluation_phase={self.evaluation_phase}, has_submitted={client_has_submitted})")
             return federated_learning_pb2.TrainingStatus(
                 should_train=False,
                 current_round=self.current_round,
@@ -377,12 +369,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
     def GetGlobalModel(self, request, context):
         """Send global model to client"""
-        print(f"[DEBUG] GetGlobalModel called - client_id={request.client_id}, request.round={request.round}")
         with self.lock:
-            print(f"[DEBUG] GetGlobalModel - training_started={self.training_started}, global_weights is None={self.global_weights is None}")
-            
             if not self.training_started:
-                print(f"[DEBUG] GetGlobalModel - Training not started yet, returning unavailable")
                 return federated_learning_pb2.GlobalModel(
                     round=0,
                     weights=b'',
@@ -402,8 +390,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 }
                 model_config_json = json.dumps(model_config)
 
-                print(f"[DEBUG] GetGlobalModel - Sending round {round_to_send} to client {request.client_id} (request.round={request.round})")
-                
                 # Compress or serialize global weights
                 if self.quantization_handler is not None:
                     compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
@@ -421,7 +407,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     model_config=model_config_json
                 )
             else:
-                print(f"[DEBUG] GetGlobalModel - global_weights is None!")
                 return federated_learning_pb2.GlobalModel(
                     round=self.current_round,
                     weights=b'',

@@ -1636,12 +1636,9 @@ class UnifiedFederatedLearningServer:
     
     def handle_client_update(self, data, protocol):
         """Handle client model update (thread-safe)"""
-        print(f"[DEBUG] handle_client_update ENTRY - protocol={protocol}, client_id={data.get('client_id')}, round={data.get('round')}, current_round={self.current_round}")
         with self.lock:
             client_id = data['client_id']
             round_num = data['round']
-            
-            print(f"[DEBUG] handle_client_update LOCKED - checking round: {round_num} vs {self.current_round}")
             
             # Check if this update is for the current round
             # Allow updates only for current round (not past or future)

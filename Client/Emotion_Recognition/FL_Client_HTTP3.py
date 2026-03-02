@@ -171,8 +171,6 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
                 # Append new data to buffer
                 self._stream_buffers[stream_id] += event.data
                 buffer_size = len(self._stream_buffers[stream_id])
-                if buffer_size % (100 * 1024) < len(event.data):
-                    print(f"[DEBUG] Client stream {stream_id}: ~{buffer_size // 1024}KB received")
                 
                 # Send flow control updates
                 self.transmit()
@@ -187,8 +185,6 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
                     try:
                         data_str = self._stream_buffers[stream_id].decode('utf-8')
                         message = json.loads(data_str)
-                        msg_type = message.get('type', 'unknown')
-                        print(f"[DEBUG] Client decoded complete message type '{msg_type}' from stream {stream_id}")
                         
                         # Handle message asynchronously
                         if self.client:
@@ -738,8 +734,6 @@ async def main():
             await client.register_with_server()
             
             print(f"Client {CLIENT_ID} waiting for training commands...")
-            print(f"[DEBUG] Client {CLIENT_ID} protocol._http initialized: {protocol._http is not None}")
-            print(f"[DEBUG] Client {CLIENT_ID} protocol._quic initialized: {protocol._quic is not None}")
             
             # Keep connection alive until client is stopped
             # Process events by calling transmit periodically to allow QUIC to process incoming data

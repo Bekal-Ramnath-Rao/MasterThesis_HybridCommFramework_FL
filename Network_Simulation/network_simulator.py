@@ -25,8 +25,9 @@ MACVLAN_GATEWAY = os.environ.get("FL_MACVLAN_GATEWAY", "192.168.254.1")
 
 class NetworkSimulator:
     """Simulates various network conditions on Docker containers using tc (traffic control)"""
-    
-    # Predefined network scenarios
+
+    # Predefined network scenarios. All four keys (latency, jitter, bandwidth, loss) are applied
+    # verbatim to tc: netem for delay/jitter/loss, htb or tbf for bandwidth.
     NETWORK_SCENARIOS = {
         "excellent": {
             "name": "Excellent Network (LAN)",
@@ -92,7 +93,28 @@ class NetworkSimulator:
             "loss": "6%"
         }
     }
-    
+
+    # Keys passed to tc (netem: delay/jitter/loss; htb/tbf: bandwidth)
+    _TC_CONDITION_KEYS = ("latency", "jitter", "bandwidth", "loss")
+
+    @classmethod
+    def get_scenario_conditions(cls, scenario_name: str) -> Dict[str, str]:
+        """
+        Return the tc-relevant conditions (latency, jitter, bandwidth, loss) for a scenario.
+        Ensures all four values from NETWORK_SCENARIOS are used when applying tc.
+        """
+        if scenario_name not in cls.NETWORK_SCENARIOS:
+            raise KeyError(f"Unknown scenario: {scenario_name}")
+        scenario = cls.NETWORK_SCENARIOS[scenario_name]
+        conditions = {k: scenario[k] for k in cls._TC_CONDITION_KEYS if k in scenario}
+        missing = [k for k in cls._TC_CONDITION_KEYS if k not in conditions]
+        if missing:
+            raise ValueError(
+                f"Scenario '{scenario_name}' is missing tc parameters: {missing}. "
+                "Each scenario must define latency, jitter, bandwidth, and loss."
+            )
+        return conditions
+
     def __init__(self, verbose=False):
         self.verbose = verbose
         self._host_interface_used = None  # set when we apply tc on host (host-network mode)
@@ -479,41 +501,47 @@ class NetworkSimulator:
             self.log(f"Note: Could not reset {container_name} (may not have existing rules): {e}")
     
     def apply_scenario_to_containers(self, scenario_name: str, container_pattern: str = None):
-        """Apply a predefined scenario to all matching containers"""
-        if scenario_name not in self.NETWORK_SCENARIOS:
-            print(f"[ERROR] Unknown scenario: {scenario_name}")
+        """Apply a predefined scenario to all matching containers. Uses latency, jitter, bandwidth,
+        and loss from NETWORK_SCENARIOS for all tc commands."""
+        try:
+            conditions = self.get_scenario_conditions(scenario_name)
+        except KeyError as e:
+            print(f"[ERROR] {e}")
             print(f"Available scenarios: {', '.join(self.NETWORK_SCENARIOS.keys())}")
             return
-        
+        except ValueError as e:
+            print(f"[ERROR] {e}")
+            return
+
         scenario = self.NETWORK_SCENARIOS[scenario_name]
         print(f"\n{'#'*60}")
         print(f"# Applying Scenario: {scenario['name']}")
         print(f"#{'#'*59}")
-        print(f"# Latency: {scenario.get('latency', 'N/A')}")
-        print(f"# Jitter: {scenario.get('jitter', 'N/A')}")
-        print(f"# Bandwidth: {scenario.get('bandwidth', 'N/A')}")
-        print(f"# Packet Loss: {scenario.get('loss', 'N/A')}")
+        print(f"# Latency: {conditions['latency']}")
+        print(f"# Jitter: {conditions['jitter']}")
+        print(f"# Bandwidth: {conditions['bandwidth']}")
+        print(f"# Packet Loss: {conditions['loss']}")
         print(f"{'#'*60}\n")
-        
+
         # Get list of running containers
         result = self.run_command(["docker", "ps", "--format", "{{.Names}}"])
         containers = result.stdout.strip().split('\n')
-        
+
         # Filter containers if pattern is provided
         if container_pattern:
             containers = [c for c in containers if container_pattern in c]
-        
+
         if not containers:
             print("[WARNING] No matching containers found!")
             return
-        
+
         print(f"Found {len(containers)} container(s) to configure:\n")
-        
-        # Apply conditions to each container
+
+        # Apply conditions (latency, jitter, bandwidth, loss) to each container via tc
         success_count = 0
         for container in containers:
             if container:  # Skip empty lines
-                if self.apply_network_conditions(container, scenario):
+                if self.apply_network_conditions(container, conditions):
                     success_count += 1
                 time.sleep(0.5)  # Small delay between containers
         

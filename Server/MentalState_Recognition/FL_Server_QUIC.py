@@ -75,13 +75,9 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
         super().__init__(*args, **kwargs)
         self.server = None
         self._stream_buffers = {}
-        print(f"[DEBUG] New server protocol instance created: {id(self)}")
 
     def quic_event_received(self, event: QuicEvent):
-        print(f"[DEBUG] quic_event_received called on protocol {id(self)}, event type: {type(event).__name__}")
         if isinstance(event, StreamDataReceived):
-            print(f"[DEBUG] Server received data on stream {event.stream_id}, size={len(event.data)} bytes, end_stream={event.end_stream}")
-            
             if event.stream_id not in self._stream_buffers:
                 self._stream_buffers[event.stream_id] = b''
 
@@ -101,7 +97,7 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                         if self.server:
                             asyncio.create_task(self.server.handle_message(message, self))
                         else:
-                            print(f"[DEBUG] Server not set in protocol, cannot handle message")
+                                print("Server not set in protocol, cannot handle message")
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
                         print(f"Error decoding message: {e}")
                         print(f"Message data length: {len(message_data)}")
@@ -368,7 +364,6 @@ class FederatedLearningServer:
         """Handle incoming messages from clients"""
         try:
             msg_type = message.get('type')
-            print(f"[DEBUG] Server received message type: {msg_type}")
 
             if msg_type == 'register':
                 await self.handle_client_registration(message, protocol)
@@ -384,7 +379,6 @@ class FederatedLearningServer:
     async def handle_client_registration(self, message, protocol):
         """Handle client registration"""
         client_id = message['client_id']
-        print(f"[DEBUG] Received registration from client {client_id}")
         self.registered_clients[client_id] = protocol
         self.active_clients.add(client_id)
         print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
@@ -392,7 +386,6 @@ class FederatedLearningServer:
         # Update total client count if more clients join
         if len(self.registered_clients) > self.num_clients:
             self.update_client_count(len(self.registered_clients))
-        print(f"[DEBUG] Registered clients: {sorted(self.registered_clients.keys())}")
 
         if self.training_started:
             self.active_clients.add(client_id)
@@ -436,8 +429,6 @@ class FederatedLearningServer:
             await self.mark_client_converged(client_id)
             return
 
-        print(f"[DEBUG] Server received model_update - client_id={client_id}, round_num={round_num}, current_round={self.current_round}")
-
         if round_num == self.current_round:
             # Decompress or deserialize client weights
             if 'compressed_data' in message and self.quantization_handler is not None:
@@ -457,7 +448,7 @@ class FederatedLearningServer:
             if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
                 await self.aggregate_models()
         else:
-            print(f"[DEBUG] Ignoring update from client {client_id} - round mismatch (got {round_num}, expected {self.current_round})")
+            print(f"Ignoring update from client {client_id} - round mismatch (got {round_num}, expected {self.current_round})")
 
     async def handle_client_metrics(self, message):
         """Handle evaluation metrics from client (not used for server evaluation)"""
@@ -476,8 +467,6 @@ class FederatedLearningServer:
         print(f"\n{'=' * 70}")
         print(f"Distributing Initial Global Model")
         print(f"{'=' * 70}\n")
-
-        print(f"[DEBUG] Sending initial model - round=0, has_config=True")
         
         # Prepare global model (compress if quantization enabled)
         if self.quantization_handler is not None:

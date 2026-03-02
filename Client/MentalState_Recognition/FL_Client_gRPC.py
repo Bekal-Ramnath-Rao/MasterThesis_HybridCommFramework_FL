@@ -319,11 +319,9 @@ class FederatedLearningClient:
                 self.stub = federated_learning_pb2_grpc.FederatedLearningStub(self.channel)
                 
                 # Test connection by registering
-                print(f"[DEBUG] Client {self.client_id} sending registration request to server...")
                 response = self.stub.RegisterClient(
                     federated_learning_pb2.ClientRegistration(client_id=self.client_id)
                 )
-                print(f"[DEBUG] Client {self.client_id} received registration response: success={response.success}")
                 
                 if response.success:
                     print(f"Client {self.client_id} connected to gRPC server")
@@ -368,8 +366,6 @@ class FederatedLearningClient:
                     federated_learning_pb2.ModelRequest(client_id=self.client_id, round=0)
                 )
                 
-                print(f"[DEBUG] Initial model fetch - available={model_update.available}, has_weights={bool(model_update.weights)}, has_config={bool(model_update.model_config)}, round={model_update.round}")
-                
                 if model_update.available and model_update.weights and model_update.model_config:
                     self.receive_global_model(model_update)
                     initial_model_received = True
@@ -399,8 +395,6 @@ class FederatedLearningClient:
                     )
                 )
                 
-                print(f"[DEBUG] Client {self.client_id} - Status: should_train={status.should_train}, current_round={status.current_round}, local_round={self.current_round}, is_complete={status.is_complete}")
-                
                 if status.is_complete:
                     print(f"\n{'='*70}")
                     print(f"Client {self.client_id} - Training completed!")
@@ -411,23 +405,15 @@ class FederatedLearningClient:
                     time.sleep(1)
                     continue
                 
-                print(f"[DEBUG] Client {self.client_id} - should_train is True, checking if need to fetch new model...")
-                
                 # If server's round is ahead, fetch new global model first
                 if status.current_round > self.current_round:
-                    print(f"[DEBUG] Client {self.client_id} - Fetching global model for round {status.current_round}...")
                     model_update = self.stub.GetGlobalModel(
                         federated_learning_pb2.ModelRequest(client_id=self.client_id, round=self.current_round)
                     )
-                    
-                    print(f"[DEBUG] Client {self.client_id} - Received model update, round={model_update.round}, status.current_round={status.current_round}")
-                    
                     if model_update.round == status.current_round:
-                        print(f"[DEBUG] Client {self.client_id} - Model round matches, updating...")
                         self.receive_global_model(model_update)
                         self.current_round = status.current_round
                     else:
-                        print(f"[DEBUG] Client {self.client_id} - Model round mismatch!")
                         time.sleep(0.5)
                         continue
                 
@@ -462,8 +448,6 @@ class FederatedLearningClient:
     def receive_global_model(self, model_update):
         """Receive and set global model weights from server"""
         try:
-            print(f"[DEBUG] Client {self.client_id} receive_global_model - round={model_update.round}, has_config={bool(model_update.model_config)}, model exists={self.model is not None}")
-            
             # Decompress or deserialize weights (handle pickled compressed dicts)
             if model_update.weights:
                 if self.quantizer is not None:

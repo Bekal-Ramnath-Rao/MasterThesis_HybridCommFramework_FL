@@ -640,7 +640,11 @@ def run_pipeline(
     # Phase 2: Apply tc at egress of clients only. Then Round 2 runs: Server → Global model → Client; Client → Local model → Server.
     # T_actual = recv_end_ts − send_start_ts for round index 2 (second round, client send to server receive).
     print(f"[Phase 2] Applying tc at client egress only: {scenario}. Round 2 will run with tc...")
-    conditions = sim.NETWORK_SCENARIOS[scenario]
+    try:
+        conditions = sim.get_scenario_conditions(scenario)
+    except (KeyError, ValueError) as e:
+        print(f"[ERROR] Cannot apply scenario: {e}")
+        conditions = {}
     host_mode = network_mode == "host"  # only apply tc on host when using host-network compose
     if host_mode:
         print(f"          Containers use network_mode: host; applying scenario to host interface.")

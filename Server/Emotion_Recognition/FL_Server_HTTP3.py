@@ -421,7 +421,8 @@ class FederatedLearningServer:
         self.registered_clients[client_id] = protocol  # Store protocol reference
         self.active_clients.add(client_id)
         print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
-        print(f"[DEBUG] Registered clients: {list(self.registered_clients.keys())}")
+        # Keep a simple summary of registered clients
+        print(f"Registered clients: {list(self.registered_clients.keys())}")
         
         # Update total client count if more clients join
         if len(self.registered_clients) > self.num_clients:

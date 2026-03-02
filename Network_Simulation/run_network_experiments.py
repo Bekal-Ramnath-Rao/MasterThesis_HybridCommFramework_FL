@@ -451,7 +451,11 @@ class ExperimentRunner:
         if scenario not in sim.NETWORK_SCENARIOS:
             print(f"[WARNING] Unknown scenario: {scenario}, skipping network simulation")
             return True
-        conditions = sim.NETWORK_SCENARIOS[scenario]
+        try:
+            conditions = sim.get_scenario_conditions(scenario)
+        except ValueError as e:
+            print(f"[WARNING] {e}, skipping network simulation")
+            return True
         services = self.service_patterns[self.use_case][protocol]
 
         if self.network_mode == "host":

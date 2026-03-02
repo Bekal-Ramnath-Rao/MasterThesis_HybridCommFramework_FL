@@ -558,7 +558,6 @@ class FederatedLearningClient:
         
         for sample in samples:
             if sample:
-                print(f"[DEBUG] Client {self.client_id} received command - round={sample.round}, start_training={sample.start_training}, current_round={self.current_round}")
                 if sample.training_complete:
                     print(f"\nClient {self.client_id} - Training completed!")
                     self.running = False
