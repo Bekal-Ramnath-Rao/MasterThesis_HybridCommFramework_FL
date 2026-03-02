@@ -57,7 +57,7 @@ if gpus:
             try:
                 tf.config.set_logical_device_configuration(
                     gpu,
-                    [tf.config.LogicalDeviceConfiguration(memory_limit=7000)]  # 7GB per GPU
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=int(os.environ.get("TF_GPU_MEMORY_LIMIT_MB", "4000")))]
                 )
             except RuntimeError:
                 pass  # GPU already configured
@@ -83,6 +83,19 @@ import federated_learning_pb2_grpc
 # gRPC Configuration
 GRPC_HOST = os.getenv("GRPC_HOST", "localhost")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
+# INT_MAX ms (~24 days) = effectively disable keepalive (gRPC C-core: 0 can mean "use default")
+GRPC_KEEPALIVE_DISABLED_MS = 2147483647
+# Retries for SendModelUpdate on UNAVAILABLE/DEADLINE_EXCEEDED (poor/very-poor network)
+GRPC_SEND_UPDATE_MAX_RETRIES = int(os.getenv("GRPC_SEND_UPDATE_MAX_RETRIES", "4"))
+# Timeout for SendModelUpdate in seconds. Default 3600 (1h) for very_poor. 0/none/inf = no deadline (wait indefinitely).
+_env_timeout = os.getenv("GRPC_SEND_UPDATE_TIMEOUT_SEC", "3600").strip().lower()
+if _env_timeout in ("0", "none", "inf", "infinity"):
+    GRPC_SEND_UPDATE_TIMEOUT = None  # no deadline
+else:
+    try:
+        GRPC_SEND_UPDATE_TIMEOUT = int(_env_timeout)
+    except ValueError:
+        GRPC_SEND_UPDATE_TIMEOUT = 3600  # 1 hour default
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -108,7 +121,7 @@ class FederatedLearningClient:
         self.train_generator = train_generator
         self.validation_generator = validation_generator
         self.current_round = 0
-        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        self.training_config = {"batch_size": 16, "local_epochs": 20}
         
         # gRPC connection
         self.channel = None
@@ -132,16 +145,17 @@ class FederatedLearningClient:
             try:
                 print(f"Attempting to connect to gRPC server at {GRPC_HOST}:{GRPC_PORT}...")
                 # FAIR CONFIG: Set max message size to 128MB (aligned with AMQP default)
+                # Keepalive effectively disabled (INT_MAX) so poor/very-poor networks never hit ping_timeout
                 options = [
                     ('grpc.max_send_message_length', 128 * 1024 * 1024),
                     ('grpc.max_receive_message_length', 128 * 1024 * 1024),
-                    # FAIR CONFIG: Keepalive settings 600s for very_poor network
-                    ('grpc.keepalive_time_ms', 600000),  # 10 minutes
-                    ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
+                    ('grpc.keepalive_time_ms', GRPC_KEEPALIVE_DISABLED_MS),
+                    ('grpc.keepalive_timeout_ms', GRPC_KEEPALIVE_DISABLED_MS),
                 ]
                 self.channel = grpc.insecure_channel(f'{GRPC_HOST}:{GRPC_PORT}', options=options)
                 self.stub = federated_learning_pb2_grpc.FederatedLearningStub(self.channel)
-                
+                self._grpc_options = options  # for reconnect on UNAVAILABLE
+                self._grpc_target = f'{GRPC_HOST}:{GRPC_PORT}'
                 # Test connection by registering
                 response = self.stub.RegisterClient(
                     federated_learning_pb2.ClientRegistration(client_id=self.client_id)
@@ -337,6 +351,46 @@ class FederatedLearningClient:
             print(f"Error receiving global model: {e}")
             import traceback
             traceback.print_exc()
+
+    def _reconnect_grpc_channel(self):
+        """Create a new gRPC channel and stub (e.g. after GOAWAY/ping_timeout)."""
+        if self.channel:
+            try:
+                self.channel.close()
+            except Exception:
+                pass
+            self.channel = None
+        opts = getattr(self, '_grpc_options', None)
+        target = getattr(self, '_grpc_target', f'{GRPC_HOST}:{GRPC_PORT}')
+        if not opts:
+            opts = [
+                ('grpc.max_send_message_length', 128 * 1024 * 1024),
+                ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                ('grpc.keepalive_time_ms', GRPC_KEEPALIVE_DISABLED_MS),
+                ('grpc.keepalive_timeout_ms', GRPC_KEEPALIVE_DISABLED_MS),
+            ]
+        self.channel = grpc.insecure_channel(target, options=opts)
+        self.stub = federated_learning_pb2_grpc.FederatedLearningStub(self.channel)
+        print(f"Client {self.client_id} reconnected gRPC channel to {target}")
+    
+    def _send_model_update_with_retry(self, request, send_start_cpu=None):
+        """Send model update; on UNAVAILABLE or DEADLINE_EXCEEDED reconnect and retry up to GRPC_SEND_UPDATE_MAX_RETRIES with backoff."""
+        last_error = None
+        timeout = GRPC_SEND_UPDATE_TIMEOUT  # None = no deadline (for very_poor)
+        for attempt in range(GRPC_SEND_UPDATE_MAX_RETRIES):
+            try:
+                return self.stub.SendModelUpdate(request, timeout=timeout)
+            except grpc.RpcError as e:
+                last_error = e
+                retryable = e.code() in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED)
+                if not retryable or attempt == GRPC_SEND_UPDATE_MAX_RETRIES - 1:
+                    raise
+                backoff = (2 ** attempt) * 2  # 2, 4, 8 seconds
+                reason = "ping_timeout" if e.code() == grpc.StatusCode.UNAVAILABLE else "deadline exceeded"
+                print(f"Client {self.client_id} got {reason}, reconnecting and retrying in {backoff}s (attempt {attempt + 1}/{GRPC_SEND_UPDATE_MAX_RETRIES})...")
+                time.sleep(backoff)
+                self._reconnect_grpc_channel()
+        raise last_error
     
     def train_local_model(self):
         """Train model on local data and send updates to server"""
@@ -400,16 +454,15 @@ class FederatedLearningClient:
             }
             if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
                 metrics_for_server['diagnostic_send_start_ts'] = send_start_ts
-            # Send update to server
-            response = self.stub.SendModelUpdate(
-                federated_learning_pb2.ModelUpdate(
-                    client_id=self.client_id,
-                    round=self.current_round,
-                    weights=serialized_weights,
-                    num_samples=num_samples,
-                    metrics=metrics_for_server
-                )
+            # Send update to server (long deadline for moderate/poor networks: ~9MB can take minutes)
+            request = federated_learning_pb2.ModelUpdate(
+                client_id=self.client_id,
+                round=self.current_round,
+                weights=serialized_weights,
+                num_samples=num_samples,
+                metrics=metrics_for_server
             )
+            response = self._send_model_update_with_retry(request, send_start_cpu)
             
             if send_start_cpu is not None:
                 O_send = time.perf_counter() - send_start_cpu

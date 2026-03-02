@@ -1,8 +1,11 @@
+import os
+import sys
+# Server uses CPU only (aggregation is numpy-only); must be set before any TensorFlow import
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
 import numpy as np
 import pickle
 import time
-import os
-import sys
 import json
 from pathlib import Path
 
@@ -169,7 +172,7 @@ class FederatedLearningServer:
         # Training configuration
         # Training configuration broadcast to DDS clients
         # Reduced batch size to 16 to prevent GPU OOM
-        batch_size_env = int(os.getenv("BATCH_SIZE", "32"))
+        batch_size_env = int(os.getenv("BATCH_SIZE", "16"))
         # Default to 5 for faster smoke tests if LOCAL_EPOCHS not set
         local_epochs_env = int(os.getenv("LOCAL_EPOCHS", "20"))
         self.training_config = {
@@ -277,12 +280,18 @@ class FederatedLearningServer:
         # Create domain participant
         self.participant = DomainParticipant(DDS_DOMAIN_ID)
         
-        # Reliable QoS for all messages (control and data)
-        # TransientLocal durability ensures messages survive discovery delays
+        # Reliable QoS for control/small messages
         reliable_qos = Qos(
             Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
             Policy.History.KeepLast(10),
             Policy.Durability.TransientLocal,
+        )
+        # Long blocking + resource limits for large model updates (9MB; must accept large samples in round 1 too)
+        reliable_qos_large = Qos(
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),
+            Policy.History.KeepLast(10),
+            Policy.Durability.TransientLocal,
+            Policy.ResourceLimits(max_samples=10, max_instances=10, max_samples_per_instance=10),
         )
         # Create topics (no chunk topics; single-message GlobalModel and ModelUpdate)
         topic_registration = Topic(self.participant, "ClientRegistration", ClientRegistration)
@@ -305,10 +314,10 @@ class FederatedLearningServer:
         # self.writers['global_model'] = DataWriter(self.participant, topic_global_model, qos=reliable_qos)
         # self.writers['status'] = DataWriter(self.participant, topic_status, qos=reliable_qos)
 
-        # Create readers (for receiving from clients) — all Reliable
+        # Create readers (for receiving from clients) — Reliable; model_update uses long timeout for large payloads
         self.readers['registration'] = DataReader(self.participant, topic_registration, qos=reliable_qos)
         self.readers['ready'] = DataReader(self.participant, topic_ready, qos=reliable_qos)
-        self.readers['model_update'] = DataReader(self.participant, topic_model_update, qos=reliable_qos)
+        self.readers['model_update'] = DataReader(self.participant, topic_model_update, qos=reliable_qos_large)
         self.readers['metrics'] = DataReader(self.participant, topic_metrics, qos=reliable_qos)
         
         # Create writers (for sending to clients) — all Reliable
@@ -317,7 +326,7 @@ class FederatedLearningServer:
         self.writers['global_model'] = DataWriter(self.participant, topic_global_model, qos=reliable_qos)
         self.writers['status'] = DataWriter(self.participant, topic_status, qos=reliable_qos)
         
-        print("DDS setup complete (Reliable QoS for all messages)\n")
+        print("DDS setup complete (Reliable QoS; model_update reader 10 min for large uploads)\n")
         time.sleep(0.5)  # Allow time for discovery
     
     def publish_status(self):
@@ -938,20 +947,11 @@ class FederatedLearningServer:
 
 
 if __name__ == "__main__":
-    # Clear any previous TensorFlow/CUDA errors
     import tensorflow as tf
     try:
-        # Reset any existing sessions
         tf.keras.backend.clear_session()
-        
-        # Server runs on CPU only - clients use GPU for training
-        # Disable GPU visibility for server (aggregation doesn't need GPU)
-        import os
-        os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
         print("Server configured to use CPU only (GPU disabled)")
-        
     except Exception as e:
         print(f"GPU initialization warning: {e}")
-    
     server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     server.run()

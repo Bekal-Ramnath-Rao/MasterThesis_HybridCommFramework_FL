@@ -1,12 +1,15 @@
+import os
+import sys
+# Server uses CPU only (aggregation is numpy-only); saves GPU memory for clients
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
 import numpy as np
 import json
 import pickle
 import base64
 import time
-import os
 import asyncio
 import socket
-import sys
 from typing import Dict, Optional
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -281,7 +284,7 @@ class FederatedLearningServer:
         
         # Training configuration
         self.training_config = {
-            "batch_size": 32,
+            "batch_size": int(os.getenv("BATCH_SIZE", "16")),
             "local_epochs": 20
         }
     

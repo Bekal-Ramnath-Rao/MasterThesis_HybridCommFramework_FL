@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Diagnostic Pipeline for Single-Protocol FL: Empirical Overhead, Network Extraction, Analytical Model.
+Diagnostic Pipeline for FL: Empirical Overhead, Network Extraction, Analytical Model.
 Runs separately from normal single-protocol implementation.
-Use: Select one protocol + use case (and optional baseline) from GUI, then "Run Diagnostic Pipeline".
+Supports single or multiple protocols and network scenarios:
+  - Single: --protocol X --scenario Y (one experiment).
+  - Multiple: --protocols A B --scenarios X Y (runs all combinations A+X, A+Y, B+X, B+Y).
+Use: Select one or more protocols and scenarios from GUI, then "Run Diagnostic Pipeline".
 """
 
 import argparse
@@ -68,17 +71,112 @@ def run_cmd(cmd, check=True, env=None, cwd=None):
     )
 
 
-def extract_tc_params(sender_container: str) -> dict:
-    """Phase 2: Run docker exec <container> tc qdisc show dev eth0 and extract B, p, D_tc, J.
-    B must be in bits per second. If no bandwidth limit is found (e.g. unconstrained Docker bridge),
-    B is strictly float('inf') so that S/B = 0. Never return B=0 or B=1 (would explode S/B).
+# Pattern to match FL / Framework processes that may hold GPU memory (e.g. path contains Framework_FL)
+GPU_CLEANUP_PATTERN = "Framework_FL"
+if os.environ.get("FL_GPU_CLEANUP_PATTERN", "").strip():
+    GPU_CLEANUP_PATTERN = os.environ.get("FL_GPU_CLEANUP_PATTERN", "").strip()
+
+
+def kill_gpu_processes_matching_pattern(pattern: str = None, verbose: bool = True) -> None:
     """
+    After each experiment: run nvidia-smi, find processes using GPU whose command line
+    contains the given pattern (e.g. Framework_FL), and sudo kill them to free GPU memory.
+    """
+    pattern = (pattern or GPU_CLEANUP_PATTERN).strip()
+    if not pattern:
+        return
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=str(PROJECT_ROOT),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        if verbose:
+            print("[GPU cleanup] nvidia-smi not available or failed; skipping.", flush=True)
+        return
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        return
+    pids = []
+    for line in (result.stdout or "").strip().splitlines():
+        line = line.strip().strip('"')
+        if line.isdigit():
+            pids.append(int(line))
+    my_pid = os.getpid()
+    to_kill = []
+    for pid in pids:
+        if pid == my_pid:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "r", encoding="utf-8", errors="replace") as f:
+                cmdline = f.read().replace("\x00", " ")
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+        if pattern.lower() in cmdline.lower():
+            to_kill.append(pid)
+    if not to_kill:
+        return
+    sudo_pw = os.environ.get("FL_SUDO_PASSWORD", "").strip()
+    for pid in to_kill:
+        try:
+            if sudo_pw:
+                subprocess.run(
+                    ["sudo", "-S", "kill", str(pid)],
+                    input=(sudo_pw + "\n"),
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    cwd=str(PROJECT_ROOT),
+                )
+            else:
+                subprocess.run(
+                    ["sudo", "kill", str(pid)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    cwd=str(PROJECT_ROOT),
+                )
+            if verbose:
+                print(f"[GPU cleanup] Killed PID {pid} (matched *{pattern}*)", flush=True)
+        except Exception as e:
+            if verbose:
+                print(f"[GPU cleanup] Failed to kill PID {pid}: {e}", flush=True)
+
+
+def _parse_rate_from_line(line: str):
+    """Parse 'rate 100Mbit' from a line; return bps or None."""
+    m = re.search(r"rate\s+(\d+(?:\.\d+)?)\s*(\w*)", line, re.I)
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = (m.group(2) or "").strip().lower()
+    if "gbit" in unit or "gibit" in unit:
+        return val * 1e9
+    if "mbit" in unit or "mibit" in unit:
+        return val * 1e6
+    if "kbit" in unit or "kibit" in unit:
+        return val * 1e3
+    if "bit" in unit or not unit:
+        return val
+    return val
+
+
+def extract_tc_params(sender_container: str) -> dict:
+    """Phase 2: Run tc qdisc/class show on sender (client) container and extract B, p, D_tc, J. Tc is clients-only."""
     result = run_cmd(
         ["docker", "exec", sender_container, "tc", "qdisc", "show", "dev", "eth0"],
         check=False,
     )
     out = (result.stdout or "") + (result.stderr or "")
-    B_candidates = []  # collect all rates; use max so main link rate wins over burst/small rates
+    if "htb" in out:
+        class_result = run_cmd(
+            ["docker", "exec", sender_container, "tc", "class", "show", "dev", "eth0"],
+            check=False,
+        )
+        out += "\n" + (class_result.stdout or "") + (class_result.stderr or "")
+    B_candidates = []
     p = 0.0
     D_tc = 0.0
     J = 0.0
@@ -87,31 +185,15 @@ def extract_tc_params(sender_container: str) -> dict:
     # netem: delay 50.0ms 10.0ms loss 1%
     # tbf: rate 20mbit burst 32kbit -> we only match "rate <num><unit>"; take max so link rate wins
     for line in out.splitlines():
-        m = re.search(r"rate\s+(\d+(?:\.\d+)?)\s*(\w*)", line, re.I)
-        if m:
-            val = float(m.group(1))
-            unit = (m.group(2) or "").strip().lower()
-            # 100Mbit / 100mbit -> 100 * 1e6 = 100000000 bps
-            if "gbit" in unit or "gibit" in unit:
-                bps = val * 1e9
-            elif "mbit" in unit or "mibit" in unit:
-                bps = val * 1e6
-            elif "kbit" in unit or "kibit" in unit:
-                bps = val * 1e3
-            elif "bit" in unit or not unit:
-                bps = val  # raw bps if "bit" or no unit
-            else:
-                bps = val
+        bps = _parse_rate_from_line(line)
+        if bps is not None:
             B_candidates.append(bps)
-            continue
-        # delay 500.0ms 10.0ms or delay 500000us 10000us -> D_tc and J in seconds
-        # tc output e.g.: "delay 500.0ms 10.0ms loss 1% rate 100Mbit"
+        # delay 10.0ms 2.0ms loss 0.1% – parse delay, jitter, and loss on same line
         m = re.search(r"delay\s+([\d.]+)\s*(\w*)", line, re.I)
         if m:
             raw_val, raw_unit = (m.group(1) or "").strip(), (m.group(2) or "").strip().lower()
             if raw_val:
                 D_val = float(raw_val)
-                # Convert to seconds: us/usec -> *0.000001, ms -> *0.001, s -> *1
                 if "usec" in raw_unit or ("us" in raw_unit and "ms" not in raw_unit):
                     D_tc = D_val * 0.000001
                 elif "ms" in raw_unit:
@@ -119,10 +201,9 @@ def extract_tc_params(sender_container: str) -> dict:
                 elif "s" in raw_unit and "ms" not in raw_unit and "us" not in raw_unit:
                     D_tc = D_val
                 elif not raw_unit and D_val > 1000:
-                    D_tc = D_val * 0.000001  # no unit + large value: assume microseconds
+                    D_tc = D_val * 0.000001
                 else:
-                    D_tc = D_val * 0.001  # assume ms if unknown
-            # Jitter: second number on same line (e.g. delay 500.0ms 10.0ms)
+                    D_tc = D_val * 0.001
             m2 = re.search(r"delay\s+[\d.]+\s*\S+\s+([\d.]+)\s*(\w*)", line, re.I)
             if m2:
                 j_raw, j_unit = (m2.group(1) or "").strip(), (m2.group(2) or "").strip().lower()
@@ -138,6 +219,9 @@ def extract_tc_params(sender_container: str) -> dict:
                         J = J_val * 0.000001
                     else:
                         J = J_val * 0.001
+            loss_m = re.search(r"loss\s+(\d+(?:\.\d+)?)\s*%?", line, re.I)
+            if loss_m:
+                p = float(loss_m.group(1)) / 100.0
             continue
         m = re.search(r"loss\s+(\d+(?:\.\d+)?)\s*%?", line, re.I)
         if m:
@@ -195,7 +279,7 @@ def _scenario_delay_jitter_sec(conditions: dict) -> tuple:
 
 
 def parse_fl_diag_from_logs(sender_container: str, receiver_container: str, round_index: int) -> dict:
-    """Parse FL_DIAG lines from docker logs. round_index 0 = first round (calibration), 1 = second (lossy)."""
+    """Parse FL_DIAG lines from docker logs. round_index 0 = Round 1 (calibration), 2 = Round 2 (T_actual with tc)."""
     client_log = run_cmd(["docker", "logs", sender_container], check=False)
     server_log = run_cmd(["docker", "logs", receiver_container], check=False)
     client_out = (client_log.stdout or "") + (client_log.stderr or "")
@@ -286,16 +370,9 @@ def parse_fl_diag_from_logs(sender_container: str, receiver_container: str, roun
     }
 
 
-def parse_fl_diag_from_logs_multi(
-    sender_containers: list,
-    receiver_container: str,
-    round_index: int,
-) -> list:
-    """Parse FL_DIAG for all clients; return list of dicts one per client (client_id 1, 2, ...)."""
-    # Server logs: FL_DIAG client_id=N O_recv=... recv_end_ts=... send_start_ts=...
-    server_log = run_cmd(["docker", "logs", receiver_container], check=False)
-    server_out = (server_log.stdout or "") + (server_log.stderr or "")
-    server_lines_per_client = {}  # client_id -> list of {O_recv, recv_end_ts, send_start_ts}
+def _parse_fl_diag_multi_from_strings(server_out: str, client_outs: list, round_index: int) -> list:
+    """Parse FL_DIAG from pre-fetched log strings. client_outs = [client_1_text, client_2_text, ...]. Returns list of dicts per client."""
+    server_lines_per_client = {}
     for line in server_out.splitlines():
         if "FL_DIAG" not in line or "O_recv=" not in line:
             continue
@@ -310,14 +387,11 @@ def parse_fl_diag_from_logs_multi(
                 v[key] = float(m.group(1))
         if v:
             server_lines_per_client.setdefault(client_id, []).append(v)
-    # Client logs: one container per client; order = sender_containers order (client 1, client 2)
     results = []
-    for idx, sender_container in enumerate(sender_containers):
-        client_id = idx + 1  # 1-based
-        client_log = run_cmd(["docker", "logs", sender_container], check=False)
-        client_out = (client_log.stdout or "") + (client_log.stderr or "")
+    for idx, client_out in enumerate(client_outs):
+        client_id = idx + 1
         client_vals_list = []
-        for line in client_out.splitlines():
+        for line in (client_out or "").splitlines():
             if "FL_DIAG" in line and "O_send=" in line:
                 v = {}
                 m = re.search(r"O_send=([\d.]+)", line)
@@ -350,9 +424,59 @@ def parse_fl_diag_from_logs_multi(
             "O_recv": O_recv,
             "T_total": T_total,
             "payload_bytes": int(payload_bytes),
-            "S_bits": int(payload_bytes) * 8,  # bits; ensure integer
+            "S_bits": int(payload_bytes) * 8,
         })
     return results
+
+
+def parse_fl_diag_from_logs_multi(
+    sender_containers: list,
+    receiver_container: str,
+    round_index: int,
+) -> list:
+    """Parse FL_DIAG for all clients from Docker logs; return list of dicts one per client (client_id 1, 2, ...)."""
+    server_log = run_cmd(["docker", "logs", receiver_container], check=False)
+    server_out = (server_log.stdout or "") + (server_log.stderr or "")
+    client_outs = []
+    for sender_container in sender_containers:
+        client_log = run_cmd(["docker", "logs", sender_container], check=False)
+        client_outs.append((client_log.stdout or "") + (client_log.stderr or ""))
+    return _parse_fl_diag_multi_from_strings(server_out, client_outs, round_index)
+
+
+def parse_fl_diag_from_logs_native(log_dir: Path, round_index: int, num_clients: int = 2) -> list:
+    """Parse FL_DIAG from native run log files (server.log, client_1.log, client_2.log, ...). Same return shape as parse_fl_diag_from_logs_multi."""
+    log_dir = Path(log_dir)
+    server_path = log_dir / "server.log"
+    server_out = server_path.read_text(encoding="utf-8", errors="replace") if server_path.exists() else ""
+    client_outs = []
+    for i in range(1, num_clients + 1):
+        p = log_dir / f"client_{i}.log"
+        client_outs.append(p.read_text(encoding="utf-8", errors="replace") if p.exists() else "")
+    return _parse_fl_diag_multi_from_strings(server_out, client_outs, round_index)
+
+
+def count_docker_fl_diag_rounds(sender_containers: list) -> list:
+    """Return number of FL_DIAG (O_send=) lines per client from Docker logs. [n1, n2, ...]."""
+    counts = []
+    for sender_container in sender_containers:
+        client_log = run_cmd(["docker", "logs", sender_container], check=False)
+        text = (client_log.stdout or "") + (client_log.stderr or "")
+        n = sum(1 for line in text.splitlines() if "FL_DIAG" in line and "O_send=" in line)
+        counts.append(n)
+    return counts
+
+
+def count_native_fl_diag_rounds(log_dir: Path, num_clients: int = 2) -> list:
+    """Return number of FL_DIAG (O_send=) lines per client, i.e. how many rounds have sent an update. [n1, n2, ...]."""
+    log_dir = Path(log_dir)
+    counts = []
+    for i in range(1, num_clients + 1):
+        p = log_dir / f"client_{i}.log"
+        text = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+        n = sum(1 for line in text.splitlines() if "FL_DIAG" in line and "O_send=" in line)
+        counts.append(n)
+    return counts
 
 
 def run_pipeline(
@@ -368,9 +492,15 @@ def run_pipeline(
     services: list = None,
 ) -> dict:
     """Execute full diagnostic pipeline and return summary dict.
-    Phase 1: Calibration with NO channel losses (protocol/broker overhead only).
-    Phases 2-4: Use the user-selected network scenario from the GUI.
-    network_mode: gpu (Docker bridge), host (*.host-network.yml, tc on host), host_macvlan (*.macvlan.yml, per-container tc).
+
+    Flow:
+      Phase 1 – Round 1 (round index 0): No tc on clients. Server→Global model→Client; Client→Local model→Server.
+        Used for application overhead (O_send, O_recv, O_broker).
+      Phase 2 – Apply tc at client egress only (server never shaped).
+      Phase 3 – Round 2 (round index 2): Tc on client egress. T_actual = recv_end_ts − send_start_ts for round index 2.
+
+    NUM_ROUNDS=3 so we have round indices 0, 1, 2. We use index 0 for cal and index 2 for T_actual.
+    network_mode: gpu (Docker bridge), host, host_macvlan.
     """
     use_case = use_case.lower()
     protocol = protocol.lower()
@@ -424,11 +554,13 @@ def run_pipeline(
             services = [broker, receiver_container] + sender_containers
 
     env = os.environ.copy()
-    env["NUM_ROUNDS"] = "2"
+    # 3 rounds: Round 1 (index 0) = calibration, Round 2 (index 2) = T_actual with tc on client egress
+    env["NUM_ROUNDS"] = "3"
     env["FL_DIAGNOSTIC_PIPELINE"] = "1"
 
-    # Phase 1: Calibration – NO channel losses. Protocol and broker overhead only (perfect/unshaped channel).
-    print("[Phase 1] Calibration: measuring protocol & broker overhead with NO channel losses (clean channel)...")
+    # Phase 1: Round 1 – Application overhead (no tc on client egress).
+    # Server → Global model → Client; Client → Local model → Server. Use round index 0 for O_send, O_recv, O_broker.
+    print("[Phase 1] Round 1 – Application overhead (no tc on clients)...")
     net_label = {"gpu": "bridge", "host": "host (tc on host)", "host_macvlan": "macvlan (per-container tc)"}.get(network_mode, "bridge")
     print("          Starting both clients for FL rounds (GPU={}, network={})...".format(
         "yes" if enable_gpu else "CPU", net_label))
@@ -462,19 +594,24 @@ def run_pipeline(
     elif result.returncode != 0:
         raise RuntimeError("Failed to start containers. Check docker compose and network.")
     time.sleep(15)
-    # Ensure all senders have no tc so calibration round sees zero loss/delay
+    # Tc is applied to CLIENTS ONLY (never to server). Ensure server has no tc so all shaping is on client egress.
+    try:
+        sim.reset_container_network(receiver_container)
+    except Exception:
+        pass
+    # Ensure all senders (clients) have no tc so calibration round sees zero loss/delay
     for sc in sender_containers:
         try:
             sim.reset_container_network(sc)
         except Exception:
             pass
-    print("          Sender tc cleared for calibration (no losses).")
+    print("          Server tc cleared (tc applied to clients only). Client tc cleared for calibration (no losses).")
 
-    # Wait for first round to complete (calibration – no losses); need both clients' timings
+    # Wait for Round 1 (round index 0) to complete – calibration for application overhead
     n_expected = len(sender_containers)
     for _ in range(120):
         time.sleep(2)
-        cal_list = parse_fl_diag_from_logs_multi(sender_containers, receiver_container, 0)
+        cal_list = parse_fl_diag_from_logs_multi(sender_containers, receiver_container, 0)  # round index 0 = Round 1
         n_ready = sum(1 for c in (cal_list or []) if c.get("T_total", 0) > 0)
         if cal_list and len(cal_list) >= n_expected and n_ready >= n_expected:
             break
@@ -500,8 +637,9 @@ def run_pipeline(
         O_broker = T_total_baseline0 - (O_send0 + O_recv0 + (S_bits / B_bridge))
         O_broker = max(0.0, O_broker)
 
-    # Phase 2: Apply user-selected network scenario to both sender containers
-    print(f"[Phase 2] Applying user-selected network scenario: {scenario}...")
+    # Phase 2: Apply tc at egress of clients only. Then Round 2 runs: Server → Global model → Client; Client → Local model → Server.
+    # T_actual = recv_end_ts − send_start_ts for round index 2 (second round, client send to server receive).
+    print(f"[Phase 2] Applying tc at client egress only: {scenario}. Round 2 will run with tc...")
     conditions = sim.NETWORK_SCENARIOS[scenario]
     host_mode = network_mode == "host"  # only apply tc on host when using host-network compose
     if host_mode:
@@ -544,20 +682,39 @@ def run_pipeline(
     RTT_eff = D_tc + J
     time.sleep(2)
 
-    # Phase 3: Lossy round – get T_actual per client (cap 90*2s so we don't block long after FL finished)
-    print("[Phase 3] Waiting for lossy round (round 2) under selected scenario...")
+    # Phase 3: Wait for Round 2 to fully complete: client finishes training → sends update → server receives.
+    # T_actual = recv_end_ts − send_start_ts (client send to server receive for round index 2). Do not tear down until we have this.
+    # Round 2 training (e.g. 20 epochs) can take several minutes; default 20 min to allow completion.
+    try:
+        phase3_max_wait = int(os.environ.get("FL_DIAG_PHASE3_WAIT", "600"))  # iterations; 600*2s = 20 min default
+    except (ValueError, TypeError):
+        phase3_max_wait = 600
+    phase3_max_wait = max(phase3_max_wait, 90)
+    # T_actual uses round index 2 (third round). Require >= 3 FL_DIAG lines per client so we don't
+    # break on round index 0 or 1 (parser fallback would give wrong T_actual).
+    print(f"[Phase 3] Waiting for Round 2 to complete (client finishes training → sends → server receives). T_actual = recv_end_ts − send_start_ts. Will wait up to {phase3_max_wait * 2}s...")
     lossy_list = []
-    phase3_max_wait = 90
     for iteration in range(phase3_max_wait):
         time.sleep(2)
-        lossy_list = parse_fl_diag_from_logs_multi(sender_containers, receiver_container, 1)
+        lossy_list = parse_fl_diag_from_logs_multi(sender_containers, receiver_container, 2)  # round index 2 = third round
+        round_counts = count_docker_fl_diag_rounds(sender_containers)
         n_ready = sum(1 for c in (lossy_list or []) if c.get("T_total", 0) > 0)
-        if lossy_list and len(lossy_list) >= n_expected and n_ready >= n_expected:
+        has_round2_data = round_counts and min(round_counts) >= 3
+        if lossy_list and len(lossy_list) >= n_expected and n_ready >= n_expected and has_round2_data:
+            print(f"          Round 2 complete for all {n_expected} clients (train→send→receive) after {(iteration + 1) * 2}s.")
             break
         if iteration == phase3_max_wait - 1:
-            print(f"          Proceeding after {phase3_max_wait * 2}s (training may have finished; using available data).")
+            print(f"          Timeout after {phase3_max_wait * 2}s. Set FL_DIAG_PHASE3_WAIT higher (e.g. 900 for 30 min) if Round 2 was still training.")
     if not lossy_list or len(lossy_list) < len(cal_list):
         lossy_list = [{"client_id": i + 1, "T_total": cal_list[i].get("T_total", 0)} if i < len(cal_list) else {"client_id": i + 1, "T_total": 0} for i in range(max(2, len(cal_list)))]
+    # Require round index 2 for T_actual; otherwise parser used an earlier round
+    docker_round_counts = count_docker_fl_diag_rounds(sender_containers)
+    if docker_round_counts and any(c < 3 for c in docker_round_counts):
+        print(
+            "[WARNING] Not all clients have 3 FL_DIAG rounds (have {}). T_actual must use round index 2; clients with < 3 will show T_actual=0.".format(
+                docker_round_counts
+            )
+        )
 
     # Safe transfer time: S_bits/B in seconds; S/inf = 0, avoid division by zero
     def transfer_time_bits_bps(S_bits_val, B_val):
@@ -576,6 +733,8 @@ def run_pipeline(
         S_bits_c = int(cal.get("S_bits", S_bits))
         lossy_c = next((x for x in lossy_list if x.get("client_id") == cid), lossy_list[i] if i < len(lossy_list) else {})
         T_actual = lossy_c.get("T_total", 0.0)
+        if i < len(docker_round_counts) and docker_round_counts[i] < 3:
+            T_actual = 0.0
         if protocol in ("mqtt", "amqp", "grpc"):
             B_eff = B if p == 0 else min(B, MSS_BITS / (RTT_eff * math.sqrt(p))) if RTT_eff and p else B
         else:
@@ -619,6 +778,166 @@ def run_pipeline(
     return summaries
 
 
+def run_pipeline_native(
+    protocol: str,
+    use_case: str,
+    scenario: str = "excellent",
+    enable_gpu: bool = False,
+    num_clients: int = 2,
+    payload_file: str = None,
+) -> list:
+    """Execute diagnostic pipeline using native namespaces (no Docker).
+
+    Single run with 2 rounds:
+      Phase 1 (round 1): No tc on clients → O_app from round index 0.
+      Phase 2 (round 2): Tc applied before round 2; client receive then send (send affected by tc) → T_actual from round index 1.
+      Phase 3: O_app and T_actual calculated from logs.
+    """
+    use_case = use_case.lower()
+    protocol = protocol.lower()
+    scenario = (scenario or "excellent").lower()
+    if protocol not in ("mqtt", "amqp", "grpc", "quic", "http3", "dds"):
+        raise ValueError("Protocol must be one of: mqtt, amqp, grpc, quic, http3, dds")
+
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from network_simulator import NetworkSimulator
+    from run_native_experiments import NativeExperimentRunner
+
+    sim = NetworkSimulator(verbose=True)
+    if scenario not in sim.NETWORK_SCENARIOS:
+        raise ValueError(f"Unknown scenario: {scenario}. Choose from: {list(sim.NETWORK_SCENARIOS.keys())}")
+
+    log_dir = SCRIPT_DIR / "native_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[Native] Logs: server={log_dir / 'server.log'}  clients={[str(log_dir / f'client_{i}.log') for i in range(1, num_clients + 1)]}")
+    orig_env_num_rounds = os.environ.get("NUM_ROUNDS")
+    orig_env_diag = os.environ.get("FL_DIAGNOSTIC_PIPELINE")
+    os.environ["NUM_ROUNDS"] = "2"
+    os.environ["FL_DIAGNOSTIC_PIPELINE"] = "1"
+
+    n_expected = num_clients
+
+    try:
+        # Single run: round 1 without tc (O_app), then tc applied before round 2 (T_actual from round 2 send).
+        print("[Phase 1] Native: Round 1 – no tc on clients (for O_app)...")
+        print("[Phase 2] Native: Before round 2, tc will be applied at client egress; round 2 send → T_actual.")
+        conditions = sim.NETWORK_SCENARIOS[scenario]
+        B = _scenario_bandwidth_bps(conditions)
+        p = _scenario_loss_decimal(conditions)
+        D_tc, J = _scenario_delay_jitter_sec(conditions)
+        RTT_eff = D_tc + J
+        print(f"          Scenario for round 2: B={B} bps, p={p}, D_tc={D_tc}, J={J}")
+
+        runner = NativeExperimentRunner(
+            use_case=use_case,
+            protocol=protocol,
+            scenario=scenario,
+            num_rounds=2,
+            num_clients=num_clients,
+            enable_gpu=enable_gpu,
+            apply_tc_after_round_1=scenario,
+        )
+        code = runner.run()
+        if code != 0:
+            print(f"[WARNING] Run exited with code {code}; parsing available logs.")
+
+        # Phase 3: O_app from round index 0 (round 1, no tc), T_actual from round index 1 (round 2, with tc).
+        cal_list = parse_fl_diag_from_logs_native(log_dir, 0, num_clients)
+        if not cal_list or len(cal_list) < n_expected:
+            cal_list = [
+                {"client_id": i + 1, "O_send": 0.0, "O_recv": 0.0, "T_total": 0.0, "payload_bytes": 0, "S_bits": 0}
+                for i in range(max(n_expected, 2))
+            ]
+        n_ready = sum(1 for c in cal_list if c.get("T_total", 0) > 0)
+        if n_ready < n_expected:
+            print("[WARNING] No round-1 timing for all clients; using available or defaults.")
+
+        cal0 = cal_list[0] if cal_list else {}
+        S_bits = int(cal0.get("S_bits", 0))
+        if payload_file and os.path.isfile(payload_file):
+            S_bits = int(8 * os.path.getsize(payload_file))
+        if protocol in ("grpc", "quic", "http3", "dds"):
+            O_broker = 0.0
+        else:
+            B_bridge = B_BRIDGE_BPS
+            T_total_baseline0 = cal0.get("T_total", 0)
+            O_send0 = cal0.get("O_send", 0)
+            O_recv0 = cal0.get("O_recv", 0)
+            O_broker = T_total_baseline0 - (O_send0 + O_recv0 + (S_bits / B_bridge))
+            O_broker = max(0.0, O_broker)
+
+        lossy_list = parse_fl_diag_from_logs_native(log_dir, 1, num_clients)
+        if not lossy_list or len(lossy_list) < len(cal_list):
+            lossy_list = [
+                {"client_id": i + 1, "T_total": cal_list[i].get("T_total", 0)} if i < len(cal_list) else {"client_id": i + 1, "T_total": 0}
+                for i in range(max(2, len(cal_list)))
+            ]
+        round_counts = count_native_fl_diag_rounds(log_dir, num_clients)
+        if any(c < 2 for c in round_counts):
+            print(
+                "[WARNING] Not all clients completed 2 rounds (have {} FL_DIAG O_send= lines). "
+                "T_actual uses round index 1 (round 2 with tc); clients with < 2 rounds will show T_actual=0.".format(
+                    round_counts
+                )
+            )
+
+        def transfer_time_bits_bps(S_bits_val, B_val):
+            if B_val is None or B_val <= 0 or not math.isfinite(B_val):
+                return 0.0
+            return float(S_bits_val) / float(B_val)
+
+        summaries = []
+        for i, cal in enumerate(cal_list):
+            cid = cal.get("client_id", i + 1)
+            O_send = cal.get("O_send", 0.0)
+            O_recv = cal.get("O_recv", 0.0)
+            O_app = O_send + O_recv + O_broker
+            S_bits_c = int(cal.get("S_bits", S_bits))
+            lossy_c = next((x for x in lossy_list if x.get("client_id") == cid), lossy_list[i] if i < len(lossy_list) else {})
+            T_actual = lossy_c.get("T_total", 0.0)
+            # Require round index 1 for T_actual (round 2: client send affected by tc)
+            if i < len(round_counts) and round_counts[i] < 2:
+                T_actual = 0.0
+            if protocol in ("mqtt", "amqp", "grpc"):
+                B_eff = B if p == 0 else min(B, MSS_BITS / (RTT_eff * math.sqrt(p))) if RTT_eff and p else B
+            else:
+                B_eff = B
+            O_TLS = 0.0
+            if protocol in ("quic", "http3"):
+                O_TLS = O_TLS_HANDSHAKE_S + (K_TLS_SEC_PER_BYTE * (S_bits_c / 8.0))
+            debug_extra = f" | O_TLS: {O_TLS:.6f} s" if protocol in ("quic", "http3") else ""
+            print(f"DEBUG -> S: {S_bits_c} bits | B: {B} bps | RTT_eff: {RTT_eff} s | Loss (p): {p} | O_app: {O_app} s{debug_extra}")
+            transfer_s = transfer_time_bits_bps(S_bits_c, B_eff)
+            if protocol in ("mqtt", "amqp", "grpc"):
+                T_calc = (1.5 * RTT_eff) + transfer_s + O_app
+            elif protocol in ("quic", "http3"):
+                T_calc = (1 * RTT_eff) + transfer_time_bits_bps(S_bits_c, B) + (p * (S_bits_c / MSS_BITS) * RTT_eff) + O_app + O_TLS
+            else:
+                T_calc = transfer_time_bits_bps(S_bits_c, B) + (p * (S_bits_c / MSS_BITS) * (RTT_eff + T_REPAIR)) + O_app
+            error_pct = 100.0 * (T_actual - T_calc) / T_actual if T_actual else 0.0
+            summaries.append({
+                "client_id": cid,
+                "protocol": protocol.upper(),
+                "scenario": scenario,
+                "O_app": O_app,
+                "O_broker": O_broker,
+                "p": p,
+                "T_actual": T_actual,
+                "T_calc": T_calc,
+                "error_pct": error_pct,
+            })
+        return summaries
+    finally:
+        if orig_env_num_rounds is not None:
+            os.environ["NUM_ROUNDS"] = orig_env_num_rounds
+        elif "NUM_ROUNDS" in os.environ:
+            del os.environ["NUM_ROUNDS"]
+        if orig_env_diag is not None:
+            os.environ["FL_DIAGNOSTIC_PIPELINE"] = orig_env_diag
+        elif "FL_DIAGNOSTIC_PIPELINE" in os.environ:
+            del os.environ["FL_DIAGNOSTIC_PIPELINE"]
+
+
 def print_table(summaries: list):
     """Phase 4: Print formatted terminal table (one row per client), including protocol and network scenario."""
     print()
@@ -636,49 +955,133 @@ def print_table(summaries: list):
     print()
 
 
+def _all_scenario_choices():
+    """Return list of scenario names for validation (must match network_simulator.NETWORK_SCENARIOS)."""
+    return ["excellent", "good", "moderate", "poor", "very_poor", "satellite",
+            "congested_light", "congested_moderate", "congested_heavy"]
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Diagnostic pipeline: Empirical overhead, network extraction, analytical model (single protocol).",
+        description="Diagnostic pipeline: Empirical overhead, network extraction, analytical model. Supports multiple protocols and scenarios.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--protocol", "-p", required=True, choices=["mqtt", "amqp", "grpc", "quic", "http3", "dds"])
+    parser.add_argument("--protocol", "-p", choices=["mqtt", "amqp", "grpc", "quic", "http3", "dds"],
+                        help="Single protocol (ignored if --protocols is used)")
+    parser.add_argument("--protocols", nargs="*", default=None,
+                        help="Multiple protocols (e.g. --protocols mqtt amqp quic). Runs pipeline for each protocol × scenario.")
     parser.add_argument("--use-case", "-u", default="emotion", choices=["emotion", "mentalstate", "temperature"])
     parser.add_argument(
         "--scenario", "-s",
         default="excellent",
-        choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
-                 "congested_light", "congested_moderate", "congested_heavy"],
-        help="Network scenario from GUI for Phases 2–4 (Phase 1 always uses no losses)",
+        choices=_all_scenario_choices(),
+        help="Single network scenario for Phases 2–4 (ignored if --scenarios is used)",
     )
+    parser.add_argument("--scenarios", nargs="*", default=None,
+                        help="Multiple scenarios (e.g. --scenarios excellent poor). Runs pipeline for each protocol × scenario.")
     parser.add_argument("--enable-gpu", "-g", action="store_true",
-                        help="Use GPU for clients if available (same as single-protocol); fall back to CPU if GPU unavailable")
+                        help="Use GPU for clients. Servers use CPU only. Tune TF_GPU_MEMORY_LIMIT_MB (default 4000) and BATCH_SIZE (default 16) if OOM.")
     parser.add_argument("--network-mode", choices=["gpu", "host", "host_macvlan"], default="gpu",
                         help="gpu=Docker bridge (per-container tc), host=host network (tc on host), host_macvlan=macvlan (per-container tc)")
+    parser.add_argument("--native", action="store_true",
+                        help="Run pipeline in native mode (namespaces, no Docker). Uses run_native_experiments with 2 rounds for calibration and lossy.")
     parser.add_argument("--sender-container", help="Override sender (client) container name")
     parser.add_argument("--receiver-container", help="Override receiver (server) container name")
     parser.add_argument("--payload-file", help="Path to payload file for S (bits); else from calibration run")
     args = parser.parse_args()
 
-    pat = SERVICE_PATTERNS.get(args.use_case, {}).get(args.protocol)
-    sender = args.sender_container or (pat[0] if pat else None)
-    receiver = args.receiver_container or (pat[1] if pat else None)
-    if not sender or not receiver:
-        print("Missing sender/receiver container. Use --sender-container and --receiver-container or --use-case.", file=sys.stderr)
+    # Resolve protocols list: --protocols takes precedence, else single --protocol
+    if args.protocols is not None and len(args.protocols) > 0:
+        protocols = [p.lower() for p in args.protocols]
+    elif args.protocol:
+        protocols = [args.protocol.lower()]
+    else:
+        print("Missing protocol. Use --protocol <p> or --protocols <p1> [p2 ...].", file=sys.stderr)
         sys.exit(1)
+    valid_protocols = {"mqtt", "amqp", "grpc", "quic", "http3", "dds"}
+    for p in protocols:
+        if p not in valid_protocols:
+            print(f"Invalid protocol: {p}. Choose from: {sorted(valid_protocols)}", file=sys.stderr)
+            sys.exit(1)
 
-    summary = run_pipeline(
-        protocol=args.protocol,
-        use_case=args.use_case,
-        sender_container=sender,
-        receiver_container=receiver,
-        scenario=args.scenario,
-        enable_gpu=args.enable_gpu,
-        network_mode=args.network_mode,
-        payload_file=args.payload_file,
-    )
+    # Resolve scenarios list: --scenarios takes precedence, else single --scenario
+    scenario_choices = _all_scenario_choices()
+    if args.scenarios is not None and len(args.scenarios) > 0:
+        scenarios = [s.lower() for s in args.scenarios]
+        for s in scenarios:
+            if s not in scenario_choices:
+                print(f"Unknown scenario: {s}. Choose from: {scenario_choices}", file=sys.stderr)
+                sys.exit(1)
+    else:
+        scenarios = [(args.scenario or "excellent").lower()]
+
+    # Build (protocol, scenario) pairs and run pipeline for each
+    all_summaries = []
+    pairs = [(p, s) for p in protocols for s in scenarios]
+    out_dir = PROJECT_ROOT / "shared_data"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / "diagnostic_results_latest.json"
+
+    for idx, (protocol, scenario) in enumerate(pairs):
+        print("\n" + "=" * 60)
+        print(f"Diagnostic run {idx + 1}/{len(pairs)}: protocol={protocol.upper()}, scenario={scenario}")
+        print("=" * 60)
+        try:
+            if args.native:
+                summary = run_pipeline_native(
+                    protocol=protocol,
+                    use_case=args.use_case,
+                    scenario=scenario,
+                    enable_gpu=args.enable_gpu,
+                    num_clients=2,
+                    payload_file=args.payload_file,
+                )
+            else:
+                pat = SERVICE_PATTERNS.get(args.use_case, {}).get(protocol)
+                sender = args.sender_container or (pat[0] if pat else None)
+                receiver = args.receiver_container or (pat[1] if pat else None)
+                if not sender or not receiver:
+                    print(f"Missing sender/receiver for protocol {protocol}. Use --sender-container and --receiver-container or --use-case.", file=sys.stderr)
+                    continue
+                # sender can be list (both clients) or single; run_pipeline expects receiver as str and sender as first client for single-container override
+                sender_list = list(sender) if isinstance(sender, (list, tuple)) else [sender]
+                summary = run_pipeline(
+                    protocol=protocol,
+                    use_case=args.use_case,
+                    sender_container=sender_list[0] if sender_list else sender,
+                    receiver_container=receiver,
+                    scenario=scenario,
+                    enable_gpu=args.enable_gpu,
+                    network_mode=args.network_mode,
+                    payload_file=args.payload_file,
+                )
+            all_summaries.extend(summary)
+            # Emit after each experiment so GUI Diagnostic Results tab updates incrementally
+            print("FL_DIAG_TABLE_JSON|" + json.dumps(summary), flush=True)
+            try:
+                with open(out_file, "w", encoding="utf-8") as f:
+                    json.dump(all_summaries, f, indent=2)
+            except Exception as e:
+                print(f"Warning: could not write {out_file}: {e}", flush=True)
+            # Free GPU memory: kill processes matching *Framework_FL* using GPU
+            kill_gpu_processes_matching_pattern(verbose=True)
+        except Exception as e:
+            print(f"[ERROR] Pipeline failed for protocol={protocol}, scenario={scenario}: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            kill_gpu_processes_matching_pattern(verbose=True)
+
+    summary = all_summaries
+    if not summary:
+        print("No diagnostic results (all runs failed or no protocol/scenario).", file=sys.stderr)
+        sys.exit(1)
+    print("\n" + "=" * 60)
+    print("Combined results (all protocols × scenarios)")
+    print("=" * 60)
     print_table(summary)
-    # If scenario is degraded but T_actual is similar across clients and close to calibration, network may not be shaped
-    if summary and args.scenario not in ("excellent",):
+    # If any scenario is degraded but T_actual is similar across clients and close to calibration, network may not be shaped
+    scenarios_in_results = {str(r.get("scenario", "")).strip() for r in summary}
+    if summary and scenarios_in_results - {"excellent"}:
         t_actuals = [r["T_actual"] for r in summary if r.get("T_actual")]
         if t_actuals and max(t_actuals) - min(t_actuals) < 0.5 and t_actuals[0] < 15:
             print(
@@ -688,18 +1091,25 @@ def main():
                 "  Run with --network-mode gpu or host_macvlan to see scenario effects, or apply tc on the interface used by FL traffic.",
                 flush=True,
             )
-    # Emit JSON line for GUI to display in Diagnostic Results tab (flush so it is not buffered)
+    # Final emit: full combined results (GUI merge will replace/append so tab shows complete table)
     print("FL_DIAG_TABLE_JSON|" + json.dumps(summary), flush=True)
-    # Also write to file so GUI can load reliably when experiment completes (fallback if stdout is lost)
-    out_dir = PROJECT_ROOT / "shared_data"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_file = out_dir / "diagnostic_results_latest.json"
     try:
         with open(out_file, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
     except Exception as e:
         print(f"Warning: could not write {out_file}: {e}", flush=True)
+    # Final GPU cleanup after all experiments
+    kill_gpu_processes_matching_pattern(verbose=True)
+    print("\n[DIAGNOSTIC] Experiment completed. All protocol runs finished; clients and servers will be disconnected.", flush=True)
+    # Ensure GUI receives all output and file is on disk before process exits
+    sys.stdout.flush()
+    sys.stderr.flush()
 
 
 if __name__ == "__main__":
+    if "--kill-gpu-only" in sys.argv:
+        sys.argv = [a for a in sys.argv if a != "--kill-gpu-only"]
+        kill_gpu_processes_matching_pattern(verbose=True)
+        if not sys.argv[1:]:  # no other args
+            sys.exit(0)
     main()

@@ -1,3 +1,8 @@
+import os
+import sys
+# Server uses CPU only (aggregation is numpy-only); saves GPU memory for clients
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
 import numpy as np
 import json
 import pickle
@@ -5,8 +10,6 @@ import time
 import grpc
 from concurrent import futures
 import threading
-import os
-import sys
 import matplotlib.pyplot as plt
 from pathlib import Path
 
@@ -45,9 +48,10 @@ MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 
 class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningServicer):
-    def __init__(self, min_clients, num_rounds, max_clients=100):
+    def __init__(self, min_clients, num_rounds, max_clients=100, grpc_server=None):
         self.min_clients = min_clients
         self.max_clients = max_clients
+        self._grpc_server = grpc_server  # used to stop server after training in diagnostic pipeline
         self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
@@ -91,8 +95,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         # Training configuration
         # Training configuration broadcast to gRPC clients
         self.training_config = {
-            "batch_size": 32,
-            "local_epochs": 20  # Reduced from 20 for faster experiments
+            "batch_size": int(os.getenv("BATCH_SIZE", "16")),
+            "local_epochs": 20
         }
         
         # Status flags
@@ -490,6 +494,9 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             # Save results and plot
             self.save_results()
             self.plot_results()
+            # In diagnostic pipeline, stop server so process exits and pipeline can run next scenario
+            if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" and self._grpc_server is not None:
+                self._grpc_server.stop(0)
         else:
             print(f"{'='*70}\n")
             # Continue to next round
@@ -557,27 +564,30 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         filepath = results_dir / 'grpc_training_plot.png'
         plt.savefig(filepath, dpi=300, bbox_inches='tight')
         print(f"Plot saved to {filepath}")
-        
-        plt.show()
+        plt.close(fig)
+
+        # In diagnostic pipeline, skip plt.show() so server exits and pipeline can run next scenario
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") != "1":
+            plt.show()
+
+
+# INT_MAX ms (~24 days) = effectively disable keepalive (gRPC C-core treats 0 as default)
+GRPC_KEEPALIVE_DISABLED_MS = 2147483647
 
 
 def serve():
     """Start the gRPC server"""
     # FAIR CONFIG: Aligned with MQTT/AMQP/QUIC/DDS for unbiased comparison
+    # Keepalive effectively disabled (INT_MAX) so poor/very-poor networks never get GOAWAY ping_timeout
     options = [
-        # FAIR CONFIG: Message size limits 128MB (aligned with AMQP default)
         ('grpc.max_send_message_length', 128 * 1024 * 1024),
         ('grpc.max_receive_message_length', 128 * 1024 * 1024),
-        # FAIR CONFIG: Keepalive settings 600s for very_poor network
-        ('grpc.keepalive_time_ms', 600000),  # 10 minutes
-        ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
-        ('grpc.keepalive_permit_without_calls', 1),
-        ('grpc.http2.max_pings_without_data', 0),
-        ('grpc.http2.min_time_between_pings_ms', 10000),  # 10s
-        ('grpc.http2.max_ping_strikes', 2),
+        ('grpc.keepalive_time_ms', GRPC_KEEPALIVE_DISABLED_MS),
+        ('grpc.keepalive_timeout_ms', GRPC_KEEPALIVE_DISABLED_MS),
+        ('grpc.http2.max_ping_strikes', 0),  # do not close on client pings
     ]
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10), options=options)
-    servicer = FederatedLearningServicer(MIN_CLIENTS, NUM_ROUNDS, max_clients=MAX_CLIENTS)
+    servicer = FederatedLearningServicer(MIN_CLIENTS, NUM_ROUNDS, max_clients=MAX_CLIENTS, grpc_server=server)
     federated_learning_pb2_grpc.add_FederatedLearningServicer_to_server(servicer, server)
     
     server.add_insecure_port(f'{GRPC_HOST}:{GRPC_PORT}')

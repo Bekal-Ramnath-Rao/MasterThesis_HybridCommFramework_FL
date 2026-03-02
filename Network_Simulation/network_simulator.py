@@ -31,44 +31,44 @@ class NetworkSimulator:
         "excellent": {
             "name": "Excellent Network (LAN)",
             "latency": "2ms",
-            "jitter": "0.5ms",
-            "bandwidth": "1000mbit",
+            "jitter": "1ms",
+            "bandwidth": "100mbit",
             "loss": "0.01%"
         },
         "good": {
             "name": "Good Network (Broadband)",
-            "latency": "10ms",
-            "jitter": "2ms",
+            "latency": "20ms",
+            "jitter": "5ms",
             "bandwidth": "100mbit",
             "loss": "0.1%"
         },
         "moderate": {
             "name": "Moderate Network (4G/LTE)",
-            "latency": "50ms",
+            "latency": "30ms",
             "jitter": "10ms",
-            "bandwidth": "20mbit",
-            "loss": "1%"
+            "bandwidth": "10mbit",
+            "loss": "0.3%"
         },
         "poor": {
             "name": "Poor Network (3G)",
-            "latency": "100ms",
+            "latency": "120ms",
             "jitter": "30ms",
-            "bandwidth": "2mbit",
-            "loss": "3%"
+            "bandwidth": "1mbit",
+            "loss": "0.5%"
         },
         "very_poor": {
             "name": "Very Poor Network (Edge/2G)",
-            "latency": "300ms",
+            "latency": "400ms",
             "jitter": "100ms",
-            "bandwidth": "384kbit",
-            "loss": "5%"
+            "bandwidth": "75kbit",
+            "loss": "1%"
         },
         "satellite": {
             "name": "Satellite Network",
             "latency": "600ms",
             "jitter": "50ms",
             "bandwidth": "5mbit",
-            "loss": "2%"
+            "loss": "1.5%"
         },
         "congested_light": {
             "name": "Light Congestion (Shared Network)",
@@ -549,6 +549,343 @@ class NetworkSimulator:
             print(f"  Bandwidth: {scenario.get('bandwidth', 'N/A')}")
             print(f"  Packet Loss: {scenario.get('loss', 'N/A')}")
             print()
+
+
+class NamespaceEndpoint:
+    """Represents one endpoint (server or client) in a Linux network namespace topology."""
+
+    def __init__(self, name: str, ns_name: str, veth_ns: str, veth_br: str, ip: str):
+        self.name = name
+        self.ns_name = ns_name
+        self.veth_ns = veth_ns
+        self.veth_br = veth_br
+        self.ip = ip
+
+
+class NamespaceNetworkSimulator:
+    """
+    Network simulator for native Python processes using Linux network namespaces + veth pairs.
+
+    This is designed to complement the Docker-based NetworkSimulator by providing a way to:
+      - Run FL server and clients as normal Python scripts on the SAME host
+      - Isolate them in separate network namespaces
+      - Connect them through a bridge using veth pairs
+      - Apply tc/netem independently on each namespace interface (per-direction shaping)
+
+    Typical usage (from another script):
+        sim = NamespaceNetworkSimulator(verbose=True)
+        server_ep, client_eps = sim.setup_topology("grpc-emotion", num_clients=2)
+        # Downstream (server -> clients)
+        sim.apply_conditions(
+            server_ep,
+            client_eps,
+            downstream_conditions=NetworkSimulator.NETWORK_SCENARIOS["poor"],
+            upstream_conditions=NetworkSimulator.NETWORK_SCENARIOS["excellent"],
+        )
+        # Launch processes with ip netns exec server_ep.ns_name / client_ep.ns_name ...
+        ...
+        sim.cleanup([server_ep] + client_eps)
+    """
+
+    def __init__(
+        self,
+        bridge_name: str = "fl-br0",
+        subnet: str = "10.200.0.0/24",
+        gateway: str = "10.200.0.254",
+        verbose: bool = False,
+    ):
+        self.bridge_name = bridge_name
+        self.subnet = subnet
+        self.gateway = gateway
+        self.verbose = verbose
+
+    def log(self, msg: str) -> None:
+        if self.verbose:
+            print(f"[NS] {msg}")
+
+    def _run(self, cmd: List[str], check: bool = True) -> subprocess.CompletedProcess:
+        """Run a host command (ip, tc, etc.), retrying with sudo on permission errors."""
+        self.log("Running: " + " ".join(cmd))
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").lower()
+            # Retry with sudo on typical permission errors, regardless of 'check' flag
+            if "permission denied" in err or "operation not permitted" in err or "rtnetlink" in err:
+                sudo_pw = os.environ.get("FL_SUDO_PASSWORD", "").strip()
+                if sudo_pw:
+                    self.log("Retrying with sudo (using FL_SUDO_PASSWORD)...")
+                    result = subprocess.run(
+                        ["sudo", "-S"] + cmd,
+                        input=sudo_pw + "\n",
+                        capture_output=True,
+                        text=True,
+                    )
+                else:
+                    self.log("Retrying with sudo (you may be prompted for your password)...")
+                    result = subprocess.run(
+                        ["sudo"] + cmd,
+                        capture_output=True,
+                        text=True,
+                    )
+        if check and result.returncode != 0:
+            print(f"[ERROR] Command failed: {' '.join(cmd)}")
+            print(f"[ERROR] Output: {result.stderr}")
+        return result
+
+    def _run_tc_in_ns(self, ns_name: str, args: List[str]) -> subprocess.CompletedProcess:
+        """Run tc inside a network namespace, with sudo fallback similar to _run."""
+        base_cmd = ["ip", "netns", "exec", ns_name, "tc"] + args
+        return self._run(base_cmd, check=False)
+
+    @staticmethod
+    def _split_subnet(subnet: str) -> (str, int):
+        cidr_parts = subnet.split("/")
+        base = cidr_parts[0]
+        prefix = int(cidr_parts[1]) if len(cidr_parts) == 2 else 24
+        return base, prefix
+
+    def _format_ip(self, last_octet: int) -> str:
+        base, prefix = self._split_subnet(self.subnet)
+        parts = base.split(".")
+        if len(parts) != 4:
+            raise ValueError(f"Unsupported subnet format: {self.subnet}")
+        return f"{parts[0]}.{parts[1]}.{parts[2]}.{last_octet}/{prefix}"
+
+    def ensure_bridge(self) -> None:
+        """Ensure the Linux bridge for namespaces exists and is up."""
+        self.log(f"Ensuring bridge {self.bridge_name} exists")
+        # Create bridge if missing
+        result = self._run(["ip", "link", "show", self.bridge_name], check=False)
+        if result.returncode != 0:
+            self._run(["ip", "link", "add", self.bridge_name, "type", "bridge"], check=False)
+        # Assign gateway IP (with /24 so host is on same subnet as namespaces) and bring it up
+        self._run(["ip", "addr", "flush", "dev", self.bridge_name], check=False)
+        gw_addr = self.gateway if "/" in self.gateway else f"{self.gateway}/24"
+        self._run(["ip", "addr", "add", gw_addr, "dev", self.bridge_name], check=False)
+        self._run(["ip", "link", "set", self.bridge_name, "up"], check=False)
+        self.log(f"Bridge {self.bridge_name} is up with gateway {self.gateway}")
+
+    def create_namespace(self, ns_name: str) -> None:
+        self.log(f"Creating namespace {ns_name}")
+        self._run(["ip", "netns", "add", ns_name], check=False)
+
+    def delete_namespace(self, ns_name: str) -> None:
+        self.log(f"Deleting namespace {ns_name}")
+        self._run(["ip", "netns", "del", ns_name], check=False)
+
+    def _create_veth_pair(self, veth_ns: str, veth_br: str, ns_name: str) -> None:
+        self.log(f"Creating veth pair {veth_ns} <-> {veth_br} for {ns_name}")
+        # Delete if existing
+        self._run(["ip", "link", "del", veth_br], check=False)
+        # Create and move one end into namespace
+        self._run(["ip", "link", "add", veth_ns, "type", "veth", "peer", "name", veth_br])
+        self._run(["ip", "link", "set", veth_ns, "netns", ns_name])
+        # Attach bridge-side to bridge
+        self._run(["ip", "link", "set", veth_br, "master", self.bridge_name])
+        self._run(["ip", "link", "set", veth_br, "up"])
+
+    def _configure_ns_interface(self, ns_name: str, veth_ns: str, ip_cidr: str) -> None:
+        self.log(f"Configuring {veth_ns} in {ns_name} with IP {ip_cidr}")
+        # Bring loopback up
+        self._run(["ip", "netns", "exec", ns_name, "ip", "link", "set", "lo", "up"], check=False)
+        # Assign IP and bring interface up
+        self._run(["ip", "netns", "exec", ns_name, "ip", "addr", "flush", "dev", veth_ns], check=False)
+        self._run(["ip", "netns", "exec", ns_name, "ip", "addr", "add", ip_cidr, "dev", veth_ns], check=False)
+        self._run(["ip", "netns", "exec", ns_name, "ip", "link", "set", veth_ns, "up"], check=False)
+        # Default route via bridge gateway so namespaces can reach host (e.g. AMQP proxy at gateway:25673)
+        gw = self.gateway.split("/")[0]
+        self._run(["ip", "netns", "exec", ns_name, "ip", "route", "add", "default", "via", gw], check=False)
+
+    def create_endpoint(self, name: str, ip_last_octet: int) -> NamespaceEndpoint:
+        """
+        Create one namespace + veth pair + IP for an endpoint.
+
+        Returns a NamespaceEndpoint describing the created topology.
+        """
+        # Keep actual interface and namespace names short to satisfy Linux ifname limits (~15 chars)
+        safe = name[:8]
+        ns_name = f"fl-{safe}"
+        veth_ns = f"veth-{safe}"
+        veth_br = f"veth-{safe}-br"
+        ip_cidr = self._format_ip(ip_last_octet)
+
+        self.create_namespace(ns_name)
+        self._create_veth_pair(veth_ns, veth_br, ns_name)
+        self._configure_ns_interface(ns_name, veth_ns, ip_cidr)
+
+        return NamespaceEndpoint(name=name, ns_name=ns_name, veth_ns=veth_ns, veth_br=veth_br, ip=ip_cidr.split("/")[0])
+
+    def setup_topology(self, base_name: str, num_clients: int) -> (NamespaceEndpoint, List[NamespaceEndpoint]):
+        """
+        Create a simple star topology:
+          - One server namespace
+          - N client namespaces
+          - All connected to a common bridge with per-namespace veth pairs
+
+        IP layout (subnet 10.200.0.0/24 by default):
+          - Server:  10.200.0.1
+          - Clients: 10.200.0.10 + i
+        """
+        self.ensure_bridge()
+        # Use short, fixed names so veth/ns names stay within kernel ifname limits
+        server_ep = self.create_endpoint("srv", ip_last_octet=1)
+
+        client_eps: List[NamespaceEndpoint] = []
+        for i in range(num_clients):
+            # Leave some room between server and clients
+            ip_octet = 10 + i
+            ep = self.create_endpoint(f"c{i+1}", ip_last_octet=ip_octet)
+            client_eps.append(ep)
+
+        self.log(
+            f"Created topology: server={server_ep.ns_name} ({server_ep.ip}), "
+            f"{len(client_eps)} client namespaces connected to {self.bridge_name}"
+        )
+        return server_ep, client_eps
+
+    def reset_tc(self, endpoints: List[NamespaceEndpoint]) -> None:
+        """Delete tc qdisc from all namespace interfaces."""
+        for ep in endpoints:
+            try:
+                self._run_tc_in_ns(ep.ns_name, ["qdisc", "del", "dev", ep.veth_ns, "root"])
+            except Exception as e:
+                self.log(f"reset_tc: could not reset {ep.ns_name}:{ep.veth_ns}: {e}")
+
+    def apply_tc(
+        self,
+        endpoint: NamespaceEndpoint,
+        conditions: Dict[str, str],
+    ) -> bool:
+        """
+        Apply netem/htb/tbf shaping on a namespace interface, similar to container-based logic.
+
+        The shaping applies to egress traffic of that endpoint, so by applying one set of
+        conditions on the server interface and another set on the client interfaces we get
+        independent delays/loss per direction.
+        """
+        if not conditions:
+            return False
+
+        netem_params: List[str] = []
+        if conditions.get("latency"):
+            netem_params.append(f"delay {conditions['latency']}")
+            if conditions.get("jitter"):
+                netem_params.append(conditions["jitter"])
+        if conditions.get("loss"):
+            netem_params.append(f"loss {conditions['loss']}")
+
+        has_netem = len(netem_params) > 0
+        has_bandwidth = bool(conditions.get("bandwidth"))
+
+        # First, reset any existing qdisc
+        self._run_tc_in_ns(endpoint.ns_name, ["qdisc", "del", "dev", endpoint.veth_ns, "root"])
+
+        try:
+            if has_netem and has_bandwidth:
+                # Root HTB class with rate, netem as child (same pattern as container mode)
+                r1 = self._run_tc_in_ns(
+                    endpoint.ns_name,
+                    ["qdisc", "add", "dev", endpoint.veth_ns, "root", "handle", "1:", "htb", "default", "1"],
+                )
+                if r1.returncode != 0:
+                    raise RuntimeError(r1.stderr or r1.stdout or "tc htb root failed")
+                r2 = self._run_tc_in_ns(
+                    endpoint.ns_name,
+                    [
+                        "class",
+                        "add",
+                        "dev",
+                        endpoint.veth_ns,
+                        "parent",
+                        "1:",
+                        "classid",
+                        "1:1",
+                        "htb",
+                        "rate",
+                        conditions["bandwidth"],
+                        "ceil",
+                        conditions["bandwidth"],
+                    ],
+                )
+                if r2.returncode != 0:
+                    raise RuntimeError(r2.stderr or r2.stdout or "tc htb class failed")
+                netem_args = " ".join(netem_params).split()
+                r3 = self._run_tc_in_ns(
+                    endpoint.ns_name,
+                    ["qdisc", "add", "dev", endpoint.veth_ns, "parent", "1:1", "handle", "10:", "netem", *netem_args],
+                )
+                if r3.returncode != 0:
+                    raise RuntimeError(r3.stderr or r3.stdout or "tc netem failed")
+                self.log(
+                    f"{endpoint.ns_name}:{endpoint.veth_ns}: "
+                    f"rate={conditions['bandwidth']}, netem={', '.join(netem_params)}"
+                )
+            elif has_netem:
+                netem_args = " ".join(netem_params).split()
+                r = self._run_tc_in_ns(
+                    endpoint.ns_name,
+                    ["qdisc", "add", "dev", endpoint.veth_ns, "root", "netem", *netem_args],
+                )
+                if r.returncode != 0:
+                    raise RuntimeError(r.stderr or r.stdout or "tc netem failed")
+                self.log(f"{endpoint.ns_name}:{endpoint.veth_ns}: netem={', '.join(netem_params)}")
+            elif has_bandwidth:
+                r = self._run_tc_in_ns(
+                    endpoint.ns_name,
+                    [
+                        "qdisc",
+                        "add",
+                        "dev",
+                        endpoint.veth_ns,
+                        "root",
+                        "tbf",
+                        "rate",
+                        conditions["bandwidth"],
+                        "burst",
+                        "32kbit",
+                        "latency",
+                        "400ms",
+                    ],
+                )
+                if r.returncode != 0:
+                    raise RuntimeError(r.stderr or r.stdout or "tc tbf failed")
+                self.log(f"{endpoint.ns_name}:{endpoint.veth_ns}: rate={conditions['bandwidth']}")
+            else:
+                # Nothing to apply
+                return False
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to apply tc in namespace {endpoint.ns_name} on {endpoint.veth_ns}: {e}")
+            return False
+
+    def apply_conditions(
+        self,
+        server_endpoint: NamespaceEndpoint,
+        client_endpoints: List[NamespaceEndpoint],
+        downstream_conditions: Dict[str, str],
+        upstream_conditions: Dict[str, str],
+    ) -> None:
+        """
+        Apply separate tc profiles for:
+          - downstream: server -> clients (egress from server namespace)
+          - upstream:   clients -> server (egress from each client namespace)
+
+        This achieves independent delay/loss/bandwidth per direction.
+        """
+        if downstream_conditions:
+            self.log("Applying downstream conditions (server -> clients)")
+            self.apply_tc(server_endpoint, downstream_conditions)
+        if upstream_conditions:
+            self.log("Applying upstream conditions (clients -> server)")
+            for ep in client_endpoints:
+                self.apply_tc(ep, upstream_conditions)
+
+    def cleanup(self, endpoints: List[NamespaceEndpoint]) -> None:
+        """Best-effort cleanup of tc + namespaces. Bridge is left in place for reuse."""
+        self.log("Cleaning up namespaces and tc rules")
+        self.reset_tc(endpoints)
+        for ep in endpoints:
+            self.delete_namespace(ep.ns_name)
 
 
 def main():

@@ -67,13 +67,13 @@ if gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
         print("GPU memory growth enabled")
         
-        # Set GPU memory limit to avoid OOM (RTX 3080 has 10GB, reserve 7GB per process)
-        # This prevents one process from consuming all GPU memory
+        # Limit GPU memory per process so multiple clients fit (e.g. 2 clients on one GPU)
+        memory_limit_mb = int(os.environ.get("TF_GPU_MEMORY_LIMIT_MB", "4000"))
         for gpu in gpus:
             try:
                 tf.config.set_logical_device_configuration(
                     gpu,
-                    [tf.config.LogicalDeviceConfiguration(memory_limit=7000)]  # 7GB per GPU
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=memory_limit_mb)]
                 )
             except RuntimeError:
                 pass  # GPU already configured
@@ -111,7 +111,7 @@ class FederatedLearningClient:
         self.num_clients = num_clients
         self.current_round = 0
         # Default batch size adjusted for separate GPUs
-        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        self.training_config = {"batch_size": 16, "local_epochs": 20}
         # Deduplication tracking
         self.last_global_round = -1
         self.last_training_round = -1

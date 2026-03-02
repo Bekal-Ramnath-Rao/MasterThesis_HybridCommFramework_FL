@@ -7,6 +7,7 @@ import pickle
 import base64
 import time
 import random
+import threading
 import paho.mqtt.client as mqtt
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
@@ -68,14 +69,13 @@ if gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
         print("GPU memory growth enabled")
         
-        # Set GPU memory limit to avoid OOM (RTX 3080 has 10GB, reserve 7GB per process)
-        # This prevents one process from consuming all GPU memory
-        # Lower limit for TensorFlow 2.20+ XLA command buffers
+        # Limit GPU memory per process so multiple clients fit (e.g. 2 clients on one GPU)
+        memory_limit_mb = int(os.environ.get("TF_GPU_MEMORY_LIMIT_MB", "4000"))
         for gpu in gpus:
             try:
                 tf.config.set_logical_device_configuration(
                     gpu,
-                    [tf.config.LogicalDeviceConfiguration(memory_limit=7000)]  # 7GB per GPU
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=memory_limit_mb)]
                 )
             except RuntimeError:
                 pass  # GPU already configured
@@ -95,6 +95,9 @@ from quantization_client import Quantization, QuantizationConfig
 # Auto-detect environment: Docker (/app exists) or local
 MQTT_BROKER = os.getenv("MQTT_BROKER", 'mqtt-broker' if os.path.exists('/app') else 'localhost')
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))  # MQTT broker port
+# Keepalive (seconds). Long value avoids rc=16 (keepalive timeout) in very_poor / diagnostic pipeline. Max 65535.
+_def_keepalive = 3600 if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else 600
+MQTT_KEEPALIVE_SEC = min(65535, max(10, int(os.getenv("MQTT_KEEPALIVE_SEC", str(_def_keepalive)))))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))  # Can be set via environment variable
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "5"))
@@ -117,7 +120,7 @@ class FederatedLearningClient:
         self.num_clients = num_clients
         self.current_round = 0
         # Default batch size adjusted for separate GPUs
-        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        self.training_config = {"batch_size": 16, "local_epochs": 20}
         # Deduplication tracking
         self.last_global_round = -1
         self.last_training_round = -1
@@ -133,6 +136,8 @@ class FederatedLearningClient:
         
         # Model will be initialized from server config
         self.model = None
+        self._pending_start_training_round = None  # set if start_training arrives before model ready
+        self._model_lock = threading.Lock()
 
         # Initialize packet logger database
         init_db()
@@ -147,9 +152,11 @@ class FederatedLearningClient:
             self.quantizer = None
             print(f"Client {self.client_id}: Quantization disabled")
         
-        # Initialize MQTT client with increased message size limit
-        # Use MQTTv5 for better large message handling
-        self.mqtt_client = mqtt.Client(client_id=f"fl_client_{client_id}", protocol=mqtt.MQTTv311)
+        # Unique MQTT client_id per process to avoid broker "already connected" (rc=7) reconnect loop
+        _mqtt_client_id = f"fl_client_{client_id}_{os.getpid()}"
+        self.mqtt_client = mqtt.Client(client_id=_mqtt_client_id, protocol=mqtt.MQTTv311)
+        # Long keepalive to avoid rc=16 (keepalive timeout) in very_poor / diagnostic pipeline
+        self.mqtt_client.keepalive = MQTT_KEEPALIVE_SEC
         self.mqtt_client.max_inflight_messages_set(20)
         # FAIR CONFIG: Limited queue to 1000 messages (aligned with AMQP/gRPC)
         self.mqtt_client.max_queued_messages_set(1000)
@@ -262,14 +269,16 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} received message on topic: {msg.topic}, size: {len(msg.payload)} bytes")
             log_received_packet(
                 packet_size=len(msg.payload),
-                peer=msg.topic,  # or client_id/server_id as appropriate
+                peer=msg.topic,
                 protocol="MQTT",
                 round=self.current_round if hasattr(self, 'current_round') else None,
                 extra_info=msg.topic
             )
-            
+
             if msg.topic == TOPIC_GLOBAL_MODEL:
-                self.handle_global_model(msg.payload)
+                # Process large payload in a thread so the MQTT loop stays responsive (avoids timeout/disconnect)
+                payload_copy = bytes(msg.payload)
+                threading.Thread(target=self._handle_global_model_thread, args=(payload_copy,), daemon=True).start()
             elif msg.topic == TOPIC_TRAINING_CONFIG:
                 self.handle_training_config(msg.payload)
             elif msg.topic == TOPIC_START_TRAINING:
@@ -288,15 +297,20 @@ class FederatedLearningClient:
         if rc == 0:
             print(f"Client {self.client_id} clean disconnect from broker")
             print(f"Client {self.client_id} exiting...")
-            # Stop the loop and exit
             self.mqtt_client.loop_stop()
             import sys
             sys.exit(0)
         else:
+            # rc=16: keepalive timeout (broker didn't see traffic in time). rc=7: duplicate client ID / connection lost.
             print(f"Client {self.client_id} unexpected disconnect, return code {rc}")
-            print(f"Client {self.client_id} attempting to reconnect...")
-            # Don't stop the loop - paho-mqtt will automatically reconnect
-            # The loop_forever() will handle reconnection attempts
+            if rc == 7:
+                self._reconnect_after_rc7 = getattr(self, "_reconnect_after_rc7", 0) + 1
+                if self._reconnect_after_rc7 <= 2:
+                    print(f"Client {self.client_id} will reconnect once after short delay...")
+                self.mqtt_client.loop_stop()
+            else:
+                # rc=16 or other: let paho auto-reconnect (loop_forever with retry_first_connection=True)
+                print(f"Client {self.client_id} attempting to reconnect...")
     
     def handle_training_complete(self):
         """Handle training completion signal from server"""
@@ -308,6 +322,19 @@ class FederatedLearningClient:
         self.mqtt_client.disconnect()
         print(f"Client {self.client_id} disconnected successfully.")
     
+    def _handle_global_model_thread(self, payload):
+        """Run handle_global_model in a thread; then trigger training if start_training arrived early."""
+        self.handle_global_model(payload)
+        with self._model_lock:
+            if self._pending_start_training_round is not None:
+                r = self._pending_start_training_round
+                self._pending_start_training_round = None
+                if self.model is not None:
+                    print(f"Client {self.client_id} model ready; starting pending training for round {r}")
+                    self.current_round = r
+                    self.last_training_round = r
+                    self.train_local_model()
+
     def handle_global_model(self, payload):
         """Receive and set global model weights and architecture from server"""
         try:
@@ -342,46 +369,46 @@ class FederatedLearningClient:
                 
                 model_config = data.get('model_config')
                 if model_config:
-                    # Build CNN model from server's architecture definition
-                    self.model = Sequential()
-                    self.model.add(Input(shape=tuple(model_config['input_shape'])))
+                    # Build in a local variable so self.model stays None until compile()+set_weights are done.
+                    # That avoids start_training racing and calling train_local_model() before compile().
+                    model = Sequential()
+                    model.add(Input(shape=tuple(model_config['input_shape'])))
                     
                     for layer_config in model_config['layers']:
                         if layer_config['type'] == 'Conv2D':
-                            self.model.add(Conv2D(
+                            model.add(Conv2D(
                                 filters=layer_config['filters'],
                                 kernel_size=tuple(layer_config['kernel_size']),
                                 activation=layer_config.get('activation')
                             ))
                         elif layer_config['type'] == 'MaxPooling2D':
-                            self.model.add(MaxPooling2D(pool_size=tuple(layer_config['pool_size'])))
+                            model.add(MaxPooling2D(pool_size=tuple(layer_config['pool_size'])))
                         elif layer_config['type'] == 'Dropout':
-                            self.model.add(Dropout(layer_config['rate']))
+                            model.add(Dropout(layer_config['rate']))
                         elif layer_config['type'] == 'Flatten':
-                            self.model.add(Flatten())
+                            model.add(Flatten())
                         elif layer_config['type'] == 'Dense':
-                            self.model.add(Dense(
+                            model.add(Dense(
                                 units=layer_config['units'],
                                 activation=layer_config.get('activation')
                             ))
                     
-                    # Compile model for classification
-                    self.model.compile(
+                    model.compile(
                         loss='categorical_crossentropy',
                         optimizer=Adam(learning_rate=0.0001),
                         metrics=['accuracy']
                     )
+                    model.set_weights(weights)
+                    # Assign only after compile + set_weights so start_training never sees an unready model
+                    self.model = model
                     print(f"Client {self.client_id} built CNN model from server configuration")
                     print(f"  Input shape: {model_config['input_shape']}")
                     print(f"  Output classes: {model_config['num_classes']}")
+                    print(f"Client {self.client_id} model initialized with server weights")
                 else:
                     raise ValueError("No model configuration received from server!")
                 
-                # Set the initial weights from server
-                self.model.set_weights(weights)
-                print(f"Client {self.client_id} model initialized with server weights")
                 self.current_round = 0
-                # Mark initial global model processed to ignore duplicates
                 self.last_global_round = round_num
             else:
                 # Updated model after aggregation (model already initialized)
@@ -403,12 +430,13 @@ class FederatedLearningClient:
         """Start local training when server signals"""
         data = json.loads(payload.decode())
         round_num = data['round']
-        
-        # Check if model is initialized
+
+        # If model not ready yet (global model still processing in thread), queue this round
         if self.model is None:
-            print(f"Client {self.client_id} waiting for global model (not yet initialized)...")
+            print(f"Client {self.client_id} waiting for global model; will start round {round_num} when ready")
+            self._pending_start_training_round = round_num
             return
-        
+
         # Check for duplicate training signals
         if self.last_training_round == round_num:
             print(f"Client {self.client_id} ignoring duplicate start training for round {round_num}")
@@ -608,19 +636,26 @@ class FederatedLearningClient:
     
     def start(self):
         """Connect to MQTT broker and start listening"""
-        max_retries = 5
+        max_retries = 10
         retry_delay = 2
-        
+        self._reconnect_after_rc7 = 0
+
         for attempt in range(max_retries):
             try:
                 print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
-                # Use 1 hour keepalive (3600 seconds) to prevent timeout during long training
-                # Enable automatic reconnection on connection loss
                 self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=120)
-                # FAIR CONFIG: keepalive 600s for very_poor network
-                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 600)
+                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=MQTT_KEEPALIVE_SEC)
                 print(f"Successfully connected to MQTT broker!\n")
                 self.mqtt_client.loop_forever(retry_first_connection=True)
+                # If loop stopped due to rc=7 (duplicate client ID / connection lost), do one delayed reconnect
+                if getattr(self, "_reconnect_after_rc7", 0) > 0 and self._reconnect_after_rc7 <= 2:
+                    print(f"Client {self.client_id} reconnecting after 3s (rc=7 recovery)...")
+                    time.sleep(3)
+                    try:
+                        self.mqtt_client.reconnect()
+                        self.mqtt_client.loop_forever(retry_first_connection=True)
+                    except Exception as e:
+                        print(f"Reconnect failed: {e}")
                 break
             except Exception as e:
                 print(f"Connection attempt {attempt + 1}/{max_retries} failed: {e}")
@@ -628,11 +663,7 @@ class FederatedLearningClient:
                     print(f"Retrying in {retry_delay} seconds...\n")
                     time.sleep(retry_delay)
                 else:
-                    print(f"\nFailed to connect to MQTT broker after {max_retries} attempts.")
-                    print(f"\nPlease ensure:")
-                    print(f"  1. Mosquitto broker is running: net start mosquitto")
-                    print(f"  2. Broker address is correct: {MQTT_BROKER}:{MQTT_PORT}")
-                    print(f"  3. Firewall allows connection on port {MQTT_PORT}")
+                    print(f"\nFailed to connect to MQTT broker. Ensure Mosquitto is running at {MQTT_BROKER}:{MQTT_PORT}")
                     raise
 
 def load_data(client_id):

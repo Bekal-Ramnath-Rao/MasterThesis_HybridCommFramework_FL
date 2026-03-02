@@ -1,11 +1,14 @@
+import os
+import sys
+# Server uses CPU only (aggregation is numpy-only); saves GPU memory for clients
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
 import numpy as np
 import pandas as pd
 import json
 import pickle
 import base64
 import time
-import os
-import sys
 import paho.mqtt.client as mqtt
 from typing import List, Dict
 import matplotlib.pyplot as plt
@@ -48,6 +51,9 @@ except ImportError:
 # Auto-detect environment: Docker (/app exists) or local
 MQTT_BROKER = os.getenv("MQTT_BROKER", 'mqtt-broker' if os.path.exists('/app') else 'localhost')
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))  # MQTT broker port
+# Keepalive (seconds). Long value avoids client rc=16 in very_poor / diagnostic pipeline. Max 65535.
+_def_keepalive = 3600 if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else 600
+MQTT_KEEPALIVE_SEC = min(65535, max(10, int(os.getenv("MQTT_KEEPALIVE_SEC", str(_def_keepalive)))))
 # Dynamic client configuration
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
@@ -97,9 +103,10 @@ class FederatedLearningServer:
         self.start_time = None
         self.convergence_time = None
         
-        # Training timeout tracking (prevent waiting forever for stuck clients)
+        # Training timeout tracking (prevent waiting forever for stuck clients). Long in diagnostic/very_poor.
         self.round_start_time = None
-        self.training_timeout = int(os.getenv("TRAINING_TIMEOUT", "600"))  # 10 minutes default
+        _def_training_timeout = 3600 if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else 600
+        self.training_timeout = int(os.getenv("TRAINING_TIMEOUT", str(_def_training_timeout)))
         
         # Initialize quantization handler (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
@@ -123,17 +130,17 @@ class FederatedLearningServer:
         # Training configuration
         # Training configuration broadcast to MQTT clients
         self.training_config = {
-            "batch_size": 32,
-            "local_epochs": 20  # Reduced from 20 for faster experiments (configurable via env)
+            "batch_size": int(os.getenv("BATCH_SIZE", "16")),
+            "local_epochs": 20
         }
         
-        # Initialize MQTT client with fair comparison settings
-        # clean_session=True for stateless operation (like other protocols)
-        self.mqtt_client = mqtt.Client(client_id="fl_server", protocol=mqtt.MQTTv311, clean_session=True)
+        # Unique MQTT client_id per process to avoid broker "already connected" (rc=7) reconnect loop
+        _mqtt_client_id = f"fl_server_{os.getpid()}"
+        self.mqtt_client = mqtt.Client(client_id=_mqtt_client_id, protocol=mqtt.MQTTv311, clean_session=True)
         # FAIR CONFIG: Set max packet size to 128MB (aligned with AMQP default)
         self.mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
-        # FAIR CONFIG: Set keepalive to 600s for very_poor network scenarios
-        self.mqtt_client.keepalive = 600
+        # Long keepalive to avoid client rc=16 in very_poor / diagnostic pipeline
+        self.mqtt_client.keepalive = MQTT_KEEPALIVE_SEC
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
 
@@ -518,30 +525,24 @@ class FederatedLearningServer:
         print(f"Initial model message size: {message_size / 1024:.2f} KB ({message_size} bytes)")
         print(f"Model config: {len(self.model_config['layers'])} layers, {self.model_config['num_classes']} classes")
         
-        # Publish multiple times to ensure delivery (QoS 0 can lose messages)
+        # Publish with QoS 1 so clients get at-least-once delivery (large payload)
         print("\nPublishing initial model to clients...")
-        for i in range(3):  # Send 3 times for reliability
-            result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, 
-                                             message_json,
-                                             qos=0)
-            log_sent_packet(
-                packet_size=len(message_json),
-                peer=TOPIC_GLOBAL_MODEL,  # or client_id/server_id as appropriate
-                protocol="MQTT",
-                round=self.current_round if hasattr(self, 'current_round') else None,
-                extra_info="Initial global model distribution"
-            )
-            
-            if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                print(f"  Attempt {i+1}/3: Initial model sent successfully")
-            else:
-                print(f"  Attempt {i+1}/3: FAILED (return code: {result.rc})")
-            
-            time.sleep(0.5)  # Small delay between sends
-        
-        # Wait for clients to receive and build the model...
+        result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, message_json, qos=1)
+        log_sent_packet(
+            packet_size=len(message_json),
+            peer=TOPIC_GLOBAL_MODEL,
+            protocol="MQTT",
+            round=self.current_round if hasattr(self, 'current_round') else None,
+            extra_info="Initial global model distribution"
+        )
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            print("  Initial global model sent successfully (QoS 1)")
+        else:
+            print(f"  FAILED to send initial model (return code: {result.rc})")
+
+        # Give clients time to receive and build the model (large payload + model init)
         print("\nWaiting for clients to receive and build the model...")
-        time.sleep(3)
+        time.sleep(10)
         
         # Capture which active clients will participate in this round
         self.round_participants = self.active_clients.copy()
@@ -837,8 +838,7 @@ class FederatedLearningServer:
         for attempt in range(max_retries):
             try:
                 print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
-                # FAIR CONFIG: keepalive 600s for very_poor network
-                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=600)
+                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=MQTT_KEEPALIVE_SEC)
                 print(f"Successfully connected to MQTT broker!\n")
                 self.mqtt_client.loop_forever()
                 break

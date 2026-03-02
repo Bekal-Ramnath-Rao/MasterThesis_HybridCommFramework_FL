@@ -55,7 +55,7 @@ if gpus:
             try:
                 tf.config.set_logical_device_configuration(
                     gpu,
-                    [tf.config.LogicalDeviceConfiguration(memory_limit=7000)]  # 7GB per GPU
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=int(os.environ.get("TF_GPU_MEMORY_LIMIT_MB", "4000")))]
                 )
             except RuntimeError:
                 pass  # GPU already configured
@@ -197,7 +197,7 @@ class FederatedLearningClient:
         self.train_generator = train_generator
         self.validation_generator = validation_generator
         self.current_round = 0
-        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        self.training_config = {"batch_size": 16, "local_epochs": 20}
         self.running = True
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
@@ -253,12 +253,18 @@ class FederatedLearningClient:
         # Create domain participant
         self.participant = DomainParticipant(DDS_DOMAIN_ID)
         
-        # Reliable QoS for all messages (control and data)
-        # TransientLocal durability ensures messages survive discovery delays
+        # Reliable QoS for control/small messages
         reliable_qos = Qos(
             Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
             Policy.History.KeepLast(10),
             Policy.Durability.TransientLocal
+        )
+        # Long blocking time + resource limits for large model updates (9MB; round 1 has no tc but discovery must be ready)
+        reliable_qos_large = Qos(
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),  # 10 min for degraded networks
+            Policy.History.KeepLast(10),
+            Policy.Durability.TransientLocal,
+            Policy.ResourceLimits(max_samples=10, max_instances=10, max_samples_per_instance=10),  # allow 9MB samples
         )
         # Create topics (no chunk topics; single-message GlobalModel and ModelUpdate)
         topic_registration = Topic(self.participant, "ClientRegistration", ClientRegistration)
@@ -287,13 +293,13 @@ class FederatedLearningClient:
         self.readers['global_model'] = DataReader(self.participant, topic_global_model, qos=reliable_qos)
         self.readers['status'] = DataReader(self.participant, topic_status, qos=reliable_qos)
         
-        # Create writers (for sending to server) — all Reliable
+        # Create writers (for sending to server) — Reliable; model_update uses long timeout for large payload
         self.writers['registration'] = DataWriter(self.participant, topic_registration, qos=reliable_qos)
         self.writers['ready'] = DataWriter(self.participant, topic_ready, qos=reliable_qos)
-        self.writers['model_update'] = DataWriter(self.participant, topic_model_update, qos=reliable_qos)
+        self.writers['model_update'] = DataWriter(self.participant, topic_model_update, qos=reliable_qos_large)
         self.writers['metrics'] = DataWriter(self.participant, topic_metrics, qos=reliable_qos)
 
-        print(f"Client {self.client_id} DDS setup complete (Reliable QoS for all messages)")
+        print(f"Client {self.client_id} DDS setup complete (Reliable QoS; model_update 10 min blocking for large uploads)")
         
         # Wait for DDS endpoint discovery before sending
         print(f"Client {self.client_id} waiting for endpoint discovery...")
@@ -321,7 +327,13 @@ class FederatedLearningClient:
         for i in range(3):
             self.writers['ready'].write(ready_signal)
             time.sleep(0.2)
-        print(f"Client {self.client_id} ready signal sent\n")
+        print(f"Client {self.client_id} ready signal sent")
+        # Allow time for model_update reader (server) to be discovered so round 1 send is delivered (no tc yet)
+        wait_s = int(os.environ.get("DDS_MODEL_UPDATE_DISCOVERY_WAIT", "12"))
+        if wait_s > 0:
+            print(f"Client {self.client_id} waiting {wait_s}s for model_update endpoint discovery...")
+            time.sleep(wait_s)
+        print()
     
     def run(self):
         """Main client loop"""
@@ -561,6 +573,8 @@ class FederatedLearningClient:
         time.sleep(delay)
         
         payload_bytes = len(serialized_weights)
+        if payload_bytes > 1_000_000 and os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            print(f"Client {self.client_id} sending model update ({payload_bytes / 1e6:.2f} MB); may take 1–2 min on moderate network...")
         send_start_ts = time.time()
         send_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
         # Send model update to server (single message)

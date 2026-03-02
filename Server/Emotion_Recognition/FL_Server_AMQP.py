@@ -1,11 +1,14 @@
+import os
+import sys
+# Server uses CPU only (aggregation is numpy-only); saves GPU memory for clients
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
 import numpy as np
 import json
 import pickle
 import base64
 import time
 import pika
-import os
-import sys
 from typing import List, Dict
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -112,8 +115,8 @@ class FederatedLearningServer:
         # Training configuration
         # Training configuration broadcast to AMQP clients
         self.training_config = {
-            "batch_size": 32,
-            "local_epochs": 20  # Reduced from 20 for faster experiments
+            "batch_size": int(os.getenv("BATCH_SIZE", "16")),
+            "local_epochs": 20
         }
         
         # AMQP connection
