@@ -87,9 +87,10 @@ CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
-# Model initialization timeout (seconds) - longer for poor network conditions
-# Default: 300s (5 minutes) for very poor network conditions with large models
-MODEL_INIT_TIMEOUT = float(os.getenv("MODEL_INIT_TIMEOUT", "300"))
+# Model initialization timeout (seconds). 0 / none / inf = wait indefinitely (for diagnostic pipeline).
+# Default: no timeout when FL_DIAGNOSTIC_PIPELINE=1, else 300s
+_mod_init = os.getenv("MODEL_INIT_TIMEOUT", "300" if os.getenv("FL_DIAGNOSTIC_PIPELINE") != "1" else "0").strip().lower()
+MODEL_INIT_TIMEOUT = None if _mod_init in ("0", "none", "inf", "infinity") else float(_mod_init)
 
 
 class FederatedLearningClientProtocol(QuicConnectionProtocol):
@@ -446,17 +447,22 @@ class FederatedLearningClient:
         """Start local training when server signals"""
         round_num = message['round']
         
-        # Wait for model to be initialized (with timeout)
+        # Wait for model to be initialized (optional timeout; no timeout in diagnostic pipeline)
         if not self.model_ready.is_set():
             print(f"Client {self.client_id} waiting for model initialization before training round {round_num}...")
-            print(f"Client {self.client_id} using timeout of {MODEL_INIT_TIMEOUT}s (configured via MODEL_INIT_TIMEOUT env var)")
-            try:
-                await asyncio.wait_for(self.model_ready.wait(), timeout=MODEL_INIT_TIMEOUT)
+            if MODEL_INIT_TIMEOUT is None:
+                print(f"Client {self.client_id} no timeout (wait indefinitely; set MODEL_INIT_TIMEOUT for a limit)")
+                await self.model_ready.wait()
                 print(f"Client {self.client_id} model ready, proceeding with training")
-            except asyncio.TimeoutError:
-                print(f"Client {self.client_id} ERROR: Timeout waiting for model initialization after {MODEL_INIT_TIMEOUT}s")
-                print(f"Client {self.client_id} TIP: Increase MODEL_INIT_TIMEOUT env var for very poor network conditions")
-                return
+            else:
+                print(f"Client {self.client_id} using timeout of {MODEL_INIT_TIMEOUT}s (MODEL_INIT_TIMEOUT=0 for no timeout)")
+                try:
+                    await asyncio.wait_for(self.model_ready.wait(), timeout=MODEL_INIT_TIMEOUT)
+                    print(f"Client {self.client_id} model ready, proceeding with training")
+                except asyncio.TimeoutError:
+                    print(f"Client {self.client_id} ERROR: Timeout waiting for model initialization after {MODEL_INIT_TIMEOUT}s")
+                    print(f"Client {self.client_id} TIP: Set MODEL_INIT_TIMEOUT=0 to wait indefinitely")
+                    return
         
         if self.current_round == 0 and round_num == 1:
             self.current_round = round_num
@@ -687,13 +693,15 @@ async def main():
     # Create client
     client = FederatedLearningClient(CLIENT_ID, NUM_CLIENTS, train_generator, validation_generator)
     
-    # QUIC config: cubic congestion, 60s idle; 128 MB flow control (aligned with server for fair FL comparison)
+    # QUIC config: cubic congestion; idle timeout: 0/none = no limit (diagnostic), else env or 60s
+    _idle = os.getenv("IDLE_TIMEOUT", "0" if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else "60").strip().lower()
+    idle_sec = float(_idle) if _idle not in ("0", "none", "inf", "infinity") else 86400.0 * 7  # 7 days = effectively no limit
     HTTP3_MAX_DATA_BYTES = 128 * 1024 * 1024  # 128 MB
     configuration = QuicConfiguration(
         is_client=True,
         alpn_protocols=H3_ALPN,
         congestion_control_algorithm="cubic",
-        idle_timeout=60.0,
+        idle_timeout=idle_sec,
         max_data=HTTP3_MAX_DATA_BYTES,
         max_stream_data=HTTP3_MAX_DATA_BYTES,
         max_datagram_frame_size=65536,

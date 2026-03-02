@@ -845,13 +845,15 @@ async def main():
     
     server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
-    # QUIC config: cubic congestion, 60s idle; 128 MB flow control (aligned with MQTT/gRPC for fair FL comparison)
+    # QUIC config: idle timeout 0/none = no limit (diagnostic pipeline); else env or 60s
+    _idle = os.getenv("IDLE_TIMEOUT", "0" if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else "60").strip().lower()
+    idle_sec = float(_idle) if _idle not in ("0", "none", "inf", "infinity") else 86400.0 * 7  # 7 days = effectively no limit
     HTTP3_MAX_DATA_BYTES = 128 * 1024 * 1024  # 128 MB
     configuration = QuicConfiguration(
         is_client=False,
         alpn_protocols=H3_ALPN,
         congestion_control_algorithm="cubic",
-        idle_timeout=60.0,
+        idle_timeout=idle_sec,
         max_data=HTTP3_MAX_DATA_BYTES,
         max_stream_data=HTTP3_MAX_DATA_BYTES,
         max_datagram_frame_size=65536,
