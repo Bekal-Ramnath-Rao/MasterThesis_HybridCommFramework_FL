@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (
     QLabel, QPushButton, QComboBox, QCheckBox, QSpinBox, QSlider,
     QGroupBox, QTextEdit, QProgressBar, QTabWidget, QGridLayout,
     QScrollArea, QMessageBox, QLineEdit, QRadioButton, QButtonGroup,
-    QFrame, QSplitter, QDialog, QSizePolicy
+    QFrame, QSplitter, QDialog, QSizePolicy, QFileDialog
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QPalette, QColor, QIcon
@@ -672,12 +672,26 @@ class FLExperimentGUI(QMainWindow):
         self.learning_rate.setStyleSheet("padding: 5px;")
         training_layout.addWidget(self.learning_rate, 1, 1)
         
-        training_layout.addWidget(QLabel("Min Clients:"), 1, 2)
+        training_layout.addWidget(QLabel("Min Clients (server):"), 1, 2)
         self.min_clients = QSpinBox()
         self.min_clients.setRange(1, 100)
         self.min_clients.setValue(2)
         self.min_clients.setStyleSheet("padding: 5px;")
+        self.min_clients.setToolTip("Minimum number of clients required by the FL server before training can start.")
         training_layout.addWidget(self.min_clients, 1, 3)
+
+        # Number of clients started from this GUI (Docker-based runs only; native uses Min Clients)
+        training_layout.addWidget(QLabel("Clients from this GUI:"), 2, 0)
+        self.gui_clients = QSpinBox()
+        self.gui_clients.setRange(1, 2)
+        self.gui_clients.setValue(2)
+        self.gui_clients.setStyleSheet("padding: 5px;")
+        self.gui_clients.setToolTip(
+            "Number of client containers to start on this machine when running Docker-based experiments.\n"
+            "The FL server will still wait for the configured minimum clients (e.g., 2). "
+            "You can start the remaining clients from other PCs using the Distributed Client GUI."
+        )
+        training_layout.addWidget(self.gui_clients, 2, 1)
         
         training_group.setLayout(training_layout)
         layout.addWidget(training_group)
@@ -1870,6 +1884,16 @@ class FLExperimentGUI(QMainWindow):
         diag_tab = QWidget()
         diag_layout = QVBoxLayout(diag_tab)
         diag_layout.addWidget(QLabel("Diagnostic pipeline results (Empirical Overhead, Network Extraction, Analytical Model). Data is stored in a database; new runs update by (Protocol, Scenario)."))
+
+        # Controls for Diagnostic Results (e.g., Excel export)
+        diag_controls_layout = QHBoxLayout()
+        self.diagnostic_download_excel_btn = QPushButton("📥 Download to Excel")
+        self.diagnostic_download_excel_btn.setStyleSheet("padding: 6px 12px; font-weight: bold;")
+        self.diagnostic_download_excel_btn.setToolTip("Export diagnostic_results.db to an Excel sheet.")
+        self.diagnostic_download_excel_btn.clicked.connect(self.download_diagnostic_results_excel)
+        diag_controls_layout.addWidget(self.diagnostic_download_excel_btn)
+        diag_controls_layout.addStretch()
+        diag_layout.addLayout(diag_controls_layout)
         self.diagnostic_results_table = QTableWidget()
         self.diagnostic_results_table.setColumnCount(9)
         self.diagnostic_results_table.setHorizontalHeaderLabels([
@@ -2300,7 +2324,7 @@ class FLExperimentGUI(QMainWindow):
             if scenarios:
                 cmd_parts.extend(["--scenario", scenarios[0]])
             
-            # Rounds and client count
+            # Rounds and client count (native: all clients run on this machine)
             cmd_parts.extend(["--rounds", str(self.rounds_spinbox.value())])
             cmd_parts.extend(["--num-clients", str(self.min_clients.value())])
         else:
@@ -2308,6 +2332,8 @@ class FLExperimentGUI(QMainWindow):
             # Network mode: gpu | host | host_macvlan
             mode = "host_macvlan" if self.network_mode_host_macvlan.isChecked() else ("host" if self.network_mode_host.isChecked() else "gpu")
             cmd_parts.extend(["--network-mode", mode])
+            # Number of client containers started from this GUI on the central machine
+            cmd_parts.extend(["--local-clients", str(self.gui_clients.value())])
         
         # Baseline mode flag (Docker-only at the moment)
         if not self.exec_mode_native.isChecked():
@@ -2892,6 +2918,20 @@ class FLExperimentGUI(QMainWindow):
     def update_output(self, text):
         """Update output console"""
         self._extract_results_dir_from_output(text)
+        # Detect boundaries between internal experiments (within a single long-running
+        # command such as run_network_experiments.py or diagnostic_pipeline.py) so that
+        # server/client log monitors can be restarted for each new experiment. Without
+        # this, the GUI would keep following the containers from the first experiment only.
+        try:
+            if getattr(self, "experiment_thread", None) and self.experiment_thread.isRunning():
+                if ("EXPERIMENT:" in text) or ("Diagnostic run " in text):
+                    # Containers for the next experiment are started shortly after these
+                    # markers are printed; delay slightly so docker ps can see them.
+                    QTimer.singleShot(5000, self.start_log_monitors)
+        except Exception:
+            # Log monitor refresh is best-effort; never break the main output path.
+            pass
+
         # Parse diagnostic pipeline JSON (may arrive in one chunk or split across chunks)
         if "FL_DIAG_TABLE_JSON|" in text:
             json_str = text.split("FL_DIAG_TABLE_JSON|", 1)[1]
@@ -3086,6 +3126,89 @@ class FLExperimentGUI(QMainWindow):
             if self.output_tabs.tabText(i) == "📊 Diagnostic Results":
                 self.output_tabs.setCurrentIndex(i)
                 break
+
+    def download_diagnostic_results_excel(self):
+        """Export diagnostic_results.db to an Excel file."""
+        try:
+            import pandas as pd
+        except ImportError:
+            QMessageBox.warning(self, "Export", "pandas is required. Install with: pip install pandas")
+            return
+        try:
+            from openpyxl import __version__  # noqa: F401
+        except ImportError:
+            QMessageBox.warning(self, "Export", "openpyxl is required for Excel export. Install with: pip install openpyxl")
+            return
+
+        db_path = self._diagnostic_db_path()
+        if not os.path.isfile(db_path):
+            QMessageBox.information(
+                self,
+                "Export",
+                "No diagnostic_results.db found yet. Run the Diagnostic Pipeline first to generate results.",
+            )
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Diagnostic Results",
+            "",
+            "Excel (*.xlsx);;All Files (*)",
+        )
+        if not save_path:
+            return
+        if not save_path.endswith(".xlsx"):
+            save_path = save_path + ".xlsx"
+
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(db_path)
+            df = pd.read_sql_query(
+                """
+                SELECT
+                    client_id,
+                    protocol,
+                    scenario,
+                    O_app,
+                    O_broker,
+                    p,
+                    T_actual,
+                    T_calc,
+                    error_pct,
+                    updated_at
+                FROM diagnostic_results
+                ORDER BY UPPER(protocol), LOWER(scenario), client_id
+                """,
+                conn,
+            )
+            conn.close()
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Export Error",
+                f"Could not read diagnostic_results.db:\n{e}",
+            )
+            return
+
+        if df.empty:
+            QMessageBox.information(self, "Export", "Diagnostic results database is empty. Nothing to export.")
+            return
+
+        try:
+            with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="DiagnosticResults", index=False)
+            QMessageBox.information(
+                self,
+                "Export",
+                f"Diagnostic results exported to:\n{save_path}",
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Export Error",
+                f"Failed to write Excel file:\n{e}",
+            )
 
     def _extract_results_dir_from_output(self, text):
         """Track results directory from runner stdout."""

@@ -41,9 +41,19 @@ if _env_path.exists():
 class ExperimentRunner:
     """Automates running FL experiments across different network conditions"""
     
-    def __init__(self, use_case: str = "emotion", num_rounds: int = 10, enable_congestion: bool = False,
-                 use_quantization: bool = False, quantization_params: Dict[str, str] = None, enable_gpu: bool = False,
-                 network_mode: str = "gpu", baseline_mode: bool = False, use_ql_convergence: bool = False):
+    def __init__(
+        self,
+        use_case: str = "emotion",
+        num_rounds: int = 10,
+        enable_congestion: bool = False,
+        use_quantization: bool = False,
+        quantization_params: Dict[str, str] = None,
+        enable_gpu: bool = False,
+        network_mode: str = "gpu",
+        baseline_mode: bool = False,
+        use_ql_convergence: bool = False,
+        local_clients: int = 2,
+    ):
         self.use_case = use_case
         self.num_rounds = num_rounds
         self.enable_congestion = enable_congestion
@@ -54,6 +64,8 @@ class ExperimentRunner:
             self.network_mode = "gpu"
         self.baseline_mode = baseline_mode
         self.use_ql_convergence = use_ql_convergence
+        # Number of client containers started from this runner on the central machine
+        self.local_clients = max(1, int(local_clients or 1))
         # quantization_params expected to be a dict of simple string values
         self.quantization_params = quantization_params or {}
         
@@ -391,9 +403,12 @@ class ExperimentRunner:
         
         # Stage 4: Start clients
         if clients:
+            # Respect configured number of local clients to start on this machine.
+            num_local = max(1, min(self.local_clients, len(clients)))
+            clients_to_start = clients[:num_local]
             stage_num = "[Stage 4/4]" if (broker and self.enable_congestion and congestion_level != "none") else "[Stage 3/4]"
-            print(f"\n{stage_num} Starting clients: {', '.join(clients)}")
-            cmd_clients = compose_cmd_base + ["up", "-d"] + clients
+            print(f"\n{stage_num} Starting clients ({num_local} local): {', '.join(clients_to_start)}")
+            cmd_clients = compose_cmd_base + ["up", "-d"] + clients_to_start
             result = self.run_command(cmd_clients)
             if result.returncode != 0:
                 print(f"[ERROR] Failed to start clients")
@@ -959,6 +974,12 @@ def main():
                 help="Baseline mode: Run without network conditions and save to baseline folder")
     parser.add_argument("--use-ql-convergence", action="store_true",
                 help="Unified only: End training when Q-learning value converges (multiple episodes); else end on accuracy convergence")
+    parser.add_argument(
+        "--local-clients",
+        type=int,
+        default=2,
+        help="Number of client containers to start from this runner on the central machine (default: 2).",
+    )
     
     args = parser.parse_args()
     
@@ -985,14 +1006,18 @@ def main():
         if args.quantization_per_channel:
             quant_params["QUANTIZATION_PER_CHANNEL"] = "1"
 
-    runner = ExperimentRunner(use_case=args.use_case, num_rounds=args.rounds, 
-                            enable_congestion=args.enable_congestion,
-                            use_quantization=args.use_quantization,
-                            quantization_params=quant_params,
-                            enable_gpu=args.enable_gpu,
-                            network_mode=args.network_mode,
-                            baseline_mode=args.baseline,
-                            use_ql_convergence=args.use_ql_convergence)
+    runner = ExperimentRunner(
+        use_case=args.use_case,
+        num_rounds=args.rounds,
+        enable_congestion=args.enable_congestion,
+        use_quantization=args.use_quantization,
+        quantization_params=quant_params,
+        enable_gpu=args.enable_gpu,
+        network_mode=args.network_mode,
+        baseline_mode=args.baseline,
+        use_ql_convergence=args.use_ql_convergence,
+        local_clients=args.local_clients,
+    )
     
     # In baseline mode, run all protocols with excellent scenario (no network conditions)
     if args.baseline:

@@ -494,6 +494,7 @@ def run_pipeline(
     payload_file: str = None,
     compose_file: str = None,
     services: list = None,
+    num_clients: int = 1,
 ) -> dict:
     """Execute full diagnostic pipeline and return summary dict.
 
@@ -541,7 +542,12 @@ def run_pipeline(
     if services is None:
         pat = SERVICE_PATTERNS.get(use_case, {}).get(protocol)
         if pat:
-            sender_containers = list(pat[0])  # both clients
+            all_senders = list(pat[0])
+            if num_clients is None or num_clients <= 0:
+                num_to_use = len(all_senders)
+            else:
+                num_to_use = min(num_clients, len(all_senders))
+            sender_containers = all_senders[:num_to_use]
             receiver_container = pat[1]
         else:
             sender_containers = [sender_container] if isinstance(sender_container, str) else list(sender_container or [])
@@ -557,17 +563,21 @@ def run_pipeline(
                     broker = "rabbitmq" if use_case == "emotion" else ("rabbitmq-mental" if use_case == "mentalstate" else "rabbitmq-temp")
             services = [broker, receiver_container] + sender_containers
 
+    n_expected = len(sender_containers)
+
     env = os.environ.copy()
     # 3 rounds: Round 1 (index 0) = calibration, Round 2 (index 2) = T_actual with tc on client egress
     env["NUM_ROUNDS"] = "3"
     env["FL_DIAGNOSTIC_PIPELINE"] = "1"
+    env["MIN_CLIENTS"] = str(n_expected)
+    env["MAX_CLIENTS"] = str(n_expected)
 
     # Phase 1: Round 1 – Application overhead (no tc on client egress).
     # Server → Global model → Client; Client → Local model → Server. Use round index 0 for O_send, O_recv, O_broker.
     print("[Phase 1] Round 1 – Application overhead (no tc on clients)...")
     net_label = {"gpu": "bridge", "host": "host (tc on host)", "host_macvlan": "macvlan (per-container tc)"}.get(network_mode, "bridge")
-    print("          Starting both clients for FL rounds (GPU={}, network={})...".format(
-        "yes" if enable_gpu else "CPU", net_label))
+    print("          Starting {} client(s) for FL rounds (GPU={}, network={})...".format(
+        n_expected, "yes" if enable_gpu else "CPU", net_label))
     compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"] + list(services)
     result = run_cmd(
         compose_cmd,
@@ -612,7 +622,6 @@ def run_pipeline(
     print("          Server tc cleared (tc applied to clients only). Client tc cleared for calibration (no losses).")
 
     # Wait for Round 1 (round index 0) to complete – calibration for application overhead
-    n_expected = len(sender_containers)
     for _ in range(120):
         time.sleep(2)
         cal_list = parse_fl_diag_from_logs_multi(sender_containers, receiver_container, 0)  # round index 0 = Round 1
@@ -622,8 +631,15 @@ def run_pipeline(
     else:
         print("[WARNING] No calibration timing for all clients in logs; using available or defaults.")
         cal_list = [
-            {"client_id": 1, "O_send": 0.0, "O_recv": 0.0, "T_total": 0.0, "payload_bytes": 0, "S_bits": 0},
-            {"client_id": 2, "O_send": 0.0, "O_recv": 0.0, "T_total": 0.0, "payload_bytes": 0, "S_bits": 0},
+            {
+                "client_id": i + 1,
+                "O_send": 0.0,
+                "O_recv": 0.0,
+                "T_total": 0.0,
+                "payload_bytes": 0,
+                "S_bits": 0,
+            }
+            for i in range(max(n_expected, 1))
         ]
 
     # O_broker once (from first client) for broker-based protocols
@@ -758,7 +774,14 @@ def run_pipeline(
             print(f"          Timeout after {phase3_max_wait * 2}s. Set FL_DIAG_PHASE3_WAIT=0 for no timeout, or higher (e.g. 900) for 30 min.")
         iteration += 1
     if not lossy_list or len(lossy_list) < len(cal_list):
-        lossy_list = [{"client_id": i + 1, "T_total": cal_list[i].get("T_total", 0)} if i < len(cal_list) else {"client_id": i + 1, "T_total": 0} for i in range(max(2, len(cal_list)))]
+        count = max(n_expected, len(cal_list))
+        lossy_list = [
+            {
+                "client_id": i + 1,
+                "T_total": cal_list[i].get("T_total", 0) if i < len(cal_list) else 0,
+            }
+            for i in range(count)
+        ]
     # Require round index 2 for T_actual; otherwise parser used an earlier round
     docker_round_counts = count_docker_fl_diag_rounds(sender_containers)
     if docker_round_counts and any(c < 3 for c in docker_round_counts):
@@ -835,7 +858,7 @@ def run_pipeline_native(
     use_case: str,
     scenario: str = "excellent",
     enable_gpu: bool = False,
-    num_clients: int = 2,
+    num_clients: int = 1,
     payload_file: str = None,
 ) -> list:
     """Execute diagnostic pipeline using native namespaces (no Docker).
@@ -910,8 +933,15 @@ def run_pipeline_native(
         cal_list = parse_fl_diag_from_logs_native(log_dir, 0, num_clients)
         if not cal_list or len(cal_list) < n_expected:
             cal_list = [
-                {"client_id": i + 1, "O_send": 0.0, "O_recv": 0.0, "T_total": 0.0, "payload_bytes": 0, "S_bits": 0}
-                for i in range(max(n_expected, 2))
+                {
+                    "client_id": i + 1,
+                    "O_send": 0.0,
+                    "O_recv": 0.0,
+                    "T_total": 0.0,
+                    "payload_bytes": 0,
+                    "S_bits": 0,
+                }
+                for i in range(max(n_expected, 1))
             ]
         n_ready = sum(1 for c in cal_list if c.get("T_total", 0) > 0)
         if n_ready < n_expected:
@@ -933,9 +963,13 @@ def run_pipeline_native(
 
         lossy_list = parse_fl_diag_from_logs_native(log_dir, 1, num_clients)
         if not lossy_list or len(lossy_list) < len(cal_list):
+            count = max(n_expected, len(cal_list))
             lossy_list = [
-                {"client_id": i + 1, "T_total": cal_list[i].get("T_total", 0)} if i < len(cal_list) else {"client_id": i + 1, "T_total": 0}
-                for i in range(max(2, len(cal_list)))
+                {
+                    "client_id": i + 1,
+                    "T_total": cal_list[i].get("T_total", 0) if i < len(cal_list) else 0,
+                }
+                for i in range(count)
             ]
         round_counts = count_native_fl_diag_rounds(log_dir, num_clients)
         if any(c < 2 for c in round_counts):
@@ -1053,6 +1087,12 @@ def main():
     parser.add_argument("--sender-container", help="Override sender (client) container name")
     parser.add_argument("--receiver-container", help="Override receiver (server) container name")
     parser.add_argument("--payload-file", help="Path to payload file for S (bits); else from calibration run")
+    parser.add_argument(
+        "--num-clients",
+        type=int,
+        default=1,
+        help="Number of FL clients to include in the diagnostic pipeline (default: 1).",
+    )
     args = parser.parse_args()
 
     # Resolve protocols list: --protocols takes precedence, else single --protocol
@@ -1098,7 +1138,7 @@ def main():
                     use_case=args.use_case,
                     scenario=scenario,
                     enable_gpu=args.enable_gpu,
-                    num_clients=2,
+                    num_clients=args.num_clients,
                     payload_file=args.payload_file,
                 )
             else:
@@ -1106,7 +1146,10 @@ def main():
                 sender = args.sender_container or (pat[0] if pat else None)
                 receiver = args.receiver_container or (pat[1] if pat else None)
                 if not sender or not receiver:
-                    print(f"Missing sender/receiver for protocol {protocol}. Use --sender-container and --receiver-container or --use-case.", file=sys.stderr)
+                    print(
+                        f"Missing sender/receiver for protocol {protocol}. Use --sender-container and --receiver-container or --use-case.",
+                        file=sys.stderr,
+                    )
                     continue
                 # sender can be list (both clients) or single; run_pipeline expects receiver as str and sender as first client for single-container override
                 sender_list = list(sender) if isinstance(sender, (list, tuple)) else [sender]
@@ -1119,6 +1162,7 @@ def main():
                     enable_gpu=args.enable_gpu,
                     network_mode=args.network_mode,
                     payload_file=args.payload_file,
+                    num_clients=args.num_clients,
                 )
             all_summaries.extend(summary)
             # Emit after each experiment so GUI Diagnostic Results tab updates incrementally
