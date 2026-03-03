@@ -19,9 +19,16 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
+
 # Project root
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
+
+# Paths for diagnostics and α_proto persistence
+DIAGNOSTIC_PATH = PROJECT_ROOT / "shared_data" / "Diagnostic_Pipeline_Untuned.xlsx"
+ALPHA_PATH = PROJECT_ROOT / "shared_data" / "alpha_proto.json"
 
 # Use iperf3 for network params (client-side) when set; else use tc extraction
 USE_IPERF3 = os.environ.get("USE_IPERF3", "1").strip().lower() in ("1", "true", "yes")
@@ -31,6 +38,123 @@ IPERF3_DURATION = int(os.environ.get("IPERF3_DURATION", "5"))
 MSS_BITS = 11680
 T_REPAIR = 0.005  # seconds
 B_BRIDGE_BPS = 10_000_000_000  # 10 Gbps
+
+# Protocol-specific scaling factors α_proto (fitted from diagnostics; used to scale network term)
+ALPHA_PROTO = {
+    "MQTT": 1.8,
+    "AMQP": 2.1,
+    "GRPC": 1.7,
+    "QUIC": 1.0,
+    "HTTP3": 4.5,
+    "DDS": 8.2,
+}
+
+
+def load_diagnostics(path: Path = DIAGNOSTIC_PATH) -> pd.DataFrame:
+    """Load diagnostics from Excel/CSV into a DataFrame."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Diagnostics file not found: {path}")
+    if path.suffix.lower() in (".xlsx", ".xls"):
+        return pd.read_excel(path)
+    return pd.read_csv(path)
+
+
+def fit_alpha_proto(protocol: str, df: pd.DataFrame) -> float:
+    """Fit α_proto for a single protocol: median(T_actual / (T_calc_raw - O_app))."""
+    proto = protocol.upper()
+    if "T_calc_raw" not in df.columns:
+        # Fallback: use existing α (no tuning possible without raw column)
+        return float(ALPHA_PROTO.get(proto, 1.0))
+    df_proto = df[df["protocol"].str.upper() == proto].copy()
+    if df_proto.empty:
+        return float(ALPHA_PROTO.get(proto, 1.0))
+    t_raw_network = df_proto["T_calc_raw"] - df_proto["O_app"]
+    mask = t_raw_network > 0
+    ratios = df_proto.loc[mask, "T_actual"] / t_raw_network[mask]
+    if len(ratios) == 0:
+        return float(ALPHA_PROTO.get(proto, 1.0))
+    return float(np.median(ratios))
+
+
+def calibrate_alpha_from_diagnostics(df: pd.DataFrame) -> dict:
+    """Fit α for all protocols present in diagnostics DataFrame."""
+    alphas: dict[str, float] = {}
+    if "protocol" not in df.columns:
+        return alphas
+    for proto in df["protocol"].dropna().astype(str).str.upper().unique():
+        alphas[proto] = fit_alpha_proto(proto, df)
+    return alphas
+
+
+def load_alpha_proto(path: Path = ALPHA_PATH) -> dict:
+    """Load α_proto from JSON."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+    try:
+        with path.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    # Normalize keys to uppercase protocol names
+    return {str(k).upper(): float(v) for k, v in data.items()}
+
+
+def save_alpha_proto(alphas: dict, path: Path = ALPHA_PATH, merge: bool = True) -> dict:
+    """
+    Save α_proto to JSON.
+
+    If merge is True and a file already exists, merge new values into the existing
+    dict so protocols not present in this run keep their previous α.
+    """
+    path = Path(path)
+    existing = load_alpha_proto(path) if merge and path.exists() else {}
+    new_vals = {str(k).upper(): float(v) for k, v in (alphas or {}).items()}
+    merged = {**existing, **new_vals}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(merged, f, indent=2)
+    return merged
+
+
+def init_alpha_proto():
+    """
+    Load α_proto from last run, or fit from available diagnostics.
+
+    This should be called once at the beginning of the diagnostic pipeline.
+    """
+    global ALPHA_PROTO
+
+    alphas_loaded = load_alpha_proto(ALPHA_PATH)
+    if alphas_loaded:
+        print("🔄 Using α_proto from previous run:")
+        for proto, alpha in sorted(alphas_loaded.items()):
+            print(f"  {proto}: α = {alpha:.3f}")
+        ALPHA_PROTO.update(alphas_loaded)
+        return
+
+    print("📊 No alpha_proto.json found, fitting from historical diagnostics (if available)...")
+    try:
+        df_diag = load_diagnostics(DIAGNOSTIC_PATH)
+    except FileNotFoundError:
+        print(f"  No diagnostics file found at {DIAGNOSTIC_PATH}. Using default α_proto values.")
+        return
+
+    alphas = calibrate_alpha_from_diagnostics(df_diag)
+    if not alphas:
+        print("  Diagnostics did not contain usable data for α_proto tuning. Using defaults.")
+        return
+    merged = save_alpha_proto(alphas, ALPHA_PATH, merge=False)
+    ALPHA_PROTO.update(merged)
+    print("  Fitted α_proto from existing diagnostics and saved to alpha_proto.json.")
+
+
+def save_results_to_excel(df_results: pd.DataFrame, path: Path = DIAGNOSTIC_PATH) -> None:
+    """Save diagnostic results DataFrame to Excel (and ensure directory exists)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df_results.to_excel(path, index=False)
 
 # TLS 1.3 (QUIC/HTTP3) encryption overhead – CPU-bound
 # One-time handshake crypto (key exchange + cert verify); typical 1–5 ms on modern CPU
@@ -806,7 +930,10 @@ def run_pipeline(
         O_app = O_send + O_recv + O_broker
         # S in bits: from FL_DIAG payload_bytes * 8 (ensure int)
         S_bits_c = int(cal.get("S_bits", S_bits))
-        lossy_c = next((x for x in lossy_list if x.get("client_id") == cid), lossy_list[i] if i < len(lossy_list) else {})
+        lossy_c = next(
+            (x for x in lossy_list if x.get("client_id") == cid),
+            lossy_list[i] if i < len(lossy_list) else {},
+        )
         T_actual = lossy_c.get("T_total", 0.0)
         if i < len(docker_round_counts) and docker_round_counts[i] < 3:
             T_actual = 0.0
@@ -820,28 +947,55 @@ def run_pipeline(
             O_TLS = O_TLS_HANDSHAKE_S + (K_TLS_SEC_PER_BYTE * (S_bits_c / 8.0))
         # DEBUG: values used in T_calc (user-requested)
         debug_extra = f" | O_TLS: {O_TLS:.6f} s" if protocol in ("quic", "http3") else ""
-        print(f"DEBUG -> S: {S_bits_c} bits | B: {B} bps | RTT_eff: {RTT_eff} s | Loss (p): {p} | O_app: {O_app} s{debug_extra}")
+        print(
+            f"DEBUG -> S: {S_bits_c} bits | B: {B} bps | RTT_eff: {RTT_eff} s | "
+            f"Loss (p): {p} | O_app: {O_app} s{debug_extra}"
+        )
         transfer_s = transfer_time_bits_bps(S_bits_c, B_eff)
+        proto_key = protocol.upper()
+
+        # Protocol-specific network term (without α scaling; α is applied uniformly below)
         if protocol in ("mqtt", "amqp", "grpc"):
-            T_calc = (1.5 * RTT_eff) + transfer_s + O_app
-        elif protocol in ("quic", "http3"):
-            # HTTP/3 is QUIC-based; same analytical formula + TLS 1.3 encryption (CPU) overhead
-            # T_calc = 1*RTT_eff + (S/B) + p*(S/MSS)*RTT_eff + O_app + O_TLS
-            T_calc = (1 * RTT_eff) + transfer_time_bits_bps(S_bits_c, B) + (p * (S_bits_c / MSS_BITS) * RTT_eff) + O_app + O_TLS
+            if protocol == "mqtt":
+                network_term = (2.0 * RTT_eff) + transfer_s
+            else:
+                network_term = (1.5 * RTT_eff) + transfer_s
+        elif protocol == "quic":
+            loss_term = p * (S_bits_c / MSS_BITS) * RTT_eff
+            network_term = (1.0 * RTT_eff) + transfer_time_bits_bps(S_bits_c, B) + loss_term
+        elif protocol == "http3":
+            loss_term = p * (S_bits_c / MSS_BITS) * RTT_eff
+            network_term = (1.0 * RTT_eff) + transfer_time_bits_bps(S_bits_c, B) + loss_term
         else:
-            T_calc = transfer_time_bits_bps(S_bits_c, B) + (p * (S_bits_c / MSS_BITS) * (RTT_eff + T_REPAIR)) + O_app
-        error_pct = 100.0 * (T_actual - T_calc) / T_actual if T_actual else 0.0
-        summaries.append({
-            "client_id": cid,
-            "protocol": protocol.upper(),
-            "scenario": scenario,
-            "O_app": O_app,
-            "O_broker": O_broker,
-            "p": p,
-            "T_actual": T_actual,
-            "T_calc": T_calc,
-            "error_pct": error_pct,
-        })
+            # DDS-style: chunking/repair term
+            loss_term = p * (S_bits_c / MSS_BITS) * (RTT_eff + T_REPAIR)
+            network_term = transfer_time_bits_bps(S_bits_c, B) + loss_term
+
+        alpha = ALPHA_PROTO.get(proto_key, 1.0)
+        T_calc_raw = network_term + O_app + O_TLS
+        T_calc_tuned = alpha * network_term + O_app + O_TLS
+        error_pct_raw = 100.0 * abs(T_actual - T_calc_raw) / T_actual if T_actual else 0.0
+        error_pct_tuned = 100.0 * abs(T_actual - T_calc_tuned) / T_actual if T_actual else 0.0
+
+        summaries.append(
+            {
+                "client_id": cid,
+                "protocol": protocol.upper(),
+                "scenario": scenario,
+                "O_app": O_app,
+                "O_broker": O_broker,
+                "p": p,
+                "T_actual": T_actual,
+                "T_calc_raw": T_calc_raw,
+                "alpha_proto": alpha,
+                "T_calc_tuned": T_calc_tuned,
+                # Backwards-compatible keys:
+                "T_calc": T_calc_tuned,
+                "error_pct_raw": error_pct_raw,
+                "error_pct_tuned": error_pct_tuned,
+                "error_pct": error_pct_tuned,
+            }
+        )
 
     # If we had applied tc on the host (legacy host mode), clear it. With macvlan we use per-container tc only.
     if host_mode:
@@ -992,7 +1146,10 @@ def run_pipeline_native(
             O_recv = cal.get("O_recv", 0.0)
             O_app = O_send + O_recv + O_broker
             S_bits_c = int(cal.get("S_bits", S_bits))
-            lossy_c = next((x for x in lossy_list if x.get("client_id") == cid), lossy_list[i] if i < len(lossy_list) else {})
+            lossy_c = next(
+                (x for x in lossy_list if x.get("client_id") == cid),
+                lossy_list[i] if i < len(lossy_list) else {},
+            )
             T_actual = lossy_c.get("T_total", 0.0)
             # Require round index 1 for T_actual (round 2: client send affected by tc)
             if i < len(round_counts) and round_counts[i] < 2:
@@ -1005,26 +1162,54 @@ def run_pipeline_native(
             if protocol in ("quic", "http3"):
                 O_TLS = O_TLS_HANDSHAKE_S + (K_TLS_SEC_PER_BYTE * (S_bits_c / 8.0))
             debug_extra = f" | O_TLS: {O_TLS:.6f} s" if protocol in ("quic", "http3") else ""
-            print(f"DEBUG -> S: {S_bits_c} bits | B: {B} bps | RTT_eff: {RTT_eff} s | Loss (p): {p} | O_app: {O_app} s{debug_extra}")
+            print(
+                f"DEBUG -> S: {S_bits_c} bits | B: {B} bps | RTT_eff: {RTT_eff} s | "
+                f"Loss (p): {p} | O_app: {O_app} s{debug_extra}"
+            )
             transfer_s = transfer_time_bits_bps(S_bits_c, B_eff)
+            proto_key = protocol.upper()
+
+            # Protocol-specific network term (without α scaling; α is applied uniformly below)
             if protocol in ("mqtt", "amqp", "grpc"):
-                T_calc = (1.5 * RTT_eff) + transfer_s + O_app
-            elif protocol in ("quic", "http3"):
-                T_calc = (1 * RTT_eff) + transfer_time_bits_bps(S_bits_c, B) + (p * (S_bits_c / MSS_BITS) * RTT_eff) + O_app + O_TLS
+                if protocol == "mqtt":
+                    network_term = (2.0 * RTT_eff) + transfer_s
+                else:
+                    network_term = (1.5 * RTT_eff) + transfer_s
+            elif protocol == "quic":
+                loss_term = p * (S_bits_c / MSS_BITS) * RTT_eff
+                network_term = (1.0 * RTT_eff) + transfer_time_bits_bps(S_bits_c, B) + loss_term
+            elif protocol == "http3":
+                loss_term = p * (S_bits_c / MSS_BITS) * RTT_eff
+                network_term = (1.0 * RTT_eff) + transfer_time_bits_bps(S_bits_c, B) + loss_term
             else:
-                T_calc = transfer_time_bits_bps(S_bits_c, B) + (p * (S_bits_c / MSS_BITS) * (RTT_eff + T_REPAIR)) + O_app
-            error_pct = 100.0 * (T_actual - T_calc) / T_actual if T_actual else 0.0
-            summaries.append({
-                "client_id": cid,
-                "protocol": protocol.upper(),
-                "scenario": scenario,
-                "O_app": O_app,
-                "O_broker": O_broker,
-                "p": p,
-                "T_actual": T_actual,
-                "T_calc": T_calc,
-                "error_pct": error_pct,
-            })
+                loss_term = p * (S_bits_c / MSS_BITS) * (RTT_eff + T_REPAIR)
+                network_term = transfer_time_bits_bps(S_bits_c, B) + loss_term
+
+            alpha = ALPHA_PROTO.get(proto_key, 1.0)
+            T_calc_raw = network_term + O_app + O_TLS
+            T_calc_tuned = alpha * network_term + O_app + O_TLS
+            error_pct_raw = 100.0 * abs(T_actual - T_calc_raw) / T_actual if T_actual else 0.0
+            error_pct_tuned = 100.0 * abs(T_actual - T_calc_tuned) / T_actual if T_actual else 0.0
+
+            summaries.append(
+                {
+                    "client_id": cid,
+                    "protocol": protocol.upper(),
+                    "scenario": scenario,
+                    "O_app": O_app,
+                    "O_broker": O_broker,
+                    "p": p,
+                    "T_actual": T_actual,
+                    "T_calc_raw": T_calc_raw,
+                    "alpha_proto": alpha,
+                    "T_calc_tuned": T_calc_tuned,
+                    # Backwards-compatible keys:
+                    "T_calc": T_calc_tuned,
+                    "error_pct_raw": error_pct_raw,
+                    "error_pct_tuned": error_pct_tuned,
+                    "error_pct": error_pct_tuned,
+                }
+            )
         return summaries
     finally:
         if orig_env_num_rounds is not None:
@@ -1061,6 +1246,10 @@ def _all_scenario_choices():
 
 
 def main():
+    # Load or initialize α_proto BEFORE running any diagnostics so all T_calc
+    # computations for this run use the latest calibrated values.
+    init_alpha_proto()
+
     parser = argparse.ArgumentParser(
         description="Diagnostic pipeline: Empirical overhead, network extraction, analytical model. Supports multiple protocols and scenarios.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1184,6 +1373,40 @@ def main():
     if not summary:
         print("No diagnostic results (all runs failed or no protocol/scenario).", file=sys.stderr)
         sys.exit(1)
+
+    # Build DataFrame, save diagnostics, and perform mandatory α_proto refit
+    try:
+        df_results = pd.DataFrame(summary)
+    except Exception as e:
+        df_results = None
+        print(f"Warning: could not create DataFrame from diagnostic results: {e}", flush=True)
+
+    if df_results is not None and not df_results.empty:
+        try:
+            save_results_to_excel(df_results, DIAGNOSTIC_PATH)
+            print(f"\nDiagnostics saved to Excel at {DIAGNOSTIC_PATH}")
+        except Exception as e:
+            print(f"Warning: could not write diagnostics Excel to {DIAGNOSTIC_PATH}: {e}", flush=True)
+
+        # NEW: Mandatory α_proto refit and save based on this run
+        print("\n=== MANDATORY: Updating α_proto from this run's diagnostics ===")
+        try:
+            df_diag = load_diagnostics(DIAGNOSTIC_PATH)
+            alphas = calibrate_alpha_from_diagnostics(df_diag)
+            if alphas:
+                merged = save_alpha_proto(alphas, ALPHA_PATH, merge=True)
+                # Update in-memory ALPHA_PROTO for any subsequent use in this process
+                ALPHA_PROTO.update(merged)
+                print("✅ α_proto updated and saved to alpha_proto.json")
+                print("Next run will use these values:")
+                for proto, alpha in sorted(merged.items()):
+                    print(f"  {proto}: α = {float(alpha):.3f}")
+            else:
+                print("No valid diagnostics rows found for α_proto calibration; keeping existing values.")
+        except FileNotFoundError:
+            print(f"Diagnostics file {DIAGNOSTIC_PATH} not found; skipping α_proto update.", flush=True)
+        except Exception as e:
+            print(f"Warning: could not calibrate α_proto from diagnostics: {e}", flush=True)
     print("\n" + "=" * 60)
     print("Combined results (all protocols × scenarios)")
     print("=" * 60)

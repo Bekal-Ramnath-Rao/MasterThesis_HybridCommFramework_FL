@@ -6,7 +6,6 @@ import json
 import pickle
 import base64
 import time
-import random
 import pika
 
 # Detect Docker environment and set project root accordingly
@@ -99,6 +98,14 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+
+# AMQP delivery mode: 2=persistent (default), 1=non-persistent (for diagnostics/experiments)
+try:
+    AMQP_DELIVERY_MODE = int(os.getenv("AMQP_DELIVERY_MODE", "2"))
+except (TypeError, ValueError):
+    AMQP_DELIVERY_MODE = 2
+if AMQP_DELIVERY_MODE not in (1, 2):
+    AMQP_DELIVERY_MODE = 2
 
 # AMQP Exchanges and Queues
 EXCHANGE_BROADCAST = "fl_broadcast"
@@ -311,7 +318,7 @@ class FederatedLearningClient:
         for attempt in range(max_retries):
             try:
                 if properties is None:
-                    properties = pika.BasicProperties(delivery_mode=2)
+                    properties = pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
                     
                 self.channel.basic_publish(
                     exchange=exchange,
@@ -354,7 +361,7 @@ class FederatedLearningClient:
             exchange=EXCHANGE_CLIENT_UPDATES,
             routing_key='client.register',
             body=json.dumps(registration),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         ):
             log_sent_packet(
                 packet_size=len(json.dumps(registration)),
@@ -629,19 +636,17 @@ class FederatedLearningClient:
             send_start_ts = time.time()
             send_start_cpu = time.perf_counter()
             update_message["diagnostic_send_start_ts"] = send_start_ts
-        
-        # Introduce random delay before sending model update
-        delay = random.uniform(0.5, 3.0)  # Random delay between 0.5 and 3.0 seconds
-        print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
-        time.sleep(delay)
-        
+
+        # FAIR FIX: Removed random pre-send delay so AMQP matches other protocols and
+        # diagnostic pipeline measurements are not biased by artificial sleep.
+
         payload = json.dumps(update_message)
         # Publish with retry logic
         if self.publish_with_retry(
             exchange=EXCHANGE_CLIENT_UPDATES,
             routing_key='client.update',
             body=payload,
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         ):
             if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
                 send_end_cpu = time.perf_counter()
@@ -704,7 +709,7 @@ class FederatedLearningClient:
             exchange=EXCHANGE_CLIENT_UPDATES,
             routing_key='client.metrics',
             body=json.dumps(metrics_message),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         ):
             print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
             log_sent_packet(

@@ -1708,6 +1708,8 @@ class UnifiedFLClient_Emotion:
             # Reliable QoS handles delivery, no need for artificial delay
             if (chunk_id + 1) % 20 == 0:  # Progress update every 20 chunks
                 print(f"  Sent {chunk_id + 1}/{total_chunks} chunks")
+        
+        return total_chunks
     
     def deserialize_weights(self, encoded_weights):
         """Deserialize model weights received from server"""
@@ -3003,7 +3005,7 @@ class UnifiedFLClient_Emotion:
             weights_list = list(weights_bytes)  # Convert bytes to List[int]
             
             # FAIR CONFIG: Use chunking to match standalone DDS implementation
-            self.send_model_update_chunked(
+            total_chunks = self.send_model_update_chunked(
                 round_num=message['round'],
                 serialized_weights=weights_list,
                 num_samples=message.get('num_samples', 0),
@@ -3013,13 +3015,13 @@ class UnifiedFLClient_Emotion:
                 mape=message.get('mape', 0.0)
             )
             
-            # Log the packet (log total size, not individual chunks)
+            # Log the packet (log total size, plus chunk count metadata)
             log_sent_packet(
                 packet_size=len(weights_bytes),
                 peer="server",
                 protocol="DDS",
                 round=self.current_round,
-                extra_info="model_update_chunked"
+                extra_info=f"model_update_chunked total_chunks={total_chunks}"
             )
             
             print(f"Client {self.client_id} sent chunked model update for round {self.current_round} via DDS")

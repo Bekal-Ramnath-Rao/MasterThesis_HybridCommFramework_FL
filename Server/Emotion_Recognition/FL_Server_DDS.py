@@ -516,7 +516,6 @@ class FederatedLearningServer:
             time.sleep(0.5)
         if len(self.ready_clients) < self.num_clients:
             print(f"[WARNING] Only {len(self.ready_clients)}/{self.num_clients} clients signaled ready. Proceeding anyway.")
-        time.sleep(1)
 
         # Send initial global model in a single message
         print("Publishing initial model to clients...")
@@ -525,7 +524,7 @@ class FederatedLearningServer:
         
         # Wait for clients to receive and set the initial model
         print("Waiting for clients to receive and build the model...")
-        time.sleep(3)
+        time.sleep(2)
         
         print(f"\n{'='*70}")
         print(f"Starting Round {self.current_round}/{self.num_rounds}")

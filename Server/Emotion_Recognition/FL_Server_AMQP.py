@@ -47,6 +47,14 @@ AMQP_HOST = os.getenv("AMQP_HOST", "localhost")
 AMQP_PORT = int(os.getenv("AMQP_PORT", "5672"))
 AMQP_USER = os.getenv("AMQP_USER", "guest")
 AMQP_PASSWORD = os.getenv("AMQP_PASSWORD", "guest")
+
+# AMQP delivery mode: 2=persistent (default), 1=non-persistent (for diagnostics/experiments)
+try:
+    AMQP_DELIVERY_MODE = int(os.getenv("AMQP_DELIVERY_MODE", "2"))
+except (TypeError, ValueError):
+    AMQP_DELIVERY_MODE = 2
+if AMQP_DELIVERY_MODE not in (1, 2):
+    AMQP_DELIVERY_MODE = 2
 # Dynamic client configuration
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
@@ -416,7 +424,7 @@ class FederatedLearningServer:
                 "message_type": "training_config",
                 "config": self.training_config
             }),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         )
         
         self.current_round = 1
@@ -476,7 +484,7 @@ class FederatedLearningServer:
             exchange=EXCHANGE_BROADCAST,
             routing_key='',
             body=message_json,
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         )
         log_sent_packet(
             packet_size=message_size,
@@ -505,7 +513,7 @@ class FederatedLearningServer:
                 "message_type": "start_training",
                 "round": self.current_round
             }),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         )
         print("Start training signal sent successfully\n")
     
@@ -533,7 +541,7 @@ class FederatedLearningServer:
             exchange=EXCHANGE_BROADCAST,
             routing_key='',
             body=json.dumps(msg),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         )
         print(f"Current global model (round {self.current_round}) sent to client {client_id} (broadcast)")
     
@@ -586,7 +594,7 @@ class FederatedLearningServer:
             exchange=EXCHANGE_BROADCAST,
             routing_key='',
             body=json.dumps(global_model_message),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         )
         message_size = len(json.dumps(global_model_message).encode('utf-8'))
         log_sent_packet(
@@ -608,7 +616,7 @@ class FederatedLearningServer:
                 "message_type": "start_evaluation",
                 "round": self.current_round
             }),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         )
         log_sent_packet(
             packet_size=len(json.dumps({
@@ -682,7 +690,7 @@ class FederatedLearningServer:
                     "message_type": "start_training",
                     "round": self.current_round
                 }),
-                properties=pika.BasicProperties(delivery_mode=2)
+                properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
             )
             log_sent_packet(
                 packet_size=len(json.dumps({
@@ -742,7 +750,7 @@ class FederatedLearningServer:
             body=json.dumps({
                 "message_type": "training_complete"
             }),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         )
         log_sent_packet(
             packet_size=len(json.dumps({

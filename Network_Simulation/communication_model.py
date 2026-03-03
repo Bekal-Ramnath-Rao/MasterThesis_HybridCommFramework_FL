@@ -20,6 +20,9 @@ from typing import Dict, Optional, Tuple
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 
+# Shared path for α_proto JSON (kept in shared_data, updated by diagnostic pipeline)
+ALPHA_PATH = PROJECT_ROOT / "shared_data" / "alpha_proto.json"
+
 # Default iperf3 server port
 IPERF3_PORT = int(os.environ.get("IPERF3_PORT", "5201"))
 
@@ -28,6 +31,40 @@ MSS_BITS = 11680
 T_REPAIR = 0.005
 O_TLS_HANDSHAKE_S = float(os.environ.get("O_TLS_HANDSHAKE_S", "0.003"))
 K_TLS_SEC_PER_BYTE = float(os.environ.get("K_TLS_SEC_PER_BYTE", "2e-8"))
+
+# Protocol-specific scaling factors α_proto for analytical network term
+ALPHA_PROTO = {
+    "MQTT": 1.8,
+    "AMQP": 2.1,
+    "GRPC": 1.7,
+    "QUIC": 1.0,
+    "HTTP3": 4.5,
+    "DDS": 8.2,
+}
+
+
+def load_alpha_proto(path: Optional[Path] = None) -> Dict[str, float]:
+    """Load α_proto from JSON if available."""
+    p = Path(path) if path is not None else ALPHA_PATH
+    if not p.exists():
+        return {}
+    try:
+        with p.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    return {str(k).upper(): float(v) for k, v in data.items()}
+
+
+def init_alpha_proto_from_disk() -> None:
+    """
+    Initialize ALPHA_PROTO from the persisted alpha_proto.json produced
+    by the diagnostic pipeline, if present.
+    """
+    global ALPHA_PROTO
+    loaded = load_alpha_proto(ALPHA_PATH)
+    if loaded:
+        ALPHA_PROTO.update(loaded)
 
 
 def _run_iperf3_cmd(cmd: list, timeout_sec: int = 30, cwd: Optional[str] = None) -> Tuple[bool, str, str]:
@@ -68,7 +105,7 @@ def _parse_iperf3_json(stdout: str) -> Dict:
     if bps is not None:
         out["bandwidth_bps"] = float(bps)
 
-    # UDP: jitter_ms, lost_packets, packets
+    # UDP: jitter_ms, lost_packets, packets, optional latency_ms
     jitter_ms = sum_recv.get("jitter_ms") or sum_sent.get("jitter_ms")
     if jitter_ms is not None:
         out["jitter_ms"] = float(jitter_ms)
@@ -80,6 +117,20 @@ def _parse_iperf3_json(stdout: str) -> Dict:
         pct = (sum_recv or sum_sent).get("lost_percent")
         if pct is not None:
             out["loss_fraction"] = float(pct) / 100.0
+
+    # Some iperf3 UDP builds expose latency_ms per-stream; take max or first available
+    try:
+        streams = (end.get("streams") or []) if isinstance(end, dict) else []
+        latencies = []
+        for s in streams:
+            udp_section = s.get("udp") or s.get("sum", {})
+            if isinstance(udp_section, dict) and "latency_ms" in udp_section:
+                latencies.append(float(udp_section.get("latency_ms")))
+        if latencies:
+            out["latency_ms"] = max(latencies)
+    except Exception:
+        # Best-effort; latency may not be available in all iperf3 versions
+        pass
 
     return out
 
@@ -213,9 +264,15 @@ def network_params_to_t_calc_input(params: Dict, scenario_fallback: Optional[Dic
     jitter_ms = params.get("jitter_ms")
     J = (float(jitter_ms) / 1000.0) if jitter_ms is not None else 0.0
     p = float(params.get("loss_fraction") or 0.0)
-    # Delay: iperf3 does not report RTT; use scenario or 0
+    # Delay: prefer iperf3 latency_ms when available, else scenario fallback
     D_tc = 0.0
-    if scenario_fallback:
+    latency_ms = params.get("latency_ms")
+    if latency_ms is not None:
+        try:
+            D_tc = float(latency_ms) / 1000.0
+        except (TypeError, ValueError):
+            D_tc = 0.0
+    if D_tc == 0.0 and scenario_fallback:
         lat = (scenario_fallback.get("latency") or "0").strip().lower()
         if lat:
             import re
@@ -252,18 +309,35 @@ def compute_t_calc(
         B_eff = B_bps
     transfer_s = transfer_time_bits_bps(float(S_bits), B_eff)
 
-    if protocol in ("mqtt", "amqp", "grpc"):
-        if p > 0 and RTT_eff > 0:
-            B_eff = min(B_bps, MSS_BITS / (RTT_eff * math.sqrt(p))) if math.isfinite(B_bps) else B_bps
-            transfer_s = transfer_time_bits_bps(float(S_bits), B_eff)
-        return (1.5 * RTT_eff) + transfer_s + O_app
+    proto_key = protocol.upper()
 
+    # QUIC/HTTP3 TLS overhead (not scaled by α)
+    O_TLS = 0.0
     if protocol in ("quic", "http3"):
         O_TLS = O_TLS_HANDSHAKE_S + (K_TLS_SEC_PER_BYTE * (S_bits / 8.0))
-        return (1.0 * RTT_eff) + transfer_time_bits_bps(S_bits, B_bps) + (p * (S_bits / MSS_BITS) * RTT_eff) + O_app + O_TLS
 
-    # dds or other
-    return transfer_s + (p * (S_bits / MSS_BITS) * (RTT_eff + T_REPAIR)) + O_app
+    # Protocol-specific network term without α scaling; α is applied uniformly below
+    if protocol in ("mqtt", "amqp", "grpc"):
+        if p > 0 and RTT_eff > 0 and math.isfinite(B_bps):
+            B_eff = min(B_bps, MSS_BITS / (RTT_eff * math.sqrt(p)))
+            transfer_s = transfer_time_bits_bps(float(S_bits), B_eff)
+        if protocol == "mqtt":
+            network_term = (2.0 * RTT_eff) + transfer_s
+        else:
+            network_term = (1.5 * RTT_eff) + transfer_s
+    elif protocol == "quic":
+        loss_term = p * (S_bits / MSS_BITS) * RTT_eff
+        network_term = (1.0 * RTT_eff) + transfer_time_bits_bps(S_bits, B_bps) + loss_term
+    elif protocol == "http3":
+        loss_term = p * (S_bits / MSS_BITS) * RTT_eff
+        network_term = (1.0 * RTT_eff) + transfer_time_bits_bps(S_bits, B_bps) + loss_term
+    else:
+        # dds or other
+        loss_term = p * (S_bits / MSS_BITS) * (RTT_eff + T_REPAIR)
+        network_term = transfer_s + loss_term
+
+    alpha = ALPHA_PROTO.get(proto_key, 1.0)
+    return alpha * network_term + O_app + O_TLS
 
 
 def get_t_calc_for_reward(
@@ -275,8 +349,13 @@ def get_t_calc_for_reward(
     """
     Load network params from iperf3 JSON and compute T_calc for the given protocol.
     Used by RL client to pass t_calc into calculate_reward (high T_calc -> more negative reward).
+    Ensures that the latest calibrated α_proto values from alpha_proto.json are used.
     Returns None if params unavailable.
     """
+    # Ensure α_proto is initialized from disk before computing T_calc so RL
+    # rewards reflect the latest tuned analytical model.
+    init_alpha_proto_from_disk()
+
     params = load_network_params(json_path)
     if not params:
         return None
@@ -286,6 +365,9 @@ def get_t_calc_for_reward(
 
 
 if __name__ == "__main__":
+    # Ensure α_proto reflects the latest calibration if available on disk
+    init_alpha_proto_from_disk()
+
     # Quick test: run native iperf3 if server given
     server = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
     print(f"Running iperf3 (native) to {server}...")
