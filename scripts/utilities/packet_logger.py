@@ -110,6 +110,40 @@ def log_received_packet(packet_size, peer, protocol, round=None, extra_info=None
     except Exception as e:
         print(f"Server error logging received packet: {e}")
 
+
+def get_round_bytes_sent_received(round_num, protocol=None):
+    """
+    Return total bytes sent and received for a given round (optionally for a specific protocol).
+    protocol is case-insensitive (e.g. 'mqtt' or 'MQTT').
+    Returns (bytes_sent, bytes_recv); (0, 0) on error or missing tables.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        protocol_upper = protocol.upper() if protocol else None
+        if protocol_upper:
+            c.execute(
+                'SELECT COALESCE(SUM(packet_size), 0) FROM sent_packets WHERE round = ? AND protocol = ?',
+                (round_num, protocol_upper)
+            )
+            sent = c.fetchone()[0] or 0
+            c.execute(
+                'SELECT COALESCE(SUM(packet_size), 0) FROM received_packets WHERE round = ? AND protocol = ?',
+                (round_num, protocol_upper)
+            )
+            recv = c.fetchone()[0] or 0
+        else:
+            c.execute('SELECT COALESCE(SUM(packet_size), 0) FROM sent_packets WHERE round = ?', (round_num,))
+            sent = c.fetchone()[0] or 0
+            c.execute('SELECT COALESCE(SUM(packet_size), 0) FROM received_packets WHERE round = ?', (round_num,))
+            recv = c.fetchone()[0] or 0
+        conn.close()
+        return (int(sent), int(recv))
+    except Exception as e:
+        print(f"[PacketLogger] get_round_bytes_sent_received error: {e}")
+        return (0, 0)
+
+
 if __name__ == "__main__":
     init_db()
     # Example usage:

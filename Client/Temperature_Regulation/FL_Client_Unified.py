@@ -186,7 +186,24 @@ class UnifiedFLClient_Temperature:
                 return 'mqtt'
         else:
             return os.getenv("DEFAULT_PROTOCOL", "mqtt").lower()
-    
+
+    def _shared_data_dir(self):
+        if os.path.exists("/shared_data"):
+            return "/shared_data"
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(base, "shared_data")
+
+    def _get_t_calc_for_reward(self, protocol: str, payload_bytes: int):
+        try:
+            import sys
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "Network_Simulation"))
+            from communication_model import get_t_calc_for_reward
+            from pathlib import Path
+            path = Path(self._shared_data_dir()) / "iperf3_network_params.json"
+            return get_t_calc_for_reward(protocol, payload_bytes, json_path=path)
+        except Exception:
+            return None
+
     def train_local_model(self) -> Dict:
         """Train model locally using real temperature data"""
         if self.model is None:
@@ -299,15 +316,18 @@ class UnifiedFLClient_Temperature:
             self.round_metrics['accuracy'] = train_metrics['val_accuracy']
             self.round_metrics['success'] = True
             
-            # Update RL
+            # Update RL (T_calc from communication model: high T_calc -> more negative reward)
             if USE_RL_SELECTION and self.rl_selector and self.env_manager:
                 resources = self.env_manager.get_resource_consumption()
+                payload_bytes = self.round_metrics.get('payload_bytes', 12 * 1024 * 1024)
+                t_calc = self._get_t_calc_for_reward(protocol, payload_bytes)
                 reward = self.rl_selector.calculate_reward(
                     self.round_metrics['communication_time'],
                     self.round_metrics['success'],
                     self.round_metrics['convergence_time'],
                     self.round_metrics['accuracy'],
-                    resources
+                    resources,
+                    t_calc=t_calc,
                 )
                 self.rl_selector.update_q_value(reward, done=False)
                 print(f"[RL] Reward: {reward:.2f}")

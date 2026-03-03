@@ -150,53 +150,65 @@ class QLearningProtocolSelector:
         success: bool,
         convergence_time: float,
         accuracy: float,
-        resource_consumption: Dict[str, float]
+        resource_consumption: Dict[str, float],
+        t_calc: Optional[float] = None,
     ) -> float:
         """
-        Calculate reward based on multiple metrics
-        
+        Calculate reward based on multiple metrics.
+        When t_calc (analytical transfer time from communication model) is provided,
+        higher T_calc penalizes reward; lower T_calc affects reward less negatively.
+
         Args:
             communication_time: Time for round-trip communication (seconds)
             success: Whether communication was successful
             convergence_time: Time for model convergence (seconds)
             accuracy: Model accuracy (0-1)
             resource_consumption: Dict with cpu, memory, bandwidth usage
-            
+            t_calc: Optional analytical transfer time (seconds). If set, high T_calc
+                    reduces reward; low T_calc reduces reward less (communication model impact).
+
         Returns:
             Calculated reward value
         """
         # Base reward for successful communication
         if not success:
             return -10.0  # Large penalty for failure
-        
+
         reward = 10.0  # Base reward for success
-        
+
         # 1. Communication time reward (faster is better)
         # Normalize: 0-3600 seconds (1 hour) -> reward 5 to 0
-        # This allows differentiation even in poor/very_poor network conditions
         time_reward = max(0, 5.0 - (communication_time / 720.0))
         reward += time_reward
-        
+
         # 2. Convergence time reward (faster is better)
-        # Normalize: 0-100 seconds -> reward 5 to 0
         conv_reward = max(0, 5.0 - (convergence_time / 20.0))
         reward += conv_reward
-        
+
         # 3. Accuracy reward (higher is better)
-        # Scale accuracy (0-1) to reward (0-10)
         accuracy_reward = accuracy * 10.0
         reward += accuracy_reward
-        
+
         # 4. Resource consumption penalty (lower is better)
         cpu_usage = resource_consumption.get('cpu', 0.5)
         memory_usage = resource_consumption.get('memory', 0.5)
         bandwidth_usage = resource_consumption.get('bandwidth', 0.5)
-        
-        # Average resource usage (0-1) converted to penalty (0 to -5)
         avg_resource = (cpu_usage + memory_usage + bandwidth_usage) / 3.0
         resource_penalty = -5.0 * avg_resource
         reward += resource_penalty
-        
+
+        # 4b. Battery-aware penalty: when SoC is low, energy consumption hurts more
+        battery_level = resource_consumption.get('battery', 1.0)
+        energy_norm = resource_consumption.get('energy', 0.0)
+        low_batt_penalty = -5.0 * (1.0 - battery_level) * energy_norm
+        reward += low_batt_penalty
+
+        # 5. T_calc (communication model): higher T_calc -> more negative reward; lower T_calc -> less penalty
+        if t_calc is not None and t_calc >= 0:
+            # Penalty scale: e.g. T_calc 0->0 penalty, 10s->-2.5, 30s->-5 (cap)
+            t_calc_penalty = min(5.0, t_calc * 0.5)
+            reward -= t_calc_penalty
+
         return reward
     
     def update_q_value(
@@ -494,6 +506,10 @@ class QLearningProtocolSelector:
         print(f"[Q-Learning] Q-table reset complete. Starting fresh with {len(self.PROTOCOLS)} protocols: {self.PROTOCOLS}")
 
 
+# Reference energy (J) for normalizing last-round energy in get_resource_consumption
+E_REF = 10.0
+
+
 class EnvironmentStateManager:
     """
     Manages environment state for RL agent
@@ -512,7 +528,16 @@ class EnvironmentStateManager:
         self.cpu_usage_history = []
         self.memory_usage_history = []
         self.bandwidth_usage_history = []
-        
+
+        # Battery / energy state (continuous; not part of Q-table state space)
+        self.battery_soc = 1.0  # state of charge [0, 1]
+        self.last_energy_j = 0.0  # Joules used in the last round
+
+    def update_battery(self, soc: float, last_energy_j: float) -> None:
+        """Update battery state of charge [0,1] and last-round energy in Joules."""
+        self.battery_soc = max(0.0, min(1.0, soc))
+        self.last_energy_j = max(0.0, last_energy_j)
+
     def update_network_condition(self, condition: str):
         """Update network condition"""
         if condition in QLearningProtocolSelector.NETWORK_CONDITIONS:
@@ -583,27 +608,37 @@ class EnvironmentStateManager:
     def get_resource_consumption(self) -> Dict[str, float]:
         """
         Get current resource consumption metrics
-        
+
         Returns:
-            Dictionary with normalized (0-1) resource usage
+            Dictionary with normalized (0-1) resource usage, plus battery and energy.
         """
         try:
             import psutil
-            
+
             cpu = psutil.cpu_percent(interval=0.1) / 100.0
             memory = psutil.virtual_memory().percent / 100.0
-            
+
             # Bandwidth estimation (simplified)
             net_io = psutil.net_io_counters()
             bandwidth = min(1.0, (net_io.bytes_sent + net_io.bytes_recv) / 1e9)
-            
+
+            energy_norm = min(1.0, self.last_energy_j / E_REF)
+
             return {
                 'cpu': cpu,
                 'memory': memory,
-                'bandwidth': bandwidth
+                'bandwidth': bandwidth,
+                'battery': self.battery_soc,
+                'energy': energy_norm,
             }
-        except:
-            return {'cpu': 0.5, 'memory': 0.5, 'bandwidth': 0.5}
+        except Exception:
+            return {
+                'cpu': 0.5,
+                'memory': 0.5,
+                'bandwidth': 0.5,
+                'battery': getattr(self, 'battery_soc', 1.0),
+                'energy': min(1.0, getattr(self, 'last_energy_j', 0.0) / E_REF),
+            }
 
 
 if __name__ == "__main__":

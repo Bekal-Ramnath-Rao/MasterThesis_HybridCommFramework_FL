@@ -23,6 +23,10 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 
+# Use iperf3 for network params (client-side) when set; else use tc extraction
+USE_IPERF3 = os.environ.get("USE_IPERF3", "1").strip().lower() in ("1", "true", "yes")
+IPERF3_DURATION = int(os.environ.get("IPERF3_DURATION", "5"))
+
 # Constants
 MSS_BITS = 11680
 T_REPAIR = 0.005  # seconds
@@ -664,25 +668,64 @@ def run_pipeline(
             except Exception as e:
                 print(f"          WARNING: Could not apply scenario to {sc}: {e}")
         print(f"          Applied to both clients: {conditions.get('name', scenario)}")
-        print("[Phase 2] Extracting tc parameters from sender container...")
-        tc = extract_tc_params(sender_containers[0])
-        B, p, D_tc, J = tc["B"], tc["p"], tc["D_tc"], tc["J"]
-        # No bandwidth in tc (unconstrained Docker bridge) -> use scenario B so S/B is well-defined
+        B, p, D_tc, J = None, None, None, None
+        params = {}
+        if USE_IPERF3:
+            # Collect network parameters using iperf3 from client container (client egress = tc applied)
+            sys.path.insert(0, str(SCRIPT_DIR))
+            try:
+                from communication_model import (
+                    run_iperf3_docker,
+                    load_network_params,
+                    network_params_to_t_calc_input,
+                )
+                iperf3_out = PROJECT_ROOT / "shared_data" / "iperf3_network_params.json"
+                iperf3_out.parent.mkdir(parents=True, exist_ok=True)
+                # Start iperf3 server on receiver so client can measure to it
+                run_cmd(
+                    ["docker", "exec", "-d", receiver_container, "iperf3", "-s"],
+                    check=False,
+                )
+                time.sleep(2)
+                print("[Phase 2] Running iperf3 from client container to get network params...")
+                run_iperf3_docker(
+                    sender_containers[0],
+                    server_host=receiver_container,
+                    server_port=5201,
+                    duration_sec=min(IPERF3_DURATION, 10),
+                    use_udp=True,
+                    output_json_path=iperf3_out,
+                )
+                run_cmd(
+                    ["docker", "exec", receiver_container, "pkill", "-x", "iperf3"],
+                    check=False,
+                )
+                params = load_network_params(iperf3_out)
+                if params:
+                    B, D_tc, J, p = network_params_to_t_calc_input(params, scenario_fallback=conditions)
+                    print(f"          iperf3: B={B} bps, p={p}, D_tc={D_tc}, J={J} (D from scenario)")
+            except Exception as e:
+                print(f"          iperf3 failed ({e}); falling back to tc.")
+        if B is None or p is None:
+            print("[Phase 2] Extracting tc parameters from sender container...")
+            tc = extract_tc_params(sender_containers[0])
+            B, p, D_tc, J = tc["B"], tc["p"], tc["D_tc"], tc["J"]
+        # No bandwidth (unconstrained Docker bridge) -> use scenario B so S/B is well-defined
         if B == float("inf"):
             B = _scenario_bandwidth_bps(conditions)
             if p == 0 and D_tc == 0 and J == 0:
                 p = _scenario_loss_decimal(conditions)
                 D_tc, J = _scenario_delay_jitter_sec(conditions)
-            print(f"          No tc rate found; using scenario-derived B={B} bps, p={p}, D_tc={D_tc}, J={J}")
+            if not (USE_IPERF3 and params):
+                print(f"          No tc rate found; using scenario-derived B={B} bps, p={p}, D_tc={D_tc}, J={J}")
         elif B != float("inf") and (B < 1e6 or B <= 0) and conditions.get("bandwidth"):
-            # Extracted B too small or invalid (e.g. burst 32kbit); use scenario bandwidth
             B = _scenario_bandwidth_bps(conditions)
-            print(f"          Using scenario bandwidth (extracted B was {tc['B']:.0f} bps): B={B}")
-        # If tc did not report loss/delay/jitter (e.g. netem format), use scenario so T_calc matches scenario
+            print(f"          Using scenario bandwidth: B={B}")
         if p == 0 and D_tc == 0 and J == 0 and (conditions.get("loss") or conditions.get("latency")):
             p = _scenario_loss_decimal(conditions)
             D_tc, J = _scenario_delay_jitter_sec(conditions)
-            print(f"          Tc had no loss/delay; using scenario p={p}, D_tc={D_tc}, J={J} for analytical model.")
+            if not (USE_IPERF3 and params):
+                print(f"          Tc had no loss/delay; using scenario p={p}, D_tc={D_tc}, J={J} for analytical model.")
     RTT_eff = D_tc + J
     time.sleep(2)
 
@@ -849,6 +892,19 @@ def run_pipeline_native(
         code = runner.run()
         if code != 0:
             print(f"[WARNING] Run exited with code {code}; parsing available logs.")
+
+        # Native: load iperf3 params from client (written during run when FL_DIAGNOSTIC_PIPELINE=1)
+        if USE_IPERF3:
+            try:
+                from communication_model import load_network_params, network_params_to_t_calc_input
+                iperf3_path = PROJECT_ROOT / "shared_data" / "iperf3_network_params.json"
+                params = load_network_params(iperf3_path)
+                if params:
+                    B, D_tc, J, p = network_params_to_t_calc_input(params, scenario_fallback=conditions)
+                    RTT_eff = D_tc + J
+                    print(f"          Native: using iperf3 params from client: B={B} bps, p={p}, D_tc={D_tc}, J={J}")
+            except Exception as e:
+                print(f"          Native: iperf3 params not available ({e}); using scenario.")
 
         # Phase 3: O_app from round index 0 (round 1, no tc), T_actual from round index 1 (round 2, with tc).
         cal_list = parse_fl_diag_from_logs_native(log_dir, 0, num_clients)

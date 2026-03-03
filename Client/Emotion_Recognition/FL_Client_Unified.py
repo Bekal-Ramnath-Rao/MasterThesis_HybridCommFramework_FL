@@ -240,7 +240,7 @@ _utilities_path = os.path.join(project_root, 'scripts', 'utilities')
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 
-from packet_logger import init_db, log_sent_packet, log_received_packet
+from packet_logger import init_db, log_sent_packet, log_received_packet, get_round_bytes_sent_received
 try:
     from q_learning_logger import init_db as init_qlearning_db, log_q_step
 except ImportError:
@@ -287,6 +287,29 @@ MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 USE_QL_CONVERGENCE = os.getenv("USE_QL_CONVERGENCE", "false").lower() == "true"
 Q_CONVERGENCE_THRESHOLD = float(os.getenv("Q_CONVERGENCE_THRESHOLD", "0.01"))
 Q_CONVERGENCE_PATIENCE = int(os.getenv("Q_CONVERGENCE_PATIENCE", "5"))
+
+# Energy / battery model constants (tunable)
+k_tx = 1e-8
+k_rx = 1e-8
+E_fixed = 0.1  # J
+P_CPU_MAX = 10.0  # W
+BATTERY_CAP_J = 60.0 * 3600.0  # 60 Wh example capacity (Joules)
+PROTOCOL_ENERGY_ALPHA = {
+    "mqtt": 1.0,
+    "amqp": 1.1,
+    "grpc": 1.2,
+    "quic": 1.1,
+    "http3": 1.25,
+    "dds": 1.1,
+}
+PROTOCOL_CPU_BETA = {
+    "mqtt": 1.0,
+    "amqp": 1.05,
+    "grpc": 1.1,
+    "quic": 1.05,
+    "http3": 1.15,
+    "dds": 1.0,
+}
 
 # MQTT Configuration
 MQTT_BROKER = os.getenv("MQTT_BROKER", 'localhost')
@@ -1514,6 +1537,44 @@ class UnifiedFLClient_Emotion:
         except Exception as e:
             print(f"[Network] Failed to measure network condition: {e}")
 
+    def _shared_data_dir(self):
+        """Resolve shared_data path (Docker: /shared_data; native: project shared_data)."""
+        if os.path.exists("/shared_data"):
+            return "/shared_data"
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(base, "shared_data")
+
+    def _get_t_calc_for_reward(self, protocol: str, payload_bytes: int) -> Optional[float]:
+        """Get T_calc from communication model (iperf3 JSON) for reward; None if unavailable."""
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "Network_Simulation"))
+            from communication_model import get_t_calc_for_reward
+            from pathlib import Path
+            shared = self._shared_data_dir()
+            path = Path(shared) / "iperf3_network_params.json"
+            return get_t_calc_for_reward(protocol, payload_bytes, json_path=path)
+        except Exception:
+            return None
+
+    def _run_iperf3_if_diagnostic(self):
+        """When FL_DIAGNOSTIC_PIPELINE=1 and current_round==1, run iperf3 from client and write to shared_data."""
+        if not os.environ.get("FL_DIAGNOSTIC_PIPELINE", "").strip() in ("1", "true", "yes"):
+            return
+        if getattr(self, "current_round", 0) != 1:
+            return
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "Network_Simulation"))
+            from communication_model import run_iperf3_native
+            from pathlib import Path
+            server_host = os.getenv("MQTT_BROKER") or os.getenv("GRPC_HOST") or "127.0.0.1"
+            shared = self._shared_data_dir()
+            os.makedirs(shared, exist_ok=True)
+            out_path = Path(shared) / "iperf3_network_params.json"
+            run_iperf3_native(server_host, duration_sec=5, use_udp=True, output_json_path=out_path)
+            print(f"[Client {self.client_id}] Diagnostic: iperf3 run complete, params written to {out_path}")
+        except Exception as e:
+            print(f"[Client {self.client_id}] Diagnostic iperf3 failed: {e}")
+
     def select_protocol(self) -> str:
         """
         Select protocol using RL based on current environment and network conditions
@@ -1656,8 +1717,10 @@ class UnifiedFLClient_Emotion:
     
     def train_local_model(self):
         """Train model on local data and send updates to server via RL-selected protocol"""
+        # In diagnostic pipeline (native): run iperf3 from client on round 1 to measure network params
+        self._run_iperf3_if_diagnostic()
         start_time = time.time()
-        
+
         batch_size = self.training_config['batch_size']
         epochs = self.training_config['local_epochs']
         
@@ -1697,15 +1760,17 @@ class UnifiedFLClient_Emotion:
         protocol = self.select_protocol()
         
         # Send model update via selected protocol
+        serialized_weights = self.serialize_weights(updated_weights)
+        self.round_metrics['payload_bytes'] = len(serialized_weights.encode('utf-8') if isinstance(serialized_weights, str) else len(serialized_weights))
         update_message = {
             "client_id": self.client_id,
             "round": self.current_round,
-            "weights": self.serialize_weights(updated_weights),
+            "weights": serialized_weights,
             "num_samples": num_samples,
             "metrics": metrics,
             "protocol": protocol
         }
-        
+
         comm_start = time.time()
         success = False
         protocols_to_try = [protocol, 'amqp', 'mqtt', 'grpc', 'quic', 'http3', 'dds']  # AMQP second in fallback for testing
@@ -1806,13 +1871,43 @@ class UnifiedFLClient_Emotion:
             # RL update and optional Q-convergence end condition
             if USE_RL_SELECTION and self.rl_selector and self.env_manager:
                 try:
+                    # Energy model: estimate E_total for this round and update battery before reward
+                    protocol = self.selected_protocol or 'mqtt'
+                    try:
+                        bytes_sent, bytes_recv = get_round_bytes_sent_received(self.current_round, protocol)
+                    except Exception:
+                        bytes_sent, bytes_recv = 0, 0
+                    bits_tx = bytes_sent * 8
+                    bits_rx = bytes_recv * 8
+                    t_round = self.round_metrics.get('training_time', 0.0) + self.round_metrics.get('communication_time', 0.0)
+                    try:
+                        import psutil
+                        cpu_util = psutil.cpu_percent(interval=0.0)
+                    except Exception:
+                        cpu_util = 50.0
+                    alpha = PROTOCOL_ENERGY_ALPHA.get(protocol, 1.0)
+                    beta = PROTOCOL_CPU_BETA.get(protocol, 1.0)
+                    E_radio_baseline = k_tx * bits_tx + k_rx * bits_rx + E_fixed
+                    E_radio = alpha * E_radio_baseline
+                    E_cpu = P_CPU_MAX * (cpu_util / 100.0) * t_round * beta
+                    E_total = E_radio + E_cpu
+                    soc = self.env_manager.battery_soc
+                    delta_soc = E_total / BATTERY_CAP_J
+                    new_soc = soc - delta_soc
+                    self.env_manager.update_battery(new_soc, E_total)
+                    if os.environ.get("FL_DIAGNOSTIC_PIPELINE", "").strip().lower() in ("1", "true", "yes"):
+                        print(f"[Energy] round={self.current_round} E_total={E_total:.4f} J SoC={new_soc:.4f} protocol={protocol}")
+
                     resources = self.env_manager.get_resource_consumption()
+                    payload_bytes = self.round_metrics.get('payload_bytes') or (12 * 1024 * 1024)
+                    t_calc = self._get_t_calc_for_reward(self.selected_protocol or 'mqtt', payload_bytes)
                     reward = self.rl_selector.calculate_reward(
                         self.round_metrics['communication_time'],
                         self.round_metrics['success'],
                         self.round_metrics.get('training_time', 0.0),
                         self.round_metrics['accuracy'],
                         resources,
+                        t_calc=t_calc,
                     )
                     self.rl_selector.update_q_value(reward, next_state=None, done=True)
                     q_delta = self.rl_selector.get_last_q_delta()
