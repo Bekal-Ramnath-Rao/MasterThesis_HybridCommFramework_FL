@@ -399,9 +399,10 @@ class NativeExperimentRunner:
         env["NUM_ROUNDS"] = str(self.num_rounds)
         env["MIN_CLIENTS"] = str(self.num_clients)
         env["MAX_CLIENTS"] = str(self.num_clients)
-        # Prevent early exit: clients must not report convergence before num_rounds
-        env["CONVERGENCE_PATIENCE"] = str(max(10, self.num_rounds + 5))
-        env["MIN_ROUNDS"] = str(max(10, self.num_rounds + 5))
+        # Match Docker defaults for convergence behaviour unless explicitly overridden
+        env.setdefault("CONVERGENCE_THRESHOLD", "0.001")
+        env.setdefault("CONVERGENCE_PATIENCE", "2")
+        env.setdefault("MIN_ROUNDS", "3")
 
         # Protocol-specific server-side configuration
         if self.protocol == "grpc":
@@ -476,9 +477,10 @@ class NativeExperimentRunner:
             env["PYTHONUNBUFFERED"] = "1"  # Flush FL_DIAG immediately for diagnostic pipeline T_actual
             env["CLIENT_ID"] = str(idx)
             env["NUM_CLIENTS"] = str(self.num_clients)
-            # Align with server: do not converge before num_rounds
-            env["CONVERGENCE_PATIENCE"] = str(max(10, self.num_rounds + 5))
-            env["MIN_ROUNDS"] = str(max(10, self.num_rounds + 5))
+            # Match Docker defaults for convergence behaviour unless explicitly overridden
+            env.setdefault("CONVERGENCE_THRESHOLD", "0.001")
+            env.setdefault("CONVERGENCE_PATIENCE", "2")
+            env.setdefault("MIN_ROUNDS", "3")
 
             # Protocol-specific client-side configuration
             if self.protocol == "grpc":
