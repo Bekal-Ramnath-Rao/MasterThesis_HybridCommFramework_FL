@@ -211,10 +211,19 @@ class DistributedClientGUI(QMainWindow):
         self.protocol_mode.setStyleSheet("padding: 8px; font-size: 12px;")
         layout.addWidget(self.protocol_mode, 2, 1)
         
+        # DDS implementation selector (only meaningful when DDS protocol is selected)
+        self.dds_impl_label = QLabel("DDS Implementation:")
+        self.dds_impl = QComboBox()
+        self.dds_impl.addItem("CycloneDDS", "cyclonedds")
+        self.dds_impl.addItem("Fast DDS", "fastdds")
+        self.dds_impl.setStyleSheet("padding: 8px; font-size: 12px;")
+        layout.addWidget(self.dds_impl_label, 3, 0)
+        layout.addWidget(self.dds_impl, 3, 1)
+        
         # GPU Support
         self.gpu_enabled = QCheckBox("Enable GPU (if available)")
         self.gpu_enabled.setStyleSheet("padding: 5px; font-size: 12px;")
-        layout.addWidget(self.gpu_enabled, 3, 0, 1, 2)
+        layout.addWidget(self.gpu_enabled, 4, 0, 1, 2)
         
         # Q-Learning Convergence Training (only for RL-Unified)
         self.ql_convergence_enabled = QCheckBox("Train until Q-value converges (RL-Unified only)")
@@ -224,7 +233,9 @@ class DistributedClientGUI(QMainWindow):
         
         # Update checkbox state when protocol mode changes
         self.protocol_mode.currentIndexChanged.connect(self.update_ql_convergence_visibility)
+        self.protocol_mode.currentIndexChanged.connect(self.update_dds_impl_visibility)
         self.update_ql_convergence_visibility()
+        self.update_dds_impl_visibility()
         
         group.setLayout(layout)
         return group
@@ -372,6 +383,12 @@ class DistributedClientGUI(QMainWindow):
         self.ql_convergence_enabled.setEnabled(is_rl_unified)
         if not is_rl_unified:
             self.ql_convergence_enabled.setChecked(False)
+    
+    def update_dds_impl_visibility(self):
+        """Enable DDS implementation selector only when DDS protocol is selected"""
+        is_dds = (self.protocol_mode.currentData() == "dds")
+        self.dds_impl_label.setEnabled(is_dds)
+        self.dds_impl.setEnabled(is_dds)
     
     def create_log_section(self):
         """Create log and status section"""
@@ -536,6 +553,7 @@ class DistributedClientGUI(QMainWindow):
             f"Server: {server_ip}\n"
             f"Use Case: {use_case}\n"
             f"Protocol: {protocol}\n"
+            f"DDS Implementation: {self.dds_impl.currentText() if protocol == 'dds' else 'N/A'}\n"
             f"Network: {network_scenario}\n"
             f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
             f"Q-Learning Convergence: {'Enabled' if (is_unified and self.ql_convergence_enabled.isChecked()) else 'Disabled'}\n\n"
@@ -619,6 +637,11 @@ class DistributedClientGUI(QMainWindow):
             "-e", "QUIC_PORT=4433",
             "-e", "DDS_DOMAIN_ID=0"
         ]
+        
+        # DDS implementation vendor selection (passed as environment variable)
+        if protocol == "dds":
+            dds_impl_value = self.dds_impl.currentData() or self.dds_impl.currentText()
+            cmd.extend(["-e", f"DDS_IMPL={dds_impl_value}"])
         
         # Add unified-specific env vars
         if is_unified:

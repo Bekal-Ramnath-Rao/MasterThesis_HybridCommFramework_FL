@@ -133,6 +133,7 @@ class NativeExperimentRunner:
         use_pruning: bool = False,
         pruning_sparsity: Optional[float] = None,
         pruning_structured: bool = False,
+        rl_reward_scenario: Optional[str] = None,
     ) -> None:
         self.use_case = use_case
         self.protocol = protocol
@@ -148,6 +149,8 @@ class NativeExperimentRunner:
         self.use_pruning = use_pruning
         self.pruning_sparsity = pruning_sparsity
         self.pruning_structured = pruning_structured
+        # When set (e.g. "good", "moderate", "poor"): run in excellent conditions but reward/state as if in that scenario (RL_REWARD_SCENARIO)
+        self.rl_reward_scenario = (rl_reward_scenario or "").strip().lower() or None
 
         # Resolve concrete script paths for this (use_case, protocol)
         self.server_script = _resolve_script_path(use_case, protocol, role="server")
@@ -516,6 +519,8 @@ class NativeExperimentRunner:
                 env["GRPC_HOST"] = server_ep.ip
                 env["QUIC_HOST"] = server_ep.ip
                 env["HTTP3_HOST"] = server_ep.ip
+                if getattr(self, "rl_reward_scenario", None):
+                    env["RL_REWARD_SCENARIO"] = self.rl_reward_scenario
 
             # Pruning configuration (client side)
             if self.use_pruning:
@@ -555,11 +560,16 @@ class NativeExperimentRunner:
             if self.apply_tc_after_round_1
             else f"  Tc: clients only (scenario={self.upstream_scenario}); server has no delay/loss/bandwidth.\n"
         )
+        rl_reward_note = (
+            f"  RL reward scenario : {self.rl_reward_scenario} (train in current conditions, reward as if in {self.rl_reward_scenario})\n"
+            if getattr(self, "rl_reward_scenario", None) else ""
+        )
         print(
             f"\n=== Starting NATIVE FL experiment ===\n"
             f"  Use case : {self.use_case}\n"
             f"  Protocol : {self.protocol}\n"
             f"  Scenario : {self.scenario}\n"
+            f"{rl_reward_note}"
             f"  Rounds   : {self.num_rounds}\n"
             f"  Clients  : {self.num_clients}\n"
             f"{tc_note}"
@@ -813,12 +823,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable structured pruning (sets PRUNING_STRUCTURED=true).",
     )
+    parser.add_argument(
+        "--dds-impl",
+        choices=["cyclonedds", "fastdds"],
+        default="cyclonedds",
+        help="DDS implementation vendor to use when protocol='dds'.",
+    )
+    parser.add_argument(
+        "--rl-reward-scenario",
+        metavar="SCENARIO",
+        help="For protocol=rl_unified: train in excellent conditions but use reward/state for SCENARIO (e.g. good, moderate, poor). Sets RL_REWARD_SCENARIO for clients.",
+    )
 
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+
+    # Propagate DDS implementation choice so native DDS server/clients can switch vendor based on DDS_IMPL
+    if getattr(args, "dds_impl", None):
+        os.environ["DDS_IMPL"] = args.dds_impl
 
     runner = NativeExperimentRunner(
         use_case=args.use_case,
@@ -832,6 +857,7 @@ def main() -> None:
         use_pruning=args.use_pruning,
         pruning_sparsity=args.pruning_sparsity,
         pruning_structured=args.pruning_structured,
+        rl_reward_scenario=getattr(args, "rl_reward_scenario", None),
     )
     _install_signal_handlers(runner)
     code = runner.run()

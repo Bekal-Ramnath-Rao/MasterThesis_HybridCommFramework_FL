@@ -1556,6 +1556,16 @@ class UnifiedFLClient_Emotion:
         except Exception:
             return None
 
+    def _get_t_calc_for_scenario(self, protocol: str, payload_bytes: int, scenario_name: str) -> Optional[float]:
+        """Get T_calc for a named network scenario (e.g. good, moderate, poor) for simulated reward.
+        Used when RL_REWARD_SCENARIO is set: train in excellent conditions but reward as if in that scenario."""
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "Network_Simulation"))
+            from communication_model import get_t_calc_for_scenario
+            return get_t_calc_for_scenario(protocol, payload_bytes, scenario_name)
+        except Exception:
+            return None
+
     def _run_iperf3_if_diagnostic(self):
         """When FL_DIAGNOSTIC_PIPELINE=1 and current_round==1, run iperf3 from client and write to shared_data."""
         if not os.environ.get("FL_DIAGNOSTIC_PIPELINE", "").strip() in ("1", "true", "yes"):
@@ -1591,14 +1601,22 @@ class UnifiedFLClient_Emotion:
                 resource_level = self.env_manager.detect_resource_level(cpu, memory)
                 self.env_manager.update_resource_level(resource_level)
 
-                # Update network condition in the RL environment based on
-                # current connectivity to the aggregation server / broker.
-                self.measure_network_condition()
+                # Training only: when RL_REWARD_SCENARIO is set, use that scenario for state so we
+                # train in excellent conditions but learn Q(s,a) for the target scenario.
+                # Inference: always use actual network condition so we load Q-table and choose
+                # best action for the real scenario.
+                if USE_QL_CONVERGENCE:
+                    reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
+                    if reward_scenario and reward_scenario in self.rl_selector.NETWORK_CONDITIONS:
+                        self.env_manager.update_network_condition(reward_scenario)
+                    else:
+                        self.measure_network_condition()
+                else:
+                    # Inference: use actual scenario (load Q-table, pick best action for current state)
+                    self.measure_network_condition()
 
                 state = self.env_manager.get_current_state()
-                # Use training mode based on USE_QL_CONVERGENCE flag
-                # If False: pure exploitation (use best known protocol)
-                # If True: epsilon-greedy (explore and learn)
+                # Training: epsilon-greedy. Inference: greedy (best known action from Q-table).
                 training_mode = USE_QL_CONVERGENCE
                 protocol = self.rl_selector.select_protocol(state, training=training_mode)
                 
@@ -1902,14 +1920,32 @@ class UnifiedFLClient_Emotion:
 
                     resources = self.env_manager.get_resource_consumption()
                     payload_bytes = self.round_metrics.get('payload_bytes') or (12 * 1024 * 1024)
-                    t_calc = self._get_t_calc_for_reward(self.selected_protocol or 'mqtt', payload_bytes)
+                    protocol = self.selected_protocol or 'mqtt'
+                    # Training only: when RL_REWARD_SCENARIO is set, use simulated comm time/t_calc
+                    # for that scenario. Inference: always use actual metrics (real scenario).
+                    if USE_QL_CONVERGENCE:
+                        reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
+                        if reward_scenario:
+                            simulated_t_calc = self._get_t_calc_for_scenario(protocol, payload_bytes, reward_scenario)
+                            if simulated_t_calc is not None:
+                                comm_time_for_reward = simulated_t_calc
+                                t_calc_for_reward = simulated_t_calc
+                            else:
+                                comm_time_for_reward = self.round_metrics['communication_time']
+                                t_calc_for_reward = self._get_t_calc_for_reward(protocol, payload_bytes)
+                        else:
+                            comm_time_for_reward = self.round_metrics['communication_time']
+                            t_calc_for_reward = self._get_t_calc_for_reward(protocol, payload_bytes)
+                    else:
+                        comm_time_for_reward = self.round_metrics['communication_time']
+                        t_calc_for_reward = self._get_t_calc_for_reward(protocol, payload_bytes)
                     reward = self.rl_selector.calculate_reward(
-                        self.round_metrics['communication_time'],
+                        comm_time_for_reward,
                         self.round_metrics['success'],
                         self.round_metrics.get('training_time', 0.0),
                         self.round_metrics['accuracy'],
                         resources,
-                        t_calc=t_calc,
+                        t_calc=t_calc_for_reward,
                     )
                     self.rl_selector.update_q_value(reward, next_state=None, done=True)
                     q_delta = self.rl_selector.get_last_q_delta()

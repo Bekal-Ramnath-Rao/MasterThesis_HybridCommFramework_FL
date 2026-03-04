@@ -43,6 +43,14 @@ from cyclonedds.core import Qos, Policy
 from dataclasses import dataclass
 from typing import List
 
+# DDS implementation vendor (CycloneDDS vs Fast DDS placeholder)
+DDS_IMPL = os.getenv("DDS_IMPL", "cyclonedds").strip().lower()
+print(f"DDS implementation (server): {DDS_IMPL}")
+if DDS_IMPL not in ("cyclonedds", "fastdds"):
+    print("Warning: Unknown DDS_IMPL; defaulting to CycloneDDS transport.")
+elif DDS_IMPL == "fastdds":
+    print("Note: Fast DDS integration is not yet implemented; using CycloneDDS stack for now.")
+
 # Server Configuration
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
 # Dynamic client configuration

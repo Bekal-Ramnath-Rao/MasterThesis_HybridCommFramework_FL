@@ -1315,7 +1315,17 @@ def main():
         default=1,
         help="Number of FL clients to include in the diagnostic pipeline (default: 1).",
     )
+    parser.add_argument(
+        "--dds-impl",
+        choices=["cyclonedds", "fastdds"],
+        default="cyclonedds",
+        help="DDS implementation vendor to use when protocol includes DDS.",
+    )
     args = parser.parse_args()
+
+    # Propagate DDS implementation choice so downstream scripts/containers can pick the DDS vendor
+    if getattr(args, "dds_impl", None):
+        os.environ["DDS_IMPL"] = args.dds_impl
 
     # Resolve protocols list: --protocols takes precedence, else single --protocol
     if args.protocols is not None and len(args.protocols) > 0:

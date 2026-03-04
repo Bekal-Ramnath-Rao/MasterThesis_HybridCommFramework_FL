@@ -1037,9 +1037,19 @@ def main():
         default=2,
         help="Number of client containers to start from this runner on the central machine (default: 2).",
     )
+    parser.add_argument(
+        "--dds-impl",
+        choices=["cyclonedds", "fastdds"],
+        default="cyclonedds",
+        help="DDS implementation vendor to use when running DDS experiments.",
+    )
     
     args = parser.parse_args()
     
+    # Propagate DDS implementation choice to environment so compose scripts and containers can read it
+    if args.dds_impl:
+        os.environ["DDS_IMPL"] = args.dds_impl
+
     # Determine congestion level(s)
     congestion_levels = None
     if args.enable_congestion:

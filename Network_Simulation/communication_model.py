@@ -11,6 +11,7 @@ Output is stored in JSON under shared_data (iperf3_network_params.json).
 
 import json
 import math
+import re
 import os
 import subprocess
 import sys
@@ -338,6 +339,74 @@ def compute_t_calc(
 
     alpha = ALPHA_PROTO.get(proto_key, 1.0)
     return alpha * network_term + O_app + O_TLS
+
+
+def scenario_conditions_to_t_calc_input(conditions: Dict[str, str]) -> Tuple[float, float, float, float]:
+    """
+    Convert a scenario conditions dict (latency, jitter, bandwidth, loss as strings)
+    to (B_bps, D_tc_sec, J_sec, p) for compute_t_calc.
+    Same format as network_simulator.NETWORK_SCENARIOS (e.g. "20ms", "5ms", "50mbit", "0.1%").
+    """
+    def _bandwidth_bps(s: str) -> float:
+        s = (s or "").strip().lower()
+        if not s:
+            return float("inf")
+        m = re.match(r"(\d+(?:\.\d+)?)\s*(\w*)", s)
+        if not m:
+            return float("inf")
+        val, unit = float(m.group(1)), (m.group(2) or "").lower()
+        if "gbit" in unit or "gibit" in unit:
+            return val * 1e9
+        if "mbit" in unit or "mibit" in unit:
+            return val * 1e6
+        if "kbit" in unit or "kibit" in unit:
+            return val * 1e3
+        return val
+
+    def _loss_decimal() -> float:
+        s = (conditions.get("loss") or "0").strip().replace("%", "")
+        try:
+            return float(s) / 100.0
+        except ValueError:
+            return 0.0
+
+    def _delay_sec(key: str) -> float:
+        s = (conditions.get(key) or "0").strip().lower()
+        m = re.match(r"(\d+(?:\.\d+)?)\s*(\w*)", s)
+        if not m:
+            return 0.0
+        val, unit = float(m.group(1)), (m.group(2) or "").lower()
+        return val / 1000.0 if "ms" in unit else val
+
+    B = _bandwidth_bps(conditions.get("bandwidth") or "")
+    if B <= 0 or not math.isfinite(B):
+        B = float("inf")
+    D_tc = _delay_sec("latency")
+    J = _delay_sec("jitter")
+    p = _loss_decimal()
+    return B, D_tc, J, p
+
+
+def get_t_calc_for_scenario(
+    protocol: str,
+    payload_bytes: int,
+    scenario_name: str,
+    O_app_estimate: float = 0.01,
+) -> Optional[float]:
+    """
+    Compute T_calc for a named network scenario (e.g. good, moderate, poor) without
+    using live iperf3 params. Used when training the RL agent in excellent conditions
+    but rewarding as if the round ran in the target scenario (RL_REWARD_SCENARIO).
+    """
+    init_alpha_proto_from_disk()
+    try:
+        from network_simulator import NetworkSimulator
+        conditions = NetworkSimulator.get_scenario_conditions(scenario_name)
+    except Exception:
+        return None
+    B, D_tc, J, p = scenario_conditions_to_t_calc_input(conditions)
+    S_bits = payload_bytes * 8
+    return compute_t_calc(protocol, S_bits, O_app_estimate, B, D_tc, J, p)
 
 
 def get_t_calc_for_reward(

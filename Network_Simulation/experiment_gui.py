@@ -561,6 +561,25 @@ class FLExperimentGUI(QMainWindow):
         ])
         layout.addWidget(protocol_group)
         self.protocol_checkboxes = protocol_group.findChildren(QCheckBox)
+
+        # DDS implementation selector (CycloneDDS vs Fast DDS)
+        self.dds_impl_group = QGroupBox("🔧 DDS Implementation")
+        self.dds_impl_group.setStyleSheet(self.get_group_style())
+        dds_impl_layout = QHBoxLayout()
+        self.dds_impl_label = QLabel("DDS Library:")
+        self.dds_impl = QComboBox()
+        self.dds_impl.addItem("CycloneDDS", "cyclonedds")
+        self.dds_impl.addItem("Fast DDS", "fastdds")
+        self.dds_impl.setStyleSheet("padding: 5px; font-size: 12px;")
+        dds_impl_layout.addWidget(self.dds_impl_label)
+        dds_impl_layout.addWidget(self.dds_impl)
+        dds_impl_layout.addStretch()
+        self.dds_impl_group.setLayout(dds_impl_layout)
+        layout.addWidget(self.dds_impl_group)
+        # Update visibility based on whether DDS is selected
+        for cb in self.protocol_checkboxes:
+            cb.toggled.connect(self.update_dds_impl_visibility)
+        self.update_dds_impl_visibility()
         
         # Q-learning convergence (unified use case only)
         ql_conv_group = QGroupBox("🎓 Q-Learning End Condition (Unified Only)")
@@ -1918,6 +1937,51 @@ class FLExperimentGUI(QMainWindow):
         self._seed_diagnostic_db_from_json_if_present()
         self._load_diagnostic_results_table_from_db()
 
+        # Tab: Experimental Results (per-protocol FL run metrics)
+        exp_result_tab = QWidget()
+        exp_result_layout = QVBoxLayout(exp_result_tab)
+        exp_result_layout.addWidget(QLabel(
+            "FL experiment results per protocol: protocol name, clients, rounds, time per round, convergence time. "
+            "Data is loaded from experiment_results/ and experiment_results_baseline/; use Refresh after runs."
+        ))
+        exp_result_controls = QHBoxLayout()
+        self.experiment_results_refresh_btn = QPushButton("🔄 Refresh from experiment_results")
+        self.experiment_results_refresh_btn.setStyleSheet("padding: 6px 12px; font-weight: bold;")
+        self.experiment_results_refresh_btn.setToolTip("Scan experiment_results and experiment_results_baseline folders and reload the table.")
+        self.experiment_results_refresh_btn.clicked.connect(self._refresh_experiment_results_from_disk)
+        exp_result_controls.addWidget(self.experiment_results_refresh_btn)
+        self.experiment_results_download_excel_btn = QPushButton("📥 Download to Excel")
+        self.experiment_results_download_excel_btn.setStyleSheet("padding: 6px 12px; font-weight: bold;")
+        self.experiment_results_download_excel_btn.setToolTip("Export experimental results table to an Excel file.")
+        self.experiment_results_download_excel_btn.clicked.connect(self.download_experiment_results_excel)
+        exp_result_controls.addWidget(self.experiment_results_download_excel_btn)
+        exp_result_controls.addStretch()
+        exp_result_layout.addLayout(exp_result_controls)
+        self.experiment_results_table = QTableWidget()
+        self.experiment_results_table.setColumnCount(14)
+        self.experiment_results_table.setHorizontalHeaderLabels([
+            "Protocol", "Scenario", "Use Case", "Num Clients", "Num Rounds",
+            "Avg Time/Round (s)", "Min RTT (s)", "Max RTT (s)",
+            "Convergence Time (s)", "Convergence Time (min)",
+            "Final Accuracy %", "Final Loss", "Run Timestamp", "Source"
+        ])
+        self.experiment_results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.experiment_results_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.experiment_results_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #222831;
+                color: #eee;
+                gridline-color: #444;
+                font-size: 12px;
+            }
+            QTableWidget::item { padding: 6px; }
+            QHeaderView::section { background-color: #393e46; color: #00adb5; padding: 8px; }
+        """)
+        exp_result_layout.addWidget(self.experiment_results_table)
+        self.output_tabs.addTab(exp_result_tab, "📈 Experimental Results")
+        self._init_experiment_results_db()
+        self._load_experiment_results_table_from_db()
+
         # Add Docker Build Logs tab
         self.docker_build_log_text = QTextEdit()
         self.docker_build_log_text.setReadOnly(True)
@@ -2289,6 +2353,20 @@ class FLExperimentGUI(QMainWindow):
                 scenarios.append(checkbox.property("value"))
         return scenarios
     
+    def update_dds_impl_visibility(self):
+        """Enable DDS implementation selector only when DDS protocol is selected."""
+        if not hasattr(self, "dds_impl_group") or not hasattr(self, "protocol_checkboxes"):
+            return
+        has_dds = False
+        for checkbox in self.protocol_checkboxes:
+            value = checkbox.property("value")
+            if value == "dds" and checkbox.isChecked():
+                has_dds = True
+                break
+        self.dds_impl_group.setEnabled(has_dds)
+        self.dds_impl_label.setEnabled(has_dds)
+        self.dds_impl.setEnabled(has_dds)
+
     def build_command(self):
         """Build the experiment command"""
         base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
@@ -2403,7 +2481,16 @@ class FLExperimentGUI(QMainWindow):
             # Q-learning convergence (only when rl_unified is selected)
             if self.use_ql_convergence.isChecked() and "rl_unified" in self.get_selected_protocols():
                 cmd_parts.append("--use-ql-convergence")
-        
+
+        # DDS implementation flag (CycloneDDS vs Fast DDS) – applies when DDS protocol is selected
+        selected_protocols = self.get_selected_protocols()
+        if any(p.lower() == "dds" for p in selected_protocols):
+            impl = getattr(self, "dds_impl", None)
+            if impl is not None:
+                dds_impl_value = impl.currentData() or str(impl.currentText()).strip().lower().replace(" ", "")
+                if dds_impl_value:
+                    cmd_parts.extend(["--dds-impl", dds_impl_value])
+
         return " ".join(cmd_parts)
     
     def start_experiment(self):
@@ -2560,6 +2647,11 @@ class FLExperimentGUI(QMainWindow):
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         script = os.path.join(base_dir, "Network_Simulation", "diagnostic_pipeline.py")
         command = f"python3 {script} --protocols {' '.join(pipeline_selected)} --scenarios {' '.join(scenario_list)} --use-case {use_case}"
+        # DDS implementation selection applies when DDS is part of the diagnostic protocols
+        if any(p.lower() == "dds" for p in pipeline_selected) and hasattr(self, "dds_impl"):
+            dds_impl_value = self.dds_impl.currentData() or str(self.dds_impl.currentText()).strip().lower().replace(" ", "")
+            if dds_impl_value:
+                command += f" --dds-impl {dds_impl_value}"
         if self.gpu_enabled.isChecked():
             command += " --enable-gpu"
         is_native = getattr(self, "exec_mode_native", None) and self.exec_mode_native.isChecked()
@@ -3270,6 +3362,298 @@ class FLExperimentGUI(QMainWindow):
                 f"Failed to write Excel file:\n{e}",
             )
 
+    def _experiment_results_db_path(self):
+        """Path to SQLite database for experimental results (shared_data/experimental_results.db)."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        shared = os.path.join(base_dir, "shared_data")
+        os.makedirs(shared, exist_ok=True)
+        return os.path.join(shared, "experimental_results.db")
+
+    def _init_experiment_results_db(self):
+        """Create experimental_results table if it does not exist."""
+        import sqlite3
+        path = self._experiment_results_db_path()
+        try:
+            conn = sqlite3.connect(path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS experimental_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    protocol TEXT NOT NULL,
+                    scenario TEXT NOT NULL,
+                    use_case TEXT NOT NULL,
+                    num_clients INTEGER NOT NULL DEFAULT 2,
+                    num_rounds INTEGER NOT NULL DEFAULT 0,
+                    avg_time_per_round REAL,
+                    min_rtt REAL,
+                    max_rtt REAL,
+                    convergence_time_sec REAL,
+                    convergence_time_min REAL,
+                    final_accuracy_pct REAL,
+                    final_loss REAL,
+                    run_timestamp TEXT,
+                    source TEXT,
+                    exp_folder TEXT,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            if hasattr(self, "output_text"):
+                self.output_text.append(f"[Experimental Results DB] Could not init DB: {e}\n")
+
+    def _scan_experiment_results_from_disk(self, results_base_dir):
+        """
+        Scan a single results directory (e.g. experiment_results/emotion_20250104_123456 or
+        experiment_results_baseline/emotion) for protocol_scenario subdirs; extract metrics and return list of row dicts.
+        """
+        import sqlite3
+        rows = []
+        if not results_base_dir or not os.path.isdir(results_base_dir):
+            return rows
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        try:
+            script_dir = os.path.join(base_dir, "Network_Simulation")
+            if script_dir not in sys.path:
+                sys.path.insert(0, script_dir)
+            from consolidate_results import extract_results_from_logs
+        except ImportError:
+            return rows
+        exp_folder = os.path.basename(results_base_dir.rstrip(os.sep))
+        is_baseline = "baseline" in results_base_dir
+        for name in os.listdir(results_base_dir):
+            subdir = os.path.join(results_base_dir, name)
+            if not os.path.isdir(subdir):
+                continue
+            # Expect names like mqtt_excellent, grpc_poor, or mqtt_excellent_congestion_moderate
+            parts = name.split("_")
+            if len(parts) < 2:
+                continue
+            protocol = parts[0].upper()
+            scenario = "_".join(parts[1:]).split("_congestion_")[0] if "_congestion_" in name else "_".join(parts[1:])
+            server_log = os.path.join(subdir, "server_logs.txt")
+            if not os.path.isfile(server_log):
+                continue
+            try:
+                extracted = extract_results_from_logs(server_log)
+            except Exception:
+                extracted = None
+            if not extracted:
+                continue
+            metadata = {}
+            meta_path = os.path.join(subdir, "metadata.json")
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        metadata = json.load(f)
+                except Exception:
+                    pass
+            rtt_data = {}
+            for rtt_name in ["rtt.json", "grpc_rtt.json", "mqtt_rtt.json", "amqp_rtt.json", "quic_rtt.json", "http3_rtt.json", "dds_rtt.json", "rl_unified_rtt.json"]:
+                rtt_path = os.path.join(subdir, rtt_name)
+                if not os.path.isfile(rtt_path):
+                    for f in (os.listdir(subdir) if os.path.isdir(subdir) else []):
+                        if "rtt" in f.lower() and f.endswith(".json"):
+                            rtt_path = os.path.join(subdir, f)
+                            break
+                if os.path.isfile(rtt_path):
+                    try:
+                        with open(rtt_path, "r", encoding="utf-8") as f:
+                            rtt_data = json.load(f)
+                        break
+                    except Exception:
+                        pass
+            num_clients = metadata.get("num_clients") or extracted.get("num_clients", 2)
+            num_rounds = metadata.get("num_rounds") or extracted.get("total_rounds", 0)
+            conv_sec = extracted.get("convergence_time_seconds") or 0
+            conv_min = extracted.get("convergence_time_minutes") or 0
+            avg_rtt = rtt_data.get("avg_rtt_per_round") or (sum(rtt_data.get("rtt_per_round", [])) / len(rtt_data.get("rtt_per_round") or [1]) if rtt_data.get("rtt_per_round") else None)
+            min_rtt = rtt_data.get("min_rtt")
+            max_rtt = rtt_data.get("max_rtt")
+            final_acc = None
+            if extracted.get("accuracy"):
+                final_acc = (extracted["accuracy"][-1] * 100.0) if isinstance(extracted["accuracy"][-1], (int, float)) else None
+            final_loss = extracted.get("loss", [None])[-1] if extracted.get("loss") else None
+            run_ts = metadata.get("timestamp", "")
+            use_case = metadata.get("use_case", "")
+            if not use_case:
+                # exp_folder is e.g. emotion_20250104_123456 or emotion for baseline
+                if exp_folder.startswith("emotion") or exp_folder.startswith("mental") or exp_folder.startswith("temperature"):
+                    use_case = exp_folder.split("_")[0]
+                if not use_case and "baseline" in results_base_dir:
+                    use_case = exp_folder
+            rows.append({
+                "protocol": protocol,
+                "scenario": scenario,
+                "use_case": use_case or "unknown",
+                "num_clients": num_clients,
+                "num_rounds": num_rounds,
+                "avg_time_per_round": avg_rtt,
+                "min_rtt": min_rtt,
+                "max_rtt": max_rtt,
+                "convergence_time_sec": conv_sec,
+                "convergence_time_min": conv_min,
+                "final_accuracy_pct": final_acc,
+                "final_loss": final_loss,
+                "run_timestamp": run_ts,
+                "source": "baseline" if is_baseline else "network",
+                "exp_folder": exp_folder,
+            })
+        return rows
+
+    def _refresh_experiment_results_from_disk(self):
+        """Scan experiment_results and experiment_results_baseline, upsert into DB, reload table."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        all_rows = []
+        for base_name in ["experiment_results", "experiment_results_baseline"]:
+            root = os.path.join(base_dir, base_name)
+            if not os.path.isdir(root):
+                continue
+            for name in os.listdir(root):
+                sub = os.path.join(root, name)
+                if os.path.isdir(sub):
+                    all_rows.extend(self._scan_experiment_results_from_disk(sub))
+        if not all_rows and hasattr(self, "output_text"):
+            self.output_text.append("[Experimental Results] No experiment result directories found. Run experiments first.\n")
+        path = self._experiment_results_db_path()
+        import sqlite3
+        try:
+            conn = sqlite3.connect(path)
+            conn.execute("DELETE FROM experimental_results")
+            for r in all_rows:
+                conn.execute("""
+                    INSERT INTO experimental_results
+                    (protocol, scenario, use_case, num_clients, num_rounds, avg_time_per_round, min_rtt, max_rtt,
+                     convergence_time_sec, convergence_time_min, final_accuracy_pct, final_loss, run_timestamp, source, exp_folder)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    r.get("protocol", ""),
+                    r.get("scenario", ""),
+                    r.get("use_case", ""),
+                    r.get("num_clients", 2),
+                    r.get("num_rounds", 0),
+                    r.get("avg_time_per_round"),
+                    r.get("min_rtt"),
+                    r.get("max_rtt"),
+                    r.get("convergence_time_sec"),
+                    r.get("convergence_time_min"),
+                    r.get("final_accuracy_pct"),
+                    r.get("final_loss"),
+                    r.get("run_timestamp", ""),
+                    r.get("source", ""),
+                    r.get("exp_folder", ""),
+                ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            if hasattr(self, "output_text"):
+                self.output_text.append(f"[Experimental Results] DB error: {e}\n")
+            return
+        self._load_experiment_results_table_from_db()
+        if hasattr(self, "output_text"):
+            self.output_text.append(f"[Experimental Results] Loaded {len(all_rows)} row(s) from disk.\n")
+
+    def _load_experiment_results_from_db(self):
+        """Load all rows from experimental_results table."""
+        import sqlite3
+        path = self._experiment_results_db_path()
+        rows = []
+        try:
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("""
+                SELECT protocol, scenario, use_case, num_clients, num_rounds,
+                       avg_time_per_round, min_rtt, max_rtt, convergence_time_sec, convergence_time_min,
+                       final_accuracy_pct, final_loss, run_timestamp, source
+                FROM experimental_results
+                ORDER BY run_timestamp DESC, UPPER(protocol), scenario
+            """)
+            for row in cur.fetchall():
+                rows.append(dict(row))
+            conn.close()
+        except Exception:
+            pass
+        return rows
+
+    def _load_experiment_results_table_from_db(self):
+        """Populate Experimental Results tab from database."""
+        from PyQt5.QtWidgets import QTableWidgetItem
+        if not hasattr(self, "experiment_results_table"):
+            return
+        rows = self._load_experiment_results_from_db()
+        self.experiment_results_table.setRowCount(len(rows))
+        for row_idx, r in enumerate(rows):
+            def _cell(v, fmt=None):
+                if v is None: return ""
+                if fmt == "f" and isinstance(v, (int, float)): return f"{v:.2f}"
+                if fmt == "pct" and isinstance(v, (int, float)): return f"{v:.1f}%"
+                return str(v)
+            self.experiment_results_table.setItem(row_idx, 0, QTableWidgetItem(str(r.get("protocol", ""))))
+            self.experiment_results_table.setItem(row_idx, 1, QTableWidgetItem(str(r.get("scenario", ""))))
+            self.experiment_results_table.setItem(row_idx, 2, QTableWidgetItem(str(r.get("use_case", ""))))
+            self.experiment_results_table.setItem(row_idx, 3, QTableWidgetItem(str(r.get("num_clients", ""))))
+            self.experiment_results_table.setItem(row_idx, 4, QTableWidgetItem(str(r.get("num_rounds", ""))))
+            self.experiment_results_table.setItem(row_idx, 5, QTableWidgetItem(_cell(r.get("avg_time_per_round"), "f")))
+            self.experiment_results_table.setItem(row_idx, 6, QTableWidgetItem(_cell(r.get("min_rtt"), "f")))
+            self.experiment_results_table.setItem(row_idx, 7, QTableWidgetItem(_cell(r.get("max_rtt"), "f")))
+            self.experiment_results_table.setItem(row_idx, 8, QTableWidgetItem(_cell(r.get("convergence_time_sec"), "f")))
+            self.experiment_results_table.setItem(row_idx, 9, QTableWidgetItem(_cell(r.get("convergence_time_min"), "f")))
+            self.experiment_results_table.setItem(row_idx, 10, QTableWidgetItem(_cell(r.get("final_accuracy_pct"), "pct")))
+            self.experiment_results_table.setItem(row_idx, 11, QTableWidgetItem(_cell(r.get("final_loss"), "f")))
+            self.experiment_results_table.setItem(row_idx, 12, QTableWidgetItem(str(r.get("run_timestamp", ""))[:19] if r.get("run_timestamp") else ""))
+            self.experiment_results_table.setItem(row_idx, 13, QTableWidgetItem(str(r.get("source", ""))))
+
+    def download_experiment_results_excel(self):
+        """Export experimental_results table to Excel."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        try:
+            import pandas as pd
+        except ImportError:
+            QMessageBox.warning(self, "Export", "pandas and openpyxl are required to export to Excel.")
+            return
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Experimental Results",
+            os.path.join(base_dir, "experimental_results.xlsx"),
+            "Excel (*.xlsx);;All Files (*)",
+        )
+        if not save_path:
+            return
+        import sqlite3
+        db_path = self._experiment_results_db_path()
+        if not os.path.isfile(db_path):
+            QMessageBox.information(
+                self,
+                "Export",
+                "No experimental_results.db found. Use 'Refresh from experiment_results' first.",
+            )
+            return
+        try:
+            conn = sqlite3.connect(db_path)
+            df = pd.read_sql_query(
+                """
+                SELECT protocol, scenario, use_case, num_clients, num_rounds,
+                       avg_time_per_round, min_rtt, max_rtt, convergence_time_sec, convergence_time_min,
+                       final_accuracy_pct, final_loss, run_timestamp, source
+                FROM experimental_results
+                ORDER BY run_timestamp DESC, UPPER(protocol), scenario
+                """,
+                conn,
+            )
+            conn.close()
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Could not read DB: {e}")
+            return
+        if df.empty:
+            QMessageBox.information(self, "Export", "Experimental results table is empty. Run experiments and Refresh first.")
+            return
+        try:
+            with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="ExperimentalResults", index=False)
+            QMessageBox.information(self, "Export", f"Experimental results exported to:\n{save_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to write Excel: {e}")
+
     def _extract_results_dir_from_output(self, text):
         """Track results directory from runner stdout."""
         markers = ("Results Directory:", "Results saved in:")
@@ -3453,6 +3837,13 @@ class FLExperimentGUI(QMainWindow):
                     if self.output_tabs.tabText(i) == "📊 Diagnostic Results":
                         self.output_tabs.setCurrentIndex(i)
                         break
+
+        # Experimental Results: when a normal FL run (not diagnostic) completes, refresh from disk so new run appears
+        if not is_diagnostic and hasattr(self, "_refresh_experiment_results_from_disk"):
+            try:
+                self._refresh_experiment_results_from_disk()
+            except Exception:
+                pass
 
         # Free GPU memory (non-blocking)
         diag_script = os.path.join(base_dir, "Network_Simulation", "diagnostic_pipeline.py")
