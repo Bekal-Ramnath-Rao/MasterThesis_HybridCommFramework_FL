@@ -130,6 +130,9 @@ class NativeExperimentRunner:
         upstream_scenario: str = None,
         enable_gpu: bool = False,
         apply_tc_after_round_1: Optional[str] = None,
+        use_pruning: bool = False,
+        pruning_sparsity: Optional[float] = None,
+        pruning_structured: bool = False,
     ) -> None:
         self.use_case = use_case
         self.protocol = protocol
@@ -141,6 +144,10 @@ class NativeExperimentRunner:
         self.enable_gpu = enable_gpu
         # When set (e.g. "good"): start with no tc; after round 1 complete apply this scenario to clients
         self.apply_tc_after_round_1 = apply_tc_after_round_1
+        # Pruning configuration (applied via environment variables)
+        self.use_pruning = use_pruning
+        self.pruning_sparsity = pruning_sparsity
+        self.pruning_structured = pruning_structured
 
         # Resolve concrete script paths for this (use_case, protocol)
         self.server_script = _resolve_script_path(use_case, protocol, role="server")
@@ -431,6 +438,14 @@ class NativeExperimentRunner:
             env.setdefault("QUIC_HOST", "0.0.0.0")
             env.setdefault("HTTP3_HOST", "0.0.0.0")
 
+        # Pruning configuration (server side)
+        if self.use_pruning:
+            env["USE_PRUNING"] = "1"
+            if self.pruning_sparsity is not None:
+                env["PRUNING_SPARSITY"] = str(self.pruning_sparsity)
+            # Default to "false" unless explicitly structured
+            env["PRUNING_STRUCTURED"] = "true" if self.pruning_structured else env.get("PRUNING_STRUCTURED", "false")
+
         if self.enable_gpu:
             # In native mode we simply respect whatever CUDA_VISIBLE_DEVICES the user already set.
             print("[INFO] GPU mode enabled for native server (respecting existing CUDA_VISIBLE_DEVICES).")
@@ -499,6 +514,13 @@ class NativeExperimentRunner:
                 env["GRPC_HOST"] = server_ep.ip
                 env["QUIC_HOST"] = server_ep.ip
                 env["HTTP3_HOST"] = server_ep.ip
+
+            # Pruning configuration (client side)
+            if self.use_pruning:
+                env["USE_PRUNING"] = "1"
+                if self.pruning_sparsity is not None:
+                    env["PRUNING_SPARSITY"] = str(self.pruning_sparsity)
+                env["PRUNING_STRUCTURED"] = "true" if self.pruning_structured else env.get("PRUNING_STRUCTURED", "false")
 
             if self.enable_gpu:
                 # Ensure every client uses a GPU: pin to GPU 0 so both use the same GPU
@@ -681,6 +703,21 @@ class NativeExperimentRunner:
             except Exception as e:
                 print(f"[WARNING] Namespace cleanup failed: {e}")
 
+        # If pruning was enabled, plot model memory vs round (only when pruning data is present)
+        if getattr(self, "use_pruning", False) and log_dir is not None:
+            try:
+                sys.path.insert(0, str(PROJECT_ROOT / "Network_Simulation"))
+                from pruning_memory_plot import plot_pruning_memory_from_experiment
+                plot_path = plot_pruning_memory_from_experiment(
+                    log_dir,
+                    output_filename="pruning_memory_by_round.png",
+                    server_log_name="server.log",
+                )
+                if plot_path:
+                    print(f"[Pruning] Memory plot saved: {plot_path}")
+            except Exception as e:
+                print(f"[WARNING] Could not generate pruning memory plot: {e}")
+
         print(f"\n=== Native experiment finished with code {exit_code} ===\n")
         return exit_code
 
@@ -759,6 +796,21 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable GPU usage for native processes (honors existing CUDA_VISIBLE_DEVICES).",
     )
+    parser.add_argument(
+        "--use-pruning",
+        action="store_true",
+        help="Enable model pruning for server and clients (sets USE_PRUNING env).",
+    )
+    parser.add_argument(
+        "--pruning-sparsity",
+        type=float,
+        help="Target sparsity for pruning as a fraction between 0.0 and 1.0 (PRUNING_SPARSITY).",
+    )
+    parser.add_argument(
+        "--pruning-structured",
+        action="store_true",
+        help="Enable structured pruning (sets PRUNING_STRUCTURED=true).",
+    )
 
     return parser.parse_args()
 
@@ -775,6 +827,9 @@ def main() -> None:
         downstream_scenario=args.downstream_scenario,
         upstream_scenario=args.upstream_scenario,
         enable_gpu=args.enable_gpu,
+        use_pruning=args.use_pruning,
+        pruning_sparsity=args.pruning_sparsity,
+        pruning_structured=args.pruning_structured,
     )
     _install_signal_handlers(runner)
     code = runner.run()

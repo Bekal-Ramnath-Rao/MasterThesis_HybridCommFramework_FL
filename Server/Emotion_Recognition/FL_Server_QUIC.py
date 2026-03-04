@@ -650,9 +650,12 @@ class FederatedLearningServer:
         results_dir.mkdir(exist_ok=True)
         plt.savefig(results_dir / 'quic_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'quic_training_metrics.png'}")
-        print("\nDisplaying plot... Close the plot window to exit.")
-        plt.show()
-        
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            plt.close()
+        else:
+            print("\nDisplaying plot... Close the plot window to exit.")
+            plt.show()
+
         print("\nPlot closed. Server shutting down...")
         import sys
         sys.exit(0)

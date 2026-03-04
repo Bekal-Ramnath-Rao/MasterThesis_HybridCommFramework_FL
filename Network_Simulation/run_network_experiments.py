@@ -48,6 +48,8 @@ class ExperimentRunner:
         enable_congestion: bool = False,
         use_quantization: bool = False,
         quantization_params: Dict[str, str] = None,
+        use_pruning: bool = False,
+        pruning_params: Dict[str, str] = None,
         enable_gpu: bool = False,
         network_mode: str = "gpu",
         baseline_mode: bool = False,
@@ -58,6 +60,7 @@ class ExperimentRunner:
         self.num_rounds = num_rounds
         self.enable_congestion = enable_congestion
         self.use_quantization = use_quantization
+        self.use_pruning = use_pruning
         self.enable_gpu = enable_gpu
         self.network_mode = (network_mode or "gpu").lower().strip()
         if self.network_mode not in ("gpu", "host", "host_macvlan"):
@@ -68,6 +71,8 @@ class ExperimentRunner:
         self.local_clients = max(1, int(local_clients or 1))
         # quantization_params expected to be a dict of simple string values
         self.quantization_params = quantization_params or {}
+        # pruning_params expected to be a dict of simple string values
+        self.pruning_params = pruning_params or {}
         
         # Map use_case values to actual Server directory names
         self.use_case_dir_map = {
@@ -77,16 +82,19 @@ class ExperimentRunner:
         }
         self.use_case_dir = self.use_case_dir_map.get(use_case, f"{use_case.title()}_Recognition")
         
-        # Print quantization status
+        # Print compression (quantization + pruning) status
+        print(f"\n{'='*70}")
         if self.use_quantization:
-            print(f"\n{'='*70}")
             print("QUANTIZATION ENABLED")
-            print(f"Parameters: {self.quantization_params}")
-            print(f"{'='*70}\n")
+            print(f"Quantization params: {self.quantization_params}")
         else:
-            print(f"\n{'='*70}")
             print("QUANTIZATION DISABLED")
-            print(f"{'='*70}\n")
+        if self.use_pruning:
+            print("PRUNING ENABLED")
+            print(f"Pruning params: {self.pruning_params}")
+        else:
+            print("PRUNING DISABLED")
+        print(f"{'='*70}\n")
         
         # Get the script's directory and project root
         script_dir = Path(__file__).parent.absolute()
@@ -104,6 +112,21 @@ class ExperimentRunner:
                 folder_parts.append("quantized")
                 if quantization_params.get('QUANTIZATION_BITS'):
                     folder_parts.append(f"{quantization_params['QUANTIZATION_BITS']}bit")
+            if use_pruning:
+                folder_parts.append("pruned")
+                # Try to include pruning sparsity percentage when available
+                sparsity_str = (pruning_params or {}).get("PRUNING_SPARSITY")
+                if sparsity_str is not None:
+                    try:
+                        sparsity_val = float(sparsity_str)
+                        # Interpret values > 1.0 as already-percentage
+                        if sparsity_val <= 1.0:
+                            sparsity_pct = int(round(sparsity_val * 100))
+                        else:
+                            sparsity_pct = int(round(sparsity_val))
+                        folder_parts.append(f"{sparsity_pct}pct")
+                    except (ValueError, TypeError):
+                        pass
             if enable_congestion:
                 folder_parts.append("congestion")
             folder_parts.append(datetime.now().strftime('%Y%m%d_%H%M%S'))
@@ -262,6 +285,14 @@ class ExperimentRunner:
             quant_env = {k: v for k, v in env.items() if 'QUANTIZATION' in k or k == 'USE_QUANTIZATION'}
             if quant_env:
                 print(f"[QUANTIZATION ENV] {quant_env}")
+        # Inject pruning-related environment variables for subprocesses when enabled
+        if getattr(self, 'use_pruning', False):
+            env.update({"USE_PRUNING": "1"})
+            for k, v in self.pruning_params.items():
+                env[str(k)] = str(v)
+            prune_env = {k: v for k, v in env.items() if 'PRUNING' in k or k == 'USE_PRUNING'}
+            if prune_env:
+                print(f"[PRUNING ENV] {prune_env}")
         if env_vars:
             env.update(env_vars)
             print(f"[ENV] {env_vars}")
@@ -673,6 +704,8 @@ class ExperimentRunner:
             f"{protocol}_training_results.csv",
             "fl_results.json"
         ]
+        if getattr(self, "use_pruning", False):
+            result_files.append("pruning_metrics.json")
         
         for result_file in result_files:
             try:
@@ -721,6 +754,24 @@ class ExperimentRunner:
                 json.dump(rtt_data, f, indent=2)
             
             print(f"  RTT Stats: Avg={avg_rtt:.2f}s, Min={min(round_trip_times):.2f}s, Max={max(round_trip_times):.2f}s")
+        
+        # If pruning was enabled, plot model memory vs round (only when pruning data is present)
+        if getattr(self, "use_pruning", False):
+            try:
+                script_dir = Path(__file__).resolve().parent
+                if str(script_dir) not in sys.path:
+                    sys.path.insert(0, str(script_dir))
+                from pruning_memory_plot import plot_pruning_memory_from_experiment
+                exp_dir_path = Path(exp_dir)
+                plot_path = plot_pruning_memory_from_experiment(
+                    exp_dir_path,
+                    output_filename="pruning_memory_by_round.png",
+                    server_log_name="server_logs.txt",
+                )
+                if plot_path:
+                    print(f"  Pruning memory plot saved: {plot_path}")
+            except Exception as e:
+                print(f"  [WARNING] Could not generate pruning memory plot: {e}")
         
         print(f"Results saved to: {exp_dir}")
     
@@ -966,6 +1017,12 @@ def main():
                 help="Set QUANTIZATION_SYMMETRIC=1 if symmetric quantization should be used")
     parser.add_argument("--quantization-per-channel", action="store_true",
                 help="Set QUANTIZATION_PER_CHANNEL=1 if per-channel quantization should be used")
+    parser.add_argument("--use-pruning", action="store_true",
+                help="Enable model pruning for clients and server (sets USE_PRUNING env var)")
+    parser.add_argument("--pruning-sparsity", type=float,
+                help="Target sparsity for pruning as a fraction between 0.0 and 1.0 (PRUNING_SPARSITY)")
+    parser.add_argument("--pruning-structured", action="store_true",
+                help="Enable structured pruning (sets PRUNING_STRUCTURED=true)")
     parser.add_argument("--enable-gpu", "-g", action="store_true",
                 help="Enable GPU acceleration using NVIDIA runtime (requires nvidia-docker)")
     parser.add_argument("--network-mode", choices=["gpu", "host", "host_macvlan"], default="gpu",
@@ -1005,6 +1062,13 @@ def main():
             quant_params["QUANTIZATION_SYMMETRIC"] = "1"
         if args.quantization_per_channel:
             quant_params["QUANTIZATION_PER_CHANNEL"] = "1"
+    # Build pruning params dict to pass into runner
+    pruning_params: Dict[str, str] = {}
+    if args.use_pruning:
+        if args.pruning_sparsity is not None:
+            pruning_params["PRUNING_SPARSITY"] = str(args.pruning_sparsity)
+        if args.pruning_structured:
+            pruning_params["PRUNING_STRUCTURED"] = "true"
 
     runner = ExperimentRunner(
         use_case=args.use_case,
@@ -1012,6 +1076,8 @@ def main():
         enable_congestion=args.enable_congestion,
         use_quantization=args.use_quantization,
         quantization_params=quant_params,
+        use_pruning=args.use_pruning,
+        pruning_params=pruning_params,
         enable_gpu=args.enable_gpu,
         network_mode=args.network_mode,
         baseline_mode=args.baseline,

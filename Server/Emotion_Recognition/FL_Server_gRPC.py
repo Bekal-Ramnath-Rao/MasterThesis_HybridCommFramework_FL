@@ -564,10 +564,10 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         filepath = results_dir / 'grpc_training_plot.png'
         plt.savefig(filepath, dpi=300, bbox_inches='tight')
         print(f"Plot saved to {filepath}")
-        plt.close(fig)
-
         # In diagnostic pipeline, skip plt.show() so server exits and pipeline can run next scenario
-        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") != "1":
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            plt.close(fig)
+        else:
             plt.show()
 
 

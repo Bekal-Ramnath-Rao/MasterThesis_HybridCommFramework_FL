@@ -705,8 +705,11 @@ class FederatedLearningServer:
         results_dir.mkdir(exist_ok=True)
         plt.savefig(results_dir / 'mqtt_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'mqtt_training_metrics.png'}")
-        plt.show(block=False)
-        
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            plt.close()
+        else:
+            plt.show(block=False)
+
         # Disconnect and exit
         print("\nTraining complete. Disconnecting...")
         time.sleep(2)

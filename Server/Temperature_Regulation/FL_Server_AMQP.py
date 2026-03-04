@@ -654,8 +654,11 @@ class FederatedLearningServer:
         results_dir.mkdir(exist_ok=True)
         plt.savefig(results_dir / 'amqp_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'amqp_training_metrics.png'}")
-        plt.show()
-        
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            plt.close()
+        else:
+            plt.show()
+
         # Disconnect and exit after plot is closed
         print("\nTraining complete. Disconnecting...")
         self.stop()

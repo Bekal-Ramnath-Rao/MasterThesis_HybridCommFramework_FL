@@ -1895,9 +1895,9 @@ class FLExperimentGUI(QMainWindow):
         diag_controls_layout.addStretch()
         diag_layout.addLayout(diag_controls_layout)
         self.diagnostic_results_table = QTableWidget()
-        self.diagnostic_results_table.setColumnCount(9)
+        self.diagnostic_results_table.setColumnCount(10)
         self.diagnostic_results_table.setHorizontalHeaderLabels([
-            "Client", "Protocol", "Scenario", "O_app (s)", "O_broker", "Loss (p)", "T_actual (s)", "T_calc (s)", "Error %"
+            "Client", "Protocol", "Scenario", "O_app (s)", "O_broker", "Loss (p)", "T_actual (s)", "T_calc (s)", "Error %", "Alpha"
         ])
         self.diagnostic_results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.diagnostic_results_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -2327,6 +2327,12 @@ class FLExperimentGUI(QMainWindow):
             # Rounds and client count (native: all clients run on this machine)
             cmd_parts.extend(["--rounds", str(self.rounds_spinbox.value())])
             cmd_parts.extend(["--num-clients", str(self.min_clients.value())])
+            # Pruning (native mode)
+            if self.pruning_enabled.isChecked():
+                cmd_parts.append("--use-pruning")
+                # Slider is 0–90 (%); convert to fraction 0.0–0.9
+                sparsity = self.pruning_ratio.value() / 100.0
+                cmd_parts.extend(["--pruning-sparsity", f"{sparsity:.2f}"])
         else:
             # Docker-based experiment runner options (existing behavior).
             # Network mode: gpu | host | host_macvlan
@@ -2387,6 +2393,12 @@ class FLExperimentGUI(QMainWindow):
                 cmd_parts.append("--enable-compression")
                 cmd_parts.extend(["--compression-algorithm", self.compression_algo.currentText()])
                 cmd_parts.extend(["--compression-level", str(self.compression_level.value())])
+            
+            # Pruning (Docker-based experiments)
+            if self.pruning_enabled.isChecked():
+                cmd_parts.append("--use-pruning")
+                sparsity = self.pruning_ratio.value() / 100.0
+                cmd_parts.extend(["--pruning-sparsity", f"{sparsity:.2f}"])
             
             # Q-learning convergence (only when rl_unified is selected)
             if self.use_ql_convergence.isChecked() and "rl_unified" in self.get_selected_protocols():
@@ -3001,6 +3013,11 @@ class FLExperimentGUI(QMainWindow):
                 )
             """)
             conn.commit()
+            try:
+                conn.execute("ALTER TABLE diagnostic_results ADD COLUMN alpha REAL")
+                conn.commit()
+            except Exception:
+                pass
             conn.close()
         except Exception as e:
             if hasattr(self, "output_text"):
@@ -3044,21 +3061,34 @@ class FLExperimentGUI(QMainWindow):
                     (proto.lower(), scen.lower()),
                 )
             for r in new_rows:
-                conn.execute(
-                    """INSERT INTO diagnostic_results (client_id, protocol, scenario, O_app, O_broker, p, T_actual, T_calc, error_pct)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        int(r.get("client_id", 0)),
-                        str(r.get("protocol", "")),
-                        str(r.get("scenario", "")),
-                        float(r.get("O_app", 0)),
-                        float(r.get("O_broker", 0)),
-                        float(r.get("p", 0)),
-                        float(r.get("T_actual", 0)),
-                        float(r.get("T_calc", 0)),
-                        float(r.get("error_pct", 0)),
-                    ),
+                alpha_val = r.get("alpha")
+                if alpha_val is None:
+                    alpha_val = r.get("alpha_proto")
+                alpha_val = float(alpha_val) if alpha_val is not None else None
+                row_tuple = (
+                    int(r.get("client_id", 0)),
+                    str(r.get("protocol", "")),
+                    str(r.get("scenario", "")),
+                    float(r.get("O_app", 0)),
+                    float(r.get("O_broker", 0)),
+                    float(r.get("p", 0)),
+                    float(r.get("T_actual", 0)),
+                    float(r.get("T_calc", 0)),
+                    float(r.get("error_pct", 0)),
+                    alpha_val,
                 )
+                try:
+                    conn.execute(
+                        """INSERT INTO diagnostic_results (client_id, protocol, scenario, O_app, O_broker, p, T_actual, T_calc, error_pct, alpha)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        row_tuple,
+                    )
+                except sqlite3.OperationalError:
+                    conn.execute(
+                        """INSERT INTO diagnostic_results (client_id, protocol, scenario, O_app, O_broker, p, T_actual, T_calc, error_pct)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        row_tuple[:9],
+                    )
             conn.commit()
             conn.close()
         except Exception as e:
@@ -3074,9 +3104,14 @@ class FLExperimentGUI(QMainWindow):
         try:
             conn = sqlite3.connect(path)
             conn.row_factory = sqlite3.Row
-            cur = conn.execute(
-                "SELECT client_id, protocol, scenario, O_app, O_broker, p, T_actual, T_calc, error_pct FROM diagnostic_results ORDER BY UPPER(protocol), LOWER(scenario), client_id"
-            )
+            try:
+                cur = conn.execute(
+                    "SELECT client_id, protocol, scenario, O_app, O_broker, p, T_actual, T_calc, error_pct, alpha FROM diagnostic_results ORDER BY UPPER(protocol), LOWER(scenario), client_id"
+                )
+            except sqlite3.OperationalError:
+                cur = conn.execute(
+                    "SELECT client_id, protocol, scenario, O_app, O_broker, p, T_actual, T_calc, error_pct FROM diagnostic_results ORDER BY UPPER(protocol), LOWER(scenario), client_id"
+                )
             rows = [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()]
             conn.close()
             return rows
@@ -3100,6 +3135,8 @@ class FLExperimentGUI(QMainWindow):
             self.diagnostic_results_table.setItem(row_idx, 6, QTableWidgetItem(f"{r.get('T_actual', 0):.4f}"))
             self.diagnostic_results_table.setItem(row_idx, 7, QTableWidgetItem(f"{r.get('T_calc', 0):.4f}"))
             self.diagnostic_results_table.setItem(row_idx, 8, QTableWidgetItem(f"{r.get('error_pct', 0):.2f}%"))
+            alpha = r.get("alpha")
+            self.diagnostic_results_table.setItem(row_idx, 9, QTableWidgetItem(f"{alpha:.4f}" if alpha is not None else ""))
 
     def update_diagnostic_results_table(self, summary):
         """Update Diagnostic Results: save to DB (overwrite by protocol+scenario, add new), then reload table from DB."""
@@ -3122,6 +3159,8 @@ class FLExperimentGUI(QMainWindow):
             self.diagnostic_results_table.setItem(row_idx, 6, QTableWidgetItem(f"{r.get('T_actual', 0):.4f}"))
             self.diagnostic_results_table.setItem(row_idx, 7, QTableWidgetItem(f"{r.get('T_calc', 0):.4f}"))
             self.diagnostic_results_table.setItem(row_idx, 8, QTableWidgetItem(f"{r.get('error_pct', 0):.2f}%"))
+            alpha = r.get("alpha")
+            self.diagnostic_results_table.setItem(row_idx, 9, QTableWidgetItem(f"{alpha:.4f}" if alpha is not None else ""))
         for i in range(self.output_tabs.count()):
             if self.output_tabs.tabText(i) == "📊 Diagnostic Results":
                 self.output_tabs.setCurrentIndex(i)
@@ -3164,24 +3203,45 @@ class FLExperimentGUI(QMainWindow):
             import sqlite3
 
             conn = sqlite3.connect(db_path)
-            df = pd.read_sql_query(
-                """
-                SELECT
-                    client_id,
-                    protocol,
-                    scenario,
-                    O_app,
-                    O_broker,
-                    p,
-                    T_actual,
-                    T_calc,
-                    error_pct,
-                    updated_at
-                FROM diagnostic_results
-                ORDER BY UPPER(protocol), LOWER(scenario), client_id
-                """,
-                conn,
-            )
+            try:
+                df = pd.read_sql_query(
+                    """
+                    SELECT
+                        client_id,
+                        protocol,
+                        scenario,
+                        O_app,
+                        O_broker,
+                        p,
+                        T_actual,
+                        T_calc,
+                        error_pct,
+                        alpha,
+                        updated_at
+                    FROM diagnostic_results
+                    ORDER BY UPPER(protocol), LOWER(scenario), client_id
+                    """,
+                    conn,
+                )
+            except sqlite3.OperationalError:
+                df = pd.read_sql_query(
+                    """
+                    SELECT
+                        client_id,
+                        protocol,
+                        scenario,
+                        O_app,
+                        O_broker,
+                        p,
+                        T_actual,
+                        T_calc,
+                        error_pct,
+                        updated_at
+                    FROM diagnostic_results
+                    ORDER BY UPPER(protocol), LOWER(scenario), client_id
+                    """,
+                    conn,
+                )
             conn.close()
         except Exception as e:
             QMessageBox.critical(
@@ -3458,7 +3518,14 @@ class FLExperimentGUI(QMainWindow):
             canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             layout.addWidget(canvas)
             dialog.resize(700, 450)
-            QTimer.singleShot(5000, dialog.accept)
+            # Auto-close after 5 seconds so experiment proceeds without user interaction (capture dialog in lambda)
+            def close_after_5s(d=dialog):
+                try:
+                    d.accept()
+                    d.close()
+                except Exception:
+                    pass
+            QTimer.singleShot(5000, close_after_5s)
             dialog.exec_()
             plt.close(fig)
         except Exception as e:
@@ -3485,6 +3552,8 @@ class FLExperimentGUI(QMainWindow):
             self.diagnostic_results_table.setItem(row_idx, 6, QTableWidgetItem(f"{r.get('T_actual', 0):.4f}"))
             self.diagnostic_results_table.setItem(row_idx, 7, QTableWidgetItem(f"{r.get('T_calc', 0):.4f}"))
             self.diagnostic_results_table.setItem(row_idx, 8, QTableWidgetItem(f"{r.get('error_pct', 0):.2f}%"))
+            alpha = r.get("alpha")
+            self.diagnostic_results_table.setItem(row_idx, 9, QTableWidgetItem(f"{alpha:.4f}" if alpha is not None else ""))
     
     def reset_ui(self):
         """Reset UI after experiment"""

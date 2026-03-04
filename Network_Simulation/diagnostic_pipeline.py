@@ -39,6 +39,11 @@ MSS_BITS = 11680
 T_REPAIR = 0.005  # seconds
 B_BRIDGE_BPS = 10_000_000_000  # 10 Gbps
 
+# Target maximum absolute percentage error for tuned T_calc; used for
+# iterative α tuning per (protocol, scenario) during the diagnostic pipeline.
+ALPHA_TUNE_ERROR_THRESHOLD = float(os.environ.get("ALPHA_TUNE_ERROR_THRESHOLD", "5.0"))
+ALPHA_TUNE_MAX_ITERS = max(1, int(os.environ.get("ALPHA_TUNE_MAX_ITERS", "5")))
+
 # Protocol-specific scaling factors α_proto (fitted from diagnostics; used to scale network term)
 ALPHA_PROTO = {
     "MQTT": 1.8,
@@ -61,17 +66,24 @@ def load_diagnostics(path: Path = DIAGNOSTIC_PATH) -> pd.DataFrame:
 
 
 def fit_alpha_proto(protocol: str, df: pd.DataFrame) -> float:
-    """Fit α_proto for a single protocol: median(T_actual / (T_calc_raw - O_app))."""
+    """
+    Fit α_proto so that T_calc_tuned = α * network_term + O_app ≈ T_actual.
+    Hence α = (T_actual - O_app) / network_term, with network_term = T_calc_raw - O_app
+    (for protocols without TLS; for QUIC/HTTP3, T_calc_raw already includes O_TLS in the raw term).
+    """
     proto = protocol.upper()
-    if "T_calc_raw" not in df.columns:
-        # Fallback: use existing α (no tuning possible without raw column)
+    if "T_calc_raw" not in df.columns or "O_app" not in df.columns:
         return float(ALPHA_PROTO.get(proto, 1.0))
     df_proto = df[df["protocol"].str.upper() == proto].copy()
     if df_proto.empty:
         return float(ALPHA_PROTO.get(proto, 1.0))
-    t_raw_network = df_proto["T_calc_raw"] - df_proto["O_app"]
-    mask = t_raw_network > 0
-    ratios = df_proto.loc[mask, "T_actual"] / t_raw_network[mask]
+    network_term = df_proto["T_calc_raw"] - df_proto["O_app"]
+    mask = network_term > 1e-9  # avoid div by zero
+    if not mask.any():
+        return float(ALPHA_PROTO.get(proto, 1.0))
+    # α such that α * network_term + O_app = T_actual  =>  α = (T_actual - O_app) / network_term
+    ratios = (df_proto.loc[mask, "T_actual"] - df_proto.loc[mask, "O_app"]) / network_term[mask]
+    ratios = ratios[np.isfinite(ratios) & (ratios > 0)]
     if len(ratios) == 0:
         return float(ALPHA_PROTO.get(proto, 1.0))
     return float(np.median(ratios))
@@ -745,12 +757,29 @@ def run_pipeline(
             pass
     print("          Server tc cleared (tc applied to clients only). Client tc cleared for calibration (no losses).")
 
-    # Wait for Round 1 (round index 0) to complete – calibration for application overhead
+    # Wait for Round 1 (round index 0) to complete – calibration for application overhead.
+    # For DDS specifically, also ensure that the server has finished aggregating round 1
+    # before any tc shaping is applied (round 1 must be fully complete end‑to‑end).
     for _ in range(120):
         time.sleep(2)
         cal_list = parse_fl_diag_from_logs_multi(sender_containers, receiver_container, 0)  # round index 0 = Round 1
         n_ready = sum(1 for c in (cal_list or []) if c.get("T_total", 0) > 0)
         if cal_list and len(cal_list) >= n_expected and n_ready >= n_expected:
+            if protocol == "dds":
+                # Extra guard for DDS: wait until the DDS server log shows that
+                # round 1 has been fully aggregated before we move on to tc.
+                try:
+                    srv_log = run_cmd(["docker", "logs", receiver_container], check=False)
+                    srv_text = (srv_log.stdout or "") + (srv_log.stderr or "")
+                except Exception:
+                    srv_text = ""
+                if (
+                    "Round 1 Aggregated Metrics" not in srv_text
+                    and "Aggregated global model from round 1" not in srv_text
+                ):
+                    # Calibration timings are present but round 1 is still in progress
+                    # on the DDS server – keep waiting so that tc is not applied mid‑round.
+                    continue
             break
     else:
         print("[WARNING] No calibration timing for all clients in logs; using available or defaults.")
@@ -987,7 +1016,9 @@ def run_pipeline(
                 "p": p,
                 "T_actual": T_actual,
                 "T_calc_raw": T_calc_raw,
+                # Alpha used for this protocol in this run
                 "alpha_proto": alpha,
+                "alpha": alpha,
                 "T_calc_tuned": T_calc_tuned,
                 # Backwards-compatible keys:
                 "T_calc": T_calc_tuned,
@@ -1201,7 +1232,9 @@ def run_pipeline_native(
                     "p": p,
                     "T_actual": T_actual,
                     "T_calc_raw": T_calc_raw,
+                    # Alpha used for this protocol in this run
                     "alpha_proto": alpha,
+                    "alpha": alpha,
                     "T_calc_tuned": T_calc_tuned,
                     # Backwards-compatible keys:
                     "T_calc": T_calc_tuned,
@@ -1320,54 +1353,110 @@ def main():
         print("\n" + "=" * 60)
         print(f"Diagnostic run {idx + 1}/{len(pairs)}: protocol={protocol.upper()}, scenario={scenario}")
         print("=" * 60)
-        try:
-            if args.native:
-                summary = run_pipeline_native(
-                    protocol=protocol,
-                    use_case=args.use_case,
-                    scenario=scenario,
-                    enable_gpu=args.enable_gpu,
-                    num_clients=args.num_clients,
-                    payload_file=args.payload_file,
-                )
-            else:
-                pat = SERVICE_PATTERNS.get(args.use_case, {}).get(protocol)
-                sender = args.sender_container or (pat[0] if pat else None)
-                receiver = args.receiver_container or (pat[1] if pat else None)
-                if not sender or not receiver:
-                    print(
-                        f"Missing sender/receiver for protocol {protocol}. Use --sender-container and --receiver-container or --use-case.",
-                        file=sys.stderr,
-                    )
-                    continue
-                # sender can be list (both clients) or single; run_pipeline expects receiver as str and sender as first client for single-container override
-                sender_list = list(sender) if isinstance(sender, (list, tuple)) else [sender]
-                summary = run_pipeline(
-                    protocol=protocol,
-                    use_case=args.use_case,
-                    sender_container=sender_list[0] if sender_list else sender,
-                    receiver_container=receiver,
-                    scenario=scenario,
-                    enable_gpu=args.enable_gpu,
-                    network_mode=args.network_mode,
-                    payload_file=args.payload_file,
-                    num_clients=args.num_clients,
-                )
-            all_summaries.extend(summary)
-            # Emit after each experiment so GUI Diagnostic Results tab updates incrementally
-            print("FL_DIAG_TABLE_JSON|" + json.dumps(summary), flush=True)
+
+        # For each (protocol, scenario) pair, iteratively refine α_proto using
+        # the just-completed run until the tuned T_calc error is below the
+        # target threshold, or ALPHA_TUNE_MAX_ITERS is reached.
+        proto_key = protocol.upper()
+        pair_summaries = []
+        for iter_idx in range(ALPHA_TUNE_MAX_ITERS):
+            print(f"\n[α-tune] Iteration {iter_idx + 1}/{ALPHA_TUNE_MAX_ITERS} for {proto_key} / {scenario}")
             try:
-                with open(out_file, "w", encoding="utf-8") as f:
-                    json.dump(all_summaries, f, indent=2)
+                if args.native:
+                    summary = run_pipeline_native(
+                        protocol=protocol,
+                        use_case=args.use_case,
+                        scenario=scenario,
+                        enable_gpu=args.enable_gpu,
+                        num_clients=args.num_clients,
+                        payload_file=args.payload_file,
+                    )
+                else:
+                    pat = SERVICE_PATTERNS.get(args.use_case, {}).get(protocol)
+                    sender = args.sender_container or (pat[0] if pat else None)
+                    receiver = args.receiver_container or (pat[1] if pat else None)
+                    if not sender or not receiver:
+                        print(
+                            f"Missing sender/receiver for protocol {protocol}. Use --sender-container and --receiver-container or --use-case.",
+                            file=sys.stderr,
+                        )
+                        break
+                    # sender can be list (both clients) or single; run_pipeline expects receiver as str
+                    # and sender as first client for single-container override
+                    sender_list = list(sender) if isinstance(sender, (list, tuple)) else [sender]
+                    summary = run_pipeline(
+                        protocol=protocol,
+                        use_case=args.use_case,
+                        sender_container=sender_list[0] if sender_list else sender,
+                        receiver_container=receiver,
+                        scenario=scenario,
+                        enable_gpu=args.enable_gpu,
+                        network_mode=args.network_mode,
+                        payload_file=args.payload_file,
+                        num_clients=args.num_clients,
+                    )
+                pair_summaries.extend(summary)
+                all_summaries.extend(summary)
+                # Emit after each experiment so GUI Diagnostic Results tab updates incrementally
+                print("FL_DIAG_TABLE_JSON|" + json.dumps(summary), flush=True)
+                try:
+                    with open(out_file, "w", encoding="utf-8") as f:
+                        json.dump(all_summaries, f, indent=2)
+                except Exception as e:
+                    print(f"Warning: could not write {out_file}: {e}", flush=True)
+                # Free GPU memory: kill processes matching *Framework_FL* using GPU
+                kill_gpu_processes_matching_pattern(verbose=True)
             except Exception as e:
-                print(f"Warning: could not write {out_file}: {e}", flush=True)
-            # Free GPU memory: kill processes matching *Framework_FL* using GPU
-            kill_gpu_processes_matching_pattern(verbose=True)
-        except Exception as e:
-            print(f"[ERROR] Pipeline failed for protocol={protocol}, scenario={scenario}: {e}", file=sys.stderr)
-            import traceback
-            traceback.print_exc()
-            kill_gpu_processes_matching_pattern(verbose=True)
+                print(f"[ERROR] Pipeline failed for protocol={protocol}, scenario={scenario}: {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
+                kill_gpu_processes_matching_pattern(verbose=True)
+                break
+
+            # Compute median absolute tuned error % for this (protocol, scenario)
+            try:
+                df_pair = pd.DataFrame(summary)
+                if not df_pair.empty and "T_actual" in df_pair.columns:
+                    # Prefer error_pct_tuned (new key), fall back to error_pct (legacy)
+                    if "error_pct_tuned" in df_pair.columns:
+                        errs = df_pair["error_pct_tuned"]
+                    elif "error_pct" in df_pair.columns:
+                        errs = df_pair["error_pct"]
+                    else:
+                        errs = None
+                    if errs is not None:
+                        errs_values = [abs(float(x)) for x in errs if x is not None]
+                        current_err = float(np.median(errs_values)) if errs_values else 0.0
+                    else:
+                        current_err = 0.0
+                else:
+                    current_err = 0.0
+            except Exception as e:
+                print(f"Warning: could not compute error statistics for α tuning: {e}", flush=True)
+                current_err = 0.0
+
+            print(f"[α-tune] {proto_key} / {scenario}: median |error_pct_tuned| = {current_err:.2f}% "
+                  f"(target ≤ {ALPHA_TUNE_ERROR_THRESHOLD:.2f}%)")
+
+            # Stop if target error threshold reached
+            if current_err <= ALPHA_TUNE_ERROR_THRESHOLD:
+                print(f"[α-tune] Target error reached for {proto_key} / {scenario}; stopping iterations.")
+                break
+
+            # Otherwise, refit α from all data for this (protocol, scenario) so far for stability
+            try:
+                pair_df = pd.DataFrame(pair_summaries) if pair_summaries else df_pair
+                new_alpha = fit_alpha_proto(proto_key, pair_df)
+                old_alpha = ALPHA_PROTO.get(proto_key, 1.0)
+                ALPHA_PROTO[proto_key] = new_alpha
+                save_alpha_proto({proto_key: new_alpha}, ALPHA_PATH, merge=True)
+                print(
+                    f"[α-tune] Updating α_proto[{proto_key}] from {old_alpha:.3f} to {new_alpha:.3f} "
+                    f"(fitted from {len(pair_summaries)} runs for this pair)."
+                )
+            except Exception as e:
+                print(f"Warning: could not refit α_proto for {proto_key}: {e}", flush=True)
+                break
 
     summary = all_summaries
     if not summary:
