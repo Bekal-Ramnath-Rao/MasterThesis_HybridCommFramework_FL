@@ -137,8 +137,8 @@ class FederatedLearningServer:
         # Unique MQTT client_id per process to avoid broker "already connected" (rc=7) reconnect loop
         _mqtt_client_id = f"fl_server_{os.getpid()}"
         self.mqtt_client = mqtt.Client(client_id=_mqtt_client_id, protocol=mqtt.MQTTv311, clean_session=True)
-        # FAIR CONFIG: Set max packet size to 128MB (aligned with AMQP default)
-        self.mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
+        # Realistic max payload: MQTT 128 KB
+        self.mqtt_client._max_packet_size = 128 * 1024  # 128 KB
         # Long keepalive to avoid client rc=16 in very_poor / diagnostic pipeline
         self.mqtt_client.keepalive = MQTT_KEEPALIVE_SEC
         self.mqtt_client.on_connect = self.on_connect

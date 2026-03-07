@@ -1045,6 +1045,12 @@ def run_pipeline_native(
     enable_gpu: bool = False,
     num_clients: int = 1,
     payload_file: str = None,
+    use_pruning: bool = False,
+    pruning_sparsity: float = 0.5,
+    use_quantization: bool = False,
+    quantization_bits: int = 8,
+    quantization_strategy: str = "parameter_quantization",
+    quantization_symmetric: bool = False,
 ) -> list:
     """Execute diagnostic pipeline using native namespaces (no Docker).
 
@@ -1088,6 +1094,9 @@ def run_pipeline_native(
         RTT_eff = D_tc + J
         print(f"          Scenario for round 2: B={B} bps, p={p}, D_tc={D_tc}, J={J}")
 
+        if use_quantization and not use_pruning:
+            use_pruning = True
+            print("[Native] Quantization enabled: pruning auto-enabled (pruning -> quantization).")
         runner = NativeExperimentRunner(
             use_case=use_case,
             protocol=protocol,
@@ -1096,6 +1105,12 @@ def run_pipeline_native(
             num_clients=num_clients,
             enable_gpu=enable_gpu,
             apply_tc_after_round_1=scenario,
+            use_pruning=use_pruning,
+            pruning_sparsity=pruning_sparsity,
+            use_quantization=use_quantization,
+            quantization_bits=quantization_bits,
+            quantization_strategy=quantization_strategy,
+            quantization_symmetric=quantization_symmetric,
         )
         code = runner.run()
         if code != 0:
@@ -1321,6 +1336,12 @@ def main():
         default="cyclonedds",
         help="DDS implementation vendor to use when protocol includes DDS.",
     )
+    parser.add_argument("--use-pruning", action="store_true", help="Enable model pruning (client: train -> prune -> quantize -> send).")
+    parser.add_argument("--pruning-sparsity", type=float, default=0.5, help="Pruning sparsity (fraction, e.g. 0.5 for 50%%).")
+    parser.add_argument("--use-quantization", action="store_true", help="Enable quantization (requires pruning; client runs pruning then quantization).")
+    parser.add_argument("--quantization-bits", type=int, default=8, choices=[8, 16, 32], help="Quantization bit width.")
+    parser.add_argument("--quantization-strategy", type=str, default="parameter_quantization", help="Quantization strategy.")
+    parser.add_argument("--quantization-symmetric", action="store_true", help="Use symmetric quantization.")
     args = parser.parse_args()
 
     # Propagate DDS implementation choice so downstream scripts/containers can pick the DDS vendor
@@ -1379,7 +1400,13 @@ def main():
                         scenario=scenario,
                         enable_gpu=args.enable_gpu,
                         num_clients=args.num_clients,
-                        payload_file=args.payload_file,
+                        payload_file=getattr(args, "payload_file", None),
+                        use_pruning=getattr(args, "use_pruning", False),
+                        pruning_sparsity=getattr(args, "pruning_sparsity", 0.5),
+                        use_quantization=getattr(args, "use_quantization", False),
+                        quantization_bits=getattr(args, "quantization_bits", 8),
+                        quantization_strategy=getattr(args, "quantization_strategy", "parameter_quantization"),
+                        quantization_symmetric=getattr(args, "quantization_symmetric", False),
                     )
                 else:
                     pat = SERVICE_PATTERNS.get(args.use_case, {}).get(protocol)

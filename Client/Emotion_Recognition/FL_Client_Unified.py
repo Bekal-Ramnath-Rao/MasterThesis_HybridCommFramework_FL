@@ -87,6 +87,25 @@ except ImportError:
     dataclass = lambda x: x
     IdlStruct = object
 
+# Compression: pruning and quantization (client flow: train -> prune -> quantize -> send)
+_compression_root = os.path.join(os.path.dirname(__file__), "..", "Compression_Technique")
+if _compression_root not in sys.path:
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+try:
+    from Compression_Technique.pruning_client import ModelPruning, PruningConfig
+    PRUNING_AVAILABLE = True
+except ImportError:
+    PRUNING_AVAILABLE = False
+    ModelPruning = None
+    PruningConfig = None
+try:
+    from Compression_Technique.quantization_client import Quantization, QuantizationConfig
+    QUANTIZATION_AVAILABLE = True
+except ImportError:
+    QUANTIZATION_AVAILABLE = False
+    Quantization = None
+    QuantizationConfig = None
+
 # Define QUIC protocol handler if available
 if QuicConnectionProtocol is not None:
     class UnifiedClientQUICProtocol(QuicConnectionProtocol):
@@ -326,8 +345,8 @@ TOPIC_TRAINING_COMPLETE = "fl/training_complete"
 
 # DDS Configuration
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
-# FAIR CONFIG: 64 KB chunks for better DDS performance in poor networks
-CHUNK_SIZE = 64 * 1024  # 64KB chunks
+# Realistic max payload: DDS 64 KB per chunk
+CHUNK_SIZE = 64 * 1024  # 64 KB chunks
 
 # DDS Data Structures (must be defined at module level for Python 3.8)
 if DDS_AVAILABLE:
@@ -603,6 +622,27 @@ class UnifiedFLClient_Emotion:
         init_db()
         if init_qlearning_db is not None:
             init_qlearning_db()
+
+        # Pruning and quantization (flow: receive global model -> train -> prune -> quantize -> send)
+        use_pruning = os.getenv("USE_PRUNING", "0").strip() in ("1", "true", "yes")
+        use_quantization = os.getenv("USE_QUANTIZATION", "false").lower() in ("true", "1", "yes")
+        if use_quantization and not use_pruning:
+            use_pruning = True
+            print(f"[Client {client_id}] Quantization enabled: pruning auto-enabled (pruning -> quantization order)")
+        self.use_pruning = use_pruning
+        self.use_quantization = use_quantization
+        self.pruner = None
+        self.quantizer = None
+        if use_pruning and PRUNING_AVAILABLE and ModelPruning is not None:
+            sparsity = float(os.getenv("PRUNING_SPARSITY", "0.5"))
+            self.pruner = ModelPruning(PruningConfig(target_sparsity=sparsity))
+            print(f"[Client {client_id}] Pruning enabled (sparsity={sparsity})")
+        if use_quantization and QUANTIZATION_AVAILABLE and Quantization is not None:
+            bits = int(os.getenv("QUANTIZATION_BITS", os.getenv("QUANT_BITS", "8")))
+            strategy = os.getenv("QUANTIZATION_STRATEGY", "parameter_quantization")
+            symmetric = os.getenv("QUANTIZATION_SYMMETRIC", "true").lower() in ("true", "1", "yes")
+            self.quantizer = Quantization(QuantizationConfig(strategy=strategy, bits=bits, symmetric=symmetric))
+            print(f"[Client {client_id}] Quantization enabled (bits={bits}, strategy={strategy})")
         
         # QUIC persistent connection components
         self.quic_protocol = None
@@ -634,8 +674,8 @@ class UnifiedFLClient_Emotion:
         self.mqtt_client.max_inflight_messages_set(20)
         # FAIR CONFIG: Limited queue to 1000 messages (aligned with AMQP/gRPC)
         self.mqtt_client.max_queued_messages_set(1000)
-        # FAIR CONFIG: Set max packet size to 128MB (aligned with AMQP default)
-        self.mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
+        # Realistic max payload: MQTT 128 KB
+        self.mqtt_client._max_packet_size = 128 * 1024  # 128 KB
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
         self.mqtt_client.on_disconnect = self.on_disconnect
@@ -802,7 +842,8 @@ class UnifiedFLClient_Emotion:
                         port=int(os.getenv("AMQP_PORT", "5672")),
                         credentials=credentials,
                         heartbeat=600,  # 10 minutes for very_poor network
-                        blocked_connection_timeout=600  # Aligned with heartbeat
+                        blocked_connection_timeout=600,  # Aligned with heartbeat
+                        frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
                     )
                     
                     self.amqp_listener_connection = pika.BlockingConnection(parameters)
@@ -867,9 +908,12 @@ class UnifiedFLClient_Emotion:
             print(f"[AMQP] Client {self.client_id} received global model for round {round_num}")
             
             # Deserialize weights
-            if 'quantized_data' in data:
-                compressed_data = pickle.loads(base64.b64decode(data['quantized_data']))
-                weights = self.quantizer.decompress_global_model(compressed_data) if self.quantizer else None
+            if 'quantized_data' in data and self.quantizer is not None:
+                raw = data['quantized_data']
+                if isinstance(raw, str):
+                    raw = base64.b64decode(raw.encode('utf-8'))
+                compressed_data = pickle.loads(raw) if isinstance(raw, bytes) else raw
+                weights = self.quantizer.decompress(compressed_data)
             else:
                 weights = self.deserialize_weights(data['weights'])
             
@@ -1091,8 +1135,8 @@ class UnifiedFLClient_Emotion:
                 grpc_host = os.getenv("GRPC_HOST", "fl-server-unified-emotion")
                 grpc_port = os.getenv("GRPC_PORT", "50051")
                 options = [
-                    ('grpc.max_send_message_length', 128 * 1024 * 1024),
-                    ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                    ('grpc.max_send_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
+                    ('grpc.max_receive_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
                     ('grpc.keepalive_time_ms', 600000),
                     ('grpc.keepalive_timeout_ms', 60000),
                 ]
@@ -1413,8 +1457,8 @@ class UnifiedFLClient_Emotion:
             grpc_host = os.getenv("GRPC_HOST", "fl-server-unified-emotion")
             grpc_port = int(os.getenv("GRPC_PORT", "50051"))
             options = [
-                ('grpc.max_send_message_length', 128 * 1024 * 1024),
-                ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                ('grpc.max_send_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
+                ('grpc.max_receive_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
                 ('grpc.keepalive_time_ms', 600000),
                 ('grpc.keepalive_timeout_ms', 60000),
             ]
@@ -1764,7 +1808,15 @@ class UnifiedFLClient_Emotion:
         # Get updated weights
         updated_weights = self.model.get_weights()
         num_samples = self.train_generator.n
-        
+
+        # Flow: Training -> Pruning -> Quantization -> Send
+        if self.pruner is not None:
+            updated_weights = self.pruner.prune_weights(updated_weights, step=self.current_round)
+            if self.current_round == 0 or (self.current_round % 5 == 0):
+                stats = self.pruner.get_pruning_statistics(updated_weights)
+                print(f"[Client {self.client_id}] Pruning applied (round {self.current_round}): "
+                      f"sparsity={stats['overall_sparsity']:.2%}, non_zero={stats['non_zero_params']}")
+
         # Prepare training metrics
         metrics = {
             "loss": float(history.history["loss"][-1]),
@@ -1779,17 +1831,37 @@ class UnifiedFLClient_Emotion:
         # Select protocol based on RL
         protocol = self.select_protocol()
         
-        # Send model update via selected protocol
-        serialized_weights = self.serialize_weights(updated_weights)
-        self.round_metrics['payload_bytes'] = len(serialized_weights.encode('utf-8') if isinstance(serialized_weights, str) else len(serialized_weights))
-        update_message = {
-            "client_id": self.client_id,
-            "round": self.current_round,
-            "weights": serialized_weights,
-            "num_samples": num_samples,
-            "metrics": metrics,
-            "protocol": protocol
-        }
+        # Build update message: quantized (compressed_data) or raw (weights)
+        if self.quantizer is not None:
+            compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode("utf-8")
+            self.round_metrics['payload_bytes'] = len(serialized.encode("utf-8"))
+            update_message = {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "compressed_data": serialized,
+                "num_samples": num_samples,
+                "metrics": metrics,
+                "protocol": protocol
+            }
+            if getattr(self.quantizer, "get_compression_stats", None):
+                try:
+                    stats = self.quantizer.get_compression_stats(updated_weights, compressed_data)
+                    print(f"[Client {self.client_id}] Quantized: {stats.get('compression_ratio', 0):.2f}x, "
+                          f"{stats.get('compressed_size_mb', 0):.2f} MB")
+                except Exception:
+                    pass
+        else:
+            serialized_weights = self.serialize_weights(updated_weights)
+            self.round_metrics['payload_bytes'] = len(serialized_weights.encode('utf-8') if isinstance(serialized_weights, str) else len(serialized_weights))
+            update_message = {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "weights": serialized_weights,
+                "num_samples": num_samples,
+                "metrics": metrics,
+                "protocol": protocol
+            }
 
         comm_start = time.time()
         success = False
@@ -2017,8 +2089,8 @@ class UnifiedFLClient_Emotion:
             grpc_host = os.getenv("GRPC_HOST", "fl-server-unified-emotion")
             grpc_port = int(os.getenv("GRPC_PORT", "50051"))
             options = [
-                ('grpc.max_send_message_length', 128 * 1024 * 1024),
-                ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                ('grpc.max_send_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
+                ('grpc.max_receive_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
                 ('grpc.keepalive_time_ms', 600000),
                 ('grpc.keepalive_timeout_ms', 60000),
             ]
@@ -2138,7 +2210,8 @@ class UnifiedFLClient_Emotion:
                 heartbeat=600,  # 10 minutes for very_poor network
                 blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=3,
-                retry_delay=2
+                retry_delay=2,
+                frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
             )
             connection = pika.BlockingConnection(parameters)
             channel = connection.channel()
@@ -2191,7 +2264,8 @@ class UnifiedFLClient_Emotion:
                 heartbeat=600,  # 10 minutes for very_poor network
                 blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=3,
-                retry_delay=2
+                retry_delay=2,
+                frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
             )
             connection = pika.BlockingConnection(parameters)
             channel = connection.channel()
@@ -2230,8 +2304,8 @@ class UnifiedFLClient_Emotion:
             
             # FAIR CONFIG: Set max message size to 128MB (aligned with AMQP default)
             options = [
-                ('grpc.max_send_message_length', 128 * 1024 * 1024),
-                ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                ('grpc.max_send_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
+                ('grpc.max_receive_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
                 # FAIR CONFIG: Keepalive settings 600s for very_poor network
                 ('grpc.keepalive_time_ms', 600000),  # 10 minutes
                 ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
@@ -2239,16 +2313,19 @@ class UnifiedFLClient_Emotion:
             channel = grpc.insecure_channel(f'{grpc_host}:{grpc_port}', options=options)
             stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
             
-            # Send model update
-            weights_str = message['weights']
-            payload_size_mb = len(weights_str) / (1024 * 1024)
+            # Send model update (full message as JSON when quantized so server gets compressed_data)
+            if 'compressed_data' in message:
+                payload = json.dumps(message).encode('utf-8')
+            else:
+                payload = (message['weights'].encode('utf-8') if isinstance(message['weights'], str) else message['weights'])
+            payload_size_mb = len(payload) / (1024 * 1024)
             print(f"Client {self.client_id} sending via gRPC - size: {payload_size_mb:.2f} MB")
             
             response = stub.SendModelUpdate(
                 federated_learning_pb2.ModelUpdate(
                     client_id=message['client_id'],
                     round=message['round'],
-                    weights=weights_str.encode() if isinstance(weights_str, str) else weights_str,
+                    weights=payload,
                     num_samples=message['num_samples'],
                     metrics={k: float(v) for k, v in message['metrics'].items()}
                 )
@@ -2258,7 +2335,7 @@ class UnifiedFLClient_Emotion:
             self.waiting_for_aggregated_model = True
             
             log_sent_packet(
-                packet_size=len(weights_str),
+                packet_size=len(payload),
                 peer="server",
                 protocol="gRPC",
                 round=self.current_round,
@@ -2286,8 +2363,8 @@ class UnifiedFLClient_Emotion:
             
             # FAIR CONFIG: Set max message size to 128MB (aligned with AMQP default)
             options = [
-                ('grpc.max_send_message_length', 128 * 1024 * 1024),
-                ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                ('grpc.max_send_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
+                ('grpc.max_receive_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
                 # FAIR CONFIG: Keepalive settings 600s for very_poor network
                 ('grpc.keepalive_time_ms', 600000),  # 10 minutes
                 ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
@@ -2468,9 +2545,12 @@ class UnifiedFLClient_Emotion:
             print(f"[QUIC] Client {self.client_id} received global model for round {round_num}")
             
             # Deserialize weights
-            if 'quantized_data' in message:
-                compressed_data = pickle.loads(base64.b64decode(message['quantized_data']))
-                weights = self.quantizer.decompress_global_model(compressed_data) if self.quantizer else None
+            if 'quantized_data' in message and self.quantizer is not None:
+                raw = message['quantized_data']
+                if isinstance(raw, str):
+                    raw = base64.b64decode(raw.encode('utf-8'))
+                compressed_data = pickle.loads(raw) if isinstance(raw, bytes) else raw
+                weights = self.quantizer.decompress(compressed_data)
             else:
                 weights = self.deserialize_weights(message['weights'])
             
@@ -2780,9 +2860,9 @@ class UnifiedFLClient_Emotion:
             is_client=True, 
             alpn_protocols=H3_ALPN,  # HTTP/3 ALPN
             verify_mode=ssl.CERT_NONE,
-            # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
-            max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
-            max_data=256 * 1024 * 1024,  # 256 MB total connection
+            # Realistic max payload: HTTP/3 16 KB per stream
+            max_stream_data=16 * 1024,  # 16 KB per stream
+            max_data=32 * 1024,  # 32 KB total connection
             # FAIR CONFIG: Timeout 600s for very_poor network scenarios
             idle_timeout=600.0  # 10 minutes
         )
@@ -2855,9 +2935,12 @@ class UnifiedFLClient_Emotion:
             print(f"[HTTP/3] Client {self.client_id} received global model for round {round_num}")
             
             # Deserialize weights
-            if 'quantized_data' in message:
-                compressed_data = pickle.loads(base64.b64decode(message['quantized_data']))
-                weights = self.quantizer.decompress_global_model(compressed_data) if self.quantizer else None
+            if 'quantized_data' in message and self.quantizer is not None:
+                raw = message['quantized_data']
+                if isinstance(raw, str):
+                    raw = base64.b64decode(raw.encode('utf-8'))
+                compressed_data = pickle.loads(raw) if isinstance(raw, bytes) else raw
+                weights = self.quantizer.decompress(compressed_data)
             else:
                 weights = self.deserialize_weights(message['weights'])
             
@@ -3036,8 +3119,12 @@ class UnifiedFLClient_Emotion:
             raise NotImplementedError("DDS not available - triggering fallback")
         
         try:
-            # Serialize weights and convert to list of integers for chunking
-            weights_bytes = pickle.dumps(message['weights'])
+            # Serialize payload: either raw weights or quantized compressed_data for chunking
+            if 'compressed_data' in message:
+                # compressed_data is base64-encoded pickled dict; decode to bytes for chunking
+                weights_bytes = base64.b64decode(message['compressed_data'].encode('utf-8'))
+            else:
+                weights_bytes = pickle.dumps(message['weights'])
             weights_list = list(weights_bytes)  # Convert bytes to List[int]
             
             # FAIR CONFIG: Use chunking to match standalone DDS implementation

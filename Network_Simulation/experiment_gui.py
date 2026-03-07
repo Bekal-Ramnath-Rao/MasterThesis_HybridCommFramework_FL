@@ -2116,8 +2116,14 @@ class FLExperimentGUI(QMainWindow):
         return group
     
     def toggle_quantization_options(self, enabled):
-        """Toggle quantization options"""
+        """Toggle quantization options. If quantization is enabled, pruning is required (pruning -> quantization flow)."""
         self.quant_options_widget.setEnabled(enabled)
+        if enabled and not self.pruning_enabled.isChecked():
+            self.pruning_enabled.setChecked(True)
+            self.pruning_options_widget.setEnabled(True)
+            self.output_text.append(
+                "Note: Pruning was auto-enabled because quantization requires pruning to run first (pruning → quantization).\n"
+            )
     
     def toggle_compression_options(self, enabled):
         """Toggle compression options"""
@@ -2405,12 +2411,18 @@ class FLExperimentGUI(QMainWindow):
             # Rounds and client count (native: all clients run on this machine)
             cmd_parts.extend(["--rounds", str(self.rounds_spinbox.value())])
             cmd_parts.extend(["--num-clients", str(self.min_clients.value())])
-            # Pruning (native mode)
+            # Pruning (native mode) — required when quantization is on
             if self.pruning_enabled.isChecked():
                 cmd_parts.append("--use-pruning")
-                # Slider is 0–90 (%); convert to fraction 0.0–0.9
                 sparsity = self.pruning_ratio.value() / 100.0
                 cmd_parts.extend(["--pruning-sparsity", f"{sparsity:.2f}"])
+            # Quantization (native mode)
+            if self.quantization_enabled.isChecked():
+                cmd_parts.append("--use-quantization")
+                cmd_parts.extend(["--quantization-bits", self.quant_bits.currentText()])
+                cmd_parts.extend(["--quantization-strategy", self.quant_strategy.currentText()])
+                if self.quant_symmetric.isChecked():
+                    cmd_parts.append("--quantization-symmetric")
         else:
             # Docker-based experiment runner options (existing behavior).
             # Network mode: gpu | host | host_macvlan
@@ -2542,6 +2554,17 @@ class FLExperimentGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please select at least one network scenario!")
             return
 
+        # Quantization requires pruning (flow: pruning -> quantization)
+        if self.quantization_enabled.isChecked() and not self.pruning_enabled.isChecked():
+            self.pruning_enabled.setChecked(True)
+            self.pruning_options_widget.setEnabled(True)
+            QMessageBox.information(
+                self,
+                "Pruning auto-enabled",
+                "Quantization is enabled. Pruning has been auto-enabled because the client flow must run "
+                "pruning first, then quantization (pruning → quantization)."
+            )
+
         # Additional validation for native (no Docker) mode
         if self.exec_mode_native.isChecked():
             protocols = self.get_selected_protocols()
@@ -2633,6 +2656,15 @@ class FLExperimentGUI(QMainWindow):
             )
         if not pipeline_selected:
             return
+        # Quantization requires pruning (pruning -> quantization)
+        if self.quantization_enabled.isChecked() and not self.pruning_enabled.isChecked():
+            self.pruning_enabled.setChecked(True)
+            self.pruning_options_widget.setEnabled(True)
+            QMessageBox.information(
+                self,
+                "Pruning auto-enabled",
+                "Quantization is enabled. Pruning has been auto-enabled for the diagnostic pipeline (pruning → quantization)."
+            )
         scenarios = self.get_selected_scenarios()
         if not scenarios:
             QMessageBox.warning(
@@ -2654,6 +2686,17 @@ class FLExperimentGUI(QMainWindow):
                 command += f" --dds-impl {dds_impl_value}"
         if self.gpu_enabled.isChecked():
             command += " --enable-gpu"
+        # Pruning and quantization for diagnostic pipeline (pruning -> quantization)
+        if self.pruning_enabled.isChecked():
+            command += " --use-pruning"
+            sparsity = self.pruning_ratio.value() / 100.0
+            command += f" --pruning-sparsity {sparsity:.2f}"
+        if self.quantization_enabled.isChecked():
+            command += " --use-quantization"
+            command += f" --quantization-bits {self.quant_bits.currentText()}"
+            command += f" --quantization-strategy {self.quant_strategy.currentText()}"
+            if self.quant_symmetric.isChecked():
+                command += " --quantization-symmetric"
         is_native = getattr(self, "exec_mode_native", None) and self.exec_mode_native.isChecked()
         if is_native:
             command += " --native"

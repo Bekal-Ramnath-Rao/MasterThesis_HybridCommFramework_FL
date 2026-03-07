@@ -577,11 +577,11 @@ GRPC_KEEPALIVE_DISABLED_MS = 2147483647
 
 def serve():
     """Start the gRPC server"""
-    # FAIR CONFIG: Aligned with MQTT/AMQP/QUIC/DDS for unbiased comparison
+    # Realistic max payload: gRPC 4 MB
     # Keepalive effectively disabled (INT_MAX) so poor/very-poor networks never get GOAWAY ping_timeout
     options = [
-        ('grpc.max_send_message_length', 128 * 1024 * 1024),
-        ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+        ('grpc.max_send_message_length', 4 * 1024 * 1024),
+        ('grpc.max_receive_message_length', 4 * 1024 * 1024),
         ('grpc.keepalive_time_ms', GRPC_KEEPALIVE_DISABLED_MS),
         ('grpc.keepalive_timeout_ms', GRPC_KEEPALIVE_DISABLED_MS),
         ('grpc.http2.max_ping_strikes', 0),  # do not close on client pings

@@ -133,6 +133,10 @@ class NativeExperimentRunner:
         use_pruning: bool = False,
         pruning_sparsity: Optional[float] = None,
         pruning_structured: bool = False,
+        use_quantization: bool = False,
+        quantization_bits: Optional[int] = None,
+        quantization_strategy: Optional[str] = None,
+        quantization_symmetric: bool = False,
         rl_reward_scenario: Optional[str] = None,
     ) -> None:
         self.use_case = use_case
@@ -149,6 +153,11 @@ class NativeExperimentRunner:
         self.use_pruning = use_pruning
         self.pruning_sparsity = pruning_sparsity
         self.pruning_structured = pruning_structured
+        # Quantization (pruning must run first when both are enabled)
+        self.use_quantization = use_quantization
+        self.quantization_bits = quantization_bits or 8
+        self.quantization_strategy = quantization_strategy or "parameter_quantization"
+        self.quantization_symmetric = quantization_symmetric
         # When set (e.g. "good", "moderate", "poor"): run in excellent conditions but reward/state as if in that scenario (RL_REWARD_SCENARIO)
         self.rl_reward_scenario = (rl_reward_scenario or "").strip().lower() or None
 
@@ -447,8 +456,13 @@ class NativeExperimentRunner:
             env["USE_PRUNING"] = "1"
             if self.pruning_sparsity is not None:
                 env["PRUNING_SPARSITY"] = str(self.pruning_sparsity)
-            # Default to "false" unless explicitly structured
             env["PRUNING_STRUCTURED"] = "true" if self.pruning_structured else env.get("PRUNING_STRUCTURED", "false")
+        # Quantization (server side)
+        if self.use_quantization:
+            env["USE_QUANTIZATION"] = "1"
+            env["QUANTIZATION_BITS"] = str(self.quantization_bits)
+            env["QUANTIZATION_STRATEGY"] = self.quantization_strategy or "parameter_quantization"
+            env["QUANTIZATION_SYMMETRIC"] = "true" if self.quantization_symmetric else "false"
 
         if self.enable_gpu:
             # In native mode we simply respect whatever CUDA_VISIBLE_DEVICES the user already set.
@@ -528,6 +542,12 @@ class NativeExperimentRunner:
                 if self.pruning_sparsity is not None:
                     env["PRUNING_SPARSITY"] = str(self.pruning_sparsity)
                 env["PRUNING_STRUCTURED"] = "true" if self.pruning_structured else env.get("PRUNING_STRUCTURED", "false")
+            # Quantization (client side; when enabled, pruning is required and is applied first)
+            if self.use_quantization:
+                env["USE_QUANTIZATION"] = "1"
+                env["QUANTIZATION_BITS"] = str(self.quantization_bits)
+                env["QUANTIZATION_STRATEGY"] = self.quantization_strategy or "parameter_quantization"
+                env["QUANTIZATION_SYMMETRIC"] = "true" if self.quantization_symmetric else "false"
 
             if self.enable_gpu:
                 # Ensure every client uses a GPU: pin to GPU 0 so both use the same GPU
@@ -824,6 +844,29 @@ def parse_args() -> argparse.Namespace:
         help="Enable structured pruning (sets PRUNING_STRUCTURED=true).",
     )
     parser.add_argument(
+        "--use-quantization",
+        action="store_true",
+        help="Enable model quantization (sets USE_QUANTIZATION). Requires pruning; client flow: prune then quantize.",
+    )
+    parser.add_argument(
+        "--quantization-bits",
+        type=int,
+        default=8,
+        choices=[8, 16, 32],
+        help="Quantization bit width (default: 8).",
+    )
+    parser.add_argument(
+        "--quantization-strategy",
+        type=str,
+        default="parameter_quantization",
+        help="Quantization strategy (e.g. parameter_quantization, full_quantization).",
+    )
+    parser.add_argument(
+        "--quantization-symmetric",
+        action="store_true",
+        help="Use symmetric quantization.",
+    )
+    parser.add_argument(
         "--dds-impl",
         choices=["cyclonedds", "fastdds"],
         default="cyclonedds",
@@ -845,6 +888,10 @@ def main() -> None:
     if getattr(args, "dds_impl", None):
         os.environ["DDS_IMPL"] = args.dds_impl
 
+    use_quant = getattr(args, "use_quantization", False)
+    if use_quant and not args.use_pruning:
+        args.use_pruning = True
+        print("[INFO] Quantization enabled: pruning auto-enabled (pruning -> quantization).")
     runner = NativeExperimentRunner(
         use_case=args.use_case,
         protocol=args.protocol,
@@ -857,6 +904,10 @@ def main() -> None:
         use_pruning=args.use_pruning,
         pruning_sparsity=args.pruning_sparsity,
         pruning_structured=args.pruning_structured,
+        use_quantization=use_quant,
+        quantization_bits=getattr(args, "quantization_bits", 8),
+        quantization_strategy=getattr(args, "quantization_strategy", "parameter_quantization"),
+        quantization_symmetric=getattr(args, "quantization_symmetric", False),
         rl_reward_scenario=getattr(args, "rl_reward_scenario", None),
     )
     _install_signal_handlers(runner)

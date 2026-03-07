@@ -220,7 +220,8 @@ class FederatedLearningServer:
                     port=AMQP_PORT,
                     credentials=credentials,
                     heartbeat=600,  # 10 minutes for very_poor network
-                    blocked_connection_timeout=600  # Aligned with heartbeat
+                    blocked_connection_timeout=600,  # Aligned with heartbeat
+                    frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
                 )
                 self.connection = pika.BlockingConnection(parameters)
                 self.channel = self.connection.channel()

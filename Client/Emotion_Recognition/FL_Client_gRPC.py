@@ -144,11 +144,11 @@ class FederatedLearningClient:
         for attempt in range(max_retries):
             try:
                 print(f"Attempting to connect to gRPC server at {GRPC_HOST}:{GRPC_PORT}...")
-                # FAIR CONFIG: Set max message size to 128MB (aligned with AMQP default)
+                # Realistic max payload: gRPC 4 MB
                 # Keepalive effectively disabled (INT_MAX) so poor/very-poor networks never hit ping_timeout
                 options = [
-                    ('grpc.max_send_message_length', 128 * 1024 * 1024),
-                    ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                    ('grpc.max_send_message_length', 4 * 1024 * 1024),
+                    ('grpc.max_receive_message_length', 4 * 1024 * 1024),
                     ('grpc.keepalive_time_ms', GRPC_KEEPALIVE_DISABLED_MS),
                     ('grpc.keepalive_timeout_ms', GRPC_KEEPALIVE_DISABLED_MS),
                 ]
@@ -364,8 +364,8 @@ class FederatedLearningClient:
         target = getattr(self, '_grpc_target', f'{GRPC_HOST}:{GRPC_PORT}')
         if not opts:
             opts = [
-                ('grpc.max_send_message_length', 128 * 1024 * 1024),
-                ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                ('grpc.max_send_message_length', 4 * 1024 * 1024),
+                ('grpc.max_receive_message_length', 4 * 1024 * 1024),
                 ('grpc.keepalive_time_ms', GRPC_KEEPALIVE_DISABLED_MS),
                 ('grpc.keepalive_timeout_ms', GRPC_KEEPALIVE_DISABLED_MS),
             ]

@@ -160,8 +160,8 @@ class FederatedLearningClient:
         self.mqtt_client.max_inflight_messages_set(20)
         # FAIR CONFIG: Limited queue to 1000 messages (aligned with AMQP/gRPC)
         self.mqtt_client.max_queued_messages_set(1000)
-        # FAIR CONFIG: Set max packet size to 128MB (aligned with AMQP default)
-        self.mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
+        # Realistic max payload: MQTT 128 KB
+        self.mqtt_client._max_packet_size = 128 * 1024  # 128 KB
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
         self.mqtt_client.on_disconnect = self.on_disconnect

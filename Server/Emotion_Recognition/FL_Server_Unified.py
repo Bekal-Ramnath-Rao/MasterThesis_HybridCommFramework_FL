@@ -153,10 +153,12 @@ QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 HTTP3_HOST = os.getenv("HTTP3_HOST", '0.0.0.0')
 HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
-# FAIR CONFIG: 64 KB chunks for better DDS performance in poor networks
-CHUNK_SIZE = 64 * 1024  # 64KB chunks
-# FAIR CONFIG: QUIC/HTTP3 flow control aligned with MQTT/gRPC (128 MB) for unbiased FL round comparison
-QUIC_HTTP3_MAX_DATA_BYTES = 128 * 1024 * 1024  # 128 MB
+# Realistic max payload: DDS 64 KB per chunk
+CHUNK_SIZE = 64 * 1024  # 64 KB chunks
+# QUIC flow control (128 MB). HTTP/3 uses HTTP3_MAX_STREAM_DATA (16 KB) below.
+QUIC_HTTP3_MAX_DATA_BYTES = 128 * 1024 * 1024  # 128 MB for QUIC
+# Realistic max payload: HTTP/3 16 KB per stream
+HTTP3_MAX_STREAM_DATA = 16 * 1024  # 16 KB
 
 # DDS Data Structures (must be defined at module level for Python 3.8)
 if DDS_AVAILABLE:
@@ -415,8 +417,8 @@ class UnifiedFederatedLearningServer:
                 protocol=mqtt.MQTTv311, 
                 clean_session=True
             )
-            # FAIR CONFIG: Set max packet size to 128MB (aligned with AMQP default)
-            self.mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
+            # Realistic max payload: MQTT 128 KB
+            self.mqtt_client._max_packet_size = 128 * 1024  # 128 KB
             self.mqtt_client.on_connect = self.on_mqtt_connect
             self.mqtt_client.on_message = self.on_mqtt_message
             # FAIR CONFIG: keepalive 600s for very_poor network
@@ -467,7 +469,8 @@ class UnifiedFederatedLearningServer:
                             connection_attempts=5,
                             retry_delay=1,
                             heartbeat=600,  # 10 minutes for very_poor network
-                            blocked_connection_timeout=600  # Aligned with heartbeat
+                            blocked_connection_timeout=600,  # Aligned with heartbeat
+                            frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
                         )
                         conn = pika.BlockingConnection(parameters)
                         ch = conn.channel()
@@ -547,7 +550,8 @@ class UnifiedFederatedLearningServer:
                 heartbeat=600,  # 10 minutes for very_poor network
                 blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=5,
-                retry_delay=2
+                retry_delay=2,
+                frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
             )
             
             # Connection 1: Consumer (owned by consumer thread)
@@ -718,7 +722,8 @@ class UnifiedFederatedLearningServer:
                         port=AMQP_PORT,
                         credentials=credentials,
                         heartbeat=600,  # 10 minutes for very_poor network
-                        blocked_connection_timeout=600  # Aligned with heartbeat
+                        blocked_connection_timeout=600,  # Aligned with heartbeat
+                        frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
                     )
                     print("Before sending message type:", message_type)
                     self.amqp_send_connection = pika.BlockingConnection(parameters)
@@ -765,9 +770,9 @@ class UnifiedFederatedLearningServer:
             self.grpc_server = grpc.server(
                 futures.ThreadPoolExecutor(max_workers=10),
                 options=[
-                    # FAIR CONFIG: Message size limits 128MB (aligned with AMQP default)
-                    ('grpc.max_send_message_length', 128 * 1024 * 1024),
-                    ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                    # Realistic max payload: gRPC 4 MB
+                    ('grpc.max_send_message_length', 4 * 1024 * 1024),
+                    ('grpc.max_receive_message_length', 4 * 1024 * 1024),
                     # FAIR CONFIG: Keepalive settings 600s for very_poor network
                     ('grpc.keepalive_time_ms', 600000),  # 10 minutes
                     ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
@@ -969,14 +974,14 @@ class UnifiedFederatedLearningServer:
     async def _run_http3_server(self):
         """Async HTTP/3 server"""
         try:
-            # QUIC config: cubic congestion, 60s idle; flow control 128 MB (aligned with MQTT/gRPC for fair comparison)
+            # Realistic max payload: HTTP/3 16 KB per stream
             configuration = QuicConfiguration(
                 is_client=False,
                 alpn_protocols=H3_ALPN,
                 congestion_control_algorithm="cubic",
                 idle_timeout=60.0,
-                max_data=QUIC_HTTP3_MAX_DATA_BYTES,
-                max_stream_data=QUIC_HTTP3_MAX_DATA_BYTES,
+                max_data=HTTP3_MAX_STREAM_DATA * 2,  # 32 KB total
+                max_stream_data=HTTP3_MAX_STREAM_DATA,  # 16 KB per stream
                 max_datagram_frame_size=65536,
             )
             
@@ -1048,7 +1053,7 @@ class UnifiedFederatedLearningServer:
             print(f"[HTTP/3]   - Host: {HTTP3_HOST}:{HTTP3_PORT}")
             print(f"[HTTP/3]   - Certificate: {cert_path}")
             print(f"[HTTP/3]   - ALPN: {H3_ALPN}")
-            print(f"[HTTP/3]   - Max stream data: {QUIC_HTTP3_MAX_DATA_BYTES // (1024*1024)} MB")
+            print(f"[HTTP/3]   - Max stream data: {HTTP3_MAX_STREAM_DATA // 1024} KB")
             print(f"[HTTP/3]   - Idle timeout: 600s")
             
             # Create protocol factory that sets server reference
@@ -1165,7 +1170,8 @@ class UnifiedFederatedLearningServer:
                 heartbeat=600,  # 10 minutes for very_poor network
                 blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=5,
-                retry_delay=2
+                retry_delay=2,
+                frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
             )
             self.amqp_consumer_connection = pika.BlockingConnection(parameters)
             self.amqp_consumer_channel = self.amqp_consumer_connection.channel()
@@ -1416,20 +1422,31 @@ class UnifiedFederatedLearningServer:
                                     
                                     # Only process if we have all chunks
                                     if len(reassembled_data) > 0:
-                                        # Deserialize client weights
-                                        weights = pickle.loads(bytes(reassembled_data))
-                                        
+                                        # Deserialize: may be weights (list) or quantized compressed_data (dict)
+                                        unpacked = pickle.loads(bytes(reassembled_data))
                                         metadata = self.model_update_metadata[client_id]
-                                        data = {
-                                            'client_id': client_id,
-                                            'round': sample.round,
-                                            'weights': weights,
-                                            'num_samples': metadata['num_samples'],
-                                            'loss': metadata['loss'],
-                                            'mse': metadata['mse'],
-                                            'mae': metadata['mae'],
-                                            'mape': metadata['mape']
-                                        }
+                                        if isinstance(unpacked, dict) and ('quantization_params' in unpacked or 'compressed_data' in unpacked):
+                                            data = {
+                                                'client_id': client_id,
+                                                'round': sample.round,
+                                                'compressed_data': unpacked,
+                                                'num_samples': metadata['num_samples'],
+                                                'loss': metadata['loss'],
+                                                'mse': metadata['mse'],
+                                                'mae': metadata['mae'],
+                                                'mape': metadata['mape']
+                                            }
+                                        else:
+                                            data = {
+                                                'client_id': client_id,
+                                                'round': sample.round,
+                                                'weights': unpacked,
+                                                'num_samples': metadata['num_samples'],
+                                                'loss': metadata['loss'],
+                                                'mse': metadata['mse'],
+                                                'mae': metadata['mae'],
+                                                'mape': metadata['mape']
+                                            }
                                         
                                         log_received_packet(
                                             packet_size=len(reassembled_data),
@@ -2212,21 +2229,38 @@ if GRPC_AVAILABLE:
                     extra_info="model_update"
                 )
                 
-                # Decode the weights - they come as bytes or string
+                # Decode the payload: may be raw weights string or full JSON (when quantized)
                 if isinstance(request.weights, bytes):
-                    weights_str = request.weights.decode('utf-8')
+                    payload_str = request.weights.decode('utf-8')
                 else:
-                    weights_str = request.weights
-                
+                    payload_str = request.weights
                 metrics = dict(request.metrics)
-                
-                data = {
-                    'client_id': request.client_id,
-                    'round': request.round,
-                    'weights': weights_str,  # Already base64-encoded from client
-                    'num_samples': request.num_samples,
-                    'metrics': metrics
-                }
+                # If client sent full message as JSON (e.g. with compressed_data), use it
+                try:
+                    parsed = json.loads(payload_str)
+                    if isinstance(parsed, dict) and ('compressed_data' in parsed or 'weights' in parsed):
+                        data = {
+                            'client_id': parsed.get('client_id', request.client_id),
+                            'round': parsed.get('round', request.round),
+                            'num_samples': parsed.get('num_samples', request.num_samples),
+                            'metrics': parsed.get('metrics', metrics)
+                        }
+                        if 'compressed_data' in parsed:
+                            data['compressed_data'] = parsed['compressed_data']
+                        else:
+                            data['weights'] = parsed['weights']
+                    else:
+                        data = None
+                except (json.JSONDecodeError, TypeError):
+                    parsed = None
+                if data is None:
+                    data = {
+                        'client_id': request.client_id,
+                        'round': request.round,
+                        'weights': payload_str,
+                        'num_samples': request.num_samples,
+                        'metrics': metrics
+                    }
                 
                 print(f"[gRPC] Calling handle_client_update for client {request.client_id}, round {request.round}")
                 self.server.handle_client_update(data, 'grpc')
