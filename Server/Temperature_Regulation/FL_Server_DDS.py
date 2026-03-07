@@ -46,6 +46,16 @@ MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
 NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 # Chunking configuration for large messages
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for better DDS performance in poor networks
 
@@ -921,8 +931,7 @@ class FederatedLearningServer:
         plt.tight_layout()
         
         # Save plot
-        results_dir = Path(__file__).parent.parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "dds")
         plt.savefig(results_dir / 'dds_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Training metrics plot saved to {results_dir / 'dds_training_metrics.png'}")
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
@@ -934,8 +943,7 @@ class FederatedLearningServer:
     
     def save_results(self):
         """Save training results to CSV"""
-        results_dir = Path(__file__).parent.parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "dds")
         
         results_df = pd.DataFrame({
             'Round': self.ROUNDS,
@@ -960,7 +968,7 @@ class FederatedLearningServer:
         
         results_df = pd.concat([results_df, summary_df], ignore_index=True)
         
-        results_file = results_dir / f'dds_{NETWORK_SCENARIO}_training_results.csv'
+        results_file = results_dir / 'dds_training_results.csv'
         results_df.to_csv(results_file, index=False)
         print(f"Training results saved to {results_file}")
     

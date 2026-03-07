@@ -26,6 +26,9 @@ import fcntl
 from typing import List, Dict, Sequence, TYPE_CHECKING
 from pathlib import Path
 from concurrent import futures
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 import tensorflow as tf
 
@@ -119,6 +122,7 @@ if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 
 from packet_logger import init_db, log_sent_packet, log_received_packet
+from experiment_results_path import get_experiment_results_dir
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -247,7 +251,10 @@ class UnifiedFederatedLearningServer:
         self.ACCURACY = []
         self.LOSS = []
         self.ROUNDS = []
-        
+        self.ROUND_TIMES = []
+        self.BATTERY_CONSUMPTION = []
+        self.round_start_time = None
+
         # Convergence tracking
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
@@ -1750,7 +1757,9 @@ class UnifiedFederatedLearningServer:
                 'num_samples': data['num_samples'],
                 'loss': data['loss'],
                 'accuracy': data['accuracy'],
-                'protocol': protocol
+                'protocol': protocol,
+                'battery_soc': float(data.get('battery_soc', 1.0)),
+                'round_time_sec': float(data.get('round_time_sec', 0.0)),
             }
             
             print(f"[{protocol.upper()}] Received metrics from client {client_id} "
@@ -1832,8 +1841,9 @@ class UnifiedFederatedLearningServer:
         # Start first round
         time.sleep(2)
         self.current_round = 1
+        self.round_start_time = time.time()
         self.signal_start_training()
-    
+
     def signal_start_training(self):
         """Signal all clients to start training for current round"""
         # Unified RL requirement: use gRPC control signaling only.
@@ -1987,7 +1997,11 @@ class UnifiedFederatedLearningServer:
         """Aggregate client evaluation metrics"""
         if not self.client_metrics:
             return
-        
+        if self.round_start_time is not None:
+            self.ROUND_TIMES.append(time.time() - self.round_start_time)
+        socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
+        avg_soc = sum(socs) / len(socs) if socs else 1.0
+        self.BATTERY_CONSUMPTION.append(1.0 - avg_soc)
         # Check if we still have active clients before aggregating
         if len(self.active_clients) == 0:
             print("[Server] No active clients remaining. Stopping training.")
@@ -2013,7 +2027,7 @@ class UnifiedFederatedLearningServer:
         
         # Clear metrics
         self.client_metrics.clear()
-        
+        self.round_start_time = time.time()
         # Continue to next round ONLY if we still have active clients
         self.current_round += 1
         
@@ -2051,13 +2065,14 @@ class UnifiedFederatedLearningServer:
     
     def save_results(self):
         """Save experiment results"""
-        results_dir = Path("/app/results" if IN_DOCKER else "./results")
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("emotion", "unified")
         
         results = {
             'rounds': self.ROUNDS,
             'accuracy': self.ACCURACY,
             'loss': self.LOSS,
+            'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
+            'battery_consumption': getattr(self, 'BATTERY_CONSUMPTION', []),
             'converged': self.converged,
             'total_time': time.time() - self.start_time,
             'convergence_time': self.convergence_time,
@@ -2076,7 +2091,61 @@ class UnifiedFederatedLearningServer:
             json.dump(results, f, indent=2)
         
         print(f"\n✅ Results saved to {results_file}")
-    
+        self.plot_results()
+
+    def plot_results(self):
+        """Plot battery consumption, round/convergence time, and loss/accuracy."""
+        results_dir = get_experiment_results_dir("emotion", "unified")
+        rounds = self.ROUNDS
+        n = len(rounds)
+        if n == 0:
+            return
+        conv_time = self.convergence_time if self.convergence_time is not None else (time.time() - self.start_time if self.start_time else 0)
+        # 1) Battery consumption
+        fig1, ax1 = plt.subplots(figsize=(7, 4))
+        bc = (self.BATTERY_CONSUMPTION + [0.0] * max(0, n - len(self.BATTERY_CONSUMPTION)))[:n] if self.BATTERY_CONSUMPTION else [0.0] * n
+        if bc:
+            ax1.plot(rounds, [c * 100 for c in bc], marker='o', linewidth=2, markersize=6, color='#2e86ab')
+        ax1.set_xlabel('Round', fontsize=12)
+        ax1.set_ylabel('Battery consumption (%)', fontsize=12)
+        ax1.set_title('Unified: Battery consumption till end of FL training', fontsize=14)
+        ax1.grid(True, alpha=0.3)
+        fig1.tight_layout()
+        fig1.savefig(results_dir / 'unified_battery_consumption.png', dpi=300, bbox_inches='tight')
+        plt.close(fig1)
+        print(f"Battery plot saved to {results_dir / 'unified_battery_consumption.png'}")
+        # 2) Time per round and convergence time
+        fig2, ax2 = plt.subplots(figsize=(7, 4))
+        rt = (self.ROUND_TIMES + [0.0] * max(0, n - len(self.ROUND_TIMES)))[:n] if self.ROUND_TIMES else [0.0] * n
+        if rt:
+            ax2.bar(rounds, rt, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        ax2.axhline(y=conv_time, color='#f18f01', linestyle='--', linewidth=2, label=f'Total convergence time: {conv_time:.1f} s')
+        ax2.set_xlabel('Round', fontsize=12)
+        ax2.set_ylabel('Time (s)', fontsize=12)
+        ax2.set_title('Unified: Time per round and total convergence time', fontsize=14)
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        fig2.tight_layout()
+        fig2.savefig(results_dir / 'unified_round_and_convergence_time.png', dpi=300, bbox_inches='tight')
+        plt.close(fig2)
+        print(f"Time plot saved to {results_dir / 'unified_round_and_convergence_time.png'}")
+        # 3) Loss and Accuracy
+        fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(12, 5))
+        ax3a.plot(rounds, self.LOSS, marker='o', linewidth=2, markersize=8, color='red')
+        ax3a.set_xlabel('Round', fontsize=12)
+        ax3a.set_ylabel('Loss', fontsize=12)
+        ax3a.set_title('Unified: Loss over FL Rounds', fontsize=14)
+        ax3a.grid(True, alpha=0.3)
+        ax3b.plot(rounds, [a * 100 for a in self.ACCURACY], marker='s', linewidth=2, markersize=8, color='green')
+        ax3b.set_xlabel('Round', fontsize=12)
+        ax3b.set_ylabel('Accuracy (%)', fontsize=12)
+        ax3b.set_title('Unified: Accuracy over FL Rounds', fontsize=14)
+        ax3b.grid(True, alpha=0.3)
+        fig3.tight_layout()
+        fig3.savefig(results_dir / 'unified_training_metrics.png', dpi=300, bbox_inches='tight')
+        plt.close(fig3)
+        print(f"Results plot saved to {results_dir / 'unified_training_metrics.png'}")
+
     def run(self):
         """Run unified server (all protocols)"""
         print("[Server] Starting all protocol handlers...\n")
@@ -2295,7 +2364,9 @@ if GRPC_AVAILABLE:
                     'round': request.round,
                     'num_samples': request.num_samples,
                     'loss': request.loss,
-                    'accuracy': request.accuracy
+                    'accuracy': request.accuracy,
+                    'battery_soc': getattr(request, 'battery_soc', 1.0),
+                    'round_time_sec': getattr(request, 'round_time_sec', 0.0),
                 }
                 
                 self.server.handle_client_metrics(data, 'grpc')

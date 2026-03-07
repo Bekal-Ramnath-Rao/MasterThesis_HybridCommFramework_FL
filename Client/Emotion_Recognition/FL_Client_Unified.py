@@ -1920,13 +1920,44 @@ class UnifiedFLClient_Emotion:
         if self.env_manager is not None:
             self._last_rl_state = self.env_manager.get_current_state()
         
+        # Update battery for this round before sending metrics (so server gets current SoC)
+        if USE_RL_SELECTION and self.env_manager:
+            try:
+                protocol_for_energy = self.selected_protocol or 'mqtt'
+                try:
+                    bytes_sent, bytes_recv = get_round_bytes_sent_received(self.current_round, protocol_for_energy)
+                except Exception:
+                    bytes_sent, bytes_recv = 0, 0
+                t_round = self.round_metrics.get('training_time', 0.0) + self.round_metrics.get('communication_time', 0.0)
+                try:
+                    import psutil
+                    cpu_util = psutil.cpu_percent(interval=0.0)
+                except Exception:
+                    cpu_util = 50.0
+                alpha = PROTOCOL_ENERGY_ALPHA.get(protocol_for_energy, 1.0)
+                beta = PROTOCOL_CPU_BETA.get(protocol_for_energy, 1.0)
+                E_radio_baseline = k_tx * (bytes_sent * 8) + k_rx * (bytes_recv * 8) + E_fixed
+                E_radio = alpha * E_radio_baseline
+                E_cpu = P_CPU_MAX * (cpu_util / 100.0) * t_round * beta
+                E_total = E_radio + E_cpu
+                soc = self.env_manager.battery_soc
+                delta_soc = E_total / BATTERY_CAP_J
+                new_soc = soc - delta_soc
+                self.env_manager.update_battery(new_soc, E_total)
+            except Exception:
+                pass
+        round_time_sec = self.round_metrics.get('training_time', 0.0) + self.round_metrics.get('communication_time', 0.0)
+        battery_soc = self.env_manager.battery_soc if (USE_RL_SELECTION and self.env_manager) else 1.0
+
         metrics_message = {
             "client_id": self.client_id,
             "round": self.current_round,
             "num_samples": num_samples,
             "loss": float(loss),
             "accuracy": float(accuracy),
-            "protocol": protocol
+            "protocol": protocol,
+            "battery_soc": float(battery_soc),
+            "round_time_sec": float(round_time_sec),
         }
         
         comm_start = time.time()
@@ -1960,36 +1991,9 @@ class UnifiedFLClient_Emotion:
             self.round_metrics['communication_time'] = time.time() - comm_start
             print(f"Client {self.client_id} sent evaluation metrics for round {self.current_round}")
             print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
-            # RL update and optional Q-convergence end condition
+            # RL update and optional Q-convergence end condition (battery already updated above for metrics)
             if USE_RL_SELECTION and self.rl_selector and self.env_manager:
                 try:
-                    # Energy model: estimate E_total for this round and update battery before reward
-                    protocol = self.selected_protocol or 'mqtt'
-                    try:
-                        bytes_sent, bytes_recv = get_round_bytes_sent_received(self.current_round, protocol)
-                    except Exception:
-                        bytes_sent, bytes_recv = 0, 0
-                    bits_tx = bytes_sent * 8
-                    bits_rx = bytes_recv * 8
-                    t_round = self.round_metrics.get('training_time', 0.0) + self.round_metrics.get('communication_time', 0.0)
-                    try:
-                        import psutil
-                        cpu_util = psutil.cpu_percent(interval=0.0)
-                    except Exception:
-                        cpu_util = 50.0
-                    alpha = PROTOCOL_ENERGY_ALPHA.get(protocol, 1.0)
-                    beta = PROTOCOL_CPU_BETA.get(protocol, 1.0)
-                    E_radio_baseline = k_tx * bits_tx + k_rx * bits_rx + E_fixed
-                    E_radio = alpha * E_radio_baseline
-                    E_cpu = P_CPU_MAX * (cpu_util / 100.0) * t_round * beta
-                    E_total = E_radio + E_cpu
-                    soc = self.env_manager.battery_soc
-                    delta_soc = E_total / BATTERY_CAP_J
-                    new_soc = soc - delta_soc
-                    self.env_manager.update_battery(new_soc, E_total)
-                    if os.environ.get("FL_DIAGNOSTIC_PIPELINE", "").strip().lower() in ("1", "true", "yes"):
-                        print(f"[Energy] round={self.current_round} E_total={E_total:.4f} J SoC={new_soc:.4f} protocol={protocol}")
-
                     resources = self.env_manager.get_resource_consumption()
                     payload_bytes = self.round_metrics.get('payload_bytes') or (12 * 1024 * 1024)
                     protocol = self.selected_protocol or 'mqtt'
@@ -2378,7 +2382,9 @@ class UnifiedFLClient_Emotion:
                     round=message['round'],
                     loss=message['loss'],
                     accuracy=message['accuracy'],
-                    num_samples=message['num_samples']
+                    num_samples=message['num_samples'],
+                    battery_soc=float(message.get('battery_soc', 1.0)),
+                    round_time_sec=float(message.get('round_time_sec', 0.0)),
                 )
             )
             

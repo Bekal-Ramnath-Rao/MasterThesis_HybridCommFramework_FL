@@ -35,6 +35,16 @@ MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
 NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
@@ -650,8 +660,7 @@ class FederatedLearningServer:
         plt.tight_layout()
         
         # Save to results folder
-        results_dir = Path(__file__).parent.parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "amqp")
         plt.savefig(results_dir / 'amqp_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'amqp_training_metrics.png'}")
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
@@ -665,8 +674,7 @@ class FederatedLearningServer:
     
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent.parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "amqp")
         
         results = {
             "rounds": self.ROUNDS,
@@ -680,7 +688,7 @@ class FederatedLearningServer:
             "num_clients": self.num_clients
         }
         
-        results_file = results_dir / f'amqp_{NETWORK_SCENARIO}_training_results.json'
+        results_file = results_dir / 'amqp_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
         

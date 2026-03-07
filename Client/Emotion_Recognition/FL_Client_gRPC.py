@@ -75,6 +75,11 @@ from quantization_client import Quantization, QuantizationConfig
 
 # Add Protocols directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'Protocols'))
+# Battery model (shared with unified and MQTT)
+_client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _client_dir not in sys.path:
+    sys.path.insert(0, _client_dir)
+from battery_model import BatteryModel
 
 # Import generated gRPC code
 import federated_learning_pb2
@@ -83,6 +88,9 @@ import federated_learning_pb2_grpc
 # gRPC Configuration
 GRPC_HOST = os.getenv("GRPC_HOST", "localhost")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
+# Max message size (4 MB); server chunks larger global models and client reassembles; client chunks large updates
+GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(4 * 1024 * 1024)))
+GRPC_CHUNK_SIZE = GRPC_MAX_MESSAGE_BYTES - 4096  # leave room for proto/metadata
 # INT_MAX ms (~24 days) = effectively disable keepalive (gRPC C-core: 0 can mean "use default")
 GRPC_KEEPALIVE_DISABLED_MS = 2147483647
 # Retries for SendModelUpdate on UNAVAILABLE/DEADLINE_EXCEEDED (poor/very-poor network)
@@ -109,6 +117,8 @@ class FederatedLearningClient:
         self.num_clients = num_clients
         self.model = None
         
+        self.battery_model = BatteryModel(protocol="grpc")
+        self._last_round_time_sec = 0.0
         # Initialize quantization compression (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
         use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
@@ -144,11 +154,11 @@ class FederatedLearningClient:
         for attempt in range(max_retries):
             try:
                 print(f"Attempting to connect to gRPC server at {GRPC_HOST}:{GRPC_PORT}...")
-                # Realistic max payload: gRPC 4 MB
+                # Max message size must allow receiving global model (~9+ MB when quantization disabled)
                 # Keepalive effectively disabled (INT_MAX) so poor/very-poor networks never hit ping_timeout
                 options = [
-                    ('grpc.max_send_message_length', 4 * 1024 * 1024),
-                    ('grpc.max_receive_message_length', 4 * 1024 * 1024),
+                    ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
+                    ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
                     ('grpc.keepalive_time_ms', GRPC_KEEPALIVE_DISABLED_MS),
                     ('grpc.keepalive_timeout_ms', GRPC_KEEPALIVE_DISABLED_MS),
                 ]
@@ -200,9 +210,7 @@ class FederatedLearningClient:
         
         while not initial_model_received and retry_count < max_connection_retries:
             try:
-                model_update = self.stub.GetGlobalModel(
-                    federated_learning_pb2.ModelRequest(client_id=self.client_id)
-                )
+                model_update = self._get_global_model_chunked(round_num=0)
                 
                 if model_update.available and model_update.weights and model_update.model_config:
                     # Initial model from server
@@ -244,10 +252,8 @@ class FederatedLearningClient:
                 
                 # Check if we need to start a new round
                 if status.current_round > self.current_round and not status.should_evaluate:
-                    # Get new global model
-                    model_update = self.stub.GetGlobalModel(
-                        federated_learning_pb2.ModelRequest(client_id=self.client_id)
-                    )
+                    # Get new global model (chunked when > 4 MB)
+                    model_update = self._get_global_model_chunked(round_num=status.current_round)
                     
                     if model_update.round == status.current_round:
                         self.receive_global_model(model_update)
@@ -282,6 +288,33 @@ class FederatedLearningClient:
         print(f"Client {self.client_id} shutting down...")
         if self.channel:
             self.channel.close()
+    
+    def _get_global_model_chunked(self, round_num=None):
+        """Fetch global model from server, reassembling chunks when total_chunks > 1 (4 MB limit)."""
+        round_val = self.current_round if round_num is None else round_num
+        req = federated_learning_pb2.ModelRequest(client_id=self.client_id, round=round_val, chunk_index=0)
+        first = self.stub.GetGlobalModel(req)
+        if not first.available or not first.weights:
+            return first
+        total_chunks = getattr(first, 'total_chunks', 1) or 1
+        if total_chunks <= 1:
+            return first
+        chunks = [first.weights]
+        model_config = first.model_config
+        for idx in range(1, total_chunks):
+            req = federated_learning_pb2.ModelRequest(client_id=self.client_id, round=round_val, chunk_index=idx)
+            part = self.stub.GetGlobalModel(req)
+            if part.weights:
+                chunks.append(part.weights)
+        assembled = b''.join(chunks)
+        return federated_learning_pb2.GlobalModel(
+            round=first.round,
+            weights=assembled,
+            available=True,
+            model_config=model_config,
+            chunk_index=0,
+            total_chunks=1
+        )
     
     def receive_global_model(self, model_update):
         """Receive and set global model weights from server"""
@@ -364,8 +397,8 @@ class FederatedLearningClient:
         target = getattr(self, '_grpc_target', f'{GRPC_HOST}:{GRPC_PORT}')
         if not opts:
             opts = [
-                ('grpc.max_send_message_length', 4 * 1024 * 1024),
-                ('grpc.max_receive_message_length', 4 * 1024 * 1024),
+                ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
+                ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
                 ('grpc.keepalive_time_ms', GRPC_KEEPALIVE_DISABLED_MS),
                 ('grpc.keepalive_timeout_ms', GRPC_KEEPALIVE_DISABLED_MS),
             ]
@@ -404,7 +437,8 @@ class FederatedLearningClient:
             except Exception:
                 steps_per_epoch = 100
                 val_steps = 25
-            
+
+            training_start = time.time()
             # Train the model
             history = self.model.fit(
                 self.train_generator,
@@ -414,7 +448,8 @@ class FederatedLearningClient:
                 validation_steps=val_steps,
                 verbose=2
             )
-            
+            training_time = time.time() - training_start
+
             # Get updated weights
             updated_weights = self.model.get_weights()
             num_samples = self.train_generator.n
@@ -439,7 +474,7 @@ class FederatedLearningClient:
             
             send_start_ts = time.time()
             send_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
-            
+            comm_start = time.time()
             # Random delay before sending
             delay = random.uniform(0.5, 3.0)
             print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
@@ -454,20 +489,46 @@ class FederatedLearningClient:
             }
             if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
                 metrics_for_server['diagnostic_send_start_ts'] = send_start_ts
-            # Send update to server (long deadline for moderate/poor networks: ~9MB can take minutes)
-            request = federated_learning_pb2.ModelUpdate(
-                client_id=self.client_id,
-                round=self.current_round,
-                weights=serialized_weights,
-                num_samples=num_samples,
-                metrics=metrics_for_server
-            )
-            response = self._send_model_update_with_retry(request, send_start_cpu)
+            # Chunk payload if over gRPC limit (4 MB)
+            payload_size = len(serialized_weights)
+            if payload_size > GRPC_CHUNK_SIZE:
+                chunks = []
+                for start in range(0, payload_size, GRPC_CHUNK_SIZE):
+                    chunks.append(serialized_weights[start:start + GRPC_CHUNK_SIZE])
+                total_chunks = len(chunks)
+                for i, chunk_data in enumerate(chunks):
+                    req = federated_learning_pb2.ModelUpdate(
+                        client_id=self.client_id,
+                        round=self.current_round,
+                        weights=chunk_data,
+                        num_samples=num_samples if i == 0 else 0,
+                        metrics=metrics_for_server if i == 0 else {},
+                        chunk_index=i,
+                        total_chunks=total_chunks
+                    )
+                    response = self._send_model_update_with_retry(req, send_start_cpu if i == 0 else None)
+                    if not response.success:
+                        raise RuntimeError(f"Chunk {i + 1}/{total_chunks} failed: {response.message}")
+                print(f"Client {self.client_id} sent update in {total_chunks} chunks ({payload_size} bytes)")
+            else:
+                request = federated_learning_pb2.ModelUpdate(
+                    client_id=self.client_id,
+                    round=self.current_round,
+                    weights=serialized_weights,
+                    num_samples=num_samples,
+                    metrics=metrics_for_server
+                )
+                response = self._send_model_update_with_retry(request, send_start_cpu)
             
             if send_start_cpu is not None:
                 O_send = time.perf_counter() - send_start_cpu
-                print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={len(serialized_weights)} send_start_ts={send_start_ts:.9f}")
+                print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={payload_size} send_start_ts={send_start_ts:.9f}")
             
+            communication_time = time.time() - comm_start
+            bytes_sent = payload_size
+            self.battery_model.update(bytes_sent, 0, training_time, communication_time)
+            self._last_round_time_sec = training_time + communication_time
+
             if response.success:
                 print(f"Client {self.client_id} successfully sent update for round {self.current_round}")
                 print(f"Training metrics - Loss: {metrics['loss']:.4f}, Accuracy: {metrics['accuracy']:.4f}")
@@ -488,26 +549,40 @@ class FederatedLearningClient:
             )
             
             num_samples = self.validation_generator.n
+            loss_f = float(loss)
+            # Signal convergence in same message so server can proceed with remaining clients
+            client_converged = 1.0 if self._would_converge_after_eval(loss_f) else 0.0
             
-            # Send metrics to server
+            # Send metrics to server (include battery, round time, and convergence flag)
             response = self.stub.SendMetrics(
                 federated_learning_pb2.Metrics(
                     client_id=self.client_id,
                     round=self.current_round,
                     num_samples=num_samples,
-                    loss=float(loss),
-                    accuracy=float(accuracy)
+                    loss=loss_f,
+                    accuracy=float(accuracy),
+                    battery_soc=float(self.battery_model.battery_soc),
+                    round_time_sec=float(self._last_round_time_sec),
+                    client_converged=client_converged,
                 )
             )
             
             if response.success:
                 print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
-                self._update_local_convergence(float(loss))
+                self._update_local_convergence(loss_f)
             
         except Exception as e:
             print(f"Error in evaluate_model: {e}")
             import traceback
             traceback.print_exc()
+
+    def _would_converge_after_eval(self, loss: float) -> bool:
+        """Return True if this evaluation loss would trigger local convergence (so server can be signalled in same SendMetrics)."""
+        if self.current_round < MIN_ROUNDS or self.has_converged:
+            return False
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            return False
+        return (self.rounds_without_improvement + 1) >= CONVERGENCE_PATIENCE
 
     def _update_local_convergence(self, loss: float):
         """Track client-local convergence and disconnect when converged."""

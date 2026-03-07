@@ -14,6 +14,16 @@ from typing import Dict, Optional
 import matplotlib.pyplot as plt
 from pathlib import Path
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
@@ -253,7 +263,10 @@ class FederatedLearningServer:
         self.ACCURACY = []
         self.LOSS = []
         self.ROUNDS = []
-        
+        self.ROUND_TIMES = []
+        self.BATTERY_CONSUMPTION = []
+        self.round_start_time = None
+
         # Convergence tracking
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
@@ -530,9 +543,12 @@ class FederatedLearningServer:
             await self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
+            m = message.get('metrics', {})
             self.client_metrics[client_id] = {
                 'num_samples': message['num_samples'],
-                'metrics': message['metrics']
+                'metrics': message['metrics'],
+                'battery_soc': float(m.get('battery_soc', 1.0)),
+                'round_time_sec': float(m.get('round_time_sec', 0.0)),
             }
             
             print(f"Received metrics from client {client_id} "
@@ -550,6 +566,7 @@ class FederatedLearningServer:
         })
         
         self.current_round = 1
+        self.round_start_time = time.time()
         
         print(f"\n{'='*70}")
         print(f"Distributing Initial Global Model")
@@ -668,7 +685,10 @@ class FederatedLearningServer:
     async def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
         print(f"\nAggregating metrics from {len(self.client_metrics)} clients...")
-        
+        if getattr(self, 'round_start_time', None) is not None:
+            self.ROUND_TIMES.append(time.time() - self.round_start_time)
+        socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
+        self.BATTERY_CONSUMPTION.append(1.0 - (sum(socs) / len(socs) if socs else 1.0))
         total_samples = sum(metric['num_samples'] 
                           for metric in self.client_metrics.values())
         
@@ -707,6 +727,7 @@ class FederatedLearningServer:
         
         if self.current_round < self.num_rounds:
             self.current_round += 1
+            self.round_start_time = time.time()
             
             print(f"\n{'='*70}")
             print(f"Starting Round {self.current_round}/{self.num_rounds}")
@@ -757,43 +778,36 @@ class FederatedLearningServer:
             return False
     
     def plot_results(self):
-        """Plot training metrics"""
-        plt.figure(figsize=(12, 5))
-        
-        plt.subplot(1, 2, 1)
-        plt.plot(self.ROUNDS, self.LOSS, marker='o', linewidth=2, markersize=8, color='red')
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Loss', fontsize=12)
-        plt.title('Loss over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        plt.subplot(1, 2, 2)
-        plt.plot(self.ROUNDS, self.ACCURACY, marker='s', linewidth=2, markersize=8, color='green')
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Accuracy', fontsize=12)
-        plt.title('Accuracy over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
-        plt.savefig(results_dir / 'http3_training_metrics.png', dpi=300, bbox_inches='tight')
+        """Plot battery, round/convergence time, and loss/accuracy."""
+        results_dir = get_experiment_results_dir("emotion", "http3")
+        rounds = self.ROUNDS
+        n = len(rounds)
+        conv_time = self.convergence_time if self.convergence_time is not None else (time.time() - self.start_time if self.start_time else 0)
+        bc = (getattr(self, 'BATTERY_CONSUMPTION', []) + [0.0] * max(0, n - len(getattr(self, 'BATTERY_CONSUMPTION', []))))[:n] or [0.0] * n
+        rt = (getattr(self, 'ROUND_TIMES', []) + [0.0] * max(0, n - len(getattr(self, 'ROUND_TIMES', []))))[:n] or [0.0] * n
+        fig1, ax1 = plt.subplots(figsize=(7, 4))
+        if bc: ax1.plot(rounds, [c * 100 for c in bc], marker='o', linewidth=2, markersize=6, color='#2e86ab')
+        ax1.set_xlabel('Round'); ax1.set_ylabel('Battery consumption (%)'); ax1.set_title('HTTP/3: Battery consumption till end of FL'); ax1.grid(True, alpha=0.3)
+        fig1.tight_layout(); fig1.savefig(results_dir / 'http3_battery_consumption.png', dpi=300, bbox_inches='tight'); plt.close(fig1)
+        fig2, ax2 = plt.subplots(figsize=(7, 4))
+        if rt: ax2.bar(rounds, rt, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        ax2.axhline(y=conv_time, color='#f18f01', linestyle='--', linewidth=2, label=f'Convergence: {conv_time:.1f} s')
+        ax2.set_xlabel('Round'); ax2.set_ylabel('Time (s)'); ax2.set_title('HTTP/3: Time per round and convergence'); ax2.legend(); ax2.grid(True, alpha=0.3)
+        fig2.tight_layout(); fig2.savefig(results_dir / 'http3_round_and_convergence_time.png', dpi=300, bbox_inches='tight'); plt.close(fig2)
+        fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(12, 5))
+        ax3a.plot(rounds, self.LOSS, marker='o', linewidth=2, markersize=8, color='red'); ax3a.set_xlabel('Round'); ax3a.set_ylabel('Loss'); ax3a.set_title('HTTP/3: Loss over Rounds'); ax3a.grid(True, alpha=0.3)
+        ax3b.plot(rounds, self.ACCURACY, marker='s', linewidth=2, markersize=8, color='green'); ax3b.set_xlabel('Round'); ax3b.set_ylabel('Accuracy'); ax3b.set_title('HTTP/3: Accuracy over Rounds'); ax3b.grid(True, alpha=0.3)
+        fig3.tight_layout(); fig3.savefig(results_dir / 'http3_training_metrics.png', dpi=300, bbox_inches='tight'); plt.close(fig3)
         print(f"Results plot saved to {results_dir / 'http3_training_metrics.png'}")
-        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
-            plt.close()
-        else:
-            print("\nDisplaying plot... Close the plot window to exit.")
-            plt.show()
-
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1": plt.close('all')
+        else: plt.show(block=False)
         print("\nPlot closed. Server shutting down...")
         import sys
         sys.exit(0)
     
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("emotion", "http3")
         
         results = {
             "rounds": self.ROUNDS,

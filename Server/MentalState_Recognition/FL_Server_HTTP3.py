@@ -13,6 +13,16 @@ from collections import Counter
 import glob
 from pathlib import Path
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
@@ -792,8 +802,7 @@ Initializing global EEG model (CNN+BiLSTM+MHA)...")
         
         plt.tight_layout()
         
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("mental_state", "http3")
         plt.savefig(results_dir / 'http3_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'http3_training_metrics.png'}")
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
@@ -808,8 +817,7 @@ Initializing global EEG model (CNN+BiLSTM+MHA)...")
     
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("mental_state", "http3")
         
         results = {
             "rounds": self.ROUNDS,

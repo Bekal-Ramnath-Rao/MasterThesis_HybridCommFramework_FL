@@ -41,6 +41,16 @@ MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
 NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
@@ -144,29 +154,31 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         # Update total client count if more clients join
         if len(self.registered_clients) > self.num_clients:
             self.update_client_count(len(self.registered_clients))
-            
-            # If all clients registered, start distributing initial global model
-            if len(self.registered_clients) == self.num_clients and not self.training_started:
-                print("\nAll clients registered. Distributing initial global model...\n")
-                self.training_started = True
-                self.current_round = 1
-                
-                print(f"\n{'='*70}")
-                print(f"Distributing Initial Global Model")
-                print(f"{'='*70}\n")
-                print("Initial global model ready for clients")
-                
-                print(f"\n{'='*70}")
-                print(f"Starting Round {self.current_round}/{self.num_rounds}")
-                print(f"{'='*70}\n")
-            
-            return federated_learning_pb2.RegistrationResponse(
-                success=True,
-                message=f"Client {client_id} registered successfully"
-                )
+
+        # Start when we have at least min_clients; after one converges we proceed with remaining active clients
+        if len(self.registered_clients) >= self.min_clients and not self.training_started:
+            print("\nMinimum clients reached. Distributing initial global model...\n")
+            self.training_started = True
+            self.current_round = 1
+
+            print(f"\n{'='*70}")
+            print(f"Distributing Initial Global Model")
+            print(f"{'='*70}\n")
+            print("Initial global model ready for clients")
+
+            print(f"\n{'='*70}")
+            print(f"Starting Round {self.current_round}/{self.num_rounds}")
+            print(f"{'='*70}\n")
+
+        return federated_learning_pb2.RegistrationResponse(
+            success=True,
+            message=f"Client {client_id} registered successfully"
+        )
     
     def mark_client_converged(self, client_id):
-        """Remove converged client from active federation."""
+        """Remove converged client from active federation; proceed with remaining clients."""
+        do_aggregate_metrics = False
+        do_aggregate_models = False
         with self.lock:
             if client_id in self.active_clients:
                 self.active_clients.discard(client_id)
@@ -181,6 +193,17 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     self.convergence_time = time.time() - self.start_time if self.start_time else 0
                     self.plot_results()
                     self.save_results()
+                else:
+                    # Re-check: remaining active clients may have already sent updates/metrics
+                    if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
+                        do_aggregate_metrics = True
+                    if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
+                        do_aggregate_models = True
+        if do_aggregate_metrics:
+            self.aggregate_metrics()
+            self.continue_training()
+        if do_aggregate_models:
+            self.aggregate_models()
     
     def GetTrainingConfig(self, request, context):
         """Return training configuration"""
@@ -578,8 +601,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         plt.tight_layout()
         
         # Save plot
-        results_dir = Path(__file__).parent.parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "grpc")
         plt.savefig(results_dir / 'grpc_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Training metrics plot saved to {results_dir / 'grpc_training_metrics.png'}")
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
@@ -591,8 +613,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
     
     def save_results(self):
         """Save training results to CSV"""
-        results_dir = Path(__file__).parent.parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "grpc")
         
         results_df = pd.DataFrame({
             'Round': self.ROUNDS,
@@ -617,7 +638,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         
         results_df = pd.concat([results_df, summary_df], ignore_index=True)
         
-        results_file = results_dir / f'grpc_{NETWORK_SCENARIO}_training_results.csv'
+        results_file = results_dir / 'grpc_training_results.csv'
         results_df.to_csv(results_file, index=False)
         print(f"Training results saved to {results_file}")
 

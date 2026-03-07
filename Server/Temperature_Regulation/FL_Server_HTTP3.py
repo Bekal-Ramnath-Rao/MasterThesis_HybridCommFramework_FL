@@ -41,6 +41,16 @@ CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 
 class FederatedLearningServerProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
@@ -642,8 +652,7 @@ Global model initialized with random weights")
         
         plt.tight_layout()
         
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "http3")
         plt.savefig(results_dir / 'http3_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'http3_training_metrics.png'}")
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
@@ -658,8 +667,7 @@ Global model initialized with random weights")
     
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "http3")
         
         results = {
             "rounds": self.ROUNDS,

@@ -13,6 +13,16 @@ from concurrent import futures
 import threading
 import tensorflow as tf
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
@@ -595,9 +605,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             "num_rounds": self.num_rounds
         }
 
-        results_dir = os.path.join(os.path.dirname(__file__), "results")
-        os.makedirs(results_dir, exist_ok=True)
-        results_file = os.path.join(results_dir, "grpc_training_results.json")
+        results_dir = get_experiment_results_dir("mental_state", "grpc")
+        results_file = results_dir / "grpc_training_results.json"
 
         with open(results_file, "w") as f:
             json.dump(results, f, indent=2)

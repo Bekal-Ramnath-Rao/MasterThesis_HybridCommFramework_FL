@@ -33,6 +33,7 @@ if _utilities_path not in sys.path:
 
 print(f"Project root set to: {project_root}")
 from packet_logger import init_db, log_sent_packet, log_received_packet
+from experiment_results_path import get_experiment_results_dir
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -93,7 +94,10 @@ class FederatedLearningServer:
         self.ACCURACY = []
         self.LOSS = []
         self.ROUNDS = []
-        
+        # Per-round time (sec) and battery consumption (0–1, from client-reported SoC)
+        self.ROUND_TIMES = []
+        self.BATTERY_CONSUMPTION = []
+
         # Convergence tracking
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
@@ -170,8 +174,8 @@ class FederatedLearningServer:
                 self.send_global_model_to_client(client_id)
     
     def get_active_clients(self):
-        """Get list of currently active clients"""
-        return list(self.registered_clients)
+        """Get list of currently active (non-converged) clients; after one converges we proceed with the rest."""
+        return list(self.active_clients)
     
     def adaptive_wait_for_clients(self, client_dict, timeout=300):
         """
@@ -546,6 +550,7 @@ class FederatedLearningServer:
         
         # Capture which active clients will participate in this round
         self.round_participants = self.active_clients.copy()
+        self.round_start_time = time.time()
         print(f"Round {self.current_round} participants: {sorted(list(self.round_participants))}")
         
         print(f"\n{'='*70}")
@@ -651,6 +656,16 @@ class FederatedLearningServer:
     def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
         print(f"\nAggregating metrics from {len(self.client_metrics)} clients...")
+
+        # Round duration and battery (from client-reported metrics)
+        if getattr(self, 'round_start_time', None) is not None:
+            self.ROUND_TIMES.append(time.time() - self.round_start_time)
+        socs = [m['metrics'].get('battery_soc', 1.0) for m in self.client_metrics.values() if isinstance(m.get('metrics'), dict)]
+        if socs:
+            avg_soc = sum(socs) / len(socs)
+            self.BATTERY_CONSUMPTION.append(1.0 - avg_soc)  # consumption = 1 - SoC
+        else:
+            self.BATTERY_CONSUMPTION.append(0.0)
         
         # Calculate total samples
         total_samples = sum(metric['num_samples'] 
@@ -693,6 +708,7 @@ class FederatedLearningServer:
         # Check if more rounds needed
         if self.current_round < self.num_rounds:
             self.current_round += 1
+            self.round_start_time = time.time()
             
             # Capture active participants for this new round
             self.round_participants = self.active_clients.copy()
@@ -770,34 +786,65 @@ class FederatedLearningServer:
             return False
     
     def plot_results(self):
-        """Plot training metrics"""
-        plt.figure(figsize=(12, 5))
-        
-        # Loss Plot
-        plt.subplot(1, 2, 1)
-        plt.plot(self.ROUNDS, self.LOSS, marker='o', linewidth=2, markersize=8, color='red')
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Loss (Categorical Crossentropy)', fontsize=12)
-        plt.title('Loss over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        # Accuracy Plot
-        plt.subplot(1, 2, 2)
-        plt.plot(self.ROUNDS, [acc*100 for acc in self.ACCURACY], marker='s', linewidth=2, markersize=8, color='green')
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Accuracy (%)', fontsize=12)
-        plt.title('Accuracy over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Save to results folder
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
-        plt.savefig(results_dir / 'mqtt_training_metrics.png', dpi=300, bbox_inches='tight')
+        """Plot training metrics: battery consumption, round/convergence time, loss & accuracy."""
+        results_dir = get_experiment_results_dir("emotion", "mqtt")
+        rounds = self.ROUNDS
+        n = len(rounds)
+        conv_time = self.convergence_time if self.convergence_time is not None else (time.time() - self.start_time if self.start_time else 0)
+
+        # 1) Battery consumption till end of FL training
+        fig1, ax1 = plt.subplots(figsize=(7, 4))
+        if self.BATTERY_CONSUMPTION and len(self.BATTERY_CONSUMPTION) == n:
+            ax1.plot(rounds, [c * 100 for c in self.BATTERY_CONSUMPTION], marker='o', linewidth=2, markersize=6, color='#2e86ab')
+        else:
+            bc = self.BATTERY_CONSUMPTION if len(self.BATTERY_CONSUMPTION) >= n else (self.BATTERY_CONSUMPTION + [0.0] * (n - len(self.BATTERY_CONSUMPTION)))[:n]
+            if bc:
+                ax1.plot(rounds, [c * 100 for c in bc], marker='o', linewidth=2, markersize=6, color='#2e86ab')
+        ax1.set_xlabel('Round', fontsize=12)
+        ax1.set_ylabel('Battery consumption (%)', fontsize=12)
+        ax1.set_title('Battery consumption till end of FL training', fontsize=14)
+        ax1.grid(True, alpha=0.3)
+        fig1.tight_layout()
+        fig1.savefig(results_dir / 'mqtt_battery_consumption.png', dpi=300, bbox_inches='tight')
+        plt.close(fig1)
+        print(f"Battery plot saved to {results_dir / 'mqtt_battery_consumption.png'}")
+
+        # 2) Total time per round and convergence time
+        fig2, ax2 = plt.subplots(figsize=(7, 4))
+        if self.ROUND_TIMES and len(self.ROUND_TIMES) == n:
+            ax2.bar(rounds, self.ROUND_TIMES, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        else:
+            rt = self.ROUND_TIMES if len(self.ROUND_TIMES) >= n else (self.ROUND_TIMES + [0.0] * (n - len(self.ROUND_TIMES)))[:n]
+            if rt:
+                ax2.bar(rounds, rt, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        ax2.axhline(y=conv_time, color='#f18f01', linestyle='--', linewidth=2, label=f'Total convergence time: {conv_time:.1f} s')
+        ax2.set_xlabel('Round', fontsize=12)
+        ax2.set_ylabel('Time (s)', fontsize=12)
+        ax2.set_title('Time per round and total convergence time', fontsize=14)
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        fig2.tight_layout()
+        fig2.savefig(results_dir / 'mqtt_round_and_convergence_time.png', dpi=300, bbox_inches='tight')
+        plt.close(fig2)
+        print(f"Time plot saved to {results_dir / 'mqtt_round_and_convergence_time.png'}")
+
+        # 3) Loss and Accuracy after each FL round
+        fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(12, 5))
+        ax3a.plot(rounds, self.LOSS, marker='o', linewidth=2, markersize=8, color='red')
+        ax3a.set_xlabel('Round', fontsize=12)
+        ax3a.set_ylabel('Loss (Categorical Crossentropy)', fontsize=12)
+        ax3a.set_title('Loss over Federated Learning Rounds', fontsize=14)
+        ax3a.grid(True, alpha=0.3)
+        ax3b.plot(rounds, [acc * 100 for acc in self.ACCURACY], marker='s', linewidth=2, markersize=8, color='green')
+        ax3b.set_xlabel('Round', fontsize=12)
+        ax3b.set_ylabel('Accuracy (%)', fontsize=12)
+        ax3b.set_title('Accuracy over Federated Learning Rounds', fontsize=14)
+        ax3b.grid(True, alpha=0.3)
+        fig3.tight_layout()
+        fig3.savefig(results_dir / 'mqtt_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'mqtt_training_metrics.png'}")
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
-            plt.close()
+            plt.close('all')
         else:
             plt.show(block=False)  # Non-blocking show
 
@@ -812,13 +859,14 @@ class FederatedLearningServer:
     
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("emotion", "mqtt")
         
         results = {
             "rounds": self.ROUNDS,
             "accuracy": self.ACCURACY,
             "loss": self.LOSS,
+            "round_times_seconds": getattr(self, 'ROUND_TIMES', []),
+            "battery_consumption": getattr(self, 'BATTERY_CONSUMPTION', []),
             "convergence_time_seconds": self.convergence_time,
             "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
             "total_rounds": len(self.ROUNDS),

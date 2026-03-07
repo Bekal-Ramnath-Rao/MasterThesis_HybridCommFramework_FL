@@ -28,6 +28,16 @@ from cyclonedds.topic import Topic
 from cyclonedds.pub import DataWriter
 from cyclonedds.sub import DataReader
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
@@ -325,8 +335,7 @@ class UnifiedFederatedLearningServer:
     
     def save_results(self):
         """Save experiment results"""
-        results_dir = Path("/app/results" if IN_DOCKER else "./results")
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "unified")
         
         results = {
             'rounds': self.ROUNDS,

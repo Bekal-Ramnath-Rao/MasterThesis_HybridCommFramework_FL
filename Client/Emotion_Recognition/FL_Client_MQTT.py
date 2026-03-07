@@ -51,7 +51,7 @@ _utilities_path = os.path.join(project_root, 'scripts', 'utilities')
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 
-from packet_logger import log_sent_packet, log_received_packet, init_db
+from packet_logger import log_sent_packet, log_received_packet, init_db, get_round_bytes_sent_received
 # Make TensorFlow logs less verbose
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
@@ -90,6 +90,12 @@ if compression_path not in sys.path:
     sys.path.insert(0, compression_path)
 
 from quantization_client import Quantization, QuantizationConfig
+
+# Battery model (shared with unified client)
+_client_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _client_dir not in sys.path:
+    sys.path.insert(0, _client_dir)
+from battery_model import BatteryModel
 
 # MQTT Configuration
 # Auto-detect environment: Docker (/app exists) or local
@@ -141,7 +147,10 @@ class FederatedLearningClient:
 
         # Initialize packet logger database
         init_db()
-        
+        # Battery/energy model (same as unified use case)
+        self.battery_model = BatteryModel(protocol="mqtt")
+        self._last_round_time_sec = 0.0  # training + communication time for last round
+
         # Initialize quantization compression (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
         use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
@@ -481,7 +490,8 @@ class FederatedLearningClient:
         except Exception:
             steps_per_epoch = 100
             val_steps = 25
-        
+
+        training_start = time.time()
         # Train the model using generator
         history = self.model.fit(
             self.train_generator,
@@ -491,7 +501,8 @@ class FederatedLearningClient:
             validation_steps=val_steps,
             verbose=2
         )
-        
+        training_time = time.time() - training_start
+
         # Get updated weights
         updated_weights = self.model.get_weights()
         num_samples = self.train_generator.n  # Total number of training samples
@@ -541,7 +552,8 @@ class FederatedLearningClient:
         
         # FAIR FIX: Removed random delay - this was causing unfair comparison with other protocols
         # Other protocols don't have random delays, so MQTT shouldn't either
-        
+
+        comm_start = time.time()
         # Serialize and send model update with error handling
         try:
             payload = json.dumps(update_message)
@@ -578,6 +590,17 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} ERROR serializing/sending update: {e}")
             import traceback
             traceback.print_exc()
+        communication_time = time.time() - comm_start
+
+        # Battery model update (same as unified use case)
+        try:
+            bytes_sent, bytes_recv = get_round_bytes_sent_received(self.current_round, "MQTT")
+        except Exception:
+            bytes_sent, bytes_recv = 0, 0
+        self.battery_model.update(
+            bytes_sent, bytes_recv, training_time, communication_time
+        )
+        self._last_round_time_sec = training_time + communication_time
     
     def _update_local_convergence(self, loss: float):
         """Track client-local convergence and disconnect when converged."""
@@ -605,10 +628,13 @@ class FederatedLearningClient:
         num_samples = self.validation_generator.n
 
         self._update_local_convergence(float(loss))
-        
+
         metrics_dict = {
             "loss": float(loss),
-            "accuracy": float(accuracy)
+            "accuracy": float(accuracy),
+            "battery_soc": float(self.battery_model.battery_soc),
+            "round_time_sec": float(self._last_round_time_sec),
+            "cumulative_energy_j": float(self.battery_model.cumulative_energy_j),
         }
         if self.has_converged:
             metrics_dict["client_converged"] = 1.0

@@ -11,6 +11,16 @@ from typing import List, Dict
 import matplotlib.pyplot as plt
 from pathlib import Path
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
@@ -563,8 +573,7 @@ class FederatedLearningServer:
         plt.tight_layout()
         
         # Save to results folder
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "mqtt")
         plt.savefig(results_dir / 'mqtt_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'mqtt_training_metrics.png'}")
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
@@ -583,8 +592,7 @@ class FederatedLearningServer:
     
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "mqtt")
         
         results = {
             "rounds": self.ROUNDS,
@@ -598,7 +606,7 @@ class FederatedLearningServer:
             "num_clients": self.num_clients
         }
         
-        results_file = results_dir / f'mqtt_{NETWORK_SCENARIO}_training_results.json'
+        results_file = results_dir / 'mqtt_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
         
