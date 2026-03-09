@@ -3,7 +3,7 @@
 ## Date: 2026-02-11
 ## Purpose: Calculate transmission time for federated learning model updates across all protocols
 
-**Analytical formulas (diagnostic pipeline):** For the exact **T_calc** formulas implemented per protocol (MQTT, AMQP, gRPC, QUIC, HTTP/3, DDS), including TLS 1.3 for QUIC/HTTP3, see **[COMMUNICATION_MODEL_FORMULAS.md](COMMUNICATION_MODEL_FORMULAS.md)**.
+**Analytical formulas (diagnostic pipeline):** For the exact **T_calc** formulas implemented per protocol (MQTT, AMQP, gRPC, QUIC, HTTP/3, DDS), including TLS 1.3 for QUIC/HTTP3 and **egress + ingress port delay**, see **[COMMUNICATION_MODEL_FORMULAS.md](COMMUNICATION_MODEL_FORMULAS.md)**. Delay is modeled on both the egress and ingress ports (same tc scenario per leg), so effective one-way delay is \(D_{\mathrm{egress}} + D_{\mathrm{ingress}} + J\).
 
 ---
 
@@ -681,28 +681,30 @@ Where:
   - QUIC: 1.2
   - MQTT: 1.0 (simple retry)
 
-### Jitter Impact
+### Jitter and Egress/Ingress Delay
+
+The analytical model includes delay on both **egress** and **ingress** ports (tc applied at both when using the diagnostic pipeline or network simulator). Effective one-way delay used in formulas is:
 
 ```
-Effective RTT = RTT + Jitter × Random Factor
+Effective one-way delay (RTT_eff) = D_egress + D_ingress + Jitter
 ```
 
-Where:
-- **Random Factor**: Typically 0.5-1.5 (normal distribution)
+When the same scenario is applied to both ports: \(D_{\mathrm{egress}} = D_{\mathrm{ingress}} = D_{\mathrm{tc}}\), so \(\mathrm{RTT}_{\mathrm{eff}} = 2 D_{\mathrm{tc}} + J\). See **COMMUNICATION_MODEL_FORMULAS.md** for the exact notation and protocol formulas.
 
 ---
 
 ## Notes
 
-1. All calculations assume **optimal conditions** (no congestion, no buffer bloat)
-2. **Real-world overhead** includes:
+1. **Egress and ingress delay:** The diagnostic pipeline and network simulator apply tc at both client egress and client ingress (same delay/jitter per leg). The communication model formulas use effective one-way delay \(\mathrm{RTT}_{\mathrm{eff}} = D_{\mathrm{egress}} + D_{\mathrm{ingress}} + J\); when both legs use the same \(D_{\mathrm{tc}}\), \(\mathrm{RTT}_{\mathrm{eff}} = 2 D_{\mathrm{tc}} + J\).
+2. All calculations assume **optimal conditions** (no congestion, no buffer bloat)
+3. **Real-world overhead** includes:
    - Protocol headers (TCP/IP, TLS, etc.)
    - Operating system processing
    - Docker networking overhead
    - Application-level buffering
-3. **Bandwidth** is assumed to be **sustained** (not burst)
-4. **Packet loss** is assumed to be **random** (not bursty)
-5. **Jitter** effects are averaged (not worst-case)
+4. **Bandwidth** is assumed to be **sustained** (not burst)
+5. **Packet loss** is assumed to be **random** (not bursty)
+6. **Jitter** effects are averaged (not worst-case)
 
 ---
 

@@ -37,10 +37,13 @@ try:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'Protocols'))
     import federated_learning_pb2
     import federated_learning_pb2_grpc
+    GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(4 * 1024 * 1024)))
+    GRPC_CHUNK_SIZE = GRPC_MAX_MESSAGE_BYTES - 4096  # leave room for proto framing
 except (ImportError, ModuleNotFoundError):
     grpc = None
     federated_learning_pb2 = None
     federated_learning_pb2_grpc = None
+    GRPC_CHUNK_SIZE = 4 * 1024 * 1024 - 4096
 
 try:
     import asyncio
@@ -345,8 +348,13 @@ TOPIC_TRAINING_COMPLETE = "fl/training_complete"
 
 # DDS Configuration
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
-# Realistic max payload: DDS 64 KB per chunk
-CHUNK_SIZE = 64 * 1024  # 64 KB chunks
+
+# Protocol max payload sizes (unified spec: AMQP/MQTT 128KB, gRPC 4MB, HTTP/3 16KB, DDS 64KB)
+MQTT_MAX_PAYLOAD_BYTES = 128 * 1024   # 128 KB
+AMQP_MAX_FRAME_BYTES = 128 * 1024    # 128 KB
+# gRPC: set in grpc import block (GRPC_MAX_MESSAGE_BYTES / GRPC_CHUNK_SIZE)
+HTTP3_MAX_STREAM_DATA_BYTES = 16 * 1024   # HTTP/3: 16 KB per stream
+CHUNK_SIZE = 64 * 1024                # DDS: 64 KB per chunk
 
 # DDS Data Structures (must be defined at module level for Python 3.8)
 if DDS_AVAILABLE:
@@ -451,18 +459,25 @@ class UnifiedFLClient_Emotion:
         
         # RL Components (load from past experience when .pkl exists)
         if USE_RL_SELECTION and QLearningProtocolSelector is not None:
-            # Persist Q-table in shared_data when in Docker so next run loads past experience
+            # Training (USE_QL_CONVERGENCE): single client saves to shared path. Inference: all clients load from same path.
             if os.path.exists("/shared_data"):
-                save_path = f"/shared_data/q_table_emotion_client_{client_id}.pkl"
+                shared_q_path = "/shared_data/q_table_emotion_trained.pkl"
+                save_path = shared_q_path  # all clients use same path; inference clients only read, training client writes
             else:
                 save_path = f"q_table_emotion_client_{client_id}.pkl"
-            # Optional: load from pretrained dir first (e.g. scripts/experiments/pretrained_q_tables)
+            # Load from shared trained table first (inference), then optional pretrained dir, then save_path
             initial_load_path = None
-            pretrained_dir = os.getenv("PRETRAINED_Q_TABLE_DIR")
-            if pretrained_dir:
-                candidate = os.path.join(pretrained_dir, f"q_table_emotion_client_{client_id}.pkl")
-                if os.path.exists(candidate):
-                    initial_load_path = candidate
+            if os.path.exists("/shared_data"):
+                if os.path.exists("/shared_data/q_table_emotion_trained.pkl"):
+                    initial_load_path = "/shared_data/q_table_emotion_trained.pkl"
+            if initial_load_path is None:
+                pretrained_dir = os.getenv("PRETRAINED_Q_TABLE_DIR")
+                if pretrained_dir:
+                    for candidate in (os.path.join(pretrained_dir, "q_table_emotion_trained.pkl"),
+                                     os.path.join(pretrained_dir, f"q_table_emotion_client_{client_id}.pkl")):
+                        if os.path.exists(candidate):
+                            initial_load_path = candidate
+                            break
             self.rl_selector = QLearningProtocolSelector(
                 save_path=save_path,
                 initial_load_path=initial_load_path,
@@ -674,8 +689,7 @@ class UnifiedFLClient_Emotion:
         self.mqtt_client.max_inflight_messages_set(20)
         # FAIR CONFIG: Limited queue to 1000 messages (aligned with AMQP/gRPC)
         self.mqtt_client.max_queued_messages_set(1000)
-        # Realistic max payload: MQTT 128 KB
-        self.mqtt_client._max_packet_size = 128 * 1024  # 128 KB
+        self.mqtt_client._max_packet_size = MQTT_MAX_PAYLOAD_BYTES  # 128 KB
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
         self.mqtt_client.on_disconnect = self.on_disconnect
@@ -843,7 +857,7 @@ class UnifiedFLClient_Emotion:
                         credentials=credentials,
                         heartbeat=600,  # 10 minutes for very_poor network
                         blocked_connection_timeout=600,  # Aligned with heartbeat
-                        frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
+                        frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
                     )
                     
                     self.amqp_listener_connection = pika.BlockingConnection(parameters)
@@ -1135,8 +1149,8 @@ class UnifiedFLClient_Emotion:
                 grpc_host = os.getenv("GRPC_HOST", "fl-server-unified-emotion")
                 grpc_port = os.getenv("GRPC_PORT", "50051")
                 options = [
-                    ('grpc.max_send_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
-                    ('grpc.max_receive_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
+                    ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
+                    ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
                     ('grpc.keepalive_time_ms', 600000),
                     ('grpc.keepalive_timeout_ms', 60000),
                 ]
@@ -1159,23 +1173,47 @@ class UnifiedFLClient_Emotion:
                         if status.should_evaluate and self.is_active:
                             self.handle_start_evaluation(json.dumps({'round': status.current_round}).encode())
 
-                        # Poll for global model (request round 0 to get latest available)
-                        # This allows client to get new model even if current_round hasn't updated yet
-                        request = federated_learning_pb2.ModelRequest(
-                            client_id=self.client_id,
-                            round=0  # 0 means "give me latest model"
-                        )
-                        response = self.grpc_stub.GetGlobalModel(request)
-                        
+                        # Poll for global model (chunked when > 4 MB)
+                        req = federated_learning_pb2.ModelRequest(client_id=self.client_id, round=0, chunk_index=0)
+                        first = self.grpc_stub.GetGlobalModel(req)
+                        if not first.available or not first.weights:
+                            response = first
+                        else:
+                            total_chunks = getattr(first, 'total_chunks', 1) or 1
+                            if total_chunks <= 1:
+                                response = first
+                            else:
+                                chunks = [first.weights]
+                                for idx in range(1, total_chunks):
+                                    req = federated_learning_pb2.ModelRequest(client_id=self.client_id, round=0, chunk_index=idx)
+                                    part = self.grpc_stub.GetGlobalModel(req)
+                                    if part.weights:
+                                        chunks.append(part.weights)
+                                assembled = b''.join(chunks)
+                                response = federated_learning_pb2.GlobalModel(
+                                    round=first.round,
+                                    weights=assembled,
+                                    available=True,
+                                    model_config=first.model_config,
+                                    chunk_index=0,
+                                    total_chunks=1
+                                )
                         # Accept model if:
-                        # 1. It's a newer round, OR
-                        # 2. Same round but we're waiting for aggregated model (after sending update)
-                        if response.available and (response.round > self.last_global_round or 
-                                                   (response.round == self.current_round and self.waiting_for_aggregated_model)):
+                        # 1. We don't have a model yet (first round) and server has one, OR
+                        # 2. Newer round than last received, OR
+                        # 3. Same round but we're waiting for aggregated model (after sending update)
+                        accept = response.available and (
+                            (self.model is None) or
+                            (response.round > self.last_global_round) or
+                            (response.round == self.current_round and self.waiting_for_aggregated_model)
+                        )
+                        if accept:
                             self.on_grpc_global_model(response)
                             
-                    except grpc.RpcError:
-                        pass  # Expected when no new model
+                    except grpc.RpcError as e:
+                        # Log so we can see message size / deadline / connection issues
+                        if self.model is None:
+                            print(f"[gRPC] Client {self.client_id} GetGlobalModel RpcError (will retry): {e.code()} - {e.details()}")
                     except Exception as e:
                         print(f"[gRPC] Listener poll error: {e}")
                     
@@ -1457,8 +1495,8 @@ class UnifiedFLClient_Emotion:
             grpc_host = os.getenv("GRPC_HOST", "fl-server-unified-emotion")
             grpc_port = int(os.getenv("GRPC_PORT", "50051"))
             options = [
-                ('grpc.max_send_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
-                ('grpc.max_receive_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
+                ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
+                ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
                 ('grpc.keepalive_time_ms', 600000),
                 ('grpc.keepalive_timeout_ms', 60000),
             ]
@@ -1631,38 +1669,39 @@ class UnifiedFLClient_Emotion:
 
     def select_protocol(self) -> str:
         """
-        Select protocol using RL based on current environment and network conditions
+        Select protocol using RL (runs on CPU) based on current environment and network conditions
         
         Returns:
             Selected protocol name: 'mqtt', 'amqp', 'grpc', 'quic', or 'dds'
         """
         if USE_RL_SELECTION and self.rl_selector and self.env_manager:
             try:
-                import psutil
-                cpu = psutil.cpu_percent(interval=0.1)
-                memory = psutil.virtual_memory().percent
-                
-                resource_level = self.env_manager.detect_resource_level(cpu, memory)
-                self.env_manager.update_resource_level(resource_level)
+                # RL logic runs on CPU only (no GPU); keeps Q-table updates off GPU
+                with tf.device('/CPU:0'):
+                    import psutil
+                    cpu = psutil.cpu_percent(interval=0.1)
+                    memory = psutil.virtual_memory().percent
+                    
+                    resource_level = self.env_manager.detect_resource_level(cpu, memory)
+                    self.env_manager.update_resource_level(resource_level)
 
-                # Training only: when RL_REWARD_SCENARIO is set, use that scenario for state so we
-                # train in excellent conditions but learn Q(s,a) for the target scenario.
-                # Inference: always use actual network condition so we load Q-table and choose
-                # best action for the real scenario.
-                if USE_QL_CONVERGENCE:
-                    reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
-                    if reward_scenario and reward_scenario in self.rl_selector.NETWORK_CONDITIONS:
-                        self.env_manager.update_network_condition(reward_scenario)
+                    # When USE_QL_CONVERGENCE: use RL_REWARD_SCENARIO for state if set (train in target scenario).
+                    # Otherwise use actual measured network so we learn/select for real conditions.
+                    if USE_QL_CONVERGENCE:
+                        reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
+                        if reward_scenario and reward_scenario in self.rl_selector.NETWORK_CONDITIONS:
+                            self.env_manager.update_network_condition(reward_scenario)
+                        else:
+                            self.measure_network_condition()
                     else:
                         self.measure_network_condition()
-                else:
-                    # Inference: use actual scenario (load Q-table, pick best action for current state)
-                    self.measure_network_condition()
 
-                state = self.env_manager.get_current_state()
-                # Training: epsilon-greedy. Inference: greedy (best known action from Q-table).
-                training_mode = USE_QL_CONVERGENCE
-                protocol = self.rl_selector.select_protocol(state, training=training_mode)
+                    state = self.env_manager.get_current_state()
+                    # Always use epsilon-greedy when RL is enabled so the agent explores and learns
+                    # (avoids always picking MQTT when Q-table is still learning). Stopping condition
+                    # is separate: USE_QL_CONVERGENCE -> stop on Q-convergence; else stop on loss.
+                    training_mode = True
+                    protocol = self.rl_selector.select_protocol(state, training=training_mode)
                 
                 print(f"\n[RL Protocol Selection]")
                 print(f"  CPU: {cpu:.1f}%, Memory: {memory:.1f}%")
@@ -1795,15 +1834,16 @@ class UnifiedFLClient_Emotion:
             steps_per_epoch = 100
             val_steps = 25
         
-        # Train the model using generator
-        history = self.model.fit(
-            self.train_generator,
-            epochs=epochs,
-            validation_data=self.validation_generator,
-            steps_per_epoch=steps_per_epoch,
-            validation_steps=val_steps,
-            verbose=2
-        )
+        # Train the model on GPU (RL runs on CPU elsewhere)
+        with tf.device('/GPU:0' if gpus else '/CPU:0'):
+            history = self.model.fit(
+                self.train_generator,
+                epochs=epochs,
+                validation_data=self.validation_generator,
+                steps_per_epoch=steps_per_epoch,
+                validation_steps=val_steps,
+                verbose=2
+            )
         
         # Get updated weights
         updated_weights = self.model.get_weights()
@@ -1992,23 +2032,19 @@ class UnifiedFLClient_Emotion:
             print(f"Client {self.client_id} sent evaluation metrics for round {self.current_round}")
             print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
             # RL update and optional Q-convergence end condition (battery already updated above for metrics)
+            # When RL is enabled: always update Q and log to DB (so GUI shows data and agent learns).
+            # Only the *stopping* condition differs: USE_QL_CONVERGENCE -> stop when Q converges; else stop on loss.
             if USE_RL_SELECTION and self.rl_selector and self.env_manager:
                 try:
                     resources = self.env_manager.get_resource_consumption()
                     payload_bytes = self.round_metrics.get('payload_bytes') or (12 * 1024 * 1024)
                     protocol = self.selected_protocol or 'mqtt'
-                    # Training only: when RL_REWARD_SCENARIO is set, use simulated comm time/t_calc
-                    # for that scenario. Inference: always use actual metrics (real scenario).
-                    if USE_QL_CONVERGENCE:
-                        reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
-                        if reward_scenario:
-                            simulated_t_calc = self._get_t_calc_for_scenario(protocol, payload_bytes, reward_scenario)
-                            if simulated_t_calc is not None:
-                                comm_time_for_reward = simulated_t_calc
-                                t_calc_for_reward = simulated_t_calc
-                            else:
-                                comm_time_for_reward = self.round_metrics['communication_time']
-                                t_calc_for_reward = self._get_t_calc_for_reward(protocol, payload_bytes)
+                    reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
+                    if reward_scenario:
+                        simulated_t_calc = self._get_t_calc_for_scenario(protocol, payload_bytes, reward_scenario)
+                        if simulated_t_calc is not None:
+                            comm_time_for_reward = simulated_t_calc
+                            t_calc_for_reward = simulated_t_calc
                         else:
                             comm_time_for_reward = self.round_metrics['communication_time']
                             t_calc_for_reward = self._get_t_calc_for_reward(protocol, payload_bytes)
@@ -2032,6 +2068,7 @@ class UnifiedFLClient_Emotion:
                         threshold=Q_CONVERGENCE_THRESHOLD,
                         patience=Q_CONVERGENCE_PATIENCE,
                     )
+                    # Always log Q-step when RL is enabled so GUI Q-learning database stays updated
                     if log_q_step is not None and self._last_rl_state is not None:
                         st = self._last_rl_state
                         log_q_step(
@@ -2047,13 +2084,16 @@ class UnifiedFLClient_Emotion:
                             q_delta=q_delta,
                             epsilon=self.rl_selector.epsilon,
                             avg_reward_last_100=float(avg_reward),
-                            converged=USE_QL_CONVERGENCE and q_converged,
+                            converged=q_converged,
                         )
+                    # End training on Q-convergence only when USE_QL_CONVERGENCE is True
                     if USE_QL_CONVERGENCE and q_converged:
                         self.has_converged = True
                         print(f"[Client {self.client_id}] Q-learning convergence reached at round {self.current_round}")
-                        # NOTE: Do NOT reset epsilon here - epsilon should be reset when starting a NEW experiment/scenario
-                        # Epsilon reset happens at experiment start (via environment variable or experiment runner)
+                        try:
+                            self.rl_selector.save_q_table()
+                        except Exception as e:
+                            print(f"[Client {self.client_id}] Warning: could not save Q-table on convergence: {e}")
                         self._notify_convergence_to_server()
                         self._disconnect_after_convergence()
                         return
@@ -2093,8 +2133,8 @@ class UnifiedFLClient_Emotion:
             grpc_host = os.getenv("GRPC_HOST", "fl-server-unified-emotion")
             grpc_port = int(os.getenv("GRPC_PORT", "50051"))
             options = [
-                ('grpc.max_send_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
-                ('grpc.max_receive_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
+                ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
+                ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
                 ('grpc.keepalive_time_ms', 600000),
                 ('grpc.keepalive_timeout_ms', 60000),
             ]
@@ -2215,7 +2255,7 @@ class UnifiedFLClient_Emotion:
                 blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=3,
                 retry_delay=2,
-                frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
+                frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
             )
             connection = pika.BlockingConnection(parameters)
             channel = connection.channel()
@@ -2269,7 +2309,7 @@ class UnifiedFLClient_Emotion:
                 blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=3,
                 retry_delay=2,
-                frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
+                frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
             )
             connection = pika.BlockingConnection(parameters)
             channel = connection.channel()
@@ -2308,8 +2348,8 @@ class UnifiedFLClient_Emotion:
             
             # FAIR CONFIG: Set max message size to 128MB (aligned with AMQP default)
             options = [
-                ('grpc.max_send_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
-                ('grpc.max_receive_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
+                ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
+                ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
                 # FAIR CONFIG: Keepalive settings 600s for very_poor network
                 ('grpc.keepalive_time_ms', 600000),  # 10 minutes
                 ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
@@ -2317,39 +2357,57 @@ class UnifiedFLClient_Emotion:
             channel = grpc.insecure_channel(f'{grpc_host}:{grpc_port}', options=options)
             stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
             
-            # Send model update (full message as JSON when quantized so server gets compressed_data)
+            # Send model update (chunked when > 4 MB)
             if 'compressed_data' in message:
                 payload = json.dumps(message).encode('utf-8')
             else:
                 payload = (message['weights'].encode('utf-8') if isinstance(message['weights'], str) else message['weights'])
-            payload_size_mb = len(payload) / (1024 * 1024)
+            payload_size = len(payload)
+            payload_size_mb = payload_size / (1024 * 1024)
             print(f"Client {self.client_id} sending via gRPC - size: {payload_size_mb:.2f} MB")
-            
-            response = stub.SendModelUpdate(
-                federated_learning_pb2.ModelUpdate(
-                    client_id=message['client_id'],
-                    round=message['round'],
-                    weights=payload,
-                    num_samples=message['num_samples'],
-                    metrics={k: float(v) for k, v in message['metrics'].items()}
+            metrics_dict = {k: float(v) for k, v in message['metrics'].items()}
+
+            if payload_size > GRPC_CHUNK_SIZE:
+                chunks = [payload[i:i + GRPC_CHUNK_SIZE] for i in range(0, payload_size, GRPC_CHUNK_SIZE)]
+                total_chunks = len(chunks)
+                for i, chunk_data in enumerate(chunks):
+                    req = federated_learning_pb2.ModelUpdate(
+                        client_id=message['client_id'],
+                        round=message['round'],
+                        weights=chunk_data,
+                        num_samples=message['num_samples'] if i == 0 else 0,
+                        metrics=metrics_dict if i == 0 else {},
+                        chunk_index=i,
+                        total_chunks=total_chunks
+                    )
+                    response = stub.SendModelUpdate(req)
+                    if not response.success:
+                        raise Exception(f"gRPC chunk {i + 1}/{total_chunks} failed: {response.message}")
+                print(f"Client {self.client_id} sent model update in {total_chunks} chunks ({payload_size} bytes) via gRPC")
+            else:
+                response = stub.SendModelUpdate(
+                    federated_learning_pb2.ModelUpdate(
+                        client_id=message['client_id'],
+                        round=message['round'],
+                        weights=payload,
+                        num_samples=message['num_samples'],
+                        metrics=metrics_dict
+                    )
                 )
-            )
-            
+                if not response.success:
+                    raise Exception(f"gRPC send failed: {response.message}")
+                print(f"Client {self.client_id} sent model update for round {self.current_round} via gRPC")
+
             # Set flag: we're now waiting for aggregated model
             self.waiting_for_aggregated_model = True
-            
+
             log_sent_packet(
-                packet_size=len(payload),
+                packet_size=payload_size,
                 peer="server",
                 protocol="gRPC",
                 round=self.current_round,
                 extra_info="model_update"
             )
-            
-            if response.success:
-                print(f"Client {self.client_id} sent model update for round {self.current_round} via gRPC")
-            else:
-                raise Exception(f"gRPC send failed: {response.message}")
             
             channel.close()
         except Exception as e:
@@ -2367,8 +2425,8 @@ class UnifiedFLClient_Emotion:
             
             # FAIR CONFIG: Set max message size to 128MB (aligned with AMQP default)
             options = [
-                ('grpc.max_send_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
-                ('grpc.max_receive_message_length', 4 * 1024 * 1024  # Realistic max payload: gRPC 4 MB),
+                ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
+                ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
                 # FAIR CONFIG: Keepalive settings 600s for very_poor network
                 ('grpc.keepalive_time_ms', 600000),  # 10 minutes
                 ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
@@ -2866,9 +2924,8 @@ class UnifiedFLClient_Emotion:
             is_client=True, 
             alpn_protocols=H3_ALPN,  # HTTP/3 ALPN
             verify_mode=ssl.CERT_NONE,
-            # Realistic max payload: HTTP/3 16 KB per stream
-            max_stream_data=16 * 1024,  # 16 KB per stream
-            max_data=32 * 1024,  # 32 KB total connection
+            max_stream_data=HTTP3_MAX_STREAM_DATA_BYTES,  # 16 KB per stream
+            max_data=HTTP3_MAX_STREAM_DATA_BYTES * 2,      # 32 KB total connection
             # FAIR CONFIG: Timeout 600s for very_poor network scenarios
             idle_timeout=600.0  # 10 minutes
         )
@@ -3347,7 +3404,10 @@ def load_emotion_data(client_id: int):
 def main():
     """Main function"""
     # Prevent duplicate client instance with same client_id in the same container/host.
-    lock_path = f"/tmp/unified_emotion_client_{CLIENT_ID}.lock"
+    # Use project-local lock dir to avoid /tmp permission issues (e.g. file owned by another user).
+    _lock_dir = os.path.join(project_root, ".locks")
+    os.makedirs(_lock_dir, exist_ok=True)
+    lock_path = os.path.join(_lock_dir, f"unified_emotion_client_{CLIENT_ID}.lock")
     lock_file = open(lock_path, "w")
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

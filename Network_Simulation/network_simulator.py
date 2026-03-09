@@ -11,6 +11,12 @@ import time
 import os
 from typing import Dict, List
 
+from network_delay_model import (
+    build_delay_models,
+    sample_delay_and_jitter_ms,
+    NetworkScenarioModel,
+)
+
 # Optional: set FL_SUDO_PASSWORD in environment to run host 'tc' without typing password.
 # Example (do NOT commit .env): echo 'FL_SUDO_PASSWORD=yourpassword' >> .env && source .env
 # Or for one run: FL_SUDO_PASSWORD=yourpassword python3 run_network_experiments.py ...
@@ -115,9 +121,30 @@ class NetworkSimulator:
             )
         return conditions
 
+    @classmethod
+    def get_scenario_conditions_sampled(
+        cls,
+        scenario_name: str,
+        models: Dict[str, NetworkScenarioModel],
+        use_extra_jitter: bool = False,
+    ) -> Dict[str, str]:
+        """
+        Return tc-relevant conditions with latency and jitter sampled from Gaussian models.
+        Delay and jitter follow normal distributions for realistic experiments.
+        """
+        if scenario_name not in cls.NETWORK_SCENARIOS:
+            raise KeyError(f"Unknown scenario: {scenario_name}")
+        base_ms, jitter_ms = sample_delay_and_jitter_ms(models, scenario_name, use_extra_jitter=use_extra_jitter)
+        scenario = cls.NETWORK_SCENARIOS[scenario_name]
+        conditions = {k: scenario[k] for k in cls._TC_CONDITION_KEYS if k in scenario}
+        conditions["latency"] = f"{base_ms:.2f}ms"
+        conditions["jitter"] = f"{jitter_ms:.2f}ms"
+        return conditions
+
     def __init__(self, verbose=False):
         self.verbose = verbose
         self._host_interface_used = None  # set when we apply tc on host (host-network mode)
+        self._host_ifb_used = None  # set when we apply ingress tc on host (ifb device name)
         
     def log(self, message):
         """Print message if verbose mode is enabled"""
@@ -182,6 +209,59 @@ class NetworkSimulator:
                 capture_output=True, text=True, timeout=15
             )
         return r
+
+    def _run_host_ip(self, args: List[str]) -> subprocess.CompletedProcess:
+        """Run ip on the host; if permission denied, retry with sudo. Uses FL_SUDO_PASSWORD if set."""
+        r = subprocess.run(
+            ["ip"] + args,
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode == 0:
+            return r
+        err = (r.stderr or r.stdout or "").lower()
+        if "permission denied" in err or "rtnetlink" in err or "operation not permitted" in err:
+            sudo_pw = os.environ.get("FL_SUDO_PASSWORD", "").strip()
+            if sudo_pw:
+                self.log("Retrying ip with sudo (using FL_SUDO_PASSWORD)...")
+                return subprocess.run(
+                    ["sudo", "-S", "ip"] + args,
+                    input=sudo_pw + "\n",
+                    capture_output=True, text=True, timeout=15
+                )
+            self.log("Retrying ip with sudo (you may be prompted for your password)...")
+            return subprocess.run(
+                ["sudo", "ip"] + args,
+                capture_output=True, text=True, timeout=15
+            )
+        return r
+
+    def _tc_egress_commands(self, device: str, conditions: Dict[str, str]) -> List[List[str]]:
+        """Return list of tc command arg lists (without 'tc' prefix) for egress-style shaping on device.
+        Used for root (egress) and for ifb (ingress mirror)."""
+        netem_params: List[str] = []
+        if conditions.get("latency"):
+            netem_params.append("delay")
+            netem_params.append(conditions["latency"])
+            if conditions.get("jitter"):
+                netem_params.append(conditions["jitter"])
+        if conditions.get("loss"):
+            netem_params.append("loss")
+            netem_params.append(conditions["loss"])
+        has_netem = len(netem_params) > 0
+        has_bandwidth = bool(conditions.get("bandwidth"))
+        if has_netem and has_bandwidth:
+            return [
+                ["qdisc", "add", "dev", device, "root", "handle", "1:", "htb", "default", "1"],
+                ["class", "add", "dev", device, "parent", "1:", "classid", "1:1", "htb",
+                 "rate", conditions["bandwidth"], "ceil", conditions["bandwidth"]],
+                ["qdisc", "add", "dev", device, "parent", "1:1", "handle", "10:", "netem"] + netem_params,
+            ]
+        if has_netem:
+            return [["qdisc", "add", "dev", device, "root", "netem"] + netem_params]
+        if has_bandwidth:
+            return [["qdisc", "add", "dev", device, "root", "tbf", "rate", conditions["bandwidth"],
+                     "burst", "32kbit", "latency", "400ms"]]
+        return []
 
     def get_host_default_interface(self) -> str:
         """Return the host's default route interface (e.g. eth0, ens33). Used for host-network tc."""
@@ -268,13 +348,12 @@ class NetworkSimulator:
 
     def apply_network_conditions_host(self, conditions: Dict[str, str]) -> bool:
         """Apply network scenario to the host's default interface (for network_mode: host).
-        All host-network containers (server and all clients) share this interface, so the same
-        delay/loss/jitter applies to every packet between server and clients. Requires tc on
-        the host (often needs root). Returns True if applied, False otherwise.
+        The same delay, jitter, loss, and bandwidth are applied to both egress and ingress
+        on the host interface so that traffic in both directions sees identical shaping.
+        All host-network containers share this interface. Requires tc on the host (often root).
 
-        Uses HTB when both netem (delay/loss) and bandwidth are needed: netem is classless so
-        it does not expose a 1:1 class; we use root handle 1: htb, class 1:1 with rate, then
-        netem as child of 1:1."""
+        Egress: root qdisc on interface; ingress: same conditions via IFB mirror.
+        Uses HTB when both netem and bandwidth are needed."""
         interface = self.get_host_default_interface()
         self._host_interface_used = interface
         netem_params = []
@@ -325,29 +404,74 @@ class NetworkSimulator:
             else:
                 return False
             if has_netem:
-                print(f"  Host interface {interface}: netem {', '.join(netem_params)}")
+                print(f"  Host interface {interface}: netem (egress) {', '.join(netem_params)}")
             if has_bandwidth:
                 print(f"  Host interface {interface}: rate {conditions['bandwidth']}")
+
+            # Ingress: same delay/jitter/loss/bandwidth on incoming traffic (via IFB)
+            ifb_name = "ifb_fl"
+            try:
+                self._run_host_tc(["qdisc", "del", "dev", interface, "ingress"])
+                self._run_host_tc(["qdisc", "del", "dev", ifb_name, "root"])
+                self._run_host_ip(["link", "set", ifb_name, "down"])
+                self._run_host_ip(["link", "del", ifb_name])
+            except Exception:
+                pass
+            rip = self._run_host_ip(["link", "add", "name", ifb_name, "type", "ifb"])
+            if rip.returncode != 0:
+                self.log(f"Host ingress (ifb): ip link add failed: {rip.stderr or rip.stdout}; continuing with egress only.")
+            else:
+                self._run_host_ip(["link", "set", ifb_name, "up"])
+                rinq = self._run_host_tc(["qdisc", "add", "dev", interface, "ingress"])
+                if rinq.returncode != 0:
+                    self.log(f"Host ingress: tc qdisc add ingress failed; continuing with egress only.")
+                else:
+                    rfil = self._run_host_tc([
+                        "filter", "add", "dev", interface, "parent", "ffff:", "protocol", "all",
+                        "u32", "match", "u32", "0", "0", "flowid", "1:1",
+                        "action", "mirred", "egress", "redirect", "dev", ifb_name
+                    ])
+                    if rfil.returncode != 0:
+                        self.log(f"Host ingress: tc filter failed; continuing with egress only.")
+                    else:
+                        for cmd in self._tc_egress_commands(ifb_name, conditions):
+                            rr = self._run_host_tc(cmd)
+                            if rr.returncode != 0:
+                                self.log(f"Host ingress (ifb): tc {' '.join(cmd)} failed: {rr.stderr or rr.stdout}")
+                                break
+                        else:
+                            self._host_ifb_used = ifb_name
+                            print(f"  Host {interface}: same delay/jitter/loss on egress and ingress (ingress via {ifb_name})")
             return True
         except Exception as e:
             print(f"[ERROR] Failed to apply host network conditions: {e}")
             print(f"[INFO] If prompted, enter your sudo password. Running from GUI? Use a terminal with sudo, or add to sudoers: youruser ALL=(ALL) NOPASSWD: /usr/sbin/tc")
             self._host_interface_used = None
+            self._host_ifb_used = None
             return False
 
     def reset_host_network(self) -> bool:
-        """Remove tc qdisc from the host interface that was used in apply_network_conditions_host."""
-        if not self._host_interface_used:
-            return True
+        """Remove tc qdisc from the host interface (egress and ingress) that was used in apply_network_conditions_host."""
+        iface = self._host_interface_used
+        ifb_name = self._host_ifb_used
         try:
-            r = self._run_host_tc(["qdisc", "del", "dev", self._host_interface_used, "root"])
-            if r.returncode == 0:
-                self.log(f"Reset host tc on {self._host_interface_used}")
+            if ifb_name and iface:
+                self._run_host_tc(["qdisc", "del", "dev", iface, "ingress"])
+                self._run_host_tc(["qdisc", "del", "dev", ifb_name, "root"])
+                self._run_host_ip(["link", "set", ifb_name, "down"])
+                self._run_host_ip(["link", "del", ifb_name])
+                self.log(f"Reset host ingress tc ({ifb_name})")
+            if iface:
+                r = self._run_host_tc(["qdisc", "del", "dev", iface, "root"])
+                if r.returncode == 0:
+                    self.log(f"Reset host tc on {iface}")
             self._host_interface_used = None
+            self._host_ifb_used = None
             return True
         except Exception as e:
             print(f"[WARNING] Could not reset host tc: {e}")
             self._host_interface_used = None
+            self._host_ifb_used = None
             return False
 
     def show_host_tc(self, interface: str = None) -> str:
@@ -394,10 +518,15 @@ class NetworkSimulator:
     def apply_network_conditions(self, container_name: str, conditions: Dict[str, str]):
         """Apply network conditions to a specific container.
         
+        The same delay, jitter, loss, and bandwidth are applied to both egress and
+        ingress on the container interface so that traffic in both directions sees
+        identical shaping.
+        
         Uses a hierarchical qdisc setup when both netem (latency/loss/jitter) and
         bandwidth limiting are needed: netem is classless (no 1:1), so we use
           root -> htb (handle 1:) -> class 1:1 (rate) -> netem (handle 10:)
         This avoids invalid 'parent 1:1' under netem.
+        Egress: root qdisc on interface; ingress: same conditions via IFB mirror.
         """
         try:
             print(f"\n{'='*60}")
@@ -439,6 +568,7 @@ class NetworkSimulator:
             has_netem = len(netem_params) > 0
             has_bandwidth = bool(conditions.get("bandwidth"))
             
+            # Egress: apply delay/jitter/loss (and optionally bandwidth) on the interface root
             if has_netem and has_bandwidth:
                 # Hierarchical setup: htb root, class 1:1 with rate, netem as child (netem is classless)
                 self.run_command([
@@ -479,6 +609,64 @@ class NetworkSimulator:
                     f"burst 32kbit latency 400ms"
                 ])
                 print(f"  Applied tbf: rate {conditions['bandwidth']}")
+
+            # Ingress: apply the same delay/jitter/loss/bandwidth to incoming traffic (via IFB mirror)
+            ifb_name = "ifb0"
+            if has_netem or has_bandwidth:
+                try:
+                    self.run_command(
+                        ["docker", "exec", container_name, "tc", "qdisc", "del", "dev", interface, "ingress"],
+                        check=False,
+                    )
+                    self.run_command(
+                        ["docker", "exec", container_name, "tc", "qdisc", "del", "dev", ifb_name, "root"],
+                        check=False,
+                    )
+                    self.run_command(
+                        ["docker", "exec", container_name, "ip", "link", "set", ifb_name, "down"],
+                        check=False,
+                    )
+                    self.run_command(
+                        ["docker", "exec", container_name, "ip", "link", "del", ifb_name],
+                        check=False,
+                    )
+                except Exception:
+                    pass
+                try:
+                    r = self.run_command(
+                        ["docker", "exec", container_name, "ip", "link", "add", "name", ifb_name, "type", "ifb"],
+                        check=False,
+                    )
+                    if r.returncode != 0:
+                        self.log(f"Container {container_name}: ip link add ifb failed (ingress skipped): {getattr(r, 'stderr', '') or getattr(r, 'stdout', '')}")
+                    else:
+                        self.run_command(
+                            ["docker", "exec", container_name, "ip", "link", "set", ifb_name, "up"],
+                            check=False,
+                        )
+                        self.run_command(
+                            ["docker", "exec", container_name, "tc", "qdisc", "add", "dev", interface, "ingress"],
+                            check=False,
+                        )
+                        self.run_command(
+                            [
+                                "docker", "exec", container_name, "tc", "filter", "add", "dev", interface,
+                                "parent", "ffff:", "protocol", "all", "u32", "match", "u32", "0", "0",
+                                "flowid", "1:1", "action", "mirred", "egress", "redirect", "dev", ifb_name,
+                            ],
+                            check=False,
+                        )
+                        for cmd in self._tc_egress_commands(ifb_name, conditions):
+                            r = self.run_command(
+                                ["docker", "exec", container_name, "tc"] + cmd,
+                                check=False,
+                            )
+                            if r.returncode != 0:
+                                self.log(f"Container {container_name}: ingress tc cmd failed: {r.stderr or r.stdout}")
+                        print(f"  Same delay/jitter/loss on egress and ingress (ingress via {ifb_name})")
+                except Exception as e:
+                    self.log(f"Container {container_name}: ingress tc failed: {e}; egress only.")
+                    print(f"  [WARNING] Ingress tc failed; same delay applied to egress only.")
             
             print(f"{'='*60}\n")
             return True
@@ -488,10 +676,26 @@ class NetworkSimulator:
             return False
     
     def reset_container_network(self, container_name: str):
-        """Reset network conditions on a container"""
+        """Reset network conditions on a container (egress and ingress)."""
         try:
             interface = self.get_container_interface(container_name)
-            # Delete existing tc rules (ignore errors if none exist)
+            # Delete ingress and IFB first, then egress
+            self.run_command(
+                ["docker", "exec", container_name, "tc", "qdisc", "del", "dev", interface, "ingress"],
+                check=False,
+            )
+            self.run_command(
+                ["docker", "exec", container_name, "tc", "qdisc", "del", "dev", "ifb0", "root"],
+                check=False,
+            )
+            self.run_command(
+                ["docker", "exec", container_name, "ip", "link", "set", "ifb0", "down"],
+                check=False,
+            )
+            self.run_command(
+                ["docker", "exec", container_name, "ip", "link", "del", "ifb0"],
+                check=False,
+            )
             self.run_command([
                 "docker", "exec", container_name,
                 "sh", "-c", f"tc qdisc del dev {interface} root"
@@ -666,6 +870,35 @@ class NamespaceNetworkSimulator:
         return self._run(base_cmd, check=False)
 
     @staticmethod
+    def _tc_egress_commands(device: str, conditions: Dict[str, str]) -> List[List[str]]:
+        """Return list of tc command arg lists (without 'tc' prefix) for egress-style shaping on device.
+        Used for root (egress) and for ifb (ingress mirror). Matches NetworkSimulator._tc_egress_commands."""
+        netem_params: List[str] = []
+        if conditions.get("latency"):
+            netem_params.append("delay")
+            netem_params.append(conditions["latency"])
+            if conditions.get("jitter"):
+                netem_params.append(conditions["jitter"])
+        if conditions.get("loss"):
+            netem_params.append("loss")
+            netem_params.append(conditions["loss"])
+        has_netem = len(netem_params) > 0
+        has_bandwidth = bool(conditions.get("bandwidth"))
+        if has_netem and has_bandwidth:
+            return [
+                ["qdisc", "add", "dev", device, "root", "handle", "1:", "htb", "default", "1"],
+                ["class", "add", "dev", device, "parent", "1:", "classid", "1:1", "htb",
+                 "rate", conditions["bandwidth"], "ceil", conditions["bandwidth"]],
+                ["qdisc", "add", "dev", device, "parent", "1:1", "handle", "10:", "netem"] + netem_params,
+            ]
+        if has_netem:
+            return [["qdisc", "add", "dev", device, "root", "netem"] + netem_params]
+        if has_bandwidth:
+            return [["qdisc", "add", "dev", device, "root", "tbf", "rate", conditions["bandwidth"],
+                     "burst", "32kbit", "latency", "400ms"]]
+        return []
+
+    @staticmethod
     def _split_subnet(subnet: str) -> (str, int):
         cidr_parts = subnet.split("/")
         base = cidr_parts[0]
@@ -772,9 +1005,13 @@ class NamespaceNetworkSimulator:
         return server_ep, client_eps
 
     def reset_tc(self, endpoints: List[NamespaceEndpoint]) -> None:
-        """Delete tc qdisc from all namespace interfaces."""
+        """Delete tc qdisc (egress and ingress) from all namespace interfaces."""
         for ep in endpoints:
             try:
+                self._run_tc_in_ns(ep.ns_name, ["qdisc", "del", "dev", ep.veth_ns, "ingress"])
+                self._run_tc_in_ns(ep.ns_name, ["qdisc", "del", "dev", "ifb0", "root"])
+                self._run(["ip", "netns", "exec", ep.ns_name, "ip", "link", "set", "ifb0", "down"], check=False)
+                self._run(["ip", "netns", "exec", ep.ns_name, "ip", "link", "del", "ifb0"], check=False)
                 self._run_tc_in_ns(ep.ns_name, ["qdisc", "del", "dev", ep.veth_ns, "root"])
             except Exception as e:
                 self.log(f"reset_tc: could not reset {ep.ns_name}:{ep.veth_ns}: {e}")
@@ -785,11 +1022,11 @@ class NamespaceNetworkSimulator:
         conditions: Dict[str, str],
     ) -> bool:
         """
-        Apply netem/htb/tbf shaping on a namespace interface, similar to container-based logic.
+        Apply netem/htb/tbf shaping on a namespace interface (egress and ingress).
 
-        The shaping applies to egress traffic of that endpoint, so by applying one set of
-        conditions on the server interface and another set on the client interfaces we get
-        independent delays/loss per direction.
+        The same delay, jitter, loss, and bandwidth are applied to both egress and ingress
+        on the endpoint's interface so that traffic in both directions sees identical shaping.
+        Egress: root qdisc; ingress: same conditions via IFB mirror.
         """
         if not conditions:
             return False
@@ -881,6 +1118,40 @@ class NamespaceNetworkSimulator:
             else:
                 # Nothing to apply
                 return False
+
+            # Ingress: same delay/jitter/loss/bandwidth on incoming traffic (via IFB)
+            ifb_name = "ifb0"
+            try:
+                self._run_tc_in_ns(endpoint.ns_name, ["qdisc", "del", "dev", endpoint.veth_ns, "ingress"])
+                self._run_tc_in_ns(endpoint.ns_name, ["qdisc", "del", "dev", ifb_name, "root"])
+                self._run(["ip", "netns", "exec", endpoint.ns_name, "ip", "link", "set", ifb_name, "down"], check=False)
+                self._run(["ip", "netns", "exec", endpoint.ns_name, "ip", "link", "del", ifb_name], check=False)
+            except Exception:
+                pass
+            try:
+                rip = self._run(["ip", "netns", "exec", endpoint.ns_name, "ip", "link", "add", "name", ifb_name, "type", "ifb"], check=False)
+                if rip.returncode != 0:
+                    self.log(f"{endpoint.ns_name}: ip link add ifb failed (ingress skipped)")
+                else:
+                    self._run(["ip", "netns", "exec", endpoint.ns_name, "ip", "link", "set", ifb_name, "up"])
+                    rinq = self._run_tc_in_ns(endpoint.ns_name, ["qdisc", "add", "dev", endpoint.veth_ns, "ingress"])
+                    if rinq.returncode != 0:
+                        self.log(f"{endpoint.ns_name}: tc ingress failed")
+                    else:
+                        self._run_tc_in_ns(
+                            endpoint.ns_name,
+                            [
+                                "filter", "add", "dev", endpoint.veth_ns, "parent", "ffff:", "protocol", "all",
+                                "u32", "match", "u32", "0", "0", "flowid", "1:1",
+                                "action", "mirred", "egress", "redirect", "dev", ifb_name,
+                            ],
+                        )
+                        for cmd in self._tc_egress_commands(ifb_name, conditions):
+                            self._run_tc_in_ns(endpoint.ns_name, cmd)
+                        self.log(f"{endpoint.ns_name}:{endpoint.veth_ns}: same delay/jitter/loss on egress and ingress (ingress via {ifb_name})")
+            except Exception as e:
+                self.log(f"{endpoint.ns_name}: ingress tc failed: {e}; egress only.")
+                print(f"  [WARNING] Ingress tc failed for {endpoint.ns_name}; same delay applied to egress only.")
             return True
         except Exception as e:
             print(f"[ERROR] Failed to apply tc in namespace {endpoint.ns_name} on {endpoint.veth_ns}: {e}")

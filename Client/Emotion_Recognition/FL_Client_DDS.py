@@ -85,6 +85,12 @@ if compression_path not in sys.path:
 
 from quantization_client import Quantization, QuantizationConfig
 
+# Battery model (shared with gRPC/MQTT/AMQP/HTTP3)
+_client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _client_dir not in sys.path:
+    sys.path.insert(0, _client_dir)
+from battery_model import BatteryModel
+
 from cyclonedds.topic import Topic
 from cyclonedds.sub import DataReader
 from cyclonedds.pub import DataWriter
@@ -168,6 +174,7 @@ class EvaluationMetrics(IdlStruct):
     loss: float
     accuracy: float
     client_converged: float = 0.0
+    battery_soc: float = 1.0
 
 
 @dataclass
@@ -193,6 +200,8 @@ class FederatedLearningClient:
         self.num_clients = num_clients
         self.model = None
         
+        # Battery/energy model for consumption tracking (server uses for battery plot)
+        self.battery_model = BatteryModel(protocol="dds")
         # Initialize quantization compression (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
         use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
@@ -549,6 +558,7 @@ class FederatedLearningClient:
             steps_per_epoch = 100
             val_steps = 25
         
+        training_start = time.time()
         # Train the model
         history = self.model.fit(
             self.train_generator,
@@ -581,6 +591,7 @@ class FederatedLearningClient:
         time.sleep(delay)
         
         payload_bytes = len(serialized_weights)
+        training_time = time.time() - training_start
         if payload_bytes > 1_000_000 and os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
             print(f"Client {self.client_id} sending model update ({payload_bytes / 1e6:.2f} MB); may take 1–2 min on moderate network...")
         send_start_ts = time.time()
@@ -593,6 +604,8 @@ class FederatedLearningClient:
             float(final_loss),
             float(final_accuracy)
         )
+        communication_time = time.time() - send_start_ts
+        self.battery_model.update(payload_bytes, 0, training_time, communication_time)
         if send_start_cpu is not None:
             O_send = time.perf_counter() - send_start_cpu
             print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={payload_bytes} send_start_ts={send_start_ts:.9f}")
@@ -671,14 +684,15 @@ class FederatedLearningClient:
         self._update_local_convergence(float(loss))
         client_converged = 1.0 if self.has_converged else 0.0
         
-        # Send metrics to server
+        # Send metrics to server (include battery_soc for server battery consumption plot)
         metrics = EvaluationMetrics(
             client_id=self.client_id,
             round=self.current_round,
             num_samples=self.validation_generator.n,
             loss=float(loss),
             accuracy=float(accuracy),
-            client_converged=client_converged
+            client_converged=client_converged,
+            battery_soc=float(self.battery_model.battery_soc),
         )
         
         # Write with explicit return check

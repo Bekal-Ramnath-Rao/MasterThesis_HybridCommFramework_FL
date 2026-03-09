@@ -58,6 +58,12 @@ Dataset/
 saved_models/
 checkpoints/
 
+# Lock files (client single-instance locks)
+.locks/
+
+# TLS certs (QUIC/HTTP3 server-generated)
+.certs/
+
 # Logs
 *.log
 logs/

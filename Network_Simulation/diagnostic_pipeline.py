@@ -637,7 +637,7 @@ def run_pipeline(
     Flow:
       Phase 1 – Round 1 (round index 0): No tc on clients. Server→Global model→Client; Client→Local model→Server.
         Used for application overhead (O_send, O_recv, O_broker).
-      Phase 2 – Apply tc at client egress only (server never shaped).
+      Phase 2 – Apply tc at client ingress and egress (server never shaped).
       Phase 3 – Round 2 (round index 2): Tc on client egress. T_actual = recv_end_ts − send_start_ts for round index 2.
 
     NUM_ROUNDS=3 so we have round indices 0, 1, 2. We use index 0 for cal and index 2 for T_actual.
@@ -651,7 +651,7 @@ def run_pipeline(
 
     # Import here to avoid circular deps and to use same scenarios as GUI/network_simulator
     sys.path.insert(0, str(SCRIPT_DIR))
-    from network_simulator import NetworkSimulator
+    from network_simulator import NetworkSimulator, build_delay_models
     sim = NetworkSimulator(verbose=True)
     if scenario not in sim.NETWORK_SCENARIOS:
         raise ValueError(f"Unknown scenario: {scenario}. Choose from: {list(sim.NETWORK_SCENARIOS.keys())}")
@@ -702,7 +702,7 @@ def run_pipeline(
     n_expected = len(sender_containers)
 
     env = os.environ.copy()
-    # 3 rounds: Round 1 (index 0) = calibration, Round 2 (index 2) = T_actual with tc on client egress
+    # 3 rounds: Round 1 (index 0) = calibration, Round 2 (index 2) = T_actual with tc on client ingress+egress
     env["NUM_ROUNDS"] = "3"
     env["FL_DIAGNOSTIC_PIPELINE"] = "1"
     env["MIN_CLIENTS"] = str(n_expected)
@@ -744,7 +744,7 @@ def run_pipeline(
     elif result.returncode != 0:
         raise RuntimeError("Failed to start containers. Check docker compose and network.")
     time.sleep(15)
-    # Tc is applied to CLIENTS ONLY (never to server). Ensure server has no tc so all shaping is on client egress.
+    # Tc is applied to CLIENTS ONLY (never to server). Ensure server has no tc so all shaping is on client ingress+egress.
     try:
         sim.reset_container_network(receiver_container)
     except Exception:
@@ -755,7 +755,7 @@ def run_pipeline(
             sim.reset_container_network(sc)
         except Exception:
             pass
-    print("          Server tc cleared (tc applied to clients only). Client tc cleared for calibration (no losses).")
+    print("          Server tc cleared (tc applied to clients only, ingress+egress). Client tc cleared for calibration (no losses).")
 
     # Wait for Round 1 (round index 0) to complete – calibration for application overhead.
     # For DDS specifically, also ensure that the server has finished aggregating round 1
@@ -810,11 +810,18 @@ def run_pipeline(
         O_broker = T_total_baseline0 - (O_send0 + O_recv0 + (S_bits / B_bridge))
         O_broker = max(0.0, O_broker)
 
-    # Phase 2: Apply tc at egress of clients only. Then Round 2 runs: Server → Global model → Client; Client → Local model → Server.
+    # Phase 2: Apply tc at ingress and egress of clients only. Then Round 2 runs: Server → Global model → Client; Client → Local model → Server.
     # T_actual = recv_end_ts − send_start_ts for round index 2 (second round, client send to server receive).
-    print(f"[Phase 2] Applying tc at client egress only: {scenario}. Round 2 will run with tc...")
+    print(f"[Phase 2] Applying tc at client ingress and egress: {scenario}. Round 2 will run with tc...")
+    use_gaussian = os.environ.get("USE_GAUSSIAN_DELAY", "1").strip().lower() in ("1", "true", "yes")
+    sigma_factor = float(os.environ.get("GAUSSIAN_SIGMA_FACTOR", "0.05"))
+    use_extra_jitter = os.environ.get("USE_EXTRA_JITTER", "0").strip().lower() in ("1", "true", "yes")
     try:
-        conditions = sim.get_scenario_conditions(scenario)
+        if use_gaussian:
+            models = build_delay_models(sim.NETWORK_SCENARIOS, sigma_factor=sigma_factor)
+            conditions = sim.get_scenario_conditions_sampled(scenario, models, use_extra_jitter=use_extra_jitter)
+        else:
+            conditions = sim.get_scenario_conditions(scenario)
     except (KeyError, ValueError) as e:
         print(f"[ERROR] Cannot apply scenario: {e}")
         conditions = {}
@@ -829,7 +836,9 @@ def run_pipeline(
         B = _scenario_bandwidth_bps(conditions)
         p = _scenario_loss_decimal(conditions)
         D_tc, J = _scenario_delay_jitter_sec(conditions)
-        print(f"          Using scenario-derived B={B} bps, p={p}, D_tc={D_tc}, J={J} (host mode).")
+        D_egress, D_ingress = D_tc, D_tc
+        RTT_eff = (D_egress + D_ingress) + J
+        print(f"          Using scenario-derived B={B} bps, p={p}, D_tc={D_tc}, J={J} (host mode; egress+ingress -> RTT_eff).")
     else:
         for sc in sender_containers:
             try:
@@ -895,7 +904,9 @@ def run_pipeline(
             D_tc, J = _scenario_delay_jitter_sec(conditions)
             if not (USE_IPERF3 and params):
                 print(f"          Tc had no loss/delay; using scenario p={p}, D_tc={D_tc}, J={J} for analytical model.")
-    RTT_eff = D_tc + J
+    # Effective one-way delay: tc is applied at both client egress and client ingress (same D_tc per leg)
+    D_egress, D_ingress = D_tc, D_tc
+    RTT_eff = (D_egress + D_ingress) + J
     time.sleep(2)
 
     # Phase 3: Wait for Round 2 to fully complete: client finishes training → sends update → server receives.
@@ -1086,13 +1097,14 @@ def run_pipeline_native(
     try:
         # Single run: round 1 without tc (O_app), then tc applied before round 2 (T_actual from round 2 send).
         print("[Phase 1] Native: Round 1 – no tc on clients (for O_app)...")
-        print("[Phase 2] Native: Before round 2, tc will be applied at client egress; round 2 send → T_actual.")
+        print("[Phase 2] Native: Before round 2, tc will be applied at client ingress and egress; round 2 send → T_actual.")
         conditions = sim.NETWORK_SCENARIOS[scenario]
         B = _scenario_bandwidth_bps(conditions)
         p = _scenario_loss_decimal(conditions)
         D_tc, J = _scenario_delay_jitter_sec(conditions)
-        RTT_eff = D_tc + J
-        print(f"          Scenario for round 2: B={B} bps, p={p}, D_tc={D_tc}, J={J}")
+        D_egress, D_ingress = D_tc, D_tc
+        RTT_eff = (D_egress + D_ingress) + J
+        print(f"          Scenario for round 2: B={B} bps, p={p}, D_tc={D_tc}, J={J} (egress+ingress -> RTT_eff)")
 
         if use_quantization and not use_pruning:
             use_pruning = True
@@ -1124,8 +1136,9 @@ def run_pipeline_native(
                 params = load_network_params(iperf3_path)
                 if params:
                     B, D_tc, J, p = network_params_to_t_calc_input(params, scenario_fallback=conditions)
-                    RTT_eff = D_tc + J
-                    print(f"          Native: using iperf3 params from client: B={B} bps, p={p}, D_tc={D_tc}, J={J}")
+                    D_egress, D_ingress = D_tc, D_tc
+                    RTT_eff = (D_egress + D_ingress) + J
+                    print(f"          Native: using iperf3 params from client: B={B} bps, p={p}, D_tc={D_tc}, J={J} (egress+ingress)")
             except Exception as e:
                 print(f"          Native: iperf3 params not available ({e}); using scenario.")
 

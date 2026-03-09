@@ -22,6 +22,7 @@ Currently this runner is intentionally conservative:
 
 import argparse
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -186,6 +187,43 @@ class NativeExperimentRunner:
             return {}
         return dict(NetworkSimulator.NETWORK_SCENARIOS[name])
 
+    def _get_scenario_conditions(self, name: str) -> Dict[str, str]:
+        """Return scenario conditions; when USE_GAUSSIAN_DELAY=1, delay/jitter are sampled from normal distributions."""
+        from network_simulator import NetworkSimulator
+
+        if not name or name not in NetworkSimulator.NETWORK_SCENARIOS:
+            return self._load_scenario(name)
+        use_gaussian = os.environ.get("USE_GAUSSIAN_DELAY", "1").strip().lower() in ("1", "true", "yes")
+        if not use_gaussian:
+            return self._load_scenario(name)
+        from network_delay_model import build_models
+        sigma_factor = float(os.environ.get("GAUSSIAN_SIGMA_FACTOR", "0.05"))
+        use_extra_jitter = os.environ.get("USE_EXTRA_JITTER", "0").strip().lower() in ("1", "true", "yes")
+        models = build_models(NetworkSimulator.NETWORK_SCENARIOS, sigma_factor=sigma_factor)
+        return NetworkSimulator.get_scenario_conditions_sampled(name, models, use_extra_jitter=use_extra_jitter)
+
+    def _get_latest_round_from_server_log(self, server_log_path: Path) -> int:
+        """Parse server log for round completion; return the latest completed round number (0 if none)."""
+        round_patterns = [
+            re.compile(r"Round (\d+) - Aggregated Metrics", re.IGNORECASE),
+            re.compile(r"ROUND (\d+)/\d+", re.IGNORECASE),
+            re.compile(r"Completed round (\d+)", re.IGNORECASE),
+        ]
+        max_round = 0
+        try:
+            if not server_log_path.exists():
+                return 0
+            text = server_log_path.read_text(encoding="utf-8", errors="replace")
+            for pattern in round_patterns:
+                for m in pattern.finditer(text):
+                    max_round = max(max_round, int(m.group(1)))
+            # "Starting Round N/" means round N is starting, so round N-1 is completed
+            for m in re.finditer(r"Starting Round (\d+)/", text, re.IGNORECASE):
+                max_round = max(max_round, int(m.group(1)) - 1)
+        except (OSError, ValueError):
+            pass
+        return max(0, max_round)
+
     def setup_network(self) -> None:
         from network_simulator import NamespaceNetworkSimulator
 
@@ -194,13 +232,13 @@ class NativeExperimentRunner:
 
         server_ep, client_eps = sim.setup_topology(base_name, self.num_clients)
 
-        # Native: apply tc only to clients (upstream), not to the server. Server has no delay/loss/bandwidth shaping.
+        # Native: apply tc only to clients (upstream), not to the server; tc applied at both ingress and egress per client.
         # If apply_tc_after_round_1 is set, start with excellent (no tc); tc will be applied mid-run after round 1.
         downstream_conditions = {}  # No tc on server
         if self.apply_tc_after_round_1:
             upstream_conditions = self._load_scenario("excellent")
         else:
-            upstream_conditions = self._load_scenario(self.upstream_scenario)
+            upstream_conditions = self._get_scenario_conditions(self.upstream_scenario)
         sim.apply_conditions(server_ep, client_eps, downstream_conditions, upstream_conditions)
 
         # Store for later cleanup
@@ -409,8 +447,13 @@ class NativeExperimentRunner:
         env["PYTHONUNBUFFERED"] = "1"
         # Common FL configuration
         env["NUM_ROUNDS"] = str(self.num_rounds)
-        env["MIN_CLIENTS"] = str(self.num_clients)
-        env["MAX_CLIENTS"] = str(self.num_clients)
+        if self.protocol == "rl_unified":
+            # Training: only 1 client is started; server still allows multiple for inference.
+            env["MIN_CLIENTS"] = "1"
+            env["MAX_CLIENTS"] = str(os.environ.get("MAX_CLIENTS", "10"))
+        else:
+            env["MIN_CLIENTS"] = str(self.num_clients)
+            env["MAX_CLIENTS"] = str(self.num_clients)
         # Match Docker defaults for convergence behaviour unless explicitly overridden
         env.setdefault("CONVERGENCE_THRESHOLD", "0.001")
         env.setdefault("CONVERGENCE_PATIENCE", "2")
@@ -575,11 +618,17 @@ class NativeExperimentRunner:
         return procs
 
     def run(self) -> int:
+        use_gaussian = os.environ.get("USE_GAUSSIAN_DELAY", "1").strip().lower() in ("1", "true", "yes")
+        scenario_for_tc_note = self.apply_tc_after_round_1 or self.upstream_scenario
         tc_note = (
             f"  Tc: round 1 no tc; after round 1 complete, apply scenario={self.apply_tc_after_round_1} to clients.\n"
             if self.apply_tc_after_round_1
             else f"  Tc: clients only (scenario={self.upstream_scenario}); server has no delay/loss/bandwidth.\n"
         )
+        if scenario_for_tc_note:
+            tc_note += (
+                f"  Per-round tc: delay/jitter re-sampled from Gaussian model after each FL round (USE_GAUSSIAN_DELAY={use_gaussian}).\n"
+            )
         rl_reward_note = (
             f"  RL reward scenario : {self.rl_reward_scenario} (train in current conditions, reward as if in {self.rl_reward_scenario})\n"
             if getattr(self, "rl_reward_scenario", None) else ""
@@ -629,38 +678,44 @@ class NativeExperimentRunner:
             time.sleep(5)
             client_procs = self._spawn_clients(client_log_files=client_logs)
 
-            # Wait for server completion; when it exits, we stop clients as well
+            # Wait for server completion; when it exits, we stop clients as well.
+            # Per-round tc: (re-)apply delay/jitter from Gaussian model after each FL round (ingress + egress).
             print("[INFO] Do not interrupt (Ctrl+C/Stop) until the server finishes all rounds.")
-            if self.apply_tc_after_round_1:
-                # Phase 1: round 1 runs without tc. After round 1 complete, apply tc so round 2 send is affected.
-                # No timeout: wait indefinitely (FL_DIAG_ROUND1_WAIT_SEC=0 or unset). Set to positive for a limit.
-                client_log_paths = [log_dir / f"client_{i}.log" for i in range(1, self.num_clients + 1)]
-                poll_interval = 2
-                round1_wait_sec = int(os.environ.get("FL_DIAG_ROUND1_WAIT_SEC", "0"))
-                deadline = (time.monotonic() + round1_wait_sec) if round1_wait_sec > 0 else None  # None = no limit
-                if deadline is None:
-                    print("[INFO] Waiting for round 1 completion (no timeout; set FL_DIAG_ROUND1_WAIT_SEC>0 for a limit).")
-                while (deadline is None or time.monotonic() < deadline) and server_proc.poll() is None:
-                    counts = []
-                    for path in client_log_paths:
-                        try:
-                            text = path.read_text(encoding="utf-8", errors="replace")
-                            n = sum(1 for line in text.splitlines() if "FL_DIAG" in line and "O_send=" in line)
-                            counts.append(n)
-                        except (IOError, OSError):
-                            counts.append(0)
-                    if counts and all(c >= 1 for c in counts):
-                        print("[INFO] Round 1 complete (all clients sent). Applying tc for round 2...")
-                        server_ep, client_eps = self._endpoints
-                        conditions = self._load_scenario(self.apply_tc_after_round_1)
-                        if conditions:
-                            for ep in client_eps:
-                                self._ns_sim.apply_tc(ep, conditions)
-                            print(f"[INFO] Tc applied to clients: {self.apply_tc_after_round_1}")
-                        break
-                    time.sleep(poll_interval)
-                if server_proc.poll() is not None:
-                    print("[WARNING] Server exited before tc was applied; round 1 may have been the only round.")
+            client_log_paths = [log_dir / f"client_{i}.log" for i in range(1, self.num_clients + 1)]
+            server_log_path = log_dir / "server.log"
+            poll_interval = 2
+            round1_wait_sec = int(os.environ.get("FL_DIAG_ROUND1_WAIT_SEC", "0"))
+            deadline = (time.monotonic() + round1_wait_sec) if round1_wait_sec > 0 else None
+            if self.apply_tc_after_round_1 and deadline is None:
+                print("[INFO] Waiting for round 1 completion (no timeout; set FL_DIAG_ROUND1_WAIT_SEC>0 for a limit).")
+            scenario_for_tc = self.apply_tc_after_round_1 or self.upstream_scenario
+            last_round_tc_applied = 0  # after each round completion we apply tc for the *next* round's send
+
+            while (deadline is None or time.monotonic() < deadline) and server_proc.poll() is None:
+                # Round completion: from client FL_DIAG O_send= count (if FL_DIAGNOSTIC_PIPELINE=1) and/or server log
+                counts = []
+                for path in client_log_paths:
+                    try:
+                        text = path.read_text(encoding="utf-8", errors="replace")
+                        n = sum(1 for line in text.splitlines() if "FL_DIAG" in line and "O_send=" in line)
+                        counts.append(n)
+                    except (IOError, OSError):
+                        counts.append(0)
+                min_sends = min(counts) if counts else 0
+                round_from_server = self._get_latest_round_from_server_log(server_log_path)
+                current_completed_rounds = max(min_sends, round_from_server)
+
+                if current_completed_rounds > last_round_tc_applied and scenario_for_tc:
+                    server_ep, client_eps = self._endpoints
+                    conditions = self._get_scenario_conditions(scenario_for_tc)
+                    if conditions:
+                        for ep in client_eps:
+                            self._ns_sim.apply_tc(ep, conditions)  # ingress + egress per client
+                        next_round = last_round_tc_applied + 1
+                        print(f"[INFO] Tc (ingress+egress) re-sampled for round {next_round + 1} send (Gaussian delay/jitter): {conditions.get('latency', '')} {conditions.get('jitter', '')}")
+                    last_round_tc_applied = current_completed_rounds
+                time.sleep(poll_interval)
+
             exit_code = server_proc.wait()
             # Give clients a short grace period to flush stdout (FL_DIAG)
             time.sleep(3)
@@ -883,6 +938,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    # RL unified training: use a single client (Q-learning / policy training).
+    if args.protocol == "rl_unified" and args.num_clients != 1:
+        print(f"[INFO] RL unified: forcing num_clients=1 for training (was {args.num_clients}).")
+        args.num_clients = 1
 
     # Propagate DDS implementation choice so native DDS server/clients can switch vendor based on DDS_IMPL
     if getattr(args, "dds_impl", None):

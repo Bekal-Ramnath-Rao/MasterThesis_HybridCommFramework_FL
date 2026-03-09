@@ -292,12 +292,17 @@ def compute_t_calc(
     D_tc_sec: float,
     J_sec: float,
     p: float,
+    D_ingress_sec: Optional[float] = None,
 ) -> float:
     """
     Compute analytical transfer time T_calc (same formula as diagnostic_pipeline).
     protocol: mqtt, amqp, grpc, quic, http3, dds
+    Delay: effective one-way includes egress and ingress port delay; when tc is applied
+    at both ports (same value), use D_egress = D_tc_sec, D_ingress = D_ingress_sec or D_tc_sec.
     """
-    RTT_eff = D_tc_sec + J_sec
+    D_egress = D_tc_sec
+    D_ingress = D_ingress_sec if D_ingress_sec is not None else D_tc_sec
+    RTT_eff = (D_egress + D_ingress) + J_sec
 
     def transfer_time_bits_bps(S: float, B: float) -> float:
         if B is None or B <= 0 or not math.isfinite(B):

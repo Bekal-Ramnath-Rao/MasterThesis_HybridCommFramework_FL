@@ -26,7 +26,10 @@ This document lists the **exact formulas** used in the diagnostic pipeline to co
 | **T_calc** | Predicted total round time (client send → server process → client receives) | s |
 | **S** | Payload size (model update) | bits |
 | **B** | Bandwidth (bottleneck link, measured via iperf3 when available) | bps |
-| **RTT_eff** | Effective RTT (delay + jitter from tc/netem or iperf3) | s |
+| **D_egress** | One-way delay on egress port (sender side, from tc/netem) | s |
+| **D_ingress** | One-way delay on ingress port (receiver side, from tc/netem) | s |
+| **RTT_eff** | Effective one-way delay (egress + ingress + jitter) used in formulas | s |
+| **J** | Jitter from tc (additive to delay) | s |
 | **p** | Packet loss rate (decimal, e.g. 0.01 = 1%) | — |
 | **O_app** | Application + broker overhead (measured in calibration) | s |
 | **O_TLS** | TLS 1.3 encryption overhead (QUIC/HTTP3 only) | s |
@@ -47,14 +50,29 @@ T_{\mathrm{transfer}}(S,\, B) = \frac{S}{B} \quad \text{(seconds)}
 
 (If \(B \leq 0\) or not finite, treat as 0.)
 
-### Effective RTT (from tc)
+### Effective one-way delay and RTT_eff (egress + ingress)
+
+Tc is applied at both **egress** and **ingress** ports (same scenario per leg). One-way path delay is the sum of both legs:
 
 \[
-\mathrm{RTT}_{\mathrm{eff}} = D_{\mathrm{tc}} + J
+D_{\mathrm{one\text{-}way}} = D_{\mathrm{egress}} + D_{\mathrm{ingress}}
 \]
 
-- \(D_{\mathrm{tc}}\): one-way delay from `tc`
-- \(J\): jitter from `tc` (used as additive to RTT here)
+**Effective delay** used in all formulas (effective one-way delay including jitter):
+
+\[
+\mathrm{RTT}_{\mathrm{eff}} = D_{\mathrm{egress}} + D_{\mathrm{ingress}} + J
+\]
+
+- \(D_{\mathrm{egress}}\): one-way delay on the egress port (from `tc`/netem)
+- \(D_{\mathrm{ingress}}\): one-way delay on the ingress port (from `tc`/netem)
+- \(J\): jitter from `tc` (additive)
+
+When the same scenario is applied to both ports (as in the diagnostic pipeline and network simulator), \(D_{\mathrm{egress}} = D_{\mathrm{ingress}} = D_{\mathrm{tc}}\), so:
+
+\[
+\mathrm{RTT}_{\mathrm{eff}} = 2\,D_{\mathrm{tc}} + J
+\]
 
 ### Application overhead
 
@@ -256,6 +274,7 @@ O_{\mathrm{TLS}} = O_{\mathrm{TLS\_handshake}} + K_{\mathrm{TLS}} \cdot (S/8)
 
 - Script: `Network_Simulation/diagnostic_pipeline.py`
 - **T_calc** is compared to **T_actual** (measured round time); **Error %** = \(100 \cdot (T_{\mathrm{actual}} - T_{\mathrm{calc}})/T_{\mathrm{actual}}\).
+- Tc is applied at **client egress and client ingress** (same delay/jitter on both). The pipeline sets \(D_{\mathrm{egress}} = D_{\mathrm{ingress}} = D_{\mathrm{tc}}\) (from scenario or tc) and uses \(\mathrm{RTT}_{\mathrm{eff}} = 2 D_{\mathrm{tc}} + J\).
 
 ### Host network mode
 

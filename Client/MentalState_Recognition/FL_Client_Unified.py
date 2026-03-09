@@ -58,6 +58,7 @@ if gpus:
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 USE_RL_SELECTION = os.getenv("USE_RL_SELECTION", "true").lower() == "true"
+USE_QL_CONVERGENCE = os.getenv("USE_QL_CONVERGENCE", "false").lower() == "true"
 
 
 class UnifiedFLClient_MentalState:
@@ -88,18 +89,24 @@ class UnifiedFLClient_MentalState:
         self.local_epochs = 5
         self.batch_size = 16
         
-        # RL Components (load from past experience when .pkl exists)
+        # RL Components: training = single client saves to shared path; inference = all clients load from same path
         if USE_RL_SELECTION:
             if os.path.exists("/shared_data"):
-                save_path = f"/shared_data/q_table_mentalstate_client_{client_id}.pkl"
+                shared_q_path = "/shared_data/q_table_mentalstate_trained.pkl"
+                save_path = shared_q_path
             else:
                 save_path = f"q_table_mentalstate_client_{client_id}.pkl"
             initial_load_path = None
-            pretrained_dir = os.getenv("PRETRAINED_Q_TABLE_DIR")
-            if pretrained_dir:
-                candidate = os.path.join(pretrained_dir, f"q_table_mentalstate_client_{client_id}.pkl")
-                if os.path.exists(candidate):
-                    initial_load_path = candidate
+            if os.path.exists("/shared_data") and os.path.exists("/shared_data/q_table_mentalstate_trained.pkl"):
+                initial_load_path = "/shared_data/q_table_mentalstate_trained.pkl"
+            if initial_load_path is None:
+                pretrained_dir = os.getenv("PRETRAINED_Q_TABLE_DIR")
+                if pretrained_dir:
+                    for candidate in (os.path.join(pretrained_dir, "q_table_mentalstate_trained.pkl"),
+                                     os.path.join(pretrained_dir, f"q_table_mentalstate_client_{client_id}.pkl")):
+                        if os.path.exists(candidate):
+                            initial_load_path = candidate
+                            break
             self.rl_selector = QLearningProtocolSelector(
                 save_path=save_path,
                 initial_load_path=initial_load_path,
@@ -165,18 +172,21 @@ class UnifiedFLClient_MentalState:
         return model
     
     def select_protocol(self) -> str:
-        """Select protocol using RL or fallback to default"""
+        """Select protocol using RL (runs on CPU) or fallback to default"""
         if USE_RL_SELECTION and self.rl_selector and self.env_manager:
             try:
-                import psutil
-                cpu = psutil.cpu_percent(interval=0.1)
-                memory = psutil.virtual_memory().percent
-                
-                resource_level = self.env_manager.detect_resource_level(cpu, memory)
-                self.env_manager.update_resource_level(resource_level)
-                
-                state = self.env_manager.get_current_state()
-                protocol = self.rl_selector.select_protocol(state, training=True)
+                # RL logic runs on CPU only (no GPU); keeps Q-table updates off GPU
+                with tf.device('/CPU:0'):
+                    import psutil
+                    cpu = psutil.cpu_percent(interval=0.1)
+                    memory = psutil.virtual_memory().percent
+                    
+                    resource_level = self.env_manager.detect_resource_level(cpu, memory)
+                    self.env_manager.update_resource_level(resource_level)
+                    
+                    state = self.env_manager.get_current_state()
+                    # Inference: use learned Q-table only (training=False); training: epsilon-greedy (training=True)
+                    protocol = self.rl_selector.select_protocol(state, training=USE_QL_CONVERGENCE)
                 
                 print(f"\n[RL Selection] State: {state}")
                 print(f"[RL Selection] Selected Protocol: {protocol.upper()}")
@@ -316,8 +326,8 @@ class UnifiedFLClient_MentalState:
             self.round_metrics['accuracy'] = train_metrics['val_accuracy']
             self.round_metrics['success'] = True
             
-            # Update RL (T_calc from communication model: high T_calc -> more negative reward)
-            if USE_RL_SELECTION and self.rl_selector and self.env_manager:
+            # Update RL only during training (USE_QL_CONVERGENCE); inference clients use loaded Q-table only
+            if USE_RL_SELECTION and self.rl_selector and self.env_manager and USE_QL_CONVERGENCE:
                 resources = self.env_manager.get_resource_consumption()
                 payload_bytes = self.round_metrics.get('payload_bytes', 12 * 1024 * 1024)
                 t_calc = self._get_t_calc_for_reward(protocol, payload_bytes)
@@ -359,7 +369,7 @@ class UnifiedFLClient_MentalState:
             for key, value in metrics.items():
                 print(f"  {key}: {value}")
             
-            if USE_RL_SELECTION and self.rl_selector:
+            if USE_RL_SELECTION and self.rl_selector and USE_QL_CONVERGENCE:
                 self.rl_selector.end_episode()
         
         if USE_RL_SELECTION and self.rl_selector:

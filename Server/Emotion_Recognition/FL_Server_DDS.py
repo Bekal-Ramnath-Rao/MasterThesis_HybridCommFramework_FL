@@ -129,6 +129,7 @@ class EvaluationMetrics(IdlStruct):
     loss: float
     accuracy: float
     client_converged: float = 0.0
+    battery_soc: float = 1.0
 
 
 @dataclass
@@ -760,6 +761,9 @@ class FederatedLearningServer:
             
             samples = self.readers['metrics'].take()
             for sample in samples:
+                # Guard: DDS may return InvalidSample when a writer disconnects (e.g. client converged)
+                if not sample or not hasattr(sample, 'round'):
+                    continue
                 if sample.round == self.current_round:
                     client_id = sample.client_id
                     conv = getattr(sample, 'client_converged', 0.0) or 0.0
@@ -776,7 +780,8 @@ class FederatedLearningServer:
                         }
                         self.client_metrics[client_id] = {
                             'metrics': metrics_dict,
-                            'num_samples': sample.num_samples
+                            'num_samples': sample.num_samples,
+                            'battery_soc': float(getattr(sample, 'battery_soc', 1.0)),
                         }
                         print(f"Progress: {len(self.client_metrics)}/{len(self.active_clients)} clients")
             

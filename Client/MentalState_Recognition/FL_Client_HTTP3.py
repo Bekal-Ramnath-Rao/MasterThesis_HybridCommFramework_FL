@@ -65,7 +65,7 @@ if gpus:
 
 # HTTP/3 Configuration
 HTTP3_HOST = os.getenv("HTTP3_HOST", "localhost")
-HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))"))
+HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -547,17 +547,19 @@ class FederatedLearningClient:
         loop = asyncio.get_event_loop()
         
         def train_model():
-            return self.model.fit(
-                ds_train,
-                epochs=epochs,
-                verbose=2,
-                callbacks=[
-                    tf.keras.callbacks.EarlyStopping(
-                        monitor="loss", patience=3,
-                        restore_best_weights=True, verbose=0
-                    )
-                ]
-            )
+            # Model training on GPU; RL logic runs on CPU elsewhere
+            with tf.device('/GPU:0' if gpus else '/CPU:0'):
+                return self.model.fit(
+                    ds_train,
+                    epochs=epochs,
+                    verbose=2,
+                    callbacks=[
+                        tf.keras.callbacks.EarlyStopping(
+                            monitor="loss", patience=3,
+                            restore_best_weights=True, verbose=0
+                        )
+                    ]
+                )
         
         history = await loop.run_in_executor(None, train_model)
         

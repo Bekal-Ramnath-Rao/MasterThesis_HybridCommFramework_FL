@@ -3,7 +3,8 @@ Q-Learning Based Protocol Selector for Federated Learning
 
 This module implements a Q-learning algorithm to dynamically select
 the best communication protocol based on network conditions and 
-system resources.
+system resources. RL logic is designed to run on CPU only (no TensorFlow
+ops); client-side model training uses GPU separately.
 
 Actions: MQTT, AMQP, gRPC, QUIC, DDS
 Rewards: Communication time, Success rate, Convergence, Accuracy, Resources

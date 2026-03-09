@@ -24,6 +24,12 @@ if _utilities_path not in sys.path:
 
 from packet_logger import log_received_packet, log_sent_packet, init_db
 
+# Battery model (shared with gRPC/MQTT/Unified)
+_client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _client_dir not in sys.path:
+    sys.path.insert(0, _client_dir)
+from battery_model import BatteryModel
+
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
@@ -147,6 +153,9 @@ class FederatedLearningClient:
         
         # Initialize packet logging database
         init_db()
+        
+        # Battery/energy model for consumption tracking (server uses for battery plot)
+        self.battery_model = BatteryModel(protocol="amqp")
         
         # AMQP connection
         self.connection = None
@@ -583,6 +592,7 @@ class FederatedLearningClient:
             steps_per_epoch = 100
             val_steps = 25
         
+        training_start = time.time()
         # Use GPU device context for training
         with tf.device('/GPU:0'):
             # Train the model with GPU acceleration
@@ -634,6 +644,7 @@ class FederatedLearningClient:
             "metrics": metrics
         }
         
+        training_time = time.time() - training_start
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
             send_start_ts = time.time()
             send_start_cpu = time.perf_counter()
@@ -643,6 +654,7 @@ class FederatedLearningClient:
         # diagnostic pipeline measurements are not biased by artificial sleep.
 
         payload = json.dumps(update_message)
+        comm_start = time.time()
         # Publish with retry logic
         if self.publish_with_retry(
             exchange=EXCHANGE_CLIENT_UPDATES,
@@ -650,6 +662,9 @@ class FederatedLearningClient:
             body=payload,
             properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         ):
+            communication_time = time.time() - comm_start
+            bytes_sent = len(payload.encode('utf-8'))
+            self.battery_model.update(bytes_sent, 0, training_time, communication_time)
             if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
                 send_end_cpu = time.perf_counter()
                 O_send = send_end_cpu - send_start_cpu
@@ -695,7 +710,8 @@ class FederatedLearningClient:
         
         metrics_dict = {
             "loss": float(loss),
-            "accuracy": float(accuracy)
+            "accuracy": float(accuracy),
+            "battery_soc": float(self.battery_model.battery_soc),
         }
         if self.has_converged:
             metrics_dict["client_converged"] = 1.0

@@ -321,6 +321,10 @@ class ExperimentRunner:
             compose_file = self.unified_compose_files[self.use_case]
             if self.use_ql_convergence:
                 os.environ["USE_QL_CONVERGENCE"] = "true"
+                # RL training: only one client runs; server waits for 1 client; run until Q converges and exit
+                os.environ["MIN_CLIENTS"] = "1"
+                os.environ["NUM_CLIENTS"] = "1"
+                print("RL training mode: starting only 1 client (converge and exit)")
             else:
                 os.environ["USE_QL_CONVERGENCE"] = "false"
             
@@ -332,7 +336,18 @@ class ExperimentRunner:
                 sim = NetworkSimulator(verbose=True)
                 if not sim.ensure_macvlan_network():
                     raise RuntimeError("Failed to create macvlan network for host_macvlan mode")
-            compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"]
+            # When QL convergence: start only brokers + server + first client (single client for training)
+            if self.use_ql_convergence:
+                uc = self.use_case  # emotion, mentalstate, temperature
+                services_single_client = [
+                    "mqtt-broker-unified",
+                    "amqp-broker-unified",
+                    f"fl-server-unified-{uc}",
+                    f"fl-client-unified-{uc}-1",
+                ]
+                compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"] + services_single_client
+            else:
+                compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"]
             
             print(f"Starting unified FL system for {self.use_case}...")
             result = self.run_command(compose_cmd)
@@ -481,7 +496,7 @@ class ExperimentRunner:
         time.sleep(5)
     
     def apply_network_scenario(self, scenario: str, protocol: str):
-        """Apply network conditions: host mode = tc on host interface; gpu/host_macvlan = per-container tc."""
+        """Apply network conditions at ingress and egress: host mode = tc on host interface; gpu/host_macvlan = per-container tc."""
         import sys
         from pathlib import Path
         parent_dir = str(Path(__file__).parent.parent)
@@ -497,9 +512,17 @@ class ExperimentRunner:
         if scenario not in sim.NETWORK_SCENARIOS:
             print(f"[WARNING] Unknown scenario: {scenario}, skipping network simulation")
             return True
+        use_gaussian = os.environ.get("USE_GAUSSIAN_DELAY", "1").strip().lower() in ("1", "true", "yes")
+        sigma_factor = float(os.environ.get("GAUSSIAN_SIGMA_FACTOR", "0.05"))
+        use_extra_jitter = os.environ.get("USE_EXTRA_JITTER", "0").strip().lower() in ("1", "true", "yes")
         try:
-            conditions = sim.get_scenario_conditions(scenario)
-        except ValueError as e:
+            if use_gaussian:
+                from network_simulator import build_delay_models
+                models = build_delay_models(sim.NETWORK_SCENARIOS, sigma_factor=sigma_factor)
+                conditions = sim.get_scenario_conditions_sampled(scenario, models, use_extra_jitter=use_extra_jitter)
+            else:
+                conditions = sim.get_scenario_conditions(scenario)
+        except (ValueError, KeyError) as e:
             print(f"[WARNING] {e}, skipping network simulation")
             return True
         services = self.service_patterns[self.use_case][protocol]
@@ -530,17 +553,23 @@ class ExperimentRunner:
         time.sleep(2)
         return success_count > 0
     
-    def wait_for_completion(self, protocol: str, timeout: Optional[int] = 3600):
+    def wait_for_completion(self, protocol: str, timeout: Optional[int] = 3600, scenario: Optional[str] = None):
         """Wait for FL training to complete and track round trip times.
-        When timeout is None, wait indefinitely (used for rl_unified + Q-learning convergence)."""
+        When timeout is None, wait indefinitely (used for rl_unified + Q-learning convergence).
+        When scenario is set and USE_GAUSSIAN_DELAY=1, delay/jitter are re-sampled from normal distribution
+        before each round's client->server send (per-round tc update)."""
         if timeout is None:
             print(f"\nWaiting for {protocol.upper()} training to complete (no time limit - until Q-learning converges)...")
         else:
             print(f"\nWaiting for {protocol.upper()} training to complete (timeout: {timeout}s)...")
         
-        # Get server container name
+        # Get server container name and client containers (for per-round tc re-apply)
         services = self.service_patterns[self.use_case][protocol]
         server_container = [s for s in services if "server" in s][0]
+        client_containers = [s for s in services if "client" in s and ("broker" not in s.lower() and "rabbitmq" not in s.lower())]
+        use_gaussian = os.environ.get("USE_GAUSSIAN_DELAY", "1").strip().lower() in ("1", "true", "yes")
+        resample_tc_per_round = scenario and use_gaussian
+        last_round_tc_applied = 0  # re-apply tc before each round's send when round completes
         
         # Track round trip times (time from global model sent to next round start)
         round_trip_times = []
@@ -601,6 +630,30 @@ class ExperimentRunner:
                             print(f"  Round {latest_round} RTT: {rtt:.2f}s")
                         last_round_complete_time = current_time
                         current_round = latest_round
+                        # Re-apply tc with new delay/jitter sample before next round's client->server send
+                        if resample_tc_per_round and current_round > last_round_tc_applied:
+                            script_dir = Path(__file__).resolve().parent
+                            if str(script_dir) not in sys.path:
+                                sys.path.insert(0, str(script_dir))
+                            try:
+                                from network_simulator import NetworkSimulator, build_delay_models
+                                sim = NetworkSimulator(verbose=False)
+                                sigma_factor = float(os.environ.get("GAUSSIAN_SIGMA_FACTOR", "0.05"))
+                                use_extra_jitter = os.environ.get("USE_EXTRA_JITTER", "0").strip().lower() in ("1", "true", "yes")
+                                models = build_delay_models(sim.NETWORK_SCENARIOS, sigma_factor=sigma_factor)
+                                conditions = sim.get_scenario_conditions_sampled(scenario, models, use_extra_jitter=use_extra_jitter)
+                                if self.network_mode == "host" and getattr(self, "_host_network_sim", None) is not None:
+                                    self._host_network_sim.apply_network_conditions_host(conditions)
+                                else:
+                                    for container in client_containers:
+                                        try:
+                                            sim.apply_network_conditions(container, conditions)
+                                        except Exception as e:
+                                            print(f"[WARNING] Per-round tc failed for {container}: {e}")
+                                print(f"  Tc (delay/jitter) re-sampled for round {current_round + 1} send: {conditions.get('latency', '')} {conditions.get('jitter', '')}")
+                            except Exception as e:
+                                print(f"[WARNING] Per-round tc re-apply failed: {e}")
+                            last_round_tc_applied = current_round
             
             # If any known completion marker appears, treat as complete
             if any(marker in log_content for marker in completion_markers):
@@ -859,7 +912,7 @@ class ExperimentRunner:
                 print(f"[INFO] No time limit - waiting until Q-learning converges for {scenario} network")
             else:
                 print(f"[INFO] Using timeout: {timeout}s ({timeout/3600:.1f} hours) for {scenario} network")
-            success, round_trip_times = self.wait_for_completion(protocol, timeout=timeout)
+            success, round_trip_times = self.wait_for_completion(protocol, timeout=timeout, scenario=scenario)
             
             if not success:
                 print(f"[WARNING] Experiment may not have completed")

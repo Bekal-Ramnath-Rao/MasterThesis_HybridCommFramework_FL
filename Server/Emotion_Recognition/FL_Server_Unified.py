@@ -157,12 +157,15 @@ QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 HTTP3_HOST = os.getenv("HTTP3_HOST", '0.0.0.0')
 HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
-# Realistic max payload: DDS 64 KB per chunk
-CHUNK_SIZE = 64 * 1024  # 64 KB chunks
-# QUIC flow control (128 MB). HTTP/3 uses HTTP3_MAX_STREAM_DATA (16 KB) below.
+
+# Protocol max payload sizes (unified spec)
+MQTT_MAX_PAYLOAD_BYTES = 128 * 1024   # 128 KB
+AMQP_MAX_FRAME_BYTES = 128 * 1024     # 128 KB
+GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(4 * 1024 * 1024)))  # 4 MB
+HTTP3_MAX_STREAM_DATA = 16 * 1024     # HTTP/3: 16 KB per stream
+CHUNK_SIZE = 64 * 1024                # DDS: 64 KB per chunk
+# QUIC flow control (separate from HTTP/3; 128 MB for QUIC stream)
 QUIC_HTTP3_MAX_DATA_BYTES = 128 * 1024 * 1024  # 128 MB for QUIC
-# Realistic max payload: HTTP/3 16 KB per stream
-HTTP3_MAX_STREAM_DATA = 16 * 1024  # 16 KB
 
 # DDS Data Structures (must be defined at module level for Python 3.8)
 if DDS_AVAILABLE:
@@ -424,8 +427,7 @@ class UnifiedFederatedLearningServer:
                 protocol=mqtt.MQTTv311, 
                 clean_session=True
             )
-            # Realistic max payload: MQTT 128 KB
-            self.mqtt_client._max_packet_size = 128 * 1024  # 128 KB
+            self.mqtt_client._max_packet_size = MQTT_MAX_PAYLOAD_BYTES  # 128 KB
             self.mqtt_client.on_connect = self.on_mqtt_connect
             self.mqtt_client.on_message = self.on_mqtt_message
             # FAIR CONFIG: keepalive 600s for very_poor network
@@ -477,7 +479,7 @@ class UnifiedFederatedLearningServer:
                             retry_delay=1,
                             heartbeat=600,  # 10 minutes for very_poor network
                             blocked_connection_timeout=600,  # Aligned with heartbeat
-                            frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
+                            frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
                         )
                         conn = pika.BlockingConnection(parameters)
                         ch = conn.channel()
@@ -558,7 +560,7 @@ class UnifiedFederatedLearningServer:
                 blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=5,
                 retry_delay=2,
-                frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
+                frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
             )
             
             # Connection 1: Consumer (owned by consumer thread)
@@ -730,7 +732,7 @@ class UnifiedFederatedLearningServer:
                         credentials=credentials,
                         heartbeat=600,  # 10 minutes for very_poor network
                         blocked_connection_timeout=600,  # Aligned with heartbeat
-                        frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
+                        frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
                     )
                     print("Before sending message type:", message_type)
                     self.amqp_send_connection = pika.BlockingConnection(parameters)
@@ -778,8 +780,8 @@ class UnifiedFederatedLearningServer:
                 futures.ThreadPoolExecutor(max_workers=10),
                 options=[
                     # Realistic max payload: gRPC 4 MB
-                    ('grpc.max_send_message_length', 4 * 1024 * 1024),
-                    ('grpc.max_receive_message_length', 4 * 1024 * 1024),
+                    ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
+                    ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
                     # FAIR CONFIG: Keepalive settings 600s for very_poor network
                     ('grpc.keepalive_time_ms', 600000),  # 10 minutes
                     ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
@@ -898,9 +900,11 @@ class UnifiedFederatedLearningServer:
                 critical=False
             ).sign(private_key, hashes.SHA256())
             
-            # Save to temp files
-            cert_path = "/tmp/quic_cert.pem"
-            key_path = "/tmp/quic_key.pem"
+            # Save to project-local cert dir to avoid /tmp permission issues
+            cert_dir = os.path.join(project_root, ".certs")
+            os.makedirs(cert_dir, exist_ok=True)
+            cert_path = os.path.join(cert_dir, "quic_cert.pem")
+            key_path = os.path.join(cert_dir, "quic_key.pem")
             
             with open(cert_path, "wb") as f:
                 f.write(cert.public_bytes(serialization.Encoding.PEM))
@@ -1040,9 +1044,11 @@ class UnifiedFederatedLearningServer:
                 critical=False
             ).sign(private_key, hashes.SHA256())
             
-            # Save to temp files
-            cert_path = "/tmp/http3_cert.pem"
-            key_path = "/tmp/http3_key.pem"
+            # Save to project-local cert dir to avoid /tmp permission issues
+            cert_dir = os.path.join(project_root, ".certs")
+            os.makedirs(cert_dir, exist_ok=True)
+            cert_path = os.path.join(cert_dir, "http3_cert.pem")
+            key_path = os.path.join(cert_dir, "http3_key.pem")
             
             with open(cert_path, "wb") as f:
                 f.write(cert.public_bytes(serialization.Encoding.PEM))
@@ -1178,7 +1184,7 @@ class UnifiedFederatedLearningServer:
                 blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=5,
                 retry_delay=2,
-                frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
+                frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
             )
             self.amqp_consumer_connection = pika.BlockingConnection(parameters)
             self.amqp_consumer_channel = self.amqp_consumer_connection.channel()
@@ -2194,11 +2200,14 @@ class UnifiedFederatedLearningServer:
 # =========================================================================
 
 if GRPC_AVAILABLE:
+    GRPC_CHUNK_SIZE = GRPC_MAX_MESSAGE_BYTES - 4096  # leave room for proto framing
+
     class FLServicer(federated_learning_pb2_grpc.FederatedLearningServicer):
-        """gRPC service implementation"""
+        """gRPC service implementation (chunked transfer when payload > 4 MB)."""
         
         def __init__(self, server):
             self.server = server
+            self._update_chunks = {}  # (client_id, round) -> {'chunks': {index: bytes}, 'num_samples': int, 'metrics': dict}
         
         def RegisterClient(self, request, context):
             """Handle client registration"""
@@ -2224,94 +2233,153 @@ if GRPC_AVAILABLE:
                 )
         
         def GetGlobalModel(self, request, context):
-            """Send global model to client"""
+            """Send global model to client (chunked when > 4 MB)."""
             try:
                 client_id = request.client_id
                 ready_round = self.server.grpc_model_ready.get(client_id)
+                chunk_index = getattr(request, 'chunk_index', 0) or 0
 
-                # If this client is marked ready for initial model, always serve round 0
-                # with model_config so first-time model initialization cannot be skipped.
-                if ready_round == 0 and request.round == 0:
-                    weights_bytes = pickle.dumps(self.server.global_weights)
-                    model_config_json = json.dumps(self.server.model_config)
-                    response = federated_learning_pb2.GlobalModel(
-                        round=0,
-                        weights=weights_bytes,
-                        available=True,
-                        model_config=model_config_json
+                # Resolve what to serve: serialized_weights, model_config_json, round_to_serve
+                if self.server.global_weights is None:
+                    return federated_learning_pb2.GlobalModel(
+                        round=0, weights=b"", available=False, model_config="",
+                        chunk_index=0, total_chunks=1
                     )
-                # Serve a specifically marked ready round for gRPC pull clients.
-                elif ready_round is not None and request.round == 0:
-                    weights_bytes = pickle.dumps(self.server.global_weights)
-                    response = federated_learning_pb2.GlobalModel(
-                        round=ready_round,
-                        weights=weights_bytes,
-                        available=True,
-                        model_config=""
-                    )
-                # Backward-compatible fallback: allow polling latest/current.
-                elif request.round == 0 or request.round == self.server.current_round or request.round == self.server.current_round - 1:
-                    weights_bytes = pickle.dumps(self.server.global_weights)
-                    response = federated_learning_pb2.GlobalModel(
-                        round=self.server.current_round,
-                        weights=weights_bytes,
-                        available=True,
-                        model_config=""
-                    )
+                if self.server.quantization_handler is not None:
+                    compressed_data = self.server.quantization_handler.compress_global_model(self.server.global_weights)
+                    serialized_weights = pickle.dumps(compressed_data)
                 else:
-                    # Client requesting old/future round - not available
-                    response = federated_learning_pb2.GlobalModel(
-                        round=request.round,
-                        weights=b"",
-                        available=False,
-                        model_config=""
+                    serialized_weights = pickle.dumps(self.server.global_weights)
+                total_size = len(serialized_weights)
+                model_config_json = json.dumps(self.server.model_config)
+
+                if ready_round == 0 and request.round == 0:
+                    round_to_serve = 0
+                elif ready_round is not None and request.round == 0:
+                    round_to_serve = ready_round
+                elif request.round == 0 or request.round == self.server.current_round or request.round == self.server.current_round - 1:
+                    round_to_serve = self.server.current_round
+                    if request.round != 0 and round_to_serve != 0:
+                        model_config_json = ""
+                else:
+                    return federated_learning_pb2.GlobalModel(
+                        round=request.round, weights=b"", available=False, model_config="",
+                        chunk_index=0, total_chunks=1
                     )
-                
+
+                # Single message if within chunk size
+                if total_size <= GRPC_CHUNK_SIZE:
+                    log_sent_packet(
+                        packet_size=total_size, peer=f"client_{client_id}", protocol="gRPC",
+                        round=round_to_serve, extra_info="global_model"
+                    )
+                    return federated_learning_pb2.GlobalModel(
+                        round=round_to_serve,
+                        weights=serialized_weights,
+                        available=True,
+                        model_config=model_config_json,
+                        chunk_index=0,
+                        total_chunks=1
+                    )
+
+                # Chunked transfer
+                chunks = [serialized_weights[i:i + GRPC_CHUNK_SIZE] for i in range(0, total_size, GRPC_CHUNK_SIZE)]
+                total_chunks = len(chunks)
+                if chunk_index < 0 or chunk_index >= total_chunks:
+                    return federated_learning_pb2.GlobalModel(
+                        round=round_to_serve, weights=b"", available=False, model_config="",
+                        chunk_index=chunk_index, total_chunks=total_chunks
+                    )
+                chunk_data = chunks[chunk_index]
+                cfg = model_config_json if chunk_index == 0 else ""
+                if chunk_index == 0:
+                    print(f"[gRPC] Client {client_id}: Sending global model (round {round_to_serve}, {total_size/1024:.2f} KB in {total_chunks} chunks)")
                 log_sent_packet(
-                    packet_size=response.ByteSize(),
-                    peer=f"client_{request.client_id}",
-                    protocol="gRPC",
-                    round=request.round,
-                    extra_info="global_model"
+                    packet_size=len(chunk_data), peer=f"client_{client_id}", protocol="gRPC",
+                    round=round_to_serve, extra_info="global_model_chunk"
                 )
-                
-                return response
+                return federated_learning_pb2.GlobalModel(
+                    round=round_to_serve,
+                    weights=chunk_data,
+                    available=True,
+                    model_config=cfg,
+                    chunk_index=chunk_index,
+                    total_chunks=total_chunks
+                )
             except Exception as e:
                 print(f"[gRPC] Error in GetGlobalModel: {e}")
                 return federated_learning_pb2.GlobalModel(
-                    round=request.round,
-                    weights=b"",
-                    available=False,
-                    model_config=""
+                    round=getattr(request, 'round', 0),
+                    weights=b"", available=False, model_config="",
+                    chunk_index=0, total_chunks=1
                 )
         
         def SendModelUpdate(self, request, context):
-            """Receive model update from client"""
+            """Receive model update from client (chunked when > 4 MB)."""
             try:
-                print(f"[gRPC] SendModelUpdate called - client_id={request.client_id}, round={request.round}, current_round={self.server.current_round}")
-                
+                client_id = request.client_id
+                round_num = request.round
+                metrics = dict(request.metrics)
+                total_chunks = getattr(request, 'total_chunks', 1) or 1
+                chunk_index = getattr(request, 'chunk_index', 0) or 0
+
                 log_received_packet(
                     packet_size=request.ByteSize(),
-                    peer=f"client_{request.client_id}",
+                    peer=f"client_{client_id}",
                     protocol="gRPC",
-                    round=request.round,
-                    extra_info="model_update"
+                    round=round_num,
+                    extra_info="model_update" if total_chunks == 1 else "model_update_chunk"
                 )
-                
-                # Decode the payload: may be raw weights string or full JSON (when quantized)
-                if isinstance(request.weights, bytes):
-                    payload_str = request.weights.decode('utf-8')
+
+                # Convergence: accept even if chunked stream incomplete
+                converged_flag = float(metrics.get('client_converged', 0.0)) >= 1.0
+                if converged_flag and round_num <= self.server.current_round and client_id in self.server.active_clients:
+                    self.server.mark_client_converged(client_id)
+                    return federated_learning_pb2.UpdateResponse(success=True, message=f"Client {client_id} convergence acknowledged")
+                if round_num != self.server.current_round:
+                    return federated_learning_pb2.UpdateResponse(success=False, message=f"Round mismatch: expected {self.server.current_round}, got {round_num}")
+
+                # Chunked: accumulate until complete
+                if total_chunks > 1:
+                    key = (client_id, round_num)
+                    if key not in self._update_chunks:
+                        self._update_chunks[key] = {'chunks': {}, 'num_samples': 0, 'metrics': {}}
+                    buf = self._update_chunks[key]
+                    buf['chunks'][chunk_index] = request.weights if request.weights else b''
+                    if chunk_index == 0:
+                        buf['num_samples'] = request.num_samples
+                        buf['metrics'] = metrics
+                    if len(buf['chunks']) < total_chunks:
+                        return federated_learning_pb2.UpdateResponse(
+                            success=True,
+                            message=f"Chunk {chunk_index + 1}/{total_chunks} received for round {round_num}"
+                        )
+                    serialized_weights = b''.join(buf['chunks'][i] for i in range(total_chunks))
+                    num_samples = buf['num_samples']
+                    metrics = buf['metrics']
+                    del self._update_chunks[key]
                 else:
-                    payload_str = request.weights
-                metrics = dict(request.metrics)
-                # If client sent full message as JSON (e.g. with compressed_data), use it
+                    serialized_weights = request.weights
+                    num_samples = request.num_samples
+
+                # Build data for handle_client_update (chunked reassembly is raw bytes; single message may be JSON)
+                if isinstance(serialized_weights, bytes):
+                    try:
+                        payload_str = serialized_weights.decode('utf-8')
+                    except UnicodeDecodeError:
+                        payload_str = base64.b64encode(serialized_weights).decode('utf-8')
+                        data = {'client_id': client_id, 'round': round_num, 'weights': payload_str, 'num_samples': num_samples, 'metrics': metrics}
+                        self.server.handle_client_update(data, 'grpc')
+                        return federated_learning_pb2.UpdateResponse(success=True, message="Update received")
+                else:
+                    payload_str = serialized_weights
                 try:
                     parsed = json.loads(payload_str)
                     if isinstance(parsed, dict) and ('compressed_data' in parsed or 'weights' in parsed):
                         data = {
-                            'client_id': parsed.get('client_id', request.client_id),
-                            'round': parsed.get('round', request.round),
-                            'num_samples': parsed.get('num_samples', request.num_samples),
+                            'client_id': parsed.get('client_id', client_id),
+                            'round': round_num,
+                            'num_samples': parsed.get('num_samples', num_samples),
                             'metrics': parsed.get('metrics', metrics)
                         }
                         if 'compressed_data' in parsed:
@@ -2321,32 +2389,23 @@ if GRPC_AVAILABLE:
                     else:
                         data = None
                 except (json.JSONDecodeError, TypeError):
-                    parsed = None
+                    data = None
                 if data is None:
                     data = {
-                        'client_id': request.client_id,
-                        'round': request.round,
+                        'client_id': client_id,
+                        'round': round_num,
                         'weights': payload_str,
-                        'num_samples': request.num_samples,
+                        'num_samples': num_samples,
                         'metrics': metrics
                     }
-                
-                print(f"[gRPC] Calling handle_client_update for client {request.client_id}, round {request.round}")
+
                 self.server.handle_client_update(data, 'grpc')
-                print(f"[gRPC] handle_client_update completed for client {request.client_id}")
-                
-                return federated_learning_pb2.UpdateResponse(
-                    success=True,
-                    message="Update received"
-                )
+                return federated_learning_pb2.UpdateResponse(success=True, message="Update received")
             except Exception as e:
                 print(f"[gRPC] Error in SendModelUpdate: {e}")
                 import traceback
                 traceback.print_exc()
-                return federated_learning_pb2.UpdateResponse(
-                    success=False,
-                    message=str(e)
-                )
+                return federated_learning_pb2.UpdateResponse(success=False, message=str(e))
         
         def SendMetrics(self, request, context):
             """Receive evaluation metrics from client"""
@@ -2630,7 +2689,8 @@ if QUIC_AVAILABLE:
 def main():
     """Main function"""
     # Prevent duplicate unified server instance in the same container/host.
-    lock_path = "/tmp/unified_emotion_server.lock"
+    # Use user-writable path (home or cwd) to avoid PermissionError on /tmp.
+    lock_path = os.path.join(os.path.expanduser("~"), ".unified_emotion_server.lock")
     lock_file = open(lock_path, "w")
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
