@@ -140,6 +140,7 @@ class NativeExperimentRunner:
         quantization_symmetric: bool = False,
         use_ql_convergence: bool = False,
         rl_reward_scenario: Optional[str] = None,
+        use_communication_model_reward: bool = True,
     ) -> None:
         self.use_case = use_case
         self.protocol = protocol
@@ -163,6 +164,7 @@ class NativeExperimentRunner:
         self.use_ql_convergence = use_ql_convergence
         # When set (e.g. "good", "moderate", "poor"): run in excellent conditions but reward/state as if in that scenario (RL_REWARD_SCENARIO)
         self.rl_reward_scenario = (rl_reward_scenario or "").strip().lower() or None
+        self.use_communication_model_reward = use_communication_model_reward
 
         # Resolve concrete script paths for this (use_case, protocol)
         self.server_script = _resolve_script_path(use_case, protocol, role="server")
@@ -179,6 +181,28 @@ class NativeExperimentRunner:
         self._amqp_host: Optional[str] = None  # When set, AMQP uses this (e.g. gateway for host RabbitMQ fallback)
         self._amqp_port: Optional[int] = None  # When set (e.g. 25673), use proxy port so namespaces can reach host RabbitMQ
         self._log_files: list = []  # keep refs so files stay open until processes exit
+
+    def _effective_num_rounds(self) -> Optional[int]:
+        """
+        Return the FL round cap to pass to the server.
+
+        In RL Q-convergence training mode, the GUI rounds input must not control
+        training length. We therefore do not forward NUM_ROUNDS unless the user
+        explicitly provides RL_MAX_TRAINING_ROUNDS as a safety cap.
+        """
+        if self.protocol == "rl_unified" and self.use_ql_convergence:
+            override = os.environ.get("RL_MAX_TRAINING_ROUNDS", "").strip()
+            if not override:
+                return None
+            try:
+                return int(override)
+            except ValueError:
+                print(
+                    f"[WARNING] Ignoring invalid RL_MAX_TRAINING_ROUNDS={override!r}; "
+                    "using server default round cap."
+                )
+                return None
+        return self.num_rounds
 
     def _load_scenario(self, name: str) -> Dict[str, str]:
         from network_simulator import NetworkSimulator
@@ -564,7 +588,11 @@ class NativeExperimentRunner:
         # diagnostic pipeline T_actual (round index 2) when we terminate clients after server exit.
         env["PYTHONUNBUFFERED"] = "1"
         # Common FL configuration
-        env["NUM_ROUNDS"] = str(self.num_rounds)
+        effective_num_rounds = self._effective_num_rounds()
+        if effective_num_rounds is not None:
+            env["NUM_ROUNDS"] = str(effective_num_rounds)
+        else:
+            env.pop("NUM_ROUNDS", None)
         if self.protocol == "rl_unified":
             if self.use_ql_convergence:
                 # RL training: run with a single client until the learned table converges.
@@ -699,6 +727,7 @@ class NativeExperimentRunner:
                 env["QUIC_HOST"] = server_ep.ip
                 env["HTTP3_HOST"] = server_ep.ip
                 env["USE_QL_CONVERGENCE"] = "true" if self.use_ql_convergence else "false"
+                env["USE_COMMUNICATION_MODEL_REWARD"] = "true" if self.use_communication_model_reward else "false"
                 if getattr(self, "rl_reward_scenario", None):
                     env["RL_REWARD_SCENARIO"] = self.rl_reward_scenario
 
@@ -743,6 +772,7 @@ class NativeExperimentRunner:
     def run(self) -> int:
         use_gaussian = os.environ.get("USE_GAUSSIAN_DELAY", "1").strip().lower() in ("1", "true", "yes")
         actual_upstream_scenario = self._actual_upstream_scenario()
+        effective_num_rounds = self._effective_num_rounds()
         scenario_for_tc_note = self.apply_tc_after_round_1 or actual_upstream_scenario
         tc_note = (
             f"  Tc: round 1 no tc; after round 1 complete, apply scenario={self.apply_tc_after_round_1} to clients.\n"
@@ -757,13 +787,24 @@ class NativeExperimentRunner:
             f"  RL reward scenario : {self.rl_reward_scenario} (train with actual network={actual_upstream_scenario}, reward as if in {self.rl_reward_scenario})\n"
             if getattr(self, "rl_reward_scenario", None) else ""
         )
+        rounds_note = (
+            "  Rounds   : auto (RL Q-convergence mode; GUI rounds ignored"
+            + (
+                f", safety cap={effective_num_rounds}"
+                if effective_num_rounds is not None
+                else ", server default safety cap"
+            )
+            + ")\n"
+            if self.protocol == "rl_unified" and self.use_ql_convergence
+            else f"  Rounds   : {self.num_rounds}\n"
+        )
         print(
             f"\n=== Starting NATIVE FL experiment ===\n"
             f"  Use case : {self.use_case}\n"
             f"  Protocol : {self.protocol}\n"
             f"  Scenario : {self.scenario}\n"
             f"{rl_reward_note}"
-            f"  Rounds   : {self.num_rounds}\n"
+            f"{rounds_note}"
             f"  Clients  : {self.num_clients}\n"
             f"{tc_note}"
             f"=====================================\n"
@@ -1063,6 +1104,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="For protocol=rl_unified: run RL training mode and stop when the learned Q-table converges.",
     )
+    parser.add_argument(
+        "--disable-communication-model-reward",
+        action="store_true",
+        help="For protocol=rl_unified: do not let communication-model T_calc affect RL rewards.",
+    )
 
     return parser.parse_args()
 
@@ -1101,6 +1147,7 @@ def main() -> None:
         quantization_symmetric=getattr(args, "quantization_symmetric", False),
         use_ql_convergence=getattr(args, "use_ql_convergence", False),
         rl_reward_scenario=getattr(args, "rl_reward_scenario", None),
+        use_communication_model_reward=not getattr(args, "disable_communication_model_reward", False),
     )
     _install_signal_handlers(runner)
     code = runner.run()

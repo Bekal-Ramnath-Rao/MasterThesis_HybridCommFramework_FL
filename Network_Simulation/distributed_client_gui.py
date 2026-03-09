@@ -309,6 +309,15 @@ class DistributedClientGUI(QMainWindow):
         self.ql_convergence_enabled.setStyleSheet("padding: 5px; font-size: 12px;")
         self.ql_convergence_enabled.setToolTip("Automatically enabled in RL training mode, disabled in inference mode.")
         layout.addWidget(self.ql_convergence_enabled, 3, 2, 1, 2)
+
+        self.communication_model_reward_enabled = QCheckBox("Include communication model in RL rewards")
+        self.communication_model_reward_enabled.setChecked(True)
+        self.communication_model_reward_enabled.setStyleSheet("padding: 5px; font-size: 12px;")
+        self.communication_model_reward_enabled.setToolTip(
+            "When enabled, RL rewards include the communication-model T_calc penalty. "
+            "Disable this to train or run RL without reward influence from the communication model."
+        )
+        layout.addWidget(self.communication_model_reward_enabled, 4, 0, 1, 4)
         
         # Update state when protocol mode changes
         self.protocol_mode.currentIndexChanged.connect(self.update_ql_convergence_visibility)
@@ -671,6 +680,7 @@ class DistributedClientGUI(QMainWindow):
         self.rl_mode_inference.setEnabled(is_rl_unified)
         self.ql_convergence_enabled.setChecked(training_selected)
         self.ql_convergence_enabled.setEnabled(False)
+        self.communication_model_reward_enabled.setEnabled(is_rl_unified)
     
     def update_dds_impl_visibility(self):
         """Enable DDS implementation selector only when DDS protocol is selected"""
@@ -900,6 +910,7 @@ class DistributedClientGUI(QMainWindow):
             f"Network: {network_scenario}\n"
             f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
             f"Q-Learning Convergence: {'Enabled' if self.is_rl_training_mode() else 'Disabled'}\n"
+            f"Communication Model Reward: {'Enabled' if is_unified and self.communication_model_reward_enabled.isChecked() else 'Disabled'}\n"
             f"Quantization: {'Enabled' if self.quantization_enabled.isChecked() else 'Disabled'}\n"
             f"Compression: {'Enabled' if self.compression_enabled.isChecked() else 'Disabled'}\n"
             f"Pruning: {'Enabled' if self.pruning_enabled.isChecked() else 'Disabled'}\n\n"
@@ -998,7 +1009,8 @@ class DistributedClientGUI(QMainWindow):
         if is_unified:
             cmd.extend([
                 "-e", "USE_RL_SELECTION=true",
-                "-e", "ENABLE_METRICS=true"
+                "-e", "ENABLE_METRICS=true",
+                "-e", f"USE_COMMUNICATION_MODEL_REWARD={'true' if self.communication_model_reward_enabled.isChecked() else 'false'}",
             ])
             if self.is_rl_training_mode():
                 cmd.extend([

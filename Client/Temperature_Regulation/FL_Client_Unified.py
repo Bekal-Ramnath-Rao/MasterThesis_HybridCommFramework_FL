@@ -47,6 +47,10 @@ CLIENT_ID = int(os.getenv("CLIENT_ID", "1"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 USE_RL_SELECTION = os.getenv("USE_RL_SELECTION", "true").lower() == "true"
 USE_QL_CONVERGENCE = os.getenv("USE_QL_CONVERGENCE", "false").lower() == "true"
+USE_COMMUNICATION_MODEL_REWARD = os.getenv("USE_COMMUNICATION_MODEL_REWARD", "true").lower() == "true"
+
+TOPIC_CLIENT_UPDATE = f"fl/client/{CLIENT_ID}/update"
+TOPIC_CLIENT_METRICS = f"fl/client/{CLIENT_ID}/metrics"
 
 
 class UnifiedFLClient_Temperature:
@@ -97,6 +101,7 @@ class UnifiedFLClient_Temperature:
             self.rl_selector = QLearningProtocolSelector(
                 save_path=save_path,
                 initial_load_path=initial_load_path,
+                use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
             )
             self.env_manager = EnvironmentStateManager()
             self.env_manager.update_model_size('small')  # Temperature (small model)
@@ -127,6 +132,8 @@ class UnifiedFLClient_Temperature:
         print(f"Client ID: {self.client_id}/{self.num_clients}")
         print(f"Training Samples: {len(self.y_train)}")
         print(f"RL Protocol Selection: {'ENABLED' if USE_RL_SELECTION else 'DISABLED'}")
+        if USE_RL_SELECTION:
+            print(f"Communication Model in Reward: {'ENABLED' if USE_COMMUNICATION_MODEL_REWARD else 'DISABLED'}")
         print(f"{'='*70}\n")
     
     def _prepare_data(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -272,8 +279,7 @@ class UnifiedFLClient_Temperature:
             client.connect(broker, port)
             
             if action == "send":
-                topic = f"fl/temperature/client_{self.client_id}/weights"
-                client.publish(topic, data)
+                client.publish(TOPIC_CLIENT_UPDATE, data)
                 client.disconnect()
                 return True, None
             elif action == "receive":
@@ -286,8 +292,27 @@ class UnifiedFLClient_Temperature:
     
     def _handle_amqp(self, action: str, data: Optional[bytes] = None) -> Tuple[bool, Optional[bytes]]:
         """Handle AMQP protocol communication"""
-        print("[AMQP] Protocol handler")
-        return True, data
+        try:
+            connection = pika.BlockingConnection(
+                pika.ConnectionParameters(host=os.getenv("AMQP_BROKER", "amqp-broker"))
+            )
+            channel = connection.channel()
+            channel.exchange_declare(exchange='fl_client_updates', exchange_type='direct', durable=True)
+            if action == "send":
+                body = data.decode('utf-8') if isinstance(data, bytes) else data
+                channel.basic_publish(
+                    exchange='fl_client_updates',
+                    routing_key='client.update',
+                    body=body,
+                    properties=pika.BasicProperties(delivery_mode=2)
+                )
+                connection.close()
+                return True, None
+            connection.close()
+            return True, data
+        except Exception as e:
+            print(f"[AMQP] Error: {e}")
+            return False, None
     
     def _handle_grpc(self, action: str, data: Optional[bytes] = None) -> Tuple[bool, Optional[bytes]]:
         """Handle gRPC protocol communication"""
@@ -330,7 +355,7 @@ class UnifiedFLClient_Temperature:
             if USE_RL_SELECTION and self.rl_selector and self.env_manager and USE_QL_CONVERGENCE:
                 resources = self.env_manager.get_resource_consumption()
                 payload_bytes = self.round_metrics.get('payload_bytes', 12 * 1024 * 1024)
-                t_calc = self._get_t_calc_for_reward(protocol, payload_bytes)
+                t_calc = self._get_t_calc_for_reward(protocol, payload_bytes) if USE_COMMUNICATION_MODEL_REWARD else None
                 reward = self.rl_selector.calculate_reward(
                     self.round_metrics['communication_time'],
                     self.round_metrics['success'],

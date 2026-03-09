@@ -55,6 +55,7 @@ class ExperimentRunner:
         baseline_mode: bool = False,
         use_ql_convergence: bool = False,
         local_clients: int = 2,
+        use_communication_model_reward: bool = True,
     ):
         self.use_case = use_case
         self.num_rounds = num_rounds
@@ -67,6 +68,7 @@ class ExperimentRunner:
             self.network_mode = "gpu"
         self.baseline_mode = baseline_mode
         self.use_ql_convergence = use_ql_convergence
+        self.use_communication_model_reward = use_communication_model_reward
         # Number of client containers started from this runner on the central machine
         self.local_clients = max(1, int(local_clients or 1))
         # quantization_params expected to be a dict of simple string values
@@ -327,6 +329,7 @@ class ExperimentRunner:
                 print("RL training mode: starting only 1 client (converge and exit)")
             else:
                 os.environ["USE_QL_CONVERGENCE"] = "false"
+            os.environ["USE_COMMUNICATION_MODEL_REWARD"] = "true" if self.use_communication_model_reward else "false"
             
             # host_macvlan: ensure fl-macvlan network exists before up
             if self.network_mode == "host_macvlan":
@@ -1085,6 +1088,11 @@ def main():
     parser.add_argument("--use-ql-convergence", action="store_true",
                 help="Unified only: End training when Q-learning value converges (multiple episodes); else end on accuracy convergence")
     parser.add_argument(
+        "--disable-communication-model-reward",
+        action="store_true",
+        help="Unified only: do not let communication-model T_calc affect RL rewards.",
+    )
+    parser.add_argument(
         "--local-clients",
         type=int,
         default=2,
@@ -1146,6 +1154,7 @@ def main():
         baseline_mode=args.baseline,
         use_ql_convergence=args.use_ql_convergence,
         local_clients=args.local_clients,
+        use_communication_model_reward=not args.disable_communication_model_reward,
     )
     
     # In baseline mode, run all protocols with excellent scenario (no network conditions)

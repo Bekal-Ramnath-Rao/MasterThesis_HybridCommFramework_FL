@@ -158,7 +158,8 @@ class UnifiedFederatedLearningServer:
         """MQTT connection callback"""
         print(f"[MQTT] Connected with result code {rc}")
         client.subscribe("fl/client_register")
-        client.subscribe("fl/training_complete")
+        client.subscribe("fl/client/+/update")
+        client.subscribe("fl/client/+/metrics")
     
     def on_mqtt_message(self, client, userdata, msg):
         """MQTT message callback"""
@@ -167,9 +168,10 @@ class UnifiedFederatedLearningServer:
             
             if msg.topic == "fl/client_register":
                 self.handle_client_registration(payload['client_id'], 'mqtt')
-            
-            elif msg.topic == "fl/training_complete":
+            elif "/update" in msg.topic:
                 self.handle_client_update(payload, 'mqtt')
+            elif "/metrics" in msg.topic:
+                self.handle_client_metrics(payload, 'mqtt')
         except Exception as e:
             print(f"[MQTT] Error handling message: {e}")
     
@@ -181,16 +183,22 @@ class UnifiedFederatedLearningServer:
             )
             channel = connection.channel()
             
-            # Declare queues
-            channel.queue_declare(queue='fl_client_register')
-            channel.queue_declare(queue='fl_training_complete')
+            channel.exchange_declare(exchange='fl_client_updates', exchange_type='direct', durable=True)
+            channel.queue_declare(queue='fl.client.register')
+            channel.queue_declare(queue='fl.client.update')
+            channel.queue_declare(queue='fl.client.metrics')
+            channel.queue_bind(exchange='fl_client_updates', queue='fl.client.register', routing_key='client.register')
+            channel.queue_bind(exchange='fl_client_updates', queue='fl.client.update', routing_key='client.update')
+            channel.queue_bind(exchange='fl_client_updates', queue='fl.client.metrics', routing_key='client.metrics')
             
-            # Set up consumers
-            channel.basic_consume(queue='fl_client_register',
+            channel.basic_consume(queue='fl.client.register',
                                 on_message_callback=self.on_amqp_register,
                                 auto_ack=True)
-            channel.basic_consume(queue='fl_training_complete',
+            channel.basic_consume(queue='fl.client.update',
                                 on_message_callback=self.on_amqp_update,
+                                auto_ack=True)
+            channel.basic_consume(queue='fl.client.metrics',
+                                on_message_callback=self.on_amqp_metrics,
                                 auto_ack=True)
             
             # Start consuming in separate thread
@@ -217,6 +225,14 @@ class UnifiedFederatedLearningServer:
             self.handle_client_update(payload, 'amqp')
         except Exception as e:
             print(f"[AMQP] Error handling update: {e}")
+    
+    def on_amqp_metrics(self, ch, method, properties, body):
+        """AMQP metrics callback"""
+        try:
+            payload = json.loads(body.decode())
+            self.handle_client_metrics(payload, 'amqp')
+        except Exception as e:
+            print(f"[AMQP] Error handling metrics: {e}")
     
     def handle_client_registration(self, client_id, protocol):
         """Handle client registration (thread-safe)"""
@@ -251,6 +267,12 @@ class UnifiedFederatedLearningServer:
             # Wait for all registered clients (dynamic)
             if len(self.client_updates) >= len(self.registered_clients):
                 self.aggregate_and_broadcast()
+    
+    def handle_client_metrics(self, payload, protocol):
+        """Track client evaluation metrics using standalone message routing."""
+        with self.lock:
+            client_id = payload['client_id']
+            self.client_metrics[client_id] = payload.get('metrics', {})
     
     def start_training(self):
         """Start federated learning process"""

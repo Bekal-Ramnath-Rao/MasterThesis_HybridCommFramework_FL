@@ -26,7 +26,7 @@ class QLearningProtocolSelector:
     """
     
     # Protocol actions
-    PROTOCOLS = ['mqtt', 'amqp', 'grpc', 'quic', 'http3', 'dds']
+    PROTOCOLS = ['mqtt', 'amqp', 'grpc', 'http3', 'dds']
     
     # Environment state dimensions
     NETWORK_CONDITIONS = ['excellent', 'good', 'moderate', 'poor', 'very_poor']
@@ -43,6 +43,7 @@ class QLearningProtocolSelector:
         epsilon_min: float = 0.01,
         save_path: str = "q_table.pkl",
         initial_load_path: Optional[str] = None,
+        use_communication_model_reward: bool = True,
     ):
         """
         Initialize Q-Learning Protocol Selector
@@ -56,6 +57,8 @@ class QLearningProtocolSelector:
             save_path: Path to save/load Q-table (persistent location recommended)
             initial_load_path: Optional path to load past experience first (e.g. pretrained .pkl).
                               If set and file exists, this is tried before save_path.
+            use_communication_model_reward: When True, apply the communication-model
+                                            T_calc penalty to the RL reward.
         """
         self.learning_rate = learning_rate
         self.discount_factor = discount_factor
@@ -64,6 +67,7 @@ class QLearningProtocolSelector:
         self.epsilon_min = epsilon_min
         self.save_path = save_path
         self.initial_load_path = initial_load_path
+        self.use_communication_model_reward = use_communication_model_reward
         
         # Initialize Q-table
         # State space: (network, resource, model_size, mobility)
@@ -153,6 +157,7 @@ class QLearningProtocolSelector:
         accuracy: float,
         resource_consumption: Dict[str, float],
         t_calc: Optional[float] = None,
+        use_communication_model_reward: Optional[bool] = None,
     ) -> float:
         """
         Calculate reward based on multiple metrics.
@@ -167,6 +172,8 @@ class QLearningProtocolSelector:
             resource_consumption: Dict with cpu, memory, bandwidth usage
             t_calc: Optional analytical transfer time (seconds). If set, high T_calc
                     reduces reward; low T_calc reduces reward less (communication model impact).
+            use_communication_model_reward: Optional per-call override for whether
+                                            T_calc should affect the reward.
 
         Returns:
             Calculated reward value
@@ -204,8 +211,11 @@ class QLearningProtocolSelector:
         low_batt_penalty = -5.0 * (1.0 - battery_level) * energy_norm
         reward += low_batt_penalty
 
+        if use_communication_model_reward is None:
+            use_communication_model_reward = self.use_communication_model_reward
+
         # 5. T_calc (communication model): higher T_calc -> more negative reward; lower T_calc -> less penalty
-        if t_calc is not None and t_calc >= 0:
+        if use_communication_model_reward and t_calc is not None and t_calc >= 0:
             # Penalty scale: e.g. T_calc 0->0 penalty, 10s->-2.5, 30s->-5 (cap)
             t_calc_penalty = min(5.0, t_calc * 0.5)
             reward -= t_calc_penalty

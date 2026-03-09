@@ -67,12 +67,17 @@ except ImportError:
 
 try:
     from aioquic.h3.connection import H3_ALPN, H3Connection
-    from aioquic.h3.events import DataReceived, HeadersReceived, H3Event, StreamReset
+    from aioquic.h3.events import DataReceived, HeadersReceived, H3Event
+    try:
+        from aioquic.h3.events import StreamReset
+    except ImportError:
+        from aioquic.quic.events import StreamReset
     HTTP3_AVAILABLE = True
 except ImportError:
     HTTP3_AVAILABLE = False
     H3Connection = None
     H3Event = None
+    StreamReset = None
 
 try:
     from cyclonedds.domain import DomainParticipant
@@ -177,6 +182,23 @@ if HTTP3_AVAILABLE and QuicConnectionProtocol is not None:
             self.client = None  # Set by factory function
             self._http = None  # H3Connection instance
             self._stream_buffers = {}  # Instance-specific stream buffers
+            self._stream_content_lengths = {}
+            self._stream_status_codes = {}
+            self._response_waiters = {}
+
+        def create_response_waiter(self, stream_id: int):
+            waiter = asyncio.get_running_loop().create_future()
+            self._response_waiters[stream_id] = waiter
+            return waiter
+
+        def _finish_response_waiter(self, stream_id: int, *, result=None, error: Exception = None):
+            waiter = self._response_waiters.pop(stream_id, None)
+            if waiter is None or waiter.done():
+                return
+            if error is not None:
+                waiter.set_exception(error)
+            else:
+                waiter.set_result(result)
         
         def quic_event_received(self, event):
             """Handle QUIC events and convert to HTTP/3 events"""
@@ -200,6 +222,9 @@ if HTTP3_AVAILABLE and QuicConnectionProtocol is not None:
                     # Initialize buffer for this stream
                     if stream_id not in self._stream_buffers:
                         self._stream_buffers[stream_id] = b''
+                    content_length = headers.get(b"content-length")
+                    self._stream_content_lengths[stream_id] = int(content_length) if content_length else None
+                    self._stream_status_codes[stream_id] = int(status) if status else None
                 except Exception as e:
                     print(f"[HTTP/3] Client error handling headers: {e}")
             
@@ -217,34 +242,68 @@ if HTTP3_AVAILABLE and QuicConnectionProtocol is not None:
                     # Send flow control updates
                     self.transmit()
                     
-                    # If stream ended, process complete message
-                    if event.end_stream:
+                    expected_length = self._stream_content_lengths.get(stream_id)
+                    received_length = len(self._stream_buffers[stream_id])
+                    response_complete = (
+                        (expected_length is not None and expected_length > 0 and received_length >= expected_length)
+                        or getattr(event, "stream_ended", False)
+                    )
+                    
+                    if response_complete:
                         try:
                             data_str = self._stream_buffers[stream_id].decode('utf-8')
-                            message = json.loads(data_str)
-                            msg_type = message.get('type', 'unknown')
+                            message = json.loads(data_str) if data_str else {}
+                            msg_type = message.get('type', 'response') if isinstance(message, dict) else 'response'
                             print(f"[HTTP/3] Client decoded complete message type '{msg_type}' from stream {stream_id}")
+
+                            status_code = self._stream_status_codes.get(stream_id)
+                            if stream_id in self._response_waiters:
+                                if status_code is not None and status_code >= 400:
+                                    self._finish_response_waiter(
+                                        stream_id,
+                                        error=ConnectionError(f"HTTP/3 request on stream {stream_id} failed with status {status_code}")
+                                    )
+                                else:
+                                    self._finish_response_waiter(
+                                        stream_id,
+                                        result={"status": status_code, "body": message}
+                                    )
                             
                             # Handle message asynchronously
-                            if self.client:
+                            if self.client and isinstance(message, dict) and 'type' in message:
                                 asyncio.create_task(self.client._handle_http3_message_async(message))
                             
                             # Clear buffer
                             self._stream_buffers[stream_id] = b''
+                            self._stream_content_lengths.pop(stream_id, None)
+                            self._stream_status_codes.pop(stream_id, None)
                         except (json.JSONDecodeError, UnicodeDecodeError) as e:
                             print(f"[HTTP/3] Client error decoding message: {e}")
+                            if stream_id in self._response_waiters:
+                                self._finish_response_waiter(
+                                    stream_id,
+                                    error=ConnectionError(f"HTTP/3 response decoding failed on stream {stream_id}: {e}")
+                                )
                             self._stream_buffers[stream_id] = b''
+                            self._stream_content_lengths.pop(stream_id, None)
+                            self._stream_status_codes.pop(stream_id, None)
                 except Exception as e:
                     print(f"[HTTP/3] Client error handling data: {e}")
                     import traceback
                     traceback.print_exc()
             
-            elif isinstance(event, StreamReset):
+            elif StreamReset is not None and isinstance(event, StreamReset):
                 # Stream was reset, clear buffer
                 stream_id = event.stream_id
                 if stream_id in self._stream_buffers:
                     del self._stream_buffers[stream_id]
                     print(f"[HTTP/3] Client stream {stream_id} reset, cleared buffer")
+                self._stream_content_lengths.pop(stream_id, None)
+                self._stream_status_codes.pop(stream_id, None)
+                self._finish_response_waiter(
+                    stream_id,
+                    error=ConnectionError(f"HTTP/3 stream {stream_id} was reset")
+                )
 else:
     UnifiedClientHTTP3Protocol = None
 
@@ -305,10 +364,12 @@ USE_RL_SELECTION = os.getenv("USE_RL_SELECTION", "true").lower() == "true"
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+ENABLE_LOCAL_CONVERGENCE_STOP = os.getenv("ENABLE_LOCAL_CONVERGENCE_STOP", "false").lower() == "true"
 # When True, training ends when Q-learning value converges; when False, ends on accuracy convergence
 USE_QL_CONVERGENCE = os.getenv("USE_QL_CONVERGENCE", "false").lower() == "true"
 Q_CONVERGENCE_THRESHOLD = float(os.getenv("Q_CONVERGENCE_THRESHOLD", "0.01"))
 Q_CONVERGENCE_PATIENCE = int(os.getenv("Q_CONVERGENCE_PATIENCE", "5"))
+USE_COMMUNICATION_MODEL_REWARD = os.getenv("USE_COMMUNICATION_MODEL_REWARD", "true").lower() == "true"
 
 # Energy / battery model constants (tunable)
 k_tx = 1e-8
@@ -355,6 +416,9 @@ AMQP_MAX_FRAME_BYTES = 128 * 1024    # 128 KB
 # gRPC: set in grpc import block (GRPC_MAX_MESSAGE_BYTES / GRPC_CHUNK_SIZE)
 HTTP3_MAX_STREAM_DATA_BYTES = 16 * 1024   # HTTP/3: 16 KB per stream
 CHUNK_SIZE = 64 * 1024                # DDS: 64 KB per chunk
+MQTT_UPDATE_CHUNK_BYTES = 96 * 1024
+AMQP_UPDATE_CHUNK_BYTES = 96 * 1024
+HTTP3_UPDATE_CHUNK_BYTES = 12 * 1024
 
 # DDS Data Structures (must be defined at module level for Python 3.8)
 if DDS_AVAILABLE:
@@ -387,9 +451,7 @@ if DDS_AVAILABLE:
         weights: sequence[int]  # CycloneDDS sequence type for sequence<octet> in IDL
         num_samples: int
         loss: float
-        mse: float
-        mae: float
-        mape: float
+        accuracy: float
     
     @dataclass
     class ModelUpdateChunk(IdlStruct):
@@ -400,9 +462,7 @@ if DDS_AVAILABLE:
         payload: sequence[int]
         num_samples: int
         loss: float
-        mse: float
-        mae: float
-        mape: float
+        accuracy: float
     
     @dataclass
     class EvaluationMetrics(IdlStruct):
@@ -411,9 +471,8 @@ if DDS_AVAILABLE:
         num_samples: int
         loss: float
         accuracy: float
-        mse: float
-        mae: float
-        mape: float
+        client_converged: float = 0.0
+        battery_soc: float = 1.0
 
 
 class UnifiedFLClient_Emotion:
@@ -445,12 +504,14 @@ class UnifiedFLClient_Emotion:
         self.last_global_round = -1
         self.last_training_round = -1
         self.pending_start_training_round = None
+        self.pending_start_evaluation_round = None
         self.grpc_registered = False
         self.protocol_listeners_started = False
         self.evaluated_rounds = set()
         self.waiting_for_aggregated_model = False  # Track if we sent update and waiting for aggregated model
         self.is_active = True
         self.has_converged = False
+        self.shutdown_requested = False
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         
@@ -481,6 +542,7 @@ class UnifiedFLClient_Emotion:
             self.rl_selector = QLearningProtocolSelector(
                 save_path=save_path,
                 initial_load_path=initial_load_path,
+                use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
             )
             
             # Reset epsilon if RESET_EPSILON environment variable is set OR reset flag file exists
@@ -669,6 +731,7 @@ class UnifiedFLClient_Emotion:
         self.http3_connection_task = None
         self.http3_loop = None
         self.http3_thread = None
+        self.http3_send_lock = threading.Lock()
         
         # AMQP listener components
         self.amqp_listener_connection = None
@@ -699,6 +762,8 @@ class UnifiedFLClient_Emotion:
         print(f"{'='*70}")
         print(f"Client ID: {self.client_id}/{self.num_clients}")
         print(f"RL Protocol Selection: {'ENABLED' if USE_RL_SELECTION else 'DISABLED'}")
+        if USE_RL_SELECTION:
+            print(f"Communication Model in Reward: {'ENABLED' if USE_COMMUNICATION_MODEL_REWARD else 'DISABLED'}")
         print(f"{'='*70}\n")
         
         # Start protocol listeners in background threads
@@ -762,18 +827,33 @@ class UnifiedFLClient_Emotion:
     
     def on_disconnect(self, client, userdata, rc):
         """Callback when disconnected from MQTT broker"""
-        # Cleanup QUIC connection
-        self.cleanup()
-        
-        if rc == 0:
+        if rc == 0 and self.shutdown_requested:
+            self.cleanup()
             print(f"\nClient {self.client_id} clean disconnect from broker")
             print(f"Client {self.client_id} exiting...")
             self.mqtt_client.loop_stop()
-            import sys
-            sys.exit(0)
+            return
         else:
-            print(f"Client {self.client_id} unexpected disconnect, return code {rc}")
+            print(f"Client {self.client_id} MQTT disconnected, return code {rc}")
     
+    def _get_amqp_connection_parameters(self):
+        """Use one consistent AMQP endpoint for listener and sends."""
+        amqp_host = os.getenv("AMQP_HOST") or os.getenv("AMQP_BROKER") or "localhost"
+        amqp_port = int(os.getenv("AMQP_PORT", "5672"))
+        amqp_user = os.getenv("AMQP_USER", "guest")
+        amqp_password = os.getenv("AMQP_PASSWORD", "guest")
+        credentials = pika.PlainCredentials(amqp_user, amqp_password)
+        return pika.ConnectionParameters(
+            host=amqp_host,
+            port=amqp_port,
+            credentials=credentials,
+            heartbeat=600,
+            blocked_connection_timeout=600,
+            connection_attempts=3,
+            retry_delay=2,
+            frame_max=AMQP_MAX_FRAME_BYTES,
+        )
+
     def cleanup(self):
         """Cleanup resources"""
         if self.quic_connection_task and self.quic_loop:
@@ -787,8 +867,10 @@ class UnifiedFLClient_Emotion:
         if self.amqp_listener_connection and not self.amqp_listener_connection.is_closed:
             try:
                 self.amqp_listener_connection.close()
-            except:
+            except Exception:
                 pass
+        self.amqp_listener_connection = None
+        self.amqp_listener_channel = None
     
     # =========================================================================
     # PROTOCOL LISTENERS - Start all protocol listeners for receiving responses
@@ -837,6 +919,9 @@ class UnifiedFLClient_Emotion:
     
     def start_amqp_listener(self):
         """Start AMQP consumer thread (mirrors FL_Client_AMQP.py)"""
+        if self.amqp_listener_thread and self.amqp_listener_thread.is_alive():
+            return
+
         def amqp_consumer_loop():
             # Retry with exponential backoff for startup race condition
             max_retries = 5
@@ -849,17 +934,7 @@ class UnifiedFLClient_Emotion:
                         time.sleep(retry_delay)
                         retry_delay *= 2  # Exponential backoff
                     
-                    credentials = pika.PlainCredentials('guest', 'guest')
-                    # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
-                    parameters = pika.ConnectionParameters(
-                        host=os.getenv("AMQP_HOST", "rabbitmq-broker-unified"),
-                        port=int(os.getenv("AMQP_PORT", "5672")),
-                        credentials=credentials,
-                        heartbeat=600,  # 10 minutes for very_poor network
-                        blocked_connection_timeout=600,  # Aligned with heartbeat
-                        frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
-                    )
-                    
+                    parameters = self._get_amqp_connection_parameters()
                     self.amqp_listener_connection = pika.BlockingConnection(parameters)
                     self.amqp_listener_channel = self.amqp_listener_connection.channel()
                     
@@ -896,6 +971,8 @@ class UnifiedFLClient_Emotion:
                     break  # Success - exit retry loop
                     
                 except Exception as e:
+                    self.amqp_listener_connection = None
+                    self.amqp_listener_channel = None
                     if attempt == max_retries - 1:
                         print(f"[AMQP] Listener failed after {max_retries} attempts: {e}")
                         import traceback
@@ -1241,8 +1318,15 @@ class UnifiedFLClient_Emotion:
                 extra_info="global_model"
             )
             
-            # Deserialize weights
-            weights = pickle.loads(response.weights)
+            # Deserialize weights, dequantizing when the server sent compressed payloads.
+            decoded = pickle.loads(response.weights)
+            if isinstance(decoded, dict) and 'compressed_data' in decoded:
+                if self.quantizer is None:
+                    raise ValueError("Received quantized gRPC global model but client quantizer is not initialized")
+                weights = self.quantizer.decompress(decoded)
+                print(f"[gRPC] Client {self.client_id} decompressed quantized global model")
+            else:
+                weights = decoded
 
             model_config = json.loads(response.model_config) if response.model_config else None
             applied = self._apply_global_model_weights(
@@ -1404,6 +1488,7 @@ class UnifiedFLClient_Emotion:
             self.model.set_weights(weights)
             self.current_round = max(self.current_round, round_num)
             self.last_global_round = round_num
+            self.waiting_for_aggregated_model = False
             print(f"[{source}] Client {self.client_id} updated model weights (round {round_num})")
 
             if self.pending_start_training_round is not None:
@@ -1414,6 +1499,12 @@ class UnifiedFLClient_Emotion:
                     self.last_training_round = pending_round
                     print(f"[{source}] Client {self.client_id} processing deferred start_training for round {pending_round}")
                     self.train_local_model()
+            if self.pending_start_evaluation_round == round_num and self.is_active:
+                self.pending_start_evaluation_round = None
+                if round_num not in self.evaluated_rounds:
+                    self.evaluated_rounds.add(round_num)
+                    print(f"[{source}] Client {self.client_id} processing deferred start_evaluation for round {round_num}")
+                    self.evaluate_model()
             return True
 
         return False
@@ -1462,6 +1553,13 @@ class UnifiedFLClient_Emotion:
         data = json.loads(payload.decode())
         round_num = data['round']
         if round_num == self.current_round:
+            if self.waiting_for_aggregated_model or self.last_global_round < round_num:
+                self.pending_start_evaluation_round = round_num
+                print(
+                    f"Client {self.client_id} deferring evaluation for round {round_num} "
+                    f"until aggregated model arrives (last_global_round={self.last_global_round})"
+                )
+                return
             if round_num in self.evaluated_rounds:
                 print(f"Client {self.client_id} ignoring duplicate evaluation for round {round_num}")
                 return
@@ -1475,6 +1573,7 @@ class UnifiedFLClient_Emotion:
     def handle_training_complete(self):
         """Handle training completion signal from server"""
         self.is_active = False
+        self.shutdown_requested = True
         print("\n" + "="*70)
         print(f"Client {self.client_id} - Training completed!")
         print("="*70)
@@ -1676,33 +1775,12 @@ class UnifiedFLClient_Emotion:
         return len(json.dumps(message).encode('utf-8'))
 
     def _protocol_can_send_update(self, protocol: str, message: dict) -> bool:
-        """Return whether a model update can be sent with the configured payload cap."""
-        if protocol in ('grpc', 'dds', 'quic'):
-            return True
-        limit = self._protocol_payload_limit_bytes(protocol)
-        if limit is None:
-            return True
-        return self._estimate_update_payload_bytes(protocol, message) <= limit
+        """Unified mode supports chunked updates on every transport."""
+        return True
 
     def _build_update_protocol_order(self, preferred_protocol: str, message: dict) -> List[str]:
-        """Prefer the RL-selected protocol, but skip non-chunked transports that exceed their cap."""
-        ordered_candidates = [preferred_protocol, 'amqp', 'mqtt', 'grpc', 'quic', 'http3', 'dds']
-        eligible_protocols = []
-        skipped_protocols = []
-        for protocol in ordered_candidates:
-            if protocol in eligible_protocols or protocol in skipped_protocols:
-                continue
-            if self._protocol_can_send_update(protocol, message):
-                eligible_protocols.append(protocol)
-            else:
-                skipped_protocols.append(protocol)
-        if skipped_protocols:
-            payload_bytes = self.round_metrics.get('payload_bytes') or 0
-            print(
-                f"[Client {self.client_id}] Skipping payload-incompatible protocols "
-                f"for {payload_bytes} B update: {', '.join(skipped_protocols)}"
-            )
-        return eligible_protocols or ['grpc', 'dds', 'quic']
+        """Send updates only on the RL-selected protocol."""
+        return [preferred_protocol]
 
     def _assert_protocol_payload_limit(self, protocol: str, payload_size_bytes: int):
         """Reject oversize non-chunked sends before they hit the transport."""
@@ -1713,6 +1791,55 @@ class UnifiedFLClient_Emotion:
             raise ValueError(
                 f"{protocol.upper()} payload {payload_size_bytes} B exceeds configured limit {limit} B"
             )
+
+    def _ensure_protocol_connection_sync(self, protocol: str):
+        """Ensure persistent transports are connected before sending."""
+        if protocol == 'quic':
+            if asyncio is None:
+                raise ConnectionError("QUIC asyncio support not available")
+            if self.quic_loop is None or self.quic_loop.is_closed():
+                self.start_quic_listener()
+            if self.quic_loop is None:
+                raise ConnectionError("QUIC event loop not available")
+            future = asyncio.run_coroutine_threadsafe(self._ensure_quic_connection(), self.quic_loop)
+            future.result(timeout=15)
+        elif protocol == 'http3':
+            if asyncio is None:
+                raise ConnectionError("HTTP/3 asyncio support not available")
+            if self.http3_loop is None or self.http3_loop.is_closed():
+                self.start_http3_listener()
+            if self.http3_loop is None:
+                raise ConnectionError("HTTP/3 event loop not available")
+            future = asyncio.run_coroutine_threadsafe(self._ensure_http3_connection(), self.http3_loop)
+            future.result(timeout=15)
+
+    def _update_payload_field(self, message: dict) -> str:
+        """Return the serialized payload field used for model updates."""
+        return 'compressed_data' if 'compressed_data' in message else 'weights'
+
+    def _chunked_update_messages(self, message: dict, chunk_bytes: int, message_type: str) -> List[dict]:
+        """Split a serialized model update into transport-safe chunks."""
+        payload_key = self._update_payload_field(message)
+        payload_text = message[payload_key]
+        if not isinstance(payload_text, str):
+            raise TypeError(f"Chunked update payload for {payload_key} must be a base64 string")
+        chunks = [payload_text[i:i + chunk_bytes] for i in range(0, len(payload_text), chunk_bytes)] or [payload_text]
+        total_chunks = len(chunks)
+        return [
+            {
+                "type": message_type,
+                "client_id": message["client_id"],
+                "round": message["round"],
+                "protocol": message.get("protocol"),
+                "payload_key": payload_key,
+                "payload_chunk": chunk_data,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "num_samples": message.get("num_samples", 0),
+                "metrics": message.get("metrics", {}),
+            }
+            for chunk_index, chunk_data in enumerate(chunks)
+        ]
 
     def _run_iperf3_if_diagnostic(self):
         """When FL_DIAGNOSTIC_PIPELINE=1 and current_round==1, run iperf3 from client and write to shared_data."""
@@ -1850,7 +1977,7 @@ class UnifiedFLClient_Emotion:
             chunks.append(data[i:i + CHUNK_SIZE])
         return chunks
     
-    def send_model_update_chunked(self, round_num, serialized_weights, num_samples, loss, mse, mae, mape):
+    def send_model_update_chunked(self, round_num, serialized_weights, num_samples, loss, accuracy):
         """Send model update as chunks via DDS"""
         chunks = self.split_into_chunks(serialized_weights)
         total_chunks = len(chunks)
@@ -1866,9 +1993,7 @@ class UnifiedFLClient_Emotion:
                 payload=chunk_data,
                 num_samples=num_samples,
                 loss=loss,
-                mse=mse,
-                mae=mae,
-                mape=mape
+                accuracy=accuracy
             )
             self.dds_update_chunk_writer.write(chunk)
             # Reliable QoS handles delivery, no need for artificial delay
@@ -1978,36 +2103,49 @@ class UnifiedFLClient_Emotion:
             try:
                 attempt_message = dict(update_message)
                 attempt_message['protocol'] = attempt_protocol
+                payload_size_bytes = self._estimate_update_payload_bytes(attempt_protocol, attempt_message)
                 if attempt_protocol == 'mqtt':
-                    self._send_via_mqtt(attempt_message)
+                    if payload_size_bytes > MQTT_MAX_PAYLOAD_BYTES:
+                        self._send_chunked_update_via_mqtt(attempt_message)
+                    else:
+                        self._send_via_mqtt(attempt_message)
                     success = True
                 elif attempt_protocol == 'amqp' and pika is not None:
-                    self._send_via_amqp(attempt_message)
+                    if payload_size_bytes > AMQP_MAX_FRAME_BYTES:
+                        self._send_chunked_update_via_amqp(attempt_message)
+                    else:
+                        self._send_via_amqp(attempt_message)
                     success = True
                 elif attempt_protocol == 'grpc' and grpc is not None:
                     self._send_via_grpc(attempt_message)
                     success = True
-                elif attempt_protocol == 'quic' and asyncio is not None and self.quic_protocol is not None:
-                    # Only try QUIC if connection is established
+                elif attempt_protocol == 'quic' and asyncio is not None:
+                    self._ensure_protocol_connection_sync('quic')
                     self._send_via_quic(attempt_message)
                     success = True
-                elif attempt_protocol == 'http3' and HTTP3_AVAILABLE and asyncio is not None and self.http3_protocol is not None:
-                    # Only try HTTP/3 if connection is established
-                    self._send_via_http3(attempt_message)
+                elif attempt_protocol == 'http3' and HTTP3_AVAILABLE and asyncio is not None:
+                    self._ensure_protocol_connection_sync('http3')
+                    if payload_size_bytes > HTTP3_MAX_STREAM_DATA_BYTES:
+                        self._send_chunked_update_via_http3(attempt_message)
+                    else:
+                        self._send_via_http3(attempt_message)
                     success = True
                 elif attempt_protocol == 'dds' and DDS_AVAILABLE:
-                    self._send_via_dds(attempt_message)
+                    if payload_size_bytes > CHUNK_SIZE:
+                        self._send_chunked_update_via_dds(attempt_message)
+                    else:
+                        self._send_via_dds(attempt_message)
                     success = True
                 if success:
                     self.selected_protocol = attempt_protocol
             except Exception as e:
-                if attempt_protocol == protocol:
-                    print(f"Client {self.client_id} WARNING: {protocol} failed ({e}), trying fallback...")
+                print(f"Client {self.client_id} ERROR: {attempt_protocol} update send failed: {e}")
                 continue
         
         if success:
             self.round_metrics['communication_time'] = time.time() - comm_start
             self.round_metrics['success'] = True
+            self.waiting_for_aggregated_model = True
         else:
             print(f"Client {self.client_id} ERROR: All protocols failed!")
             self.round_metrics['success'] = False
@@ -2064,9 +2202,14 @@ class UnifiedFLClient_Emotion:
             "num_samples": num_samples,
             "loss": float(loss),
             "accuracy": float(accuracy),
-            "protocol": protocol,
             "battery_soc": float(battery_soc),
             "round_time_sec": float(round_time_sec),
+            "metrics": {
+                "loss": float(loss),
+                "accuracy": float(accuracy),
+                "battery_soc": float(battery_soc),
+                "round_time_sec": float(round_time_sec),
+            },
         }
         
         comm_start = time.time()
@@ -2077,25 +2220,16 @@ class UnifiedFLClient_Emotion:
                 self._send_metrics_via_amqp(metrics_message)
             elif protocol == 'grpc':
                 self._send_metrics_via_grpc(metrics_message)
-            elif protocol == 'quic' and self.quic_protocol is not None:
-                # Only try QUIC if connection is established
-                self._send_metrics_via_quic(metrics_message)
             elif protocol == 'quic':
-                # QUIC not connected, fallback to MQTT
-                print(f"Client {self.client_id} WARNING: QUIC not connected, falling back to MQTT for metrics")
-                self._send_metrics_via_mqtt(metrics_message)
-            elif protocol == 'http3' and self.http3_protocol is not None:
-                # Only try HTTP/3 if connection is established
-                self._send_metrics_via_http3(metrics_message)
+                self._ensure_protocol_connection_sync('quic')
+                self._send_metrics_via_quic(metrics_message)
             elif protocol == 'http3':
-                # HTTP/3 not connected, fallback to MQTT
-                print(f"Client {self.client_id} WARNING: HTTP/3 not connected, falling back to MQTT for metrics")
-                self._send_metrics_via_mqtt(metrics_message)
+                self._ensure_protocol_connection_sync('http3')
+                self._send_metrics_via_http3(metrics_message)
             elif protocol == 'dds':
                 self._send_metrics_via_dds(metrics_message)
             else:
-                print(f"Client {self.client_id} ERROR: Unknown protocol {protocol}, falling back to MQTT")
-                self._send_metrics_via_mqtt(metrics_message)
+                raise ValueError(f"Unknown protocol {protocol}")
             
             self.round_metrics['communication_time'] = time.time() - comm_start
             print(f"Client {self.client_id} sent evaluation metrics for round {self.current_round}")
@@ -2108,17 +2242,17 @@ class UnifiedFLClient_Emotion:
                     resources = self.env_manager.get_resource_consumption()
                     payload_bytes = self.round_metrics.get('payload_bytes') or (12 * 1024 * 1024)
                     protocol = self.selected_protocol or 'mqtt'
+                    comm_time_for_reward = self.round_metrics['communication_time']
+                    t_calc_for_reward = None
                     reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
-                    if reward_scenario:
+                    if USE_COMMUNICATION_MODEL_REWARD and reward_scenario:
                         simulated_t_calc = self._get_t_calc_for_scenario(protocol, payload_bytes, reward_scenario)
                         if simulated_t_calc is not None:
                             comm_time_for_reward = simulated_t_calc
                             t_calc_for_reward = simulated_t_calc
                         else:
-                            comm_time_for_reward = self.round_metrics['communication_time']
                             t_calc_for_reward = self._get_t_calc_for_reward(protocol, payload_bytes)
-                    else:
-                        comm_time_for_reward = self.round_metrics['communication_time']
+                    elif USE_COMMUNICATION_MODEL_REWARD:
                         t_calc_for_reward = self._get_t_calc_for_reward(protocol, payload_bytes)
                     reward = self.rl_selector.calculate_reward(
                         comm_time_for_reward,
@@ -2168,7 +2302,7 @@ class UnifiedFLClient_Emotion:
                         return
                 except Exception as rl_e:
                     print(f"[Client {self.client_id}] RL update error: {rl_e}")
-            if not USE_QL_CONVERGENCE:
+            if not USE_QL_CONVERGENCE and ENABLE_LOCAL_CONVERGENCE_STOP:
                 self._update_client_convergence_and_maybe_disconnect(loss)
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending metrics: {e}")
@@ -2229,6 +2363,7 @@ class UnifiedFLClient_Emotion:
     def _disconnect_after_convergence(self):
         """Stop participating once local convergence is reached."""
         self.is_active = False
+        self.shutdown_requested = True
         print(f"[Client {self.client_id}] Disconnecting after local convergence")
         try:
             self.cleanup()
@@ -2242,12 +2377,113 @@ class UnifiedFLClient_Emotion:
     # ============================================================================
     # Protocol-Specific Send Methods (Data Transmission)
     # ============================================================================
+
+    def _send_chunked_update_via_mqtt(self, message: dict):
+        """Send a large model update over MQTT in multiple chunks."""
+        chunk_messages = self._chunked_update_messages(message, MQTT_UPDATE_CHUNK_BYTES, "update_chunk")
+        total_chunks = len(chunk_messages)
+        print(f"Client {self.client_id}: Sending model update in {total_chunks} MQTT chunks")
+        for chunk in chunk_messages:
+            payload = json.dumps(chunk)
+            result = self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, payload, qos=1)
+            if result.rc == mqtt.MQTT_ERR_NO_CONN:
+                raise Exception("MQTT not connected")
+            result.wait_for_publish(timeout=5)
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise Exception(f"MQTT publish failed with rc={result.rc}")
+            if (chunk["chunk_index"] + 1) % 20 == 0 or (chunk["chunk_index"] + 1) == total_chunks:
+                print(f"  Sent {chunk['chunk_index'] + 1}/{total_chunks} MQTT chunks")
+        log_sent_packet(
+            packet_size=len(json.dumps(message)),
+            peer="server",
+            protocol="MQTT",
+            round=self.current_round,
+            extra_info=f"model_update_chunked total_chunks={total_chunks}"
+        )
+        print(f"Client {self.client_id} sent chunked model update for round {self.current_round} via MQTT")
+
+    def _send_chunked_update_via_amqp(self, message: dict):
+        """Send a large model update over AMQP in multiple chunks."""
+        chunk_messages = self._chunked_update_messages(message, AMQP_UPDATE_CHUNK_BYTES, "update_chunk")
+        total_chunks = len(chunk_messages)
+        print(f"Client {self.client_id}: Sending model update in {total_chunks} AMQP chunks")
+        parameters = self._get_amqp_connection_parameters()
+        connection = pika.BlockingConnection(parameters)
+        try:
+            channel = connection.channel()
+            channel.exchange_declare(exchange='fl_client_updates', exchange_type='direct', durable=True)
+            for chunk in chunk_messages:
+                payload = json.dumps(chunk)
+                channel.basic_publish(
+                    exchange='fl_client_updates',
+                    routing_key=f'client_{self.client_id}_update',
+                    body=payload,
+                    properties=pika.BasicProperties(delivery_mode=2)
+                )
+                if (chunk["chunk_index"] + 1) % 20 == 0 or (chunk["chunk_index"] + 1) == total_chunks:
+                    print(f"  Sent {chunk['chunk_index'] + 1}/{total_chunks} AMQP chunks")
+        finally:
+            connection.close()
+        log_sent_packet(
+            packet_size=len(json.dumps(message)),
+            peer="server",
+            protocol="AMQP",
+            round=self.current_round,
+            extra_info=f"model_update_chunked total_chunks={total_chunks}"
+        )
+        print(f"Client {self.client_id} sent chunked model update for round {self.current_round} via AMQP")
+
+    def _send_chunked_update_via_http3(self, message: dict):
+        """Send a large model update over HTTP/3 in multiple chunks."""
+        chunk_messages = self._chunked_update_messages(message, HTTP3_UPDATE_CHUNK_BYTES, "update_chunk")
+        total_chunks = len(chunk_messages)
+        print(f"Client {self.client_id}: Sending model update in {total_chunks} HTTP/3 chunks")
+        for chunk in chunk_messages:
+            payload = json.dumps(chunk)
+            self._send_http3_payload(payload, timeout=20)
+            if (chunk["chunk_index"] + 1) % 20 == 0 or (chunk["chunk_index"] + 1) == total_chunks:
+                print(f"  Sent {chunk['chunk_index'] + 1}/{total_chunks} HTTP/3 chunks")
+        log_sent_packet(
+            packet_size=len(json.dumps(message)),
+            peer="server",
+            protocol="HTTP/3",
+            round=self.current_round,
+            extra_info=f"model_update_chunked total_chunks={total_chunks}"
+        )
+        print(f"Client {self.client_id} sent chunked model update for round {self.current_round} via HTTP/3")
+
+    def _send_chunked_update_via_dds(self, message: dict):
+        """Send a large model update over DDS in multiple chunks."""
+        if not DDS_AVAILABLE or not self.dds_update_chunk_writer:
+            raise NotImplementedError("DDS chunk writer not available")
+
+        if 'compressed_data' in message:
+            weights_bytes = base64.b64decode(message['compressed_data'].encode('utf-8'))
+        else:
+            weights_bytes = pickle.dumps(message['weights'])
+
+        metrics = message.get('metrics', {})
+        total_chunks = self.send_model_update_chunked(
+            round_num=message['round'],
+            serialized_weights=weights_bytes,
+            num_samples=message.get('num_samples', 0),
+            loss=float(metrics.get('loss', message.get('loss', 0.0))),
+            accuracy=float(metrics.get('accuracy', message.get('accuracy', 0.0))),
+        )
+
+        log_sent_packet(
+            packet_size=len(weights_bytes),
+            peer="server",
+            protocol="DDS",
+            round=self.current_round,
+            extra_info=f"model_update_chunked total_chunks={total_chunks}"
+        )
+        print(f"Client {self.client_id} sent chunked model update for round {self.current_round} via DDS")
     
     def _send_via_mqtt(self, message: dict):
         """Send model update via MQTT"""
         try:
             payload = json.dumps(message)
-            self._assert_protocol_payload_limit('mqtt', len(payload.encode('utf-8')))
             payload_size_mb = len(payload) / (1024 * 1024)
             print(f"Client {self.client_id} sending via MQTT - size: {payload_size_mb:.2f} MB")
             
@@ -2308,39 +2544,22 @@ class UnifiedFLClient_Emotion:
             raise ImportError("pika module not available for AMQP")
         
         try:
+            estimated_payload = json.dumps(message).encode('utf-8')
             # Get AMQP config
-            amqp_host = os.getenv("AMQP_HOST", "localhost")
-            amqp_port = int(os.getenv("AMQP_PORT", "5672"))
-            amqp_user = os.getenv("AMQP_USER", "guest")
-            amqp_password = os.getenv("AMQP_PASSWORD", "guest")
-            
-            # Connect to RabbitMQ
-            credentials = pika.PlainCredentials(amqp_user, amqp_password)
-            # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
-            parameters = pika.ConnectionParameters(
-                host=amqp_host,
-                port=amqp_port,
-                credentials=credentials,
-                heartbeat=600,  # 10 minutes for very_poor network
-                blocked_connection_timeout=600,  # Aligned with heartbeat
-                connection_attempts=3,
-                retry_delay=2,
-                frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
-            )
+            parameters = self._get_amqp_connection_parameters()
             connection = pika.BlockingConnection(parameters)
             channel = connection.channel()
             
             # Declare exchange and send message
             channel.exchange_declare(exchange='fl_client_updates', exchange_type='direct', durable=True)
             
-            payload = json.dumps(message)
-            self._assert_protocol_payload_limit('amqp', len(payload.encode('utf-8')))
+            payload = estimated_payload.decode('utf-8')
             payload_size_mb = len(payload) / (1024 * 1024)
             print(f"Client {self.client_id} sending via AMQP - size: {payload_size_mb:.2f} MB")
             
             channel.basic_publish(
                 exchange='fl_client_updates',
-                routing_key=f'client_{self.client_id}_update',
+                routing_key='client.update',
                 body=payload,
                 properties=pika.BasicProperties(delivery_mode=2)
             )
@@ -2365,23 +2584,7 @@ class UnifiedFLClient_Emotion:
             raise ImportError("pika module not available for AMQP")
         
         try:
-            amqp_host = os.getenv("AMQP_HOST", "localhost")
-            amqp_port = int(os.getenv("AMQP_PORT", "5672"))
-            amqp_user = os.getenv("AMQP_USER", "guest")
-            amqp_password = os.getenv("AMQP_PASSWORD", "guest")
-            
-            credentials = pika.PlainCredentials(amqp_user, amqp_password)
-            # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
-            parameters = pika.ConnectionParameters(
-                host=amqp_host,
-                port=amqp_port,
-                credentials=credentials,
-                heartbeat=600,  # 10 minutes for very_poor network
-                blocked_connection_timeout=600,  # Aligned with heartbeat
-                connection_attempts=3,
-                retry_delay=2,
-                frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
-            )
+            parameters = self._get_amqp_connection_parameters()
             connection = pika.BlockingConnection(parameters)
             channel = connection.channel()
             
@@ -2390,7 +2593,7 @@ class UnifiedFLClient_Emotion:
             payload = json.dumps(message)
             channel.basic_publish(
                 exchange='fl_client_updates',
-                routing_key=f'client_{self.client_id}_metrics',
+                routing_key='client.metrics',
                 body=payload,
                 properties=pika.BasicProperties(delivery_mode=2)
             )
@@ -2417,7 +2620,7 @@ class UnifiedFLClient_Emotion:
             grpc_host = os.getenv("GRPC_HOST", "localhost")
             grpc_port = int(os.getenv("GRPC_PORT", "50051"))
             
-            # FAIR CONFIG: Set max message size to 128MB (aligned with AMQP default)
+            # FAIR CONFIG: Set max message size to the unified gRPC limit (4 MB)
             options = [
                 ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
                 ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
@@ -2494,7 +2697,7 @@ class UnifiedFLClient_Emotion:
             grpc_host = os.getenv("GRPC_HOST", "localhost")
             grpc_port = int(os.getenv("GRPC_PORT", "50051"))
             
-            # FAIR CONFIG: Set max message size to 128MB (aligned with AMQP default)
+            # FAIR CONFIG: Set max message size to the unified gRPC limit (4 MB)
             options = [
                 ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
                 ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
@@ -2509,11 +2712,11 @@ class UnifiedFLClient_Emotion:
                 federated_learning_pb2.Metrics(
                     client_id=message['client_id'],
                     round=message['round'],
-                    loss=message['loss'],
-                    accuracy=message['accuracy'],
+                    loss=message.get('loss', message.get('metrics', {}).get('loss', 0.0)),
+                    accuracy=message.get('accuracy', message.get('metrics', {}).get('accuracy', 0.0)),
                     num_samples=message['num_samples'],
-                    battery_soc=float(message.get('battery_soc', 1.0)),
-                    round_time_sec=float(message.get('round_time_sec', 0.0)),
+                    battery_soc=float(message.get('battery_soc', message.get('metrics', {}).get('battery_soc', 1.0))),
+                    round_time_sec=float(message.get('round_time_sec', message.get('metrics', {}).get('round_time_sec', 0.0))),
                 )
             )
             
@@ -2763,7 +2966,7 @@ class UnifiedFLClient_Emotion:
                 raise ConnectionError("QUIC protocol not connected")
             
             # Add 'type' field for server to identify message type
-            quic_message = {**message, 'type': 'update'}
+            quic_message = {**message, 'type': 'model_update'}
             
             payload = json.dumps(quic_message)
             payload_size_mb = len(payload) / (1024 * 1024)
@@ -2946,8 +3149,11 @@ class UnifiedFLClient_Emotion:
     
     async def _ensure_http3_connection(self):
         """Establish persistent HTTP/3 connection if not already connected"""
-        if self.http3_protocol is not None:
+        if self.http3_protocol is not None and self.http3_connection_task is not None and not self.http3_connection_task.done():
             return  # Already connected
+        if self.http3_connection_task is not None and self.http3_connection_task.done():
+            self.http3_protocol = None
+            self.http3_connection_task = None
         
         # Start HTTP/3 connection thread if not running
         if self.http3_thread is None or not self.http3_thread.is_alive():
@@ -2957,18 +3163,25 @@ class UnifiedFLClient_Emotion:
                 name=f"HTTP3-Client-{self.client_id}"
             )
             self.http3_thread.start()
-            
-            # Wait for connection to establish
-            max_wait = 10  # seconds
-            waited = 0
-            while self.http3_protocol is None and waited < max_wait:
-                await asyncio.sleep(0.1)
-                waited += 0.1
-            
-            if self.http3_protocol is None:
-                raise ConnectionError(f"HTTP/3 connection not established after {max_wait}s")
-            
-            print(f"[HTTP/3] Client {self.client_id} connection ready")
+        if self.http3_loop is None or self.http3_loop.is_closed():
+            raise ConnectionError("HTTP/3 event loop not available")
+        if self.http3_connection_task is None:
+            self.http3_connection_task = asyncio.run_coroutine_threadsafe(
+                self._http3_connection_loop(),
+                self.http3_loop
+            )
+        
+        # Wait for connection to establish
+        max_wait = 10  # seconds
+        waited = 0
+        while self.http3_protocol is None and waited < max_wait:
+            await asyncio.sleep(0.1)
+            waited += 0.1
+        
+        if self.http3_protocol is None:
+            raise ConnectionError(f"HTTP/3 connection not established after {max_wait}s")
+        
+        print(f"[HTTP/3] Client {self.client_id} connection ready")
     
     def _run_http3_loop(self):
         """Run HTTP/3 event loop in a separate thread"""
@@ -2996,7 +3209,7 @@ class UnifiedFLClient_Emotion:
             alpn_protocols=H3_ALPN,  # HTTP/3 ALPN
             verify_mode=ssl.CERT_NONE,
             max_stream_data=HTTP3_MAX_STREAM_DATA_BYTES,  # 16 KB per stream
-            max_data=HTTP3_MAX_STREAM_DATA_BYTES * 2,      # 32 KB total connection
+            max_data=HTTP3_MAX_STREAM_DATA_BYTES * 4,      # 64 KB total connection
             # FAIR CONFIG: Timeout 600s for very_poor network scenarios
             idle_timeout=600.0  # 10 minutes
         )
@@ -3026,6 +3239,15 @@ class UnifiedFLClient_Emotion:
                 ) as protocol:
                     self.http3_protocol = protocol
                     print(f"[HTTP/3] ✓ Client {self.client_id} established persistent connection")
+                    try:
+                        register_payload = json.dumps({
+                            "type": "register",
+                            "client_id": self.client_id,
+                        })
+                        await self._do_http3_send(register_payload)
+                        print(f"[HTTP/3] Client {self.client_id} registered over persistent connection")
+                    except Exception as register_error:
+                        print(f"[HTTP/3] Client {self.client_id} registration over HTTP/3 failed: {register_error}")
                     
                     # Keep connection alive indefinitely
                     try:
@@ -3147,24 +3369,17 @@ class UnifiedFLClient_Emotion:
             if self.http3_loop.is_closed():
                 raise ConnectionError("HTTP/3 event loop is closed")
             
-            # Check if protocol is connected
-            if self.http3_protocol is None:
-                raise ConnectionError("HTTP/3 protocol not connected")
-            
             # Add 'type' field for server to identify message type
-            http3_message = {**message, 'type': 'update'}
+            http3_message = {**message, 'type': 'model_update'}
             
             payload = json.dumps(http3_message)
-            self._assert_protocol_payload_limit('http3', len(payload.encode('utf-8')))
+            if len(payload.encode('utf-8')) > HTTP3_MAX_STREAM_DATA_BYTES:
+                self._send_chunked_update_via_http3(message)
+                return
             payload_size_mb = len(payload) / (1024 * 1024)
             print(f"Client {self.client_id} sending via HTTP/3 - size: {payload_size_mb:.2f} MB")
             
-            # Use persistent connection directly via run_coroutine_threadsafe
-            future = asyncio.run_coroutine_threadsafe(
-                self._do_http3_send(payload),
-                self.http3_loop
-            )
-            future.result(timeout=15)  # Wait for send to complete
+            self._send_http3_payload(payload, timeout=20)
             
             log_sent_packet(
                 packet_size=len(payload),
@@ -3192,21 +3407,12 @@ class UnifiedFLClient_Emotion:
             if self.http3_loop.is_closed():
                 raise ConnectionError("HTTP/3 event loop is closed")
             
-            # Check if protocol is connected
-            if self.http3_protocol is None:
-                raise ConnectionError("HTTP/3 protocol not connected")
-            
             # Add 'type' field for server to identify message type
             http3_message = {**message, 'type': 'metrics'}
             
             payload = json.dumps(http3_message)
             
-            # Use persistent connection directly via run_coroutine_threadsafe
-            future = asyncio.run_coroutine_threadsafe(
-                self._do_http3_send(payload),
-                self.http3_loop
-            )
-            future.result(timeout=15)  # Wait for send to complete
+            self._send_http3_payload(payload, timeout=20)
             
             log_sent_packet(
                 packet_size=len(payload),
@@ -3218,6 +3424,35 @@ class UnifiedFLClient_Emotion:
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending metrics via HTTP/3: {e}")
             raise
+
+    def _restart_http3_connection(self):
+        """Force-close a stale HTTP/3 connection so the next send reconnects cleanly."""
+        if self.http3_connection_task is not None and not self.http3_connection_task.done():
+            self.http3_connection_task.cancel()
+            try:
+                self.http3_connection_task.result(timeout=5)
+            except Exception:
+                pass
+        self.http3_protocol = None
+        self.http3_connection_task = None
+
+    def _send_http3_payload(self, payload: str, timeout: float = 20.0):
+        """Send a single HTTP/3 request and wait for its response."""
+        last_error = None
+        for attempt in range(2):
+            try:
+                self._ensure_protocol_connection_sync('http3')
+                with self.http3_send_lock:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._do_http3_send(payload),
+                        self.http3_loop
+                    )
+                    return future.result(timeout=timeout)
+            except Exception as e:
+                last_error = e
+                print(f"[HTTP/3] Client {self.client_id} send attempt {attempt + 1}/2 failed: {e}")
+                self._restart_http3_connection()
+        raise last_error
     
     async def _do_http3_send(self, payload: str):
         """Actually send data via HTTP/3 (runs in HTTP/3 thread's event loop)"""
@@ -3230,6 +3465,7 @@ class UnifiedFLClient_Emotion:
         
         # Get next available stream ID
         stream_id = self.http3_protocol._quic.get_next_available_stream_id(is_unidirectional=False)
+        response_waiter = self.http3_protocol.create_response_waiter(stream_id)
         
         # Prepare JSON payload
         payload_bytes = payload.encode('utf-8')
@@ -3239,50 +3475,52 @@ class UnifiedFLClient_Emotion:
             (b":method", b"POST"),
             (b":path", b"/fl/message"),
             (b":scheme", b"https"),
+            (b":authority", os.getenv('HTTP3_HOST', 'localhost').encode()),
             (b"content-type", b"application/json"),
             (b"content-length", str(len(payload_bytes)).encode()),
         ]
         self.http3_protocol._http.send_headers(stream_id=stream_id, headers=headers)
         self.http3_protocol._http.send_data(stream_id=stream_id, data=payload_bytes, end_stream=True)
         self.http3_protocol.transmit()
+        await asyncio.sleep(0.05)
+        self.http3_protocol.transmit()
         
         print(f"[HTTP/3] Client {self.client_id} sent data on stream {stream_id} ({len(payload_bytes)} bytes)")
+        try:
+            return await asyncio.wait_for(response_waiter, timeout=10.0)
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(f"HTTP/3 response timeout on stream {stream_id}") from e
     
     def _send_via_dds(self, message: dict):
-        """Send model update via DDS with chunking (matching standalone)"""
-        if not DDS_AVAILABLE or not self.dds_update_chunk_writer:
+        """Send model update via DDS"""
+        if not DDS_AVAILABLE or not self.dds_update_writer:
             raise NotImplementedError("DDS not available - triggering fallback")
         
         try:
-            # Serialize payload: either raw weights or quantized compressed_data for chunking
             if 'compressed_data' in message:
-                # compressed_data is base64-encoded pickled dict; decode to bytes for chunking
                 weights_bytes = base64.b64decode(message['compressed_data'].encode('utf-8'))
             else:
                 weights_bytes = pickle.dumps(message['weights'])
-            weights_list = list(weights_bytes)  # Convert bytes to List[int]
-            
-            # FAIR CONFIG: Use chunking to match standalone DDS implementation
-            total_chunks = self.send_model_update_chunked(
-                round_num=message['round'],
-                serialized_weights=weights_list,
+            metrics = message.get('metrics', {})
+            dds_msg = ModelUpdate(
+                client_id=self.client_id,
+                round=message['round'],
+                weights=list(weights_bytes),
                 num_samples=message.get('num_samples', 0),
-                loss=message.get('loss', 0.0),
-                mse=message.get('mse', 0.0),
-                mae=message.get('mae', 0.0),
-                mape=message.get('mape', 0.0)
+                loss=float(metrics.get('loss', message.get('loss', 0.0))),
+                accuracy=float(metrics.get('accuracy', message.get('accuracy', 0.0)))
             )
+            self.dds_update_writer.write(dds_msg)
             
-            # Log the packet (log total size, plus chunk count metadata)
             log_sent_packet(
                 packet_size=len(weights_bytes),
                 peer="server",
                 protocol="DDS",
                 round=self.current_round,
-                extra_info=f"model_update_chunked total_chunks={total_chunks}"
+                extra_info="model_update"
             )
             
-            print(f"Client {self.client_id} sent chunked model update for round {self.current_round} via DDS")
+            print(f"Client {self.client_id} sent model update for round {self.current_round} via DDS")
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending via DDS: {e}")
             raise
@@ -3298,11 +3536,10 @@ class UnifiedFLClient_Emotion:
                 client_id=self.client_id,
                 round=message['round'],
                 num_samples=message.get('num_samples', 0),
-                loss=message.get('loss', 0.0),
-                accuracy=message.get('accuracy', 0.0),
-                mse=message.get('mse', 0.0),
-                mae=message.get('mae', 0.0),
-                mape=message.get('mape', 0.0)
+                loss=message.get('loss', message.get('metrics', {}).get('loss', 0.0)),
+                accuracy=message.get('accuracy', message.get('metrics', {}).get('accuracy', 0.0)),
+                client_converged=float(message.get('metrics', {}).get('client_converged', 0.0)),
+                battery_soc=float(message.get('battery_soc', message.get('metrics', {}).get('battery_soc', 1.0)))
             )
             
             # Write to DDS
@@ -3395,7 +3632,7 @@ class UnifiedFLClient_Emotion:
         return None
     
     def start(self):
-        """Connect to MQTT broker and start listening"""
+        """Connect to MQTT broker and keep the unified client alive."""
         max_retries = 5
         retry_delay = 2
         
@@ -3406,7 +3643,12 @@ class UnifiedFLClient_Emotion:
                 # FAIR CONFIG: keepalive 600s for very_poor network
                 self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 600)
                 print(f"Successfully connected to MQTT broker!\n")
-                self.mqtt_client.loop_forever(retry_first_connection=True)
+                self.mqtt_client.loop_start()
+                try:
+                    while not self.shutdown_requested:
+                        time.sleep(1)
+                finally:
+                    self.mqtt_client.loop_stop()
                 break
             except Exception as e:
                 print(f"Connection attempt {attempt + 1}/{max_retries} failed: {e}")

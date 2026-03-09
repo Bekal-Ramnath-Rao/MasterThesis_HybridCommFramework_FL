@@ -611,6 +611,18 @@ class FLExperimentGUI(QMainWindow):
         ql_conv_row.addStretch()
         rl_mode_layout.addLayout(ql_conv_row)
 
+        comm_reward_row = QHBoxLayout()
+        self.use_communication_model_reward = QCheckBox("Include communication model in RL rewards")
+        self.use_communication_model_reward.setChecked(True)
+        self.use_communication_model_reward.setStyleSheet("font-size: 12px; padding: 5px;")
+        self.use_communication_model_reward.setToolTip(
+            "When enabled, RL rewards include the communication-model T_calc penalty. "
+            "Disable this to train or run RL without communication-model influence on reward."
+        )
+        comm_reward_row.addWidget(self.use_communication_model_reward)
+        comm_reward_row.addStretch()
+        rl_mode_layout.addLayout(comm_reward_row)
+
         self.rl_mode_group_box.setLayout(rl_mode_layout)
         layout.addWidget(self.rl_mode_group_box)
         for cb in self.protocol_checkboxes:
@@ -2416,6 +2428,8 @@ class FLExperimentGUI(QMainWindow):
             training_selected = enabled and self.rl_mode_training.isChecked()
             self.use_ql_convergence.setChecked(training_selected)
             self.use_ql_convergence.setEnabled(False)
+        if hasattr(self, "use_communication_model_reward"):
+            self.use_communication_model_reward.setEnabled(enabled)
 
     def build_command(self):
         """Build the experiment command"""
@@ -2469,6 +2483,8 @@ class FLExperimentGUI(QMainWindow):
                     cmd_parts.append("--quantization-symmetric")
             if self.is_rl_training_mode():
                 cmd_parts.append("--use-ql-convergence")
+            if self.is_rl_unified_selected() and not self.use_communication_model_reward.isChecked():
+                cmd_parts.append("--disable-communication-model-reward")
         else:
             # Docker-based experiment runner options (existing behavior).
             # Network mode: gpu | host | host_macvlan
@@ -2539,6 +2555,8 @@ class FLExperimentGUI(QMainWindow):
             # RL-unified training/inference mode
             if self.is_rl_training_mode():
                 cmd_parts.append("--use-ql-convergence")
+            if self.is_rl_unified_selected() and not self.use_communication_model_reward.isChecked():
+                cmd_parts.append("--disable-communication-model-reward")
 
         # DDS implementation flag (CycloneDDS vs Fast DDS) – applies when DDS protocol is selected
         selected_protocols = self.get_selected_protocols()
@@ -2659,6 +2677,7 @@ class FLExperimentGUI(QMainWindow):
             f"Use Case: {self.get_selected_use_case()}\n"
             f"Protocols: {protocol_str}\n"
             f"RL Mode: {rl_mode_str}\n"
+            f"Communication Model Reward: {'Enabled' if self.is_rl_unified_selected() and self.use_communication_model_reward.isChecked() else 'Disabled'}\n"
             f"Scenarios: {scenario_str}\n"
             f"Rounds: {self.rounds_spinbox.value()}\n"
             f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
