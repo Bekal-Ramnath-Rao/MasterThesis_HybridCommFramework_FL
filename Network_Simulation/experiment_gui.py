@@ -581,17 +581,42 @@ class FLExperimentGUI(QMainWindow):
             cb.toggled.connect(self.update_dds_impl_visibility)
         self.update_dds_impl_visibility()
         
-        # Q-learning convergence (unified use case only)
-        ql_conv_group = QGroupBox("🎓 Q-Learning End Condition (Unified Only)")
-        ql_conv_group.setStyleSheet(self.get_group_style())
-        ql_conv_layout = QHBoxLayout()
-        self.use_ql_convergence = QCheckBox("End training when Q-learning value converges (run multiple episodes)")
+        # RL-unified mode selector
+        self.rl_mode_group_box = QGroupBox("🤖 RL-Unified Mode")
+        self.rl_mode_group_box.setStyleSheet(self.get_group_style())
+        rl_mode_layout = QVBoxLayout()
+        rl_mode_row = QHBoxLayout()
+        self.rl_mode_buttons = QButtonGroup(self)
+        self.rl_mode_training = QRadioButton("Training")
+        self.rl_mode_training.setToolTip("Train/update the Q-table before deployment.")
+        self.rl_mode_inference = QRadioButton("Inference")
+        self.rl_mode_inference.setToolTip("Load the converged Q-table and choose the best protocol greedily.")
+        self.rl_mode_inference.setChecked(True)
+        self.rl_mode_buttons.addButton(self.rl_mode_training)
+        self.rl_mode_buttons.addButton(self.rl_mode_inference)
+        rl_mode_row.addWidget(QLabel("Mode:"))
+        rl_mode_row.addWidget(self.rl_mode_training)
+        rl_mode_row.addWidget(self.rl_mode_inference)
+        rl_mode_row.addStretch()
+        rl_mode_layout.addLayout(rl_mode_row)
+
+        ql_conv_row = QHBoxLayout()
+        self.use_ql_convergence = QCheckBox("End RL training when Q-learning values converge")
         self.use_ql_convergence.setStyleSheet("font-size: 12px; padding: 5px;")
-        self.use_ql_convergence.setToolTip("If unchecked: training ends on accuracy convergence (current behavior). If checked: training runs until Q-values stabilize.")
-        ql_conv_layout.addWidget(self.use_ql_convergence)
-        ql_conv_layout.addStretch()
-        ql_conv_group.setLayout(ql_conv_layout)
-        layout.addWidget(ql_conv_group)
+        self.use_ql_convergence.setToolTip(
+            "Training only. If unchecked, RL-unified training ends on model accuracy convergence. "
+            "If checked, it runs until Q-values stabilize."
+        )
+        ql_conv_row.addWidget(self.use_ql_convergence)
+        ql_conv_row.addStretch()
+        rl_mode_layout.addLayout(ql_conv_row)
+
+        self.rl_mode_group_box.setLayout(rl_mode_layout)
+        layout.addWidget(self.rl_mode_group_box)
+        for cb in self.protocol_checkboxes:
+            cb.toggled.connect(self.update_rl_mode_visibility)
+        self.rl_mode_training.toggled.connect(self.update_rl_mode_visibility)
+        self.update_rl_mode_visibility()
         
         # Network Scenarios
         scenario_group = self.create_checkbox_group("🌐 Network Scenarios", [
@@ -2373,6 +2398,25 @@ class FLExperimentGUI(QMainWindow):
         self.dds_impl_label.setEnabled(has_dds)
         self.dds_impl.setEnabled(has_dds)
 
+    def is_rl_unified_selected(self):
+        """Return True when the RL-unified protocol is selected."""
+        return "rl_unified" in self.get_selected_protocols()
+
+    def is_rl_training_mode(self):
+        """Return True when RL-unified is set to training mode."""
+        return self.is_rl_unified_selected() and getattr(self, "rl_mode_training", None) is not None and self.rl_mode_training.isChecked()
+
+    def update_rl_mode_visibility(self):
+        """Enable RL-unified mode controls only when RL-unified is selected."""
+        if not hasattr(self, "rl_mode_group_box"):
+            return
+        enabled = self.is_rl_unified_selected()
+        self.rl_mode_group_box.setEnabled(enabled)
+        if hasattr(self, "use_ql_convergence"):
+            training_selected = enabled and self.rl_mode_training.isChecked()
+            self.use_ql_convergence.setChecked(training_selected)
+            self.use_ql_convergence.setEnabled(False)
+
     def build_command(self):
         """Build the experiment command"""
         base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
@@ -2423,6 +2467,8 @@ class FLExperimentGUI(QMainWindow):
                 cmd_parts.extend(["--quantization-strategy", self.quant_strategy.currentText()])
                 if self.quant_symmetric.isChecked():
                     cmd_parts.append("--quantization-symmetric")
+            if self.is_rl_training_mode():
+                cmd_parts.append("--use-ql-convergence")
         else:
             # Docker-based experiment runner options (existing behavior).
             # Network mode: gpu | host | host_macvlan
@@ -2490,8 +2536,8 @@ class FLExperimentGUI(QMainWindow):
                 sparsity = self.pruning_ratio.value() / 100.0
                 cmd_parts.extend(["--pruning-sparsity", f"{sparsity:.2f}"])
             
-            # Q-learning convergence (only when rl_unified is selected)
-            if self.use_ql_convergence.isChecked() and "rl_unified" in self.get_selected_protocols():
+            # RL-unified training/inference mode
+            if self.is_rl_training_mode():
                 cmd_parts.append("--use-ql-convergence")
 
         # DDS implementation flag (CycloneDDS vs Fast DDS) – applies when DDS protocol is selected
@@ -2603,6 +2649,7 @@ class FLExperimentGUI(QMainWindow):
                 "Host + macvlan" if self.network_mode_host_macvlan.isChecked()
                 else ("Host (tc on host)" if self.network_mode_host.isChecked() else "GPU (Docker bridge)")
             )
+        rl_mode_str = "Training" if self.is_rl_training_mode() else ("Inference" if self.is_rl_unified_selected() else "N/A")
         
         reply = QMessageBox.question(
             self,
@@ -2611,6 +2658,7 @@ class FLExperimentGUI(QMainWindow):
             f"Mode: {mode_str}\n"
             f"Use Case: {self.get_selected_use_case()}\n"
             f"Protocols: {protocol_str}\n"
+            f"RL Mode: {rl_mode_str}\n"
             f"Scenarios: {scenario_str}\n"
             f"Rounds: {self.rounds_spinbox.value()}\n"
             f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"

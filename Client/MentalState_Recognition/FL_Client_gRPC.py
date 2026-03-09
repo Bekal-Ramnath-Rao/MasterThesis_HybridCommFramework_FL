@@ -312,8 +312,8 @@ class FederatedLearningClient:
             try:
                 print(f"Attempting to connect to gRPC server at {GRPC_HOST}:{GRPC_PORT}...")
                 options = [
-                    ('grpc.max_send_message_length', 100 * 1024 * 1024),
-                    ('grpc.max_receive_message_length', 100 * 1024 * 1024),
+                    ('grpc.max_send_message_length', 4 * 1024 * 1024),
+                    ('grpc.max_receive_message_length', 4 * 1024 * 1024),
                 ]
                 self.channel = grpc.insecure_channel(f'{GRPC_HOST}:{GRPC_PORT}', options=options)
                 self.stub = federated_learning_pb2_grpc.FederatedLearningStub(self.channel)

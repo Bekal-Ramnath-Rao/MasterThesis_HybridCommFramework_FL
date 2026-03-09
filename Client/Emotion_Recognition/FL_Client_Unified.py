@@ -1648,6 +1648,72 @@ class UnifiedFLClient_Emotion:
         except Exception:
             return None
 
+    def _protocol_payload_limit_bytes(self, protocol: str) -> Optional[int]:
+        """Return the per-protocol payload cap for a single non-chunked send."""
+        return {
+            'mqtt': MQTT_MAX_PAYLOAD_BYTES,
+            'amqp': AMQP_MAX_FRAME_BYTES,
+            'grpc': GRPC_MAX_MESSAGE_BYTES,
+            'http3': HTTP3_MAX_STREAM_DATA_BYTES,
+            'dds': CHUNK_SIZE,
+        }.get(protocol)
+
+    def _estimate_update_payload_bytes(self, protocol: str, message: dict) -> int:
+        """Estimate transport payload size for protocol gating before send."""
+        if protocol == 'http3':
+            return len(json.dumps({**message, 'type': 'update'}).encode('utf-8'))
+        if protocol in ('mqtt', 'amqp', 'quic'):
+            return len(json.dumps(message).encode('utf-8'))
+        if protocol == 'grpc':
+            if 'compressed_data' in message:
+                return len(base64.b64decode(message['compressed_data'].encode('utf-8')))
+            weights = message.get('weights', b'')
+            return len(weights.encode('utf-8')) if isinstance(weights, str) else len(weights)
+        if protocol == 'dds':
+            if 'compressed_data' in message:
+                return len(base64.b64decode(message['compressed_data'].encode('utf-8')))
+            return len(pickle.dumps(message.get('weights')))
+        return len(json.dumps(message).encode('utf-8'))
+
+    def _protocol_can_send_update(self, protocol: str, message: dict) -> bool:
+        """Return whether a model update can be sent with the configured payload cap."""
+        if protocol in ('grpc', 'dds', 'quic'):
+            return True
+        limit = self._protocol_payload_limit_bytes(protocol)
+        if limit is None:
+            return True
+        return self._estimate_update_payload_bytes(protocol, message) <= limit
+
+    def _build_update_protocol_order(self, preferred_protocol: str, message: dict) -> List[str]:
+        """Prefer the RL-selected protocol, but skip non-chunked transports that exceed their cap."""
+        ordered_candidates = [preferred_protocol, 'amqp', 'mqtt', 'grpc', 'quic', 'http3', 'dds']
+        eligible_protocols = []
+        skipped_protocols = []
+        for protocol in ordered_candidates:
+            if protocol in eligible_protocols or protocol in skipped_protocols:
+                continue
+            if self._protocol_can_send_update(protocol, message):
+                eligible_protocols.append(protocol)
+            else:
+                skipped_protocols.append(protocol)
+        if skipped_protocols:
+            payload_bytes = self.round_metrics.get('payload_bytes') or 0
+            print(
+                f"[Client {self.client_id}] Skipping payload-incompatible protocols "
+                f"for {payload_bytes} B update: {', '.join(skipped_protocols)}"
+            )
+        return eligible_protocols or ['grpc', 'dds', 'quic']
+
+    def _assert_protocol_payload_limit(self, protocol: str, payload_size_bytes: int):
+        """Reject oversize non-chunked sends before they hit the transport."""
+        if protocol in ('grpc', 'dds', 'quic'):
+            return
+        limit = self._protocol_payload_limit_bytes(protocol)
+        if limit is not None and payload_size_bytes > limit:
+            raise ValueError(
+                f"{protocol.upper()} payload {payload_size_bytes} B exceeds configured limit {limit} B"
+            )
+
     def _run_iperf3_if_diagnostic(self):
         """When FL_DIAGNOSTIC_PIPELINE=1 and current_round==1, run iperf3 from client and write to shared_data."""
         if not os.environ.get("FL_DIAGNOSTIC_PIPELINE", "").strip() in ("1", "true", "yes"):
@@ -1697,10 +1763,9 @@ class UnifiedFLClient_Emotion:
                         self.measure_network_condition()
 
                     state = self.env_manager.get_current_state()
-                    # Always use epsilon-greedy when RL is enabled so the agent explores and learns
-                    # (avoids always picking MQTT when Q-table is still learning). Stopping condition
-                    # is separate: USE_QL_CONVERGENCE -> stop on Q-convergence; else stop on loss.
-                    training_mode = True
+                    # During RL-table training we keep epsilon-greedy exploration enabled.
+                    # Once training is done, clients load and use the converged Q-table greedily.
+                    training_mode = USE_QL_CONVERGENCE
                     protocol = self.rl_selector.select_protocol(state, training=training_mode)
                 
                 print(f"\n[RL Protocol Selection]")
@@ -1905,32 +1970,36 @@ class UnifiedFLClient_Emotion:
 
         comm_start = time.time()
         success = False
-        protocols_to_try = [protocol, 'amqp', 'mqtt', 'grpc', 'quic', 'http3', 'dds']  # AMQP second in fallback for testing
+        protocols_to_try = self._build_update_protocol_order(protocol, update_message)
         
         for attempt_protocol in protocols_to_try:
             if success:
                 break
             try:
+                attempt_message = dict(update_message)
+                attempt_message['protocol'] = attempt_protocol
                 if attempt_protocol == 'mqtt':
-                    self._send_via_mqtt(update_message)
+                    self._send_via_mqtt(attempt_message)
                     success = True
                 elif attempt_protocol == 'amqp' and pika is not None:
-                    self._send_via_amqp(update_message)
+                    self._send_via_amqp(attempt_message)
                     success = True
                 elif attempt_protocol == 'grpc' and grpc is not None:
-                    self._send_via_grpc(update_message)
+                    self._send_via_grpc(attempt_message)
                     success = True
                 elif attempt_protocol == 'quic' and asyncio is not None and self.quic_protocol is not None:
                     # Only try QUIC if connection is established
-                    self._send_via_quic(update_message)
+                    self._send_via_quic(attempt_message)
                     success = True
                 elif attempt_protocol == 'http3' and HTTP3_AVAILABLE and asyncio is not None and self.http3_protocol is not None:
                     # Only try HTTP/3 if connection is established
-                    self._send_via_http3(update_message)
+                    self._send_via_http3(attempt_message)
                     success = True
                 elif attempt_protocol == 'dds' and DDS_AVAILABLE:
-                    self._send_via_dds(update_message)
+                    self._send_via_dds(attempt_message)
                     success = True
+                if success:
+                    self.selected_protocol = attempt_protocol
             except Exception as e:
                 if attempt_protocol == protocol:
                     print(f"Client {self.client_id} WARNING: {protocol} failed ({e}), trying fallback...")
@@ -2178,6 +2247,7 @@ class UnifiedFLClient_Emotion:
         """Send model update via MQTT"""
         try:
             payload = json.dumps(message)
+            self._assert_protocol_payload_limit('mqtt', len(payload.encode('utf-8')))
             payload_size_mb = len(payload) / (1024 * 1024)
             print(f"Client {self.client_id} sending via MQTT - size: {payload_size_mb:.2f} MB")
             
@@ -2264,6 +2334,7 @@ class UnifiedFLClient_Emotion:
             channel.exchange_declare(exchange='fl_client_updates', exchange_type='direct', durable=True)
             
             payload = json.dumps(message)
+            self._assert_protocol_payload_limit('amqp', len(payload.encode('utf-8')))
             payload_size_mb = len(payload) / (1024 * 1024)
             print(f"Client {self.client_id} sending via AMQP - size: {payload_size_mb:.2f} MB")
             
@@ -3084,6 +3155,7 @@ class UnifiedFLClient_Emotion:
             http3_message = {**message, 'type': 'update'}
             
             payload = json.dumps(http3_message)
+            self._assert_protocol_payload_limit('http3', len(payload.encode('utf-8')))
             payload_size_mb = len(payload) / (1024 * 1024)
             print(f"Client {self.client_id} sending via HTTP/3 - size: {payload_size_mb:.2f} MB")
             

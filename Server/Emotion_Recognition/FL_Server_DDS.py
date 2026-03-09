@@ -948,6 +948,8 @@ class FederatedLearningServer:
             'rounds': self.ROUNDS,
             'loss': self.LOSS,
             'accuracy': self.ACCURACY,
+            'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
+            'battery_consumption': getattr(self, 'BATTERY_CONSUMPTION', []),
             'summary': {
                 'total_rounds': len(self.ROUNDS),
                 'num_clients': self.num_clients,

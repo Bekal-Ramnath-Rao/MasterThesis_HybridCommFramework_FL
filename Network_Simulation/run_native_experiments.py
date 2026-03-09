@@ -138,6 +138,7 @@ class NativeExperimentRunner:
         quantization_bits: Optional[int] = None,
         quantization_strategy: Optional[str] = None,
         quantization_symmetric: bool = False,
+        use_ql_convergence: bool = False,
         rl_reward_scenario: Optional[str] = None,
     ) -> None:
         self.use_case = use_case
@@ -159,6 +160,7 @@ class NativeExperimentRunner:
         self.quantization_bits = quantization_bits or 8
         self.quantization_strategy = quantization_strategy or "parameter_quantization"
         self.quantization_symmetric = quantization_symmetric
+        self.use_ql_convergence = use_ql_convergence
         # When set (e.g. "good", "moderate", "poor"): run in excellent conditions but reward/state as if in that scenario (RL_REWARD_SCENARIO)
         self.rl_reward_scenario = (rl_reward_scenario or "").strip().lower() or None
 
@@ -168,6 +170,7 @@ class NativeExperimentRunner:
 
         self._processes: List[subprocess.Popen] = []
         self._broker_processes: List[subprocess.Popen] = []
+        self._traffic_processes: List[subprocess.Popen] = []
         self._amqp_proxy_process: Optional[subprocess.Popen] = None  # TCP proxy gateway:port -> 127.0.0.1:5672
         self._endpoints = None
         self._ns_sim = None
@@ -201,6 +204,121 @@ class NativeExperimentRunner:
         use_extra_jitter = os.environ.get("USE_EXTRA_JITTER", "0").strip().lower() in ("1", "true", "yes")
         models = build_models(NetworkSimulator.NETWORK_SCENARIOS, sigma_factor=sigma_factor)
         return NetworkSimulator.get_scenario_conditions_sampled(name, models, use_extra_jitter=use_extra_jitter)
+
+    def _actual_upstream_scenario(self) -> str:
+        """Actual tc scenario used on the wire during this native run."""
+        return "excellent" if self.rl_reward_scenario else self.upstream_scenario
+
+    def _native_congestion_level(self) -> Optional[str]:
+        """Map tc congestion scenarios to active native background load levels."""
+        mapping = {
+            "congested_light": "light",
+            "congested_moderate": "moderate",
+            "congested_heavy": "heavy",
+        }
+        for scenario_name in (
+            self.apply_tc_after_round_1,
+            self.scenario,
+            self.downstream_scenario,
+            self.upstream_scenario,
+        ):
+            if scenario_name in mapping:
+                return mapping[scenario_name]
+        return None
+
+    def _start_native_congestion(self, log_dir: Path) -> None:
+        """Start best-effort active background load for native congested_* scenarios."""
+        level = self._native_congestion_level()
+        if not level or self._endpoints is None:
+            return
+        if subprocess.run(["which", "iperf3"], capture_output=True, text=True).returncode != 0:
+            print("[WARNING] iperf3 not installed; skipping active native congestion load.")
+            return
+
+        server_ep, client_eps = self._endpoints
+        if not client_eps:
+            return
+        traffic_dir = log_dir / "native_congestion"
+        traffic_dir.mkdir(parents=True, exist_ok=True)
+
+        jobs_by_level = {
+            "light": [
+                {"kind": "tcp", "port": 5301, "client_index": 0, "parallel": 1},
+            ],
+            "moderate": [
+                {"kind": "tcp", "port": 5301, "client_index": 0, "parallel": 1},
+                {"kind": "tcp", "port": 5302, "client_index": 1, "parallel": 1},
+                {"kind": "udp", "port": 5303, "client_index": 0, "bandwidth": "4M"},
+            ],
+            "heavy": [
+                {"kind": "tcp", "port": 5301, "client_index": 0, "parallel": 2},
+                {"kind": "tcp", "port": 5302, "client_index": 1, "parallel": 2},
+                {"kind": "udp", "port": 5303, "client_index": 0, "bandwidth": "8M"},
+                {"kind": "udp", "port": 5304, "client_index": 1, "bandwidth": "12M"},
+            ],
+        }
+        jobs = jobs_by_level.get(level, [])
+        if not jobs:
+            return
+
+        print(f"[INFO] Starting native background congestion load: {level}")
+
+        for port in sorted({job["port"] for job in jobs}):
+            server_log = (traffic_dir / f"iperf3_server_{port}.log").open("w", encoding="utf-8", errors="replace")
+            self._log_files.append(server_log)
+            proc = subprocess.Popen(
+                ["sudo", "-E", "ip", "netns", "exec", server_ep.ns_name, "iperf3", "-s", "-p", str(port)],
+                stdout=server_log,
+                stderr=subprocess.STDOUT,
+                cwd=str(PROJECT_ROOT),
+            )
+            self._traffic_processes.append(proc)
+
+        time.sleep(1)
+
+        for job_index, job in enumerate(jobs, start=1):
+            client_ep = client_eps[job["client_index"] % len(client_eps)]
+            port = int(job["port"])
+            if not _wait_for_port("127.0.0.1", port, timeout_sec=10, ns_name=server_ep.ns_name):
+                print(f"[WARNING] Native congestion iperf3 server on port {port} did not become ready.")
+                continue
+
+            client_log = (traffic_dir / f"iperf3_client_{job_index}_{job['kind']}_{port}.log").open(
+                "w", encoding="utf-8", errors="replace"
+            )
+            self._log_files.append(client_log)
+            client_cmd = [
+                "sudo", "-E", "ip", "netns", "exec", client_ep.ns_name,
+                "iperf3", "-c", server_ep.ip, "-p", str(port), "-t", "36000", "--forceflush",
+            ]
+            if job["kind"] == "udp":
+                client_cmd.extend(["-u", "-b", job["bandwidth"], "-l", "1200"])
+            else:
+                client_cmd.extend(["-P", str(job.get("parallel", 1))])
+
+            proc = subprocess.Popen(
+                client_cmd,
+                stdout=client_log,
+                stderr=subprocess.STDOUT,
+                cwd=str(PROJECT_ROOT),
+            )
+            self._traffic_processes.append(proc)
+            print(f"[INFO] Native congestion flow started: {job['kind'].upper()} {client_ep.ns_name} -> {server_ep.ns_name}:{port}")
+
+    def _stop_native_congestion(self) -> None:
+        """Stop any native background load processes launched for congestion scenarios."""
+        for proc in getattr(self, "_traffic_processes", []):
+            if proc.poll() is not None:
+                continue
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        self._traffic_processes = []
 
     def _get_latest_round_from_server_log(self, server_log_path: Path) -> int:
         """Parse server log for round completion; return the latest completed round number (0 if none)."""
@@ -238,7 +356,7 @@ class NativeExperimentRunner:
         if self.apply_tc_after_round_1:
             upstream_conditions = self._load_scenario("excellent")
         else:
-            upstream_conditions = self._get_scenario_conditions(self.upstream_scenario)
+            upstream_conditions = self._get_scenario_conditions(self._actual_upstream_scenario())
         sim.apply_conditions(server_ep, client_eps, downstream_conditions, upstream_conditions)
 
         # Store for later cleanup
@@ -278,9 +396,9 @@ class NativeExperimentRunner:
                 pass
             mqtt_config = broker_log_dir / "mosquitto_native.conf"
             try:
-                # Allow large FL model updates (~12MB+); 0 = no limit (Mosquitto 2.x)
+                # Align native MQTT broker with the configured 128 KB payload cap.
                 mqtt_config.write_text(
-                    "listener 1883 0.0.0.0\nallow_anonymous true\nmessage_size_limit 0\n",
+                    "listener 1883 0.0.0.0\nallow_anonymous true\nmax_packet_size 131072\nmessage_size_limit 131072\n",
                     encoding="utf-8",
                 )
             except Exception as e:
@@ -448,9 +566,13 @@ class NativeExperimentRunner:
         # Common FL configuration
         env["NUM_ROUNDS"] = str(self.num_rounds)
         if self.protocol == "rl_unified":
-            # Training: only 1 client is started; server still allows multiple for inference.
-            env["MIN_CLIENTS"] = "1"
-            env["MAX_CLIENTS"] = str(os.environ.get("MAX_CLIENTS", "10"))
+            if self.use_ql_convergence:
+                # RL training: run with a single client until the learned table converges.
+                env["MIN_CLIENTS"] = "1"
+                env["MAX_CLIENTS"] = "1"
+            else:
+                env["MIN_CLIENTS"] = str(self.num_clients)
+                env["MAX_CLIENTS"] = str(self.num_clients)
         else:
             env["MIN_CLIENTS"] = str(self.num_clients)
             env["MAX_CLIENTS"] = str(self.num_clients)
@@ -576,6 +698,7 @@ class NativeExperimentRunner:
                 env["GRPC_HOST"] = server_ep.ip
                 env["QUIC_HOST"] = server_ep.ip
                 env["HTTP3_HOST"] = server_ep.ip
+                env["USE_QL_CONVERGENCE"] = "true" if self.use_ql_convergence else "false"
                 if getattr(self, "rl_reward_scenario", None):
                     env["RL_REWARD_SCENARIO"] = self.rl_reward_scenario
 
@@ -619,18 +742,19 @@ class NativeExperimentRunner:
 
     def run(self) -> int:
         use_gaussian = os.environ.get("USE_GAUSSIAN_DELAY", "1").strip().lower() in ("1", "true", "yes")
-        scenario_for_tc_note = self.apply_tc_after_round_1 or self.upstream_scenario
+        actual_upstream_scenario = self._actual_upstream_scenario()
+        scenario_for_tc_note = self.apply_tc_after_round_1 or actual_upstream_scenario
         tc_note = (
             f"  Tc: round 1 no tc; after round 1 complete, apply scenario={self.apply_tc_after_round_1} to clients.\n"
             if self.apply_tc_after_round_1
-            else f"  Tc: clients only (scenario={self.upstream_scenario}); server has no delay/loss/bandwidth.\n"
+            else f"  Tc: clients only (scenario={actual_upstream_scenario}); server has no delay/loss/bandwidth.\n"
         )
         if scenario_for_tc_note:
             tc_note += (
                 f"  Per-round tc: delay/jitter re-sampled from Gaussian model after each FL round (USE_GAUSSIAN_DELAY={use_gaussian}).\n"
             )
         rl_reward_note = (
-            f"  RL reward scenario : {self.rl_reward_scenario} (train in current conditions, reward as if in {self.rl_reward_scenario})\n"
+            f"  RL reward scenario : {self.rl_reward_scenario} (train with actual network={actual_upstream_scenario}, reward as if in {self.rl_reward_scenario})\n"
             if getattr(self, "rl_reward_scenario", None) else ""
         )
         print(
@@ -664,6 +788,7 @@ class NativeExperimentRunner:
         # Start broker first for MQTT/AMQP so server and clients can connect via bridge IP
         if self.protocol in ("mqtt", "amqp", "rl_unified"):
             self._start_broker(log_dir)
+        self._start_native_congestion(log_dir)
 
         if not os.environ.get("FL_SUDO_PASSWORD", "").strip():
             print("[INFO] Server and clients run inside namespaces via sudo; you may be prompted for your password (once per process). Set FL_SUDO_PASSWORD to avoid prompts.\n")
@@ -688,7 +813,7 @@ class NativeExperimentRunner:
             deadline = (time.monotonic() + round1_wait_sec) if round1_wait_sec > 0 else None
             if self.apply_tc_after_round_1 and deadline is None:
                 print("[INFO] Waiting for round 1 completion (no timeout; set FL_DIAG_ROUND1_WAIT_SEC>0 for a limit).")
-            scenario_for_tc = self.apply_tc_after_round_1 or self.upstream_scenario
+            scenario_for_tc = self.apply_tc_after_round_1 or actual_upstream_scenario
             last_round_tc_applied = 0  # after each round completion we apply tc for the *next* round's send
 
             while (deadline is None or time.monotonic() < deadline) and server_proc.poll() is None:
@@ -761,6 +886,7 @@ class NativeExperimentRunner:
                         except Exception:
                             pass
             self._broker_processes = []
+            self._stop_native_congestion()
             # Stop AMQP TCP proxy if we started it
             proxy_proc = getattr(self, "_amqp_proxy_process", None)
             if proxy_proc is not None and proxy_proc.poll() is None:
@@ -932,6 +1058,11 @@ def parse_args() -> argparse.Namespace:
         metavar="SCENARIO",
         help="For protocol=rl_unified: train in excellent conditions but use reward/state for SCENARIO (e.g. good, moderate, poor). Sets RL_REWARD_SCENARIO for clients.",
     )
+    parser.add_argument(
+        "--use-ql-convergence",
+        action="store_true",
+        help="For protocol=rl_unified: run RL training mode and stop when the learned Q-table converges.",
+    )
 
     return parser.parse_args()
 
@@ -940,7 +1071,7 @@ def main() -> None:
     args = parse_args()
 
     # RL unified training: use a single client (Q-learning / policy training).
-    if args.protocol == "rl_unified" and args.num_clients != 1:
+    if args.protocol == "rl_unified" and args.use_ql_convergence and args.num_clients != 1:
         print(f"[INFO] RL unified: forcing num_clients=1 for training (was {args.num_clients}).")
         args.num_clients = 1
 
@@ -968,6 +1099,7 @@ def main() -> None:
         quantization_bits=getattr(args, "quantization_bits", 8),
         quantization_strategy=getattr(args, "quantization_strategy", "parameter_quantization"),
         quantization_symmetric=getattr(args, "quantization_symmetric", False),
+        use_ql_convergence=getattr(args, "use_ql_convergence", False),
         rl_reward_scenario=getattr(args, "rl_reward_scenario", None),
     )
     _install_signal_handlers(runner)

@@ -813,11 +813,15 @@ class FederatedLearningServer:
             "rounds": self.ROUNDS,
             "accuracy": self.ACCURACY,
             "loss": self.LOSS,
+            "round_times_seconds": getattr(self, 'ROUND_TIMES', []),
+            "battery_consumption": getattr(self, 'BATTERY_CONSUMPTION', []),
             "convergence_time_seconds": self.convergence_time,
             "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
             "total_rounds": len(self.ROUNDS),
             "num_clients": self.num_clients,
-            "converged": self.converged
+            "converged": self.converged,
+            "final_accuracy": self.ACCURACY[-1] if self.ACCURACY else None,
+            "final_loss": self.LOSS[-1] if self.LOSS else None,
         }
         
         results_file = results_dir / 'http3_training_results.json'

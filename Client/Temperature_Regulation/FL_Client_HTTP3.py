@@ -41,7 +41,7 @@ logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # HTTP/3 Configuration
 HTTP3_HOST = os.getenv("HTTP3_HOST", "localhost")
-HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))"))
+HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "5"))
@@ -429,8 +429,8 @@ class FederatedLearningClient:
         configuration = Http3Configuration(
             is_client=True,
             alpn_protocols=H3_ALPN,
-            max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
-            max_data=100 * 1024 * 1024,  # 100 MB total
+            max_stream_data=16 * 1024,  # 16 KB per stream
+            max_data=32 * 1024,  # 32 KB total
             idle_timeout=3600.0,  # 60 minutes idle timeout
             max_datagram_frame_size=65536,  # Larger frame size for better throughput
             initial_rtt=0.15,  # 150ms (account for 100ms latency + jitter)

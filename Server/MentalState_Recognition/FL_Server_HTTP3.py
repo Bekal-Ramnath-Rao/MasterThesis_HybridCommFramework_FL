@@ -374,8 +374,7 @@ class FederatedLearningServer:
     
     def initialize_global_model(self):
         """Initialize the global EEG model"""
-        print("
-Initializing global EEG model (CNN+BiLSTM+MHA)...")
+        print("\nInitializing global EEG model (CNN+BiLSTM+MHA)...")
         model = build_model()
         self.global_weights = model.get_weights()
         print(f"Model initialized with {len(self.global_weights)} weight layers")
@@ -877,9 +876,9 @@ async def main():
     configuration = QuicConfiguration(
         is_client=False,
         alpn_protocols=H3_ALPN,
-        # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
-        max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
-        max_data=256 * 1024 * 1024,  # 256 MB total connection
+        # Align HTTP/3 transport with the configured 16 KB stream payload cap
+        max_stream_data=16 * 1024,  # 16 KB per stream
+        max_data=32 * 1024,  # 32 KB total connection
         # FAIR CONFIG: Timeout 600s for very_poor network scenarios
         idle_timeout=600.0,  # 10 minutes
         max_datagram_frame_size=65536,  # 64 KB frames

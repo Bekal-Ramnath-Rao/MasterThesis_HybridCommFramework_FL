@@ -627,6 +627,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             'rounds': self.ROUNDS,
             'loss': self.LOSS,
             'accuracy': self.ACCURACY,
+            'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
+            'battery_consumption': getattr(self, 'BATTERY_CONSUMPTION', []),
             'converged': self.converged,
             'convergence_time': self.convergence_time if self.converged else None,
             'total_time': time.time() - self.start_time,
