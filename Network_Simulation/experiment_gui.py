@@ -7,12 +7,47 @@ A beautiful and comprehensive interface for running FL experiments
 import sys
 import os
 import json
+import shlex
 import subprocess
 import threading
 from datetime import datetime
+from pathlib import Path
 
 # Add GUI directory to path for packet_logs_tab import
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'GUI'))
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LOCAL_PRIVILEGED_ENV_FILE = PROJECT_ROOT / "Network_Simulation" / ".privileged_ops.env"
+
+
+def shell_join(parts):
+    """Quote command parts so shell=True still works from any project path."""
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def load_local_runtime_env():
+    """Load optional local-only env overrides for privileged operations."""
+    overrides = {}
+    if not LOCAL_PRIVILEGED_ENV_FILE.is_file():
+        return overrides
+
+    try:
+        with LOCAL_PRIVILEGED_ENV_FILE.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                    value = value[1:-1]
+                if key and value:
+                    overrides[key] = value
+    except OSError:
+        pass
+
+    return overrides
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -214,6 +249,7 @@ class ExperimentRunner(QThread):
             # Set environment to disable Python buffering for real-time output
             env = os.environ.copy()
             env['PYTHONUNBUFFERED'] = '1'
+            env.update(load_local_runtime_env())
             
             self.process = subprocess.Popen(
                 self.command,
@@ -285,6 +321,7 @@ class DockerBuildThread(QThread):
 class FLExperimentGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.project_root = str(PROJECT_ROOT)
         self.experiment_thread = None
         self.dashboard_thread = None
         self.network_controller = None
@@ -1475,7 +1512,7 @@ class FLExperimentGUI(QMainWindow):
         """Build Docker images for the emotion use case and show output"""
         use_cache = self.use_cache.isChecked()
         compose_file = "Docker/docker-compose-emotion.gpu-isolated.yml"
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         full_compose_path = f"{base_dir}/{compose_file}"
         cmd = ["docker", "compose", "-f", full_compose_path, "build"]
         if not use_cache:
@@ -1507,7 +1544,7 @@ class FLExperimentGUI(QMainWindow):
         """Build Docker images for the mental state use case and show output"""
         use_cache = self.use_cache.isChecked()
         compose_file = "Docker/docker-compose-mentalstate.gpu-isolated.yml"
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         full_compose_path = f"{base_dir}/{compose_file}"
         cmd = ["docker", "compose", "-f", full_compose_path, "build"]
         if not use_cache:
@@ -1537,7 +1574,7 @@ class FLExperimentGUI(QMainWindow):
         """Build Docker images for the temperature regulation use case and show output"""
         use_cache = self.use_cache.isChecked()
         compose_file = "Docker/docker-compose-temperature.gpu-isolated.yml"
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         full_compose_path = f"{base_dir}/{compose_file}"
         cmd = ["docker", "compose", "-f", full_compose_path, "build"]
         if not use_cache:
@@ -1567,7 +1604,7 @@ class FLExperimentGUI(QMainWindow):
         """Build Docker images for unified RL scenario - temperature use case"""
         use_cache = self.use_cache.isChecked()
         compose_file = "Docker/docker-compose-unified-temperature.yml"
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         full_compose_path = f"{base_dir}/{compose_file}"
         cmd = ["docker", "compose", "-f", full_compose_path, "build"]
         if not use_cache:
@@ -1595,7 +1632,7 @@ class FLExperimentGUI(QMainWindow):
         """Build Docker images for unified RL scenario - mentalstate use case"""
         use_cache = self.use_cache.isChecked()
         compose_file = "Docker/docker-compose-unified-mentalstate.yml"
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         full_compose_path = f"{base_dir}/{compose_file}"
         cmd = ["docker", "compose", "-f", full_compose_path, "build"]
         if not use_cache:
@@ -1623,7 +1660,7 @@ class FLExperimentGUI(QMainWindow):
         """Build Docker images for unified RL scenario - emotion use case"""
         use_cache = self.use_cache.isChecked()
         compose_file = "Docker/docker-compose-unified-emotion.yml"
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         full_compose_path = f"{base_dir}/{compose_file}"
         cmd = ["docker", "compose", "-f", full_compose_path, "build"]
         if not use_cache:
@@ -2433,16 +2470,16 @@ class FLExperimentGUI(QMainWindow):
 
     def build_command(self):
         """Build the experiment command"""
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = Path(self.project_root)
         
         # Decide which backend to use: Docker experiment runner or native (namespaces) runner
         if self.exec_mode_native.isChecked():
             # Native: run server + clients as Python scripts in Linux namespaces (no Docker).
-            script = f"{base_dir}/Network_Simulation/run_native_experiments.py"
+            script = base_dir / "Network_Simulation" / "run_native_experiments.py"
             cmd_parts = ["python3", script]
         else:
             # Existing Docker-based experiment runner.
-            script = f"{base_dir}/Network_Simulation/run_network_experiments.py"
+            script = base_dir / "Network_Simulation" / "run_network_experiments.py"
             cmd_parts = ["python3", script]
         
         # Use case
@@ -2567,7 +2604,7 @@ class FLExperimentGUI(QMainWindow):
                 if dds_impl_value:
                     cmd_parts.extend(["--dds-impl", dds_impl_value])
 
-        return " ".join(cmd_parts)
+        return shell_join(cmd_parts)
     
     def start_experiment(self):
         """Start the experiment"""
@@ -2743,34 +2780,34 @@ class FLExperimentGUI(QMainWindow):
             return
         scenario_list = [s.lower() for s in scenarios]
         use_case = self.get_selected_use_case()
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        script = os.path.join(base_dir, "Network_Simulation", "diagnostic_pipeline.py")
-        command = f"python3 {script} --protocols {' '.join(pipeline_selected)} --scenarios {' '.join(scenario_list)} --use-case {use_case}"
+        base_dir = Path(self.project_root)
+        script = base_dir / "Network_Simulation" / "diagnostic_pipeline.py"
+        cmd_parts = ["python3", script, "--protocols", *pipeline_selected, "--scenarios", *scenario_list, "--use-case", use_case]
         # DDS implementation selection applies when DDS is part of the diagnostic protocols
         if any(p.lower() == "dds" for p in pipeline_selected) and hasattr(self, "dds_impl"):
             dds_impl_value = self.dds_impl.currentData() or str(self.dds_impl.currentText()).strip().lower().replace(" ", "")
             if dds_impl_value:
-                command += f" --dds-impl {dds_impl_value}"
+                cmd_parts.extend(["--dds-impl", dds_impl_value])
         if self.gpu_enabled.isChecked():
-            command += " --enable-gpu"
+            cmd_parts.append("--enable-gpu")
         # Pruning and quantization for diagnostic pipeline (pruning -> quantization)
         if self.pruning_enabled.isChecked():
-            command += " --use-pruning"
+            cmd_parts.append("--use-pruning")
             sparsity = self.pruning_ratio.value() / 100.0
-            command += f" --pruning-sparsity {sparsity:.2f}"
+            cmd_parts.extend(["--pruning-sparsity", f"{sparsity:.2f}"])
         if self.quantization_enabled.isChecked():
-            command += " --use-quantization"
-            command += f" --quantization-bits {self.quant_bits.currentText()}"
-            command += f" --quantization-strategy {self.quant_strategy.currentText()}"
+            cmd_parts.append("--use-quantization")
+            cmd_parts.extend(["--quantization-bits", self.quant_bits.currentText()])
+            cmd_parts.extend(["--quantization-strategy", self.quant_strategy.currentText()])
             if self.quant_symmetric.isChecked():
-                command += " --quantization-symmetric"
+                cmd_parts.append("--quantization-symmetric")
         is_native = getattr(self, "exec_mode_native", None) and self.exec_mode_native.isChecked()
         if is_native:
-            command += " --native"
+            cmd_parts.append("--native")
             mode_label = "Native (Python + namespaces, no Docker)"
         else:
             mode = "host_macvlan" if self.network_mode_host_macvlan.isChecked() else ("host" if self.network_mode_host.isChecked() else "gpu")
-            command += f" --network-mode {mode}"
+            cmd_parts.extend(["--network-mode", mode])
             mode_label = "Host + macvlan (per-container tc)" if mode == "host_macvlan" else ("Host network (tc on host)" if mode == "host" else "GPU (Docker bridge)")
         num_runs = len(pipeline_selected) * len(scenario_list)
         reply = QMessageBox.question(
@@ -2789,6 +2826,7 @@ class FLExperimentGUI(QMainWindow):
         )
         if reply == QMessageBox.No:
             return
+        command = shell_join(cmd_parts)
         self._run_command_common(command)
     
     def _run_command_common(self, command):
@@ -3776,7 +3814,7 @@ class FLExperimentGUI(QMainWindow):
 
     def _get_fallback_results_dir(self):
         """Best-effort results directory when parser didn't capture it yet."""
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         use_case = self.get_selected_use_case()
 
         if self.baseline_mode.isChecked():
@@ -3804,7 +3842,7 @@ class FLExperimentGUI(QMainWindow):
             base_results = self._get_fallback_results_dir()
 
         if not base_results:
-            base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+            base_dir = self.project_root
             base_results = os.path.join(base_dir, "experiment_results", "manual_stop_logs")
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

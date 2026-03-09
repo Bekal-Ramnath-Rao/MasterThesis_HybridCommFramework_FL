@@ -172,6 +172,7 @@ class NativeExperimentRunner:
 
         self._processes: List[subprocess.Popen] = []
         self._broker_processes: List[subprocess.Popen] = []
+        self._broker_log_processes: List[subprocess.Popen] = []
         self._traffic_processes: List[subprocess.Popen] = []
         self._amqp_proxy_process: Optional[subprocess.Popen] = None  # TCP proxy gateway:port -> 127.0.0.1:5672
         self._endpoints = None
@@ -181,6 +182,44 @@ class NativeExperimentRunner:
         self._amqp_host: Optional[str] = None  # When set, AMQP uses this (e.g. gateway for host RabbitMQ fallback)
         self._amqp_port: Optional[int] = None  # When set (e.g. 25673), use proxy port so namespaces can reach host RabbitMQ
         self._log_files: list = []  # keep refs so files stay open until processes exit
+
+    def _start_rabbitmq_log_capture(self, broker_log_dir: Path) -> None:
+        """Capture host RabbitMQ service logs into the native log directory."""
+        rabbit_log = (broker_log_dir / "broker_rabbitmq.log").open("w", encoding="utf-8", errors="replace")
+        self._log_files.append(rabbit_log)
+
+        capture_cmd = [
+            "/bin/bash",
+            "-lc",
+            (
+                "journalctl -u rabbitmq-server -f -n 0 -o short-iso --no-pager 2>/dev/null "
+                "|| tail -n 0 -F /var/log/rabbitmq/*.log 2>/dev/null "
+                "|| echo '[broker_log_capture] Unable to access RabbitMQ logs via journalctl or /var/log/rabbitmq'"
+            ),
+        ]
+
+        sudo_pw = os.environ.get("FL_SUDO_PASSWORD", "").strip()
+        if sudo_pw:
+            cmd = ["sudo", "-E", "-S"] + capture_cmd
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=rabbit_log,
+                stderr=subprocess.STDOUT,
+                cwd=str(PROJECT_ROOT),
+            )
+            if proc.stdin:
+                proc.stdin.write((sudo_pw + "\n").encode())
+                proc.stdin.close()
+        else:
+            proc = subprocess.Popen(
+                capture_cmd,
+                stdout=rabbit_log,
+                stderr=subprocess.STDOUT,
+                cwd=str(PROJECT_ROOT),
+            )
+
+        self._broker_log_processes.append(proc)
 
     def _effective_num_rounds(self) -> Optional[int]:
         """
@@ -422,7 +461,15 @@ class NativeExperimentRunner:
             try:
                 # Align native MQTT broker with the configured 128 KB payload cap.
                 mqtt_config.write_text(
-                    "listener 1883 0.0.0.0\nallow_anonymous true\nmax_packet_size 131072\nmessage_size_limit 131072\n",
+                    (
+                        "listener 1883 0.0.0.0\n"
+                        "allow_anonymous true\n"
+                        "max_packet_size 131072\n"
+                        "message_size_limit 131072\n"
+                        "connection_messages true\n"
+                        "log_timestamp true\n"
+                        "log_type all\n"
+                    ),
                     encoding="utf-8",
                 )
             except Exception as e:
@@ -468,6 +515,10 @@ class NativeExperimentRunner:
             # forwards to 127.0.0.1:5672, so namespaces can use gateway:25673 without changing RabbitMQ config.
             broker_log = (broker_log_dir / "broker_amqp.log").open("w", encoding="utf-8", errors="replace")
             self._log_files.append(broker_log)
+            broker_log.write("[INFO] broker_amqp.log captures RabbitMQ startup/proxy activity.\n")
+            broker_log.write("[INFO] See broker_rabbitmq.log for host RabbitMQ service logs.\n")
+            broker_log.flush()
+            self._start_rabbitmq_log_capture(broker_log_dir)
             self._amqp_host = self._gateway_ip
             amqp_proxy_port = 25673
 
@@ -927,6 +978,17 @@ class NativeExperimentRunner:
                         except Exception:
                             pass
             self._broker_processes = []
+            for proc in getattr(self, "_broker_log_processes", []):
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=5)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+            self._broker_log_processes = []
             self._stop_native_congestion()
             # Stop AMQP TCP proxy if we started it
             proxy_proc = getattr(self, "_amqp_proxy_process", None)
