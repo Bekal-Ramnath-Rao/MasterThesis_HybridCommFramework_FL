@@ -141,6 +141,7 @@ class NativeExperimentRunner:
         use_ql_convergence: bool = False,
         rl_reward_scenario: Optional[str] = None,
         use_communication_model_reward: bool = True,
+        reset_epsilon: bool = True,
     ) -> None:
         self.use_case = use_case
         self.protocol = protocol
@@ -165,6 +166,7 @@ class NativeExperimentRunner:
         # When set (e.g. "good", "moderate", "poor"): run in excellent conditions but reward/state as if in that scenario (RL_REWARD_SCENARIO)
         self.rl_reward_scenario = (rl_reward_scenario or "").strip().lower() or None
         self.use_communication_model_reward = use_communication_model_reward
+        self.reset_epsilon = reset_epsilon
 
         # Resolve concrete script paths for this (use_case, protocol)
         self.server_script = _resolve_script_path(use_case, protocol, role="server")
@@ -885,6 +887,48 @@ class NativeExperimentRunner:
         if not os.environ.get("FL_SUDO_PASSWORD", "").strip():
             print("[INFO] Server and clients run inside namespaces via sudo; you may be prompted for your password (once per process). Set FL_SUDO_PASSWORD to avoid prompts.\n")
 
+        # Create reset_epsilon flag file for RL-unified protocol
+        if self.protocol == "rl_unified":
+            print(f"\n{'='*70}")
+            if self.reset_epsilon:
+                print(f"[Q-Learning] Preparing epsilon reset for new experiment: {self.scenario}")
+            else:
+                print(f"[Q-Learning] Continuing with previous epsilon (resume mode): {self.scenario}")
+            print(f"{'='*70}")
+            
+            # Set environment variable to signal epsilon reset
+            os.environ["RESET_EPSILON"] = "true" if self.reset_epsilon else "false"
+            
+            # Create a flag file in shared_data for clients to check
+            shared_data_path = PROJECT_ROOT / "shared_data"
+            shared_data_path.mkdir(exist_ok=True)
+            
+            # Create flag file with scenario identifier, unique experiment ID, and timestamp
+            reset_flag_file = shared_data_path / "reset_epsilon_flag.txt"
+            try:
+                import uuid
+                timestamp = time.time()
+                experiment_id = str(uuid.uuid4())[:8]  # Short unique ID for this experiment
+                with open(reset_flag_file, 'w') as f:
+                    f.write(f"experiment_id={experiment_id}\n")
+                    f.write(f"scenario={self.scenario}\n")
+                    f.write(f"timestamp={timestamp}\n")
+                    f.write(f"reset_epsilon={1.0 if self.reset_epsilon else 0.0}\n")  # 1.0 = reset, 0.0 = continue
+                print(f"[Q-Learning] ✓ Created flag file: {reset_flag_file}")
+                print(f"[Q-Learning]   Experiment ID: {experiment_id}")
+                print(f"[Q-Learning]   Scenario: {self.scenario}")
+                if self.reset_epsilon:
+                    print(f"[Q-Learning]   All clients will reset epsilon to 1.0 on initialization")
+                    print(f"[Q-Learning]   Note: Q-table will persist across scenarios for multi-scenario training")
+                else:
+                    print(f"[Q-Learning]   Clients will continue with previous epsilon value (resume mode)")
+                    print(f"[Q-Learning]   Note: Q-table, rewards, and learning progress will continue from previous state")
+            except Exception as e:
+                print(f"[Q-Learning] ✗ Warning: Could not create reset flag file: {e}")
+                print(f"[Q-Learning]   Epsilon behavior may not work as expected")
+            
+            print(f"{'='*70}\n")
+
         exit_code = 0
         server_proc = None
         client_procs: List[subprocess.Popen] = []
@@ -1171,6 +1215,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="For protocol=rl_unified: do not let communication-model T_calc affect RL rewards.",
     )
+    parser.add_argument(
+        "--no-reset-epsilon",
+        action="store_true",
+        help="For protocol=rl_unified training: do NOT reset epsilon to 1.0 on start. Continue with previous epsilon value (useful for resuming interrupted training).",
+    )
 
     return parser.parse_args()
 
@@ -1210,6 +1259,7 @@ def main() -> None:
         use_ql_convergence=getattr(args, "use_ql_convergence", False),
         rl_reward_scenario=getattr(args, "rl_reward_scenario", None),
         use_communication_model_reward=not getattr(args, "disable_communication_model_reward", False),
+        reset_epsilon=not getattr(args, "no_reset_epsilon", False),  # Default True (reset), --no-reset-epsilon makes it False
     )
     _install_signal_handlers(runner)
     code = runner.run()

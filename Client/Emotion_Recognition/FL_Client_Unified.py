@@ -515,6 +515,10 @@ class UnifiedFLClient_Emotion:
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         
+        # Track gRPC signals to avoid acting on persistent flags multiple times
+        self.last_grpc_train_signal_round = -1
+        self.last_grpc_eval_signal_round = -1
+        
         # Training configuration
         self.training_config = {"batch_size": 32, "local_epochs": 20}
         
@@ -550,6 +554,8 @@ class UnifiedFLClient_Emotion:
             should_reset = False
             reset_flag_file = None
             scenario_info = None
+            experiment_id = None
+            reset_epsilon_value = None
             
             # Check environment variable first
             if os.getenv("RESET_EPSILON", "false").lower() == "true":
@@ -569,48 +575,85 @@ class UnifiedFLClient_Emotion:
             for check_path in flag_paths:
                 if os.path.exists(check_path):
                     reset_flag_file = check_path
-                    should_reset = True
-                    # Read scenario info from flag file
+                    # Read scenario, experiment ID, and reset_epsilon flag from file
                     try:
                         with open(check_path, 'r') as f:
                             content = f.read()
-                            # Parse scenario info
+                            # Parse all fields
                             for line in content.split('\n'):
                                 if line.startswith('scenario='):
                                     scenario_info = line.split('=', 1)[1]
+                                elif line.startswith('experiment_id='):
+                                    experiment_id = line.split('=', 1)[1]
+                                elif line.startswith('reset_epsilon='):
+                                    reset_epsilon_value = line.split('=', 1)[1].strip()
+                        # Only set should_reset if reset_epsilon is explicitly enabled (1.0 or true)
+                        if reset_epsilon_value and (reset_epsilon_value == "1.0" or reset_epsilon_value.lower() == "true"):
+                            should_reset = True
+                        else:
+                            print(f"[Client {client_id}] Flag file exists but reset_epsilon={reset_epsilon_value} (resume mode)")
+                            should_reset = False
                     except Exception as e:
                         print(f"[Client {client_id}] Warning: Could not read flag file content: {e}")
                     break
             
-            # Check if we need to reset based on scenario change
+            # Check if we need to reset based on experiment ID change and reset_epsilon flag
+            # Using experiment_id ensures epsilon resets for EACH new GUI experiment (when reset is enabled)
             if should_reset:
-                # Check if this is a new scenario (avoid resetting multiple times for same scenario)
-                last_scenario = getattr(self.rl_selector, 'last_scenario', None)
-                if scenario_info and scenario_info == last_scenario:
-                    print(f"[Client {client_id}] Already reset epsilon for scenario '{scenario_info}', skipping reset")
+                # Check if this is a new experiment (avoid resetting multiple times for same experiment)
+                last_experiment_id = getattr(self.rl_selector, 'last_experiment_id', None)
+                if experiment_id and experiment_id == last_experiment_id:
+                    print(f"[Client {client_id}] Already processed experiment '{experiment_id}', skipping reset")
+                    print(f"[Client {client_id}] Scenario: {scenario_info}")
                     should_reset = False
                 else:
                     print(f"\n{'='*70}")
-                    print(f"[Client {client_id}] 🔄 RESETTING EPSILON TO 1.0")
+                    print(f"[Client {client_id}] 🔄 RESETTING EPSILON TO 1.0 (Fresh Training)")
+                    if experiment_id:
+                        print(f"[Client {client_id}]   New experiment ID: {experiment_id}")
+                        if last_experiment_id:
+                            print(f"[Client {client_id}]   Previous experiment ID: {last_experiment_id}")
                     if scenario_info:
-                        print(f"[Client {client_id}]   New experiment scenario: {scenario_info}")
-                        if last_scenario:
-                            print(f"[Client {client_id}]   Previous scenario: {last_scenario}")
+                        print(f"[Client {client_id}]   Training scenario: {scenario_info}")
                     print(f"[Client {client_id}]   Current epsilon before reset: {self.rl_selector.epsilon:.4f}")
-                    self.rl_selector.reset_epsilon(scenario=scenario_info)
+                    self.rl_selector.reset_epsilon(experiment_id=experiment_id, scenario=scenario_info)
                     print(f"[Client {client_id}]   ✓ Epsilon reset to: {self.rl_selector.epsilon:.4f}")
+                    print(f"[Client {client_id}]   📊 Q-table will accumulate learning across all scenarios")
                     print(f"{'='*70}\n")
                     
-                    # Save Q-table immediately to persist the reset and scenario tracking
+                    # Save Q-table immediately to persist the reset and experiment tracking
+                    # The Q-table itself is NOT reset, only epsilon - this allows multi-scenario training
                     try:
                         self.rl_selector.save_q_table()
                     except Exception as e:
                         print(f"[Client {client_id}] Warning: Could not save Q-table after epsilon reset: {e}")
-                
-                # Note: We DON'T delete the flag file here because:
+            elif reset_flag_file and experiment_id:
+                # Flag file exists but reset is disabled - this is resume mode
+                last_experiment_id = getattr(self.rl_selector, 'last_experiment_id', None)
+                if experiment_id != last_experiment_id:
+                    print(f"\n{'='*70}")
+                    print(f"[Client {client_id}] 📍 CONTINUING WITH PREVIOUS EPSILON (Resume Mode)")
+                    if experiment_id:
+                        print(f"[Client {client_id}]   Experiment ID: {experiment_id}")
+                    if scenario_info:
+                        print(f"[Client {client_id}]   Training scenario: {scenario_info}")
+                    print(f"[Client {client_id}]   Current epsilon (preserved): {self.rl_selector.epsilon:.4f}")
+                    print(f"[Client {client_id}]   📊 Q-table, rewards, and learning progress will continue from previous state")
+                    print(f"{'='*70}\n")
+                    # Update experiment ID to prevent repeated logging
+                    self.rl_selector.last_experiment_id = experiment_id
+                    if scenario_info:
+                        self.rl_selector.last_scenario = scenario_info
+                    # Save Q-table to persist the tracking
+                    try:
+                        self.rl_selector.save_q_table()
+                    except Exception as e:
+                        print(f"[Client {client_id}] Warning: Could not save Q-table: {e}")
+            
+            # Note: We DON'T delete the flag file here because:
                 # 1. Late-joining clients also need to reset epsilon
                 # 2. The flag file will be overwritten/cleaned when next experiment starts
-                # 3. Scenario tracking prevents multiple resets for the same scenario
+                # 3. Experiment ID tracking prevents multiple resets for the same experiment
             
             self.env_manager = EnvironmentStateManager()
         else:
@@ -746,6 +789,7 @@ class UnifiedFLClient_Emotion:
         # gRPC listener components
         self.grpc_listener_thread = None
         self.grpc_stub = None
+        self.grpc_lock = threading.Lock()  # Synchronize gRPC calls to prevent conflicts
         
         # Initialize MQTT client for listening (always used for signal/sync)
         self.mqtt_client = mqtt.Client(client_id=f"fl_client_{client_id}", protocol=mqtt.MQTTv311)
@@ -1242,12 +1286,16 @@ class UnifiedFLClient_Emotion:
                         # Poll control-plane status first (gRPC-only signaling in unified RL mode)
                         status_request = federated_learning_pb2.StatusRequest(client_id=self.client_id)
                         status = self.grpc_stub.CheckTrainingStatus(status_request)
-                        if status.should_train and self.is_active:
+                        
+                        # Only act on signals if we haven't already acted on them for this round
+                        if status.should_train and self.is_active and status.current_round != self.last_grpc_train_signal_round:
+                            self.last_grpc_train_signal_round = status.current_round
                             self.handle_start_training(
                                 json.dumps({'round': status.current_round}).encode(),
                                 source="gRPC"
                             )
-                        if status.should_evaluate and self.is_active:
+                        if status.should_evaluate and self.is_active and status.current_round != self.last_grpc_eval_signal_round:
+                            self.last_grpc_eval_signal_round = status.current_round
                             self.handle_start_evaluation(json.dumps({'round': status.current_round}).encode())
 
                         # Poll for global model (chunked when > 4 MB)
@@ -2612,130 +2660,114 @@ class UnifiedFLClient_Emotion:
             raise
     
     def _send_via_grpc(self, message: dict):
-        """Send model update via gRPC"""
+        """Send model update via gRPC using persistent stub"""
         if grpc is None or federated_learning_pb2 is None:
             raise ImportError("grpc modules not available for gRPC")
         
-        try:
-            grpc_host = os.getenv("GRPC_HOST", "localhost")
-            grpc_port = int(os.getenv("GRPC_PORT", "50051"))
+        # Use persistent grpc_stub with lock to prevent concurrent calls
+        with self.grpc_lock:
+            try:
+                if self.grpc_stub is None:
+                    raise Exception("gRPC stub not initialized. Listener may not be started.")
+                
+                stub = self.grpc_stub
             
-            # FAIR CONFIG: Set max message size to the unified gRPC limit (4 MB)
-            options = [
-                ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
-                ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
-                # FAIR CONFIG: Keepalive settings 600s for very_poor network
-                ('grpc.keepalive_time_ms', 600000),  # 10 minutes
-                ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
-            ]
-            channel = grpc.insecure_channel(f'{grpc_host}:{grpc_port}', options=options)
-            stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
-            
-            # Send model update (chunked when > 4 MB)
-            if 'compressed_data' in message:
-                payload = json.dumps(message).encode('utf-8')
-            else:
-                payload = (message['weights'].encode('utf-8') if isinstance(message['weights'], str) else message['weights'])
-            payload_size = len(payload)
-            payload_size_mb = payload_size / (1024 * 1024)
-            print(f"Client {self.client_id} sending via gRPC - size: {payload_size_mb:.2f} MB")
-            metrics_dict = {k: float(v) for k, v in message['metrics'].items()}
+                # Send model update (chunked when > 4 MB)
+                if 'compressed_data' in message:
+                    payload = json.dumps(message).encode('utf-8')
+                else:
+                    payload = (message['weights'].encode('utf-8') if isinstance(message['weights'], str) else message['weights'])
+                payload_size = len(payload)
+                payload_size_mb = payload_size / (1024 * 1024)
+                print(f"Client {self.client_id} sending via gRPC - size: {payload_size_mb:.2f} MB")
+                metrics_dict = {k: float(v) for k, v in message['metrics'].items()}
 
-            if payload_size > GRPC_CHUNK_SIZE:
-                chunks = [payload[i:i + GRPC_CHUNK_SIZE] for i in range(0, payload_size, GRPC_CHUNK_SIZE)]
-                total_chunks = len(chunks)
-                for i, chunk_data in enumerate(chunks):
-                    req = federated_learning_pb2.ModelUpdate(
-                        client_id=message['client_id'],
-                        round=message['round'],
-                        weights=chunk_data,
-                        num_samples=message['num_samples'] if i == 0 else 0,
-                        metrics=metrics_dict if i == 0 else {},
-                        chunk_index=i,
-                        total_chunks=total_chunks
+                if payload_size > GRPC_CHUNK_SIZE:
+                    chunks = [payload[i:i + GRPC_CHUNK_SIZE] for i in range(0, payload_size, GRPC_CHUNK_SIZE)]
+                    total_chunks = len(chunks)
+                    for i, chunk_data in enumerate(chunks):
+                        req = federated_learning_pb2.ModelUpdate(
+                            client_id=message['client_id'],
+                            round=message['round'],
+                            weights=chunk_data,
+                            num_samples=message['num_samples'] if i == 0 else 0,
+                            metrics=metrics_dict if i == 0 else {},
+                            chunk_index=i,
+                            total_chunks=total_chunks
+                        )
+                        response = stub.SendModelUpdate(req)
+                        if not response.success:
+                            raise Exception(f"gRPC chunk {i + 1}/{total_chunks} failed: {response.message}")
+                    print(f"Client {self.client_id} sent model update in {total_chunks} chunks ({payload_size} bytes) via gRPC")
+                else:
+                    response = stub.SendModelUpdate(
+                        federated_learning_pb2.ModelUpdate(
+                            client_id=message['client_id'],
+                            round=message['round'],
+                            weights=payload,
+                            num_samples=message['num_samples'],
+                            metrics=metrics_dict
+                        )
                     )
-                    response = stub.SendModelUpdate(req)
                     if not response.success:
-                        raise Exception(f"gRPC chunk {i + 1}/{total_chunks} failed: {response.message}")
-                print(f"Client {self.client_id} sent model update in {total_chunks} chunks ({payload_size} bytes) via gRPC")
-            else:
-                response = stub.SendModelUpdate(
-                    federated_learning_pb2.ModelUpdate(
-                        client_id=message['client_id'],
-                        round=message['round'],
-                        weights=payload,
-                        num_samples=message['num_samples'],
-                        metrics=metrics_dict
-                    )
+                        raise Exception(f"gRPC send failed: {response.message}")
+                    print(f"Client {self.client_id} sent model update for round {self.current_round} via gRPC")
+
+                # Set flag: we're now waiting for aggregated model
+                self.waiting_for_aggregated_model = True
+
+                log_sent_packet(
+                    packet_size=payload_size,
+                    peer="server",
+                    protocol="gRPC",
+                    round=self.current_round,
+                    extra_info="model_update"
                 )
-                if not response.success:
-                    raise Exception(f"gRPC send failed: {response.message}")
-                print(f"Client {self.client_id} sent model update for round {self.current_round} via gRPC")
-
-            # Set flag: we're now waiting for aggregated model
-            self.waiting_for_aggregated_model = True
-
-            log_sent_packet(
-                packet_size=payload_size,
-                peer="server",
-                protocol="gRPC",
-                round=self.current_round,
-                extra_info="model_update"
-            )
-            
-            channel.close()
-        except Exception as e:
-            print(f"Client {self.client_id} ERROR sending via gRPC: {e}")
-            raise
+                
+            except Exception as e:
+                print(f"Client {self.client_id} ERROR sending via gRPC: {e}")
+                raise
     
     def _send_metrics_via_grpc(self, message: dict):
-        """Send metrics via gRPC"""
+        """Send metrics via gRPC using persistent stub"""
         if grpc is None or federated_learning_pb2 is None:
             raise ImportError("grpc modules not available for gRPC")
         
-        try:
-            grpc_host = os.getenv("GRPC_HOST", "localhost")
-            grpc_port = int(os.getenv("GRPC_PORT", "50051"))
-            
-            # FAIR CONFIG: Set max message size to the unified gRPC limit (4 MB)
-            options = [
-                ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
-                ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
-                # FAIR CONFIG: Keepalive settings 600s for very_poor network
-                ('grpc.keepalive_time_ms', 600000),  # 10 minutes
-                ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
-            ]
-            channel = grpc.insecure_channel(f'{grpc_host}:{grpc_port}', options=options)
-            stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
-            
-            response = stub.SendMetrics(
-                federated_learning_pb2.Metrics(
-                    client_id=message['client_id'],
-                    round=message['round'],
-                    loss=message.get('loss', message.get('metrics', {}).get('loss', 0.0)),
-                    accuracy=message.get('accuracy', message.get('metrics', {}).get('accuracy', 0.0)),
-                    num_samples=message['num_samples'],
-                    battery_soc=float(message.get('battery_soc', message.get('metrics', {}).get('battery_soc', 1.0))),
-                    round_time_sec=float(message.get('round_time_sec', message.get('metrics', {}).get('round_time_sec', 0.0))),
+        # Use persistent grpc_stub with lock to prevent concurrent calls
+        with self.grpc_lock:
+            try:
+                if self.grpc_stub is None:
+                    raise Exception("gRPC stub not initialized. Listener may not be started.")
+                
+                stub = self.grpc_stub
+                
+                response = stub.SendMetrics(
+                    federated_learning_pb2.Metrics(
+                        client_id=message['client_id'],
+                        round=message['round'],
+                        loss=message.get('loss', message.get('metrics', {}).get('loss', 0.0)),
+                        accuracy=message.get('accuracy', message.get('metrics', {}).get('accuracy', 0.0)),
+                        num_samples=message['num_samples'],
+                        battery_soc=float(message.get('battery_soc', message.get('metrics', {}).get('battery_soc', 1.0))),
+                        round_time_sec=float(message.get('round_time_sec', message.get('metrics', {}).get('round_time_sec', 0.0))),
+                    )
                 )
-            )
-            
-            payload_size = len(json.dumps(message))
-            log_sent_packet(
-                packet_size=payload_size,
-                peer="server",
-                protocol="gRPC",
-                round=self.current_round,
-                extra_info="metrics"
-            )
-            
-            if not response.success:
-                raise Exception(f"gRPC send failed: {response.message}")
-            
-            channel.close()
-        except Exception as e:
-            print(f"Client {self.client_id} ERROR sending metrics via gRPC: {e}")
-            raise
+                
+                payload_size = len(json.dumps(message))
+                log_sent_packet(
+                    packet_size=payload_size,
+                    peer="server",
+                    protocol="gRPC",
+                    round=self.current_round,
+                    extra_info="metrics"
+                )
+                
+                if not response.success:
+                    raise Exception(f"gRPC send failed: {response.message}")
+                
+            except Exception as e:
+                print(f"Client {self.client_id} ERROR sending metrics via gRPC: {e}")
+                raise
     
     async def _ensure_quic_connection(self):
         """Establish persistent QUIC connection if not already connected"""

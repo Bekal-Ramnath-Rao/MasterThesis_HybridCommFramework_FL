@@ -281,13 +281,25 @@ class QLearningProtocolSelector:
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
     
-    def reset_epsilon(self, scenario: str = None):
-        """Reset epsilon to initial value (1.0) for re-exploration"""
+    def reset_epsilon(self, experiment_id: str = None, scenario: str = None):
+        """Reset epsilon to initial value (1.0) for re-exploration
+        
+        Args:
+            experiment_id: Unique identifier for this experiment (prevents duplicate resets)
+            scenario: Network scenario name for tracking
+        
+        Note: This resets ONLY epsilon, not the Q-table, allowing multi-scenario training
+              to accumulate learning across all network conditions in one Q-table.
+        """
         old_epsilon = self.epsilon
         self.epsilon = 1.0
+        if experiment_id:
+            self.last_experiment_id = experiment_id
         if scenario:
             self.last_scenario = scenario
         print(f"[Q-Learning] Epsilon reset from {old_epsilon:.4f} to {self.epsilon:.4f} for re-exploration")
+        if experiment_id:
+            print(f"[Q-Learning] Tracking experiment ID: {experiment_id}")
         if scenario:
             print(f"[Q-Learning] Tracking scenario: {scenario}")
     

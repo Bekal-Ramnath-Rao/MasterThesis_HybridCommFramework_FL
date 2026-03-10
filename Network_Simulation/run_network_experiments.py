@@ -56,6 +56,7 @@ class ExperimentRunner:
         use_ql_convergence: bool = False,
         local_clients: int = 2,
         use_communication_model_reward: bool = True,
+        reset_epsilon: bool = True,
     ):
         self.use_case = use_case
         self.num_rounds = num_rounds
@@ -69,6 +70,7 @@ class ExperimentRunner:
         self.baseline_mode = baseline_mode
         self.use_ql_convergence = use_ql_convergence
         self.use_communication_model_reward = use_communication_model_reward
+        self.reset_epsilon = reset_epsilon
         # Number of client containers started from this runner on the central machine
         self.local_clients = max(1, int(local_clients or 1))
         # quantization_params expected to be a dict of simple string values
@@ -867,11 +869,14 @@ class ExperimentRunner:
             # This ensures re-exploration for each new network scenario
             if protocol == "rl_unified":
                 print(f"\n{'='*70}")
-                print(f"[Q-Learning] Preparing epsilon reset for new experiment: {scenario}")
+                if self.reset_epsilon:
+                    print(f"[Q-Learning] Preparing epsilon reset for new experiment: {scenario}")
+                else:
+                    print(f"[Q-Learning] Continuing with previous epsilon (resume mode): {scenario}")
                 print(f"{'='*70}")
                 
                 # Set environment variable to signal epsilon reset
-                os.environ["RESET_EPSILON"] = "true"
+                os.environ["RESET_EPSILON"] = "true" if self.reset_epsilon else "false"
                 
                 # Create a flag file in shared_data for containers to check
                 # This ensures the reset signal persists even if env vars aren't passed through
@@ -880,21 +885,31 @@ class ExperimentRunner:
                 shared_data_path = project_root / "shared_data"
                 shared_data_path.mkdir(exist_ok=True)
                 
-                # Create flag file with scenario identifier and timestamp
+                # Create flag file with scenario identifier, unique experiment ID, and timestamp
+                # Using experiment_id ensures epsilon resets for EACH new GUI experiment
                 reset_flag_file = shared_data_path / "reset_epsilon_flag.txt"
                 try:
                     import time
+                    import uuid
                     timestamp = time.time()
+                    experiment_id = str(uuid.uuid4())[:8]  # Short unique ID for this experiment
                     with open(reset_flag_file, 'w') as f:
+                        f.write(f"experiment_id={experiment_id}\n")
                         f.write(f"scenario={scenario}\n")
                         f.write(f"timestamp={timestamp}\n")
-                        f.write(f"reset_epsilon=1.0\n")
-                    print(f"[Q-Learning] ✓ Created reset flag file: {reset_flag_file}")
+                        f.write(f"reset_epsilon={1.0 if self.reset_epsilon else 0.0}\n")  # 1.0 = reset, 0.0 = continue
+                    print(f"[Q-Learning] ✓ Created flag file: {reset_flag_file}")
+                    print(f"[Q-Learning]   Experiment ID: {experiment_id}")
                     print(f"[Q-Learning]   Scenario: {scenario}")
-                    print(f"[Q-Learning]   All clients will reset epsilon to 1.0 on initialization")
+                    if self.reset_epsilon:
+                        print(f"[Q-Learning]   All clients will reset epsilon to 1.0 on initialization")
+                        print(f"[Q-Learning]   Note: Q-table will persist across scenarios for multi-scenario training")
+                    else:
+                        print(f"[Q-Learning]   Clients will continue with previous epsilon value (resume mode)")
+                        print(f"[Q-Learning]   Note: Q-table, rewards, and learning progress will continue from previous state")
                 except Exception as e:
                     print(f"[Q-Learning] ✗ Warning: Could not create reset flag file: {e}")
-                    print(f"[Q-Learning]   Epsilon reset may not work properly")
+                    print(f"[Q-Learning]   Epsilon behavior may not work as expected")
                 
                 print(f"{'='*70}\n")
             
@@ -1093,6 +1108,11 @@ def main():
         help="Unified only: do not let communication-model T_calc affect RL rewards.",
     )
     parser.add_argument(
+        "--no-reset-epsilon",
+        action="store_true",
+        help="Unified training only: Do NOT reset epsilon to 1.0 on experiment start. Continue with previous epsilon value and accumulated learning (useful for resuming interrupted training).",
+    )
+    parser.add_argument(
         "--local-clients",
         type=int,
         default=2,
@@ -1155,6 +1175,7 @@ def main():
         use_ql_convergence=args.use_ql_convergence,
         local_clients=args.local_clients,
         use_communication_model_reward=not args.disable_communication_model_reward,
+        reset_epsilon=not args.no_reset_epsilon,  # Default True (reset), --no-reset-epsilon makes it False
     )
     
     # In baseline mode, run all protocols with excellent scenario (no network conditions)

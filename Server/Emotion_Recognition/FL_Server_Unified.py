@@ -2600,15 +2600,13 @@ if GRPC_AVAILABLE:
             try:
                 client_id = request.client_id
                 
-                # Check if client should train
+                # Check if client should train or evaluate
                 should_train = self.server.grpc_should_train.get(client_id, False)
                 should_evaluate = self.server.grpc_should_evaluate.get(client_id, False)
                 
-                # Clear flags after reading (one-time signals)
-                if should_train:
-                    self.server.grpc_should_train[client_id] = False
-                if should_evaluate:
-                    self.server.grpc_should_evaluate[client_id] = False
+                # Don't clear flags immediately - let them persist for multiple polls
+                # This prevents race conditions where signals are lost if client has guards
+                # Flags will be cleared when next round's signals are set
                 
                 return federated_learning_pb2.TrainingStatus(
                     should_train=should_train,

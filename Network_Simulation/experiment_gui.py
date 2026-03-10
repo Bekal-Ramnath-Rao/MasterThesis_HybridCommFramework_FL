@@ -660,6 +660,18 @@ class FLExperimentGUI(QMainWindow):
         comm_reward_row.addStretch()
         rl_mode_layout.addLayout(comm_reward_row)
 
+        epsilon_reset_row = QHBoxLayout()
+        self.reset_epsilon_on_start = QCheckBox("Reset Epsilon to 1.0 (Fresh Training)")
+        self.reset_epsilon_on_start.setChecked(True)  # Default: reset (current behavior)
+        self.reset_epsilon_on_start.setStyleSheet("font-size: 12px; padding: 5px;")
+        self.reset_epsilon_on_start.setToolTip(
+            "Training only. When CHECKED: Epsilon resets to 1.0 for fresh exploration (recommended for new scenarios).\n"
+            "When UNCHECKED: Continue with previous epsilon value and accumulated learning (useful for resuming interrupted training)."
+        )
+        epsilon_reset_row.addWidget(self.reset_epsilon_on_start)
+        epsilon_reset_row.addStretch()
+        rl_mode_layout.addLayout(epsilon_reset_row)
+
         self.rl_mode_group_box.setLayout(rl_mode_layout)
         layout.addWidget(self.rl_mode_group_box)
         for cb in self.protocol_checkboxes:
@@ -2594,6 +2606,11 @@ class FLExperimentGUI(QMainWindow):
                 cmd_parts.append("--use-ql-convergence")
             if self.is_rl_unified_selected() and not self.use_communication_model_reward.isChecked():
                 cmd_parts.append("--disable-communication-model-reward")
+
+        # Epsilon reset control (training only) - applies to BOTH Docker and native modes
+        if self.is_rl_unified_selected() and self.is_rl_training_mode():
+            if not self.reset_epsilon_on_start.isChecked():
+                cmd_parts.append("--no-reset-epsilon")
 
         # DDS implementation flag (CycloneDDS vs Fast DDS) – applies when DDS protocol is selected
         selected_protocols = self.get_selected_protocols()
