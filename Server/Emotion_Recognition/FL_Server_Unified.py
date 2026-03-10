@@ -11,8 +11,20 @@ import socket
 import sys
 
 # Configure GPU before importing TensorFlow
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+_gpu_id = os.environ.get('GPU_DEVICE_ID', os.environ.get('CUDA_VISIBLE_DEVICES', '0'))
+os.environ['CUDA_VISIBLE_DEVICES'] = _gpu_id
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+# Ensure pip-installed CUDA 12 ptxas is on PATH (system ptxas may be too old)
+_nvcc_bin = os.path.join(sys.prefix, 'lib', 'python' + '.'.join(map(str, sys.version_info[:2])),
+                        'site-packages', 'nvidia', 'cuda_nvcc', 'bin')
+if os.path.isdir(_nvcc_bin) and _nvcc_bin not in os.environ.get('PATH', ''):
+    os.environ['PATH'] = _nvcc_bin + ':' + os.environ.get('PATH', '')
+
+# Remove stale CUDA 10.x paths from LD_LIBRARY_PATH to avoid library conflicts
+_ld_path = os.environ.get('LD_LIBRARY_PATH', '')
+_ld_path = ':'.join(p for p in _ld_path.split(':') if p and 'cuda-10' not in p)
+os.environ['LD_LIBRARY_PATH'] = _ld_path
 
 import numpy as np
 import pandas as pd
@@ -1946,38 +1958,19 @@ class UnifiedFederatedLearningServer:
     
     def distribute_initial_model(self):
         """Distribute initial global model and config to all clients"""
-        # Prepare weights (quantized or not)
-        if self.quantization_handler is not None:
-            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
-            weights_data = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
-            weights_key = 'quantized_data'
-        else:
-            weights_data = self.serialize_weights(self.global_weights)
-            weights_key = 'weights'
-        
-        for client_id in self.registered_clients.keys():
-            if client_id not in self.active_clients:
-                continue
-            try:
-                # Unified mode always exposes the initial model through gRPC so the
-                # client can bootstrap even when the selected data plane cannot carry
-                # the full model payload.
-                self.grpc_model_ready[client_id] = 0
-                print(f"[gRPC] Initial model ready for client {client_id} to pull")
-            except Exception as e:
-                print(f"[gRPC] Error preparing initial model for client {client_id}: {e}")
-                import traceback
-                traceback.print_exc()
-        
         # Start first round
         time.sleep(2)
         self.current_round = 1
         self.round_start_time = time.time()
+
+        # Reuse broadcast_global_model which handles all protocols (MQTT, AMQP,
+        # DDS with chunking, gRPC pull) so clients can bootstrap even without gRPC.
+        self.broadcast_global_model()
+
         self.signal_start_training()
 
     def signal_start_training(self):
         """Signal all clients to start training for current round"""
-        # Unified RL requirement: use gRPC control signaling only.
         for client_id in self.registered_clients.keys():
             if client_id not in self.active_clients:
                 continue
@@ -1988,10 +1981,31 @@ class UnifiedFederatedLearningServer:
                 print(f"[gRPC] start_training flagged for client {client_id} (round {self.current_round})")
             except Exception as e:
                 pass
-    
+
+        # Publish via MQTT so event-driven clients receive the signal
+        message = json.dumps({'round': self.current_round})
+        try:
+            self.mqtt_client.publish("fl/start_training", message, qos=1)
+            print(f"[MQTT] start_training published (round {self.current_round})")
+        except Exception as e:
+            print(f"[MQTT] Error publishing start_training: {e}")
+
+        # Publish via DDS TrainingCommand
+        if DDS_AVAILABLE and 'command' in self.dds_writers:
+            try:
+                cmd = TrainingCommand(
+                    round=self.current_round,
+                    start_training=True,
+                    start_evaluation=False,
+                    training_complete=False
+                )
+                self.dds_writers['command'].write(cmd)
+                print(f"[DDS] start_training command published (round {self.current_round})")
+            except Exception as e:
+                print(f"[DDS] Error publishing start_training command: {e}")
+
     def signal_start_evaluation(self):
         """Signal all clients to start evaluation for current round"""
-        # Unified RL requirement: use gRPC control signaling only.
         for client_id in self.registered_clients.keys():
             if client_id not in self.active_clients:
                 continue
@@ -2002,6 +2016,28 @@ class UnifiedFederatedLearningServer:
                 print(f"[gRPC] start_evaluation flagged for client {client_id} (round {self.current_round})")
             except Exception as e:
                 pass
+
+        # Publish via MQTT so event-driven clients receive the signal
+        message = json.dumps({'round': self.current_round})
+        try:
+            self.mqtt_client.publish("fl/start_evaluation", message, qos=1)
+            print(f"[MQTT] start_evaluation published (round {self.current_round})")
+        except Exception as e:
+            print(f"[MQTT] Error publishing start_evaluation: {e}")
+
+        # Publish via DDS TrainingCommand
+        if DDS_AVAILABLE and 'command' in self.dds_writers:
+            try:
+                cmd = TrainingCommand(
+                    round=self.current_round,
+                    start_training=False,
+                    start_evaluation=True,
+                    training_complete=False
+                )
+                self.dds_writers['command'].write(cmd)
+                print(f"[DDS] start_evaluation command published (round {self.current_round})")
+            except Exception as e:
+                print(f"[DDS] Error publishing start_evaluation command: {e}")
 
     def _get_delivery_protocol(self, client_id):
         """Prefer the protocol used for the latest model update."""
@@ -2049,7 +2085,8 @@ class UnifiedFederatedLearningServer:
                         self.send_via_mqtt(client_id, "fl/global_model", message)
                         print(f"[MQTT] Sent global model to client {client_id}")
                     else:
-                        print(f"[MQTT] Global model for client {client_id} exceeds payload limit; client will pull via gRPC")
+                        print(f"[MQTT] Global model for client {client_id} exceeds payload limit; falling back to DDS chunking")
+                        self._send_global_model_via_dds(client_id, weights_data, weights_key)
                     
                 elif protocol == 'amqp':
                     message = {
@@ -2060,7 +2097,8 @@ class UnifiedFederatedLearningServer:
                         self.send_via_amqp(client_id, 'global_model', message)
                         print(f"[AMQP] Sent global model to client {client_id}")
                     else:
-                        print(f"[AMQP] Global model for client {client_id} exceeds payload limit; client will pull via gRPC")
+                        print(f"[AMQP] Global model for client {client_id} exceeds payload limit; falling back to DDS chunking")
+                        self._send_global_model_via_dds(client_id, weights_data, weights_key)
                     
                 elif protocol == 'quic':
                     # Send via QUIC stream (like single-protocol server does)
@@ -2083,7 +2121,8 @@ class UnifiedFederatedLearningServer:
                         self.send_http3_message(client_id, message)
                         print(f"[HTTP/3] Sent global model to client {client_id}")
                     else:
-                        print(f"[HTTP/3] Global model for client {client_id} exceeds payload limit; client will pull via gRPC")
+                        print(f"[HTTP/3] Global model for client {client_id} exceeds payload limit; falling back to DDS chunking")
+                        self._send_global_model_via_dds(client_id, weights_data, weights_key)
                     
                 elif protocol == 'grpc':
                     continue
@@ -2116,6 +2155,24 @@ class UnifiedFederatedLearningServer:
                 import traceback
                 traceback.print_exc()
     
+    def _send_global_model_via_dds(self, client_id, weights_data, weights_key):
+        """Fallback: send global model via DDS chunking when other protocols exceed payload limits."""
+        if DDS_AVAILABLE and 'global_model_chunk' in self.dds_writers:
+            try:
+                weights_bytes = base64.b64decode(weights_data)
+                weights_list = list(weights_bytes)
+                model_config_json = json.dumps(self.model_config) if self.model_config else ""
+                self.send_global_model_chunked(
+                    round_num=self.current_round,
+                    serialized_weights=weights_list,
+                    model_config=model_config_json
+                )
+                print(f"[DDS] Fallback: published chunked global model for client {client_id}")
+            except Exception as e:
+                print(f"[DDS] Fallback failed for client {client_id}: {e}")
+        else:
+            print(f"[Server] WARNING: No protocol available to deliver global model to client {client_id} (payload too large, gRPC/DDS unavailable)")
+
     def aggregate_models(self):
         """Aggregate client model updates using FedAvg"""
         if not self.client_updates:
