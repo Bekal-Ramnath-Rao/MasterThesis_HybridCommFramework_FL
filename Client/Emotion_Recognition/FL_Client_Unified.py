@@ -672,6 +672,7 @@ class UnifiedFLClient_Emotion:
             'success': False
         }
         self._last_rl_state = None  # for Q-learning log (state at time of action)
+        self._last_update_protocol = None  # protocol used to send local model update
         
         # DDS chunk reassembly buffers (FAIR CONFIG: matching standalone)
         self.global_model_chunks = {}  # {chunk_id: payload}
@@ -2058,6 +2059,7 @@ class UnifiedFLClient_Emotion:
     
     def train_local_model(self):
         """Train model on local data and send updates to server via RL-selected protocol"""
+        self._last_update_protocol = None
         # In diagnostic pipeline (native): run iperf3 from client on round 1 to measure network params
         self._run_iperf3_if_diagnostic()
         start_time = time.time()
@@ -2186,6 +2188,7 @@ class UnifiedFLClient_Emotion:
                     success = True
                 if success:
                     self.selected_protocol = attempt_protocol
+                    self._last_update_protocol = attempt_protocol
             except Exception as e:
                 print(f"Client {self.client_id} ERROR: {attempt_protocol} update send failed: {e}")
                 continue
@@ -2330,7 +2333,7 @@ class UnifiedFLClient_Emotion:
                             state_resource=st.get('resource', ''),
                             state_model_size=st.get('model_size', ''),
                             state_mobility=st.get('mobility', ''),
-                            action=self.selected_protocol or 'mqtt',
+                            action=self._last_update_protocol or self.selected_protocol or 'mqtt',
                             reward=reward,
                             q_delta=q_delta,
                             epsilon=self.rl_selector.epsilon,
