@@ -340,8 +340,22 @@ except ImportError:
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
-# Configure GPU - Force GPU 0 usage with memory growth
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+# Configure GPU - use GPU_DEVICE_ID env var if set, else CUDA_VISIBLE_DEVICES, else default to '0'
+_gpu_id = os.environ.get('GPU_DEVICE_ID', os.environ.get('CUDA_VISIBLE_DEVICES', '0'))
+os.environ['CUDA_VISIBLE_DEVICES'] = _gpu_id
+
+# Ensure pip-installed CUDA 12 ptxas is on PATH (system ptxas may be too old)
+import sys as _sys
+_nvcc_bin = os.path.join(_sys.prefix, 'lib', 'python' + '.'.join(map(str, _sys.version_info[:2])),
+                        'site-packages', 'nvidia', 'cuda_nvcc', 'bin')
+if os.path.isdir(_nvcc_bin) and _nvcc_bin not in os.environ.get('PATH', ''):
+    os.environ['PATH'] = _nvcc_bin + ':' + os.environ.get('PATH', '')
+
+# Remove stale CUDA 10.x paths from LD_LIBRARY_PATH to avoid library conflicts
+_ld_path = os.environ.get('LD_LIBRARY_PATH', '')
+_ld_path = ':'.join(p for p in _ld_path.split(':') if p and 'cuda-10' not in p)
+os.environ['LD_LIBRARY_PATH'] = _ld_path
+
 try:
     gpus = tf.config.list_physical_devices('GPU')
     if gpus:

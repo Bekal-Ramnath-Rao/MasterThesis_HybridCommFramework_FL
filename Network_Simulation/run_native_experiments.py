@@ -33,6 +33,47 @@ from typing import Dict, List, Optional, Tuple
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+NETWORK_SIM_DIR = PROJECT_ROOT / "Network_Simulation"
+
+
+def _load_local_privileged_env() -> None:
+    """Load local privileged env files into process env if values are missing."""
+    placeholder_values = {
+        "your_linux_username",
+        "your_linux_password",
+        "changeme",
+    }
+
+    def _is_placeholder(value: str) -> bool:
+        return value.strip().lower() in placeholder_values
+
+    candidates = [
+        NETWORK_SIM_DIR / ".privileged_ops.env",
+        NETWORK_SIM_DIR / "privileged_ops.env",
+    ]
+
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                        value = value[1:-1]
+                    if _is_placeholder(value):
+                        continue
+                    # Preserve explicit shell exports; only fill unset keys.
+                    if key and value and not os.environ.get(key):
+                        os.environ[key] = value
+        except OSError:
+            # Keep native runner robust even if local file permissions are unusual.
+            continue
 
 
 def _wait_for_port(host: str, port: int, timeout_sec: float = 30, ns_name: Optional[str] = None) -> bool:
@@ -711,8 +752,16 @@ class NativeExperimentRunner:
             env["QUANTIZATION_SYMMETRIC"] = "true" if self.quantization_symmetric else "false"
 
         if self.enable_gpu:
-            # In native mode we simply respect whatever CUDA_VISIBLE_DEVICES the user already set.
-            print("[INFO] GPU mode enabled for native server (respecting existing CUDA_VISIBLE_DEVICES).")
+            # Pin server to GPU 0; put pip CUDA 12 ptxas on PATH
+            env["CUDA_VISIBLE_DEVICES"] = "0"
+            env["GPU_DEVICE_ID"] = "0"
+            _nvcc_bin = os.path.join(
+                sys.prefix, 'lib',
+                f'python{sys.version_info[0]}.{sys.version_info[1]}',
+                'site-packages', 'nvidia', 'cuda_nvcc', 'bin')
+            if os.path.isdir(_nvcc_bin):
+                env["PATH"] = _nvcc_bin + ":" + env.get("PATH", "")
+            print("[INFO] GPU mode enabled for native server (GPU 0).")
 
         cmd, stdin_payload = self._netns_exec_args(
             server_ep.ns_name, sys.executable, str(self.server_script)
@@ -798,10 +847,15 @@ class NativeExperimentRunner:
                 env["QUANTIZATION_SYMMETRIC"] = "true" if self.quantization_symmetric else "false"
 
             if self.enable_gpu:
-                # Ensure every client uses a GPU: pin to GPU 0 so both use the same GPU
-                # (avoids one client falling back to CPU when only one GPU is present)
-                env["CUDA_VISIBLE_DEVICES"] = "0"
-                env.setdefault("GPU_DEVICE_ID", "0")
+                # Pin clients to GPU 1 if available, otherwise GPU 0
+                env["CUDA_VISIBLE_DEVICES"] = "1"
+                env["GPU_DEVICE_ID"] = "0"  # After CUDA_VISIBLE_DEVICES filtering, it's device 0
+                _nvcc_bin = os.path.join(
+                    sys.prefix, 'lib',
+                    f'python{sys.version_info[0]}.{sys.version_info[1]}',
+                    'site-packages', 'nvidia', 'cuda_nvcc', 'bin')
+                if os.path.isdir(_nvcc_bin):
+                    env["PATH"] = _nvcc_bin + ":" + env.get("PATH", "")
 
             cmd, stdin_payload = self._netns_exec_args(
                 ep.ns_name, sys.executable, str(self.client_script)
@@ -1225,6 +1279,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    _load_local_privileged_env()
     args = parse_args()
 
     # RL unified training: use a single client (Q-learning / policy training).
