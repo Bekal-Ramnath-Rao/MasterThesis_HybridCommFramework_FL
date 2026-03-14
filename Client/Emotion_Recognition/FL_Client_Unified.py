@@ -217,7 +217,6 @@ if HTTP3_AVAILABLE and QuicConnectionProtocol is not None:
                     stream_id = event.stream_id
                     headers = dict(event.headers)
                     status = headers.get(b":status", b"").decode()
-                    print(f"[HTTP/3] Client received headers on stream {stream_id}, status: {status}")
                     
                     # Initialize buffer for this stream
                     if stream_id not in self._stream_buffers:
@@ -237,7 +236,6 @@ if HTTP3_AVAILABLE and QuicConnectionProtocol is not None:
                     
                     # Append new data to buffer
                     self._stream_buffers[stream_id] += event.data
-                    print(f"[HTTP/3] Client stream {stream_id}: received {len(event.data)} bytes, buffer now {len(self._stream_buffers[stream_id])} bytes")
                     
                     # Send flow control updates
                     self.transmit()
@@ -253,8 +251,6 @@ if HTTP3_AVAILABLE and QuicConnectionProtocol is not None:
                         try:
                             data_str = self._stream_buffers[stream_id].decode('utf-8')
                             message = json.loads(data_str) if data_str else {}
-                            msg_type = message.get('type', 'response') if isinstance(message, dict) else 'response'
-                            print(f"[HTTP/3] Client decoded complete message type '{msg_type}' from stream {stream_id}")
 
                             status_code = self._stream_status_codes.get(stream_id)
                             if stream_id in self._response_waiters:
@@ -297,7 +293,6 @@ if HTTP3_AVAILABLE and QuicConnectionProtocol is not None:
                 stream_id = event.stream_id
                 if stream_id in self._stream_buffers:
                     del self._stream_buffers[stream_id]
-                    print(f"[HTTP/3] Client stream {stream_id} reset, cleared buffer")
                 self._stream_content_lengths.pop(stream_id, None)
                 self._stream_status_codes.pop(stream_id, None)
                 self._finish_response_waiter(
@@ -3692,8 +3687,7 @@ class UnifiedFLClient_Emotion:
         self.http3_protocol.transmit()
         await asyncio.sleep(0.05)
         self.http3_protocol.transmit()
-        
-        print(f"[HTTP/3] Client {self.client_id} sent data on stream {stream_id} ({len(payload_bytes)} bytes)")
+
         try:
             return await asyncio.wait_for(response_waiter, timeout=10.0)
         except asyncio.TimeoutError as e:

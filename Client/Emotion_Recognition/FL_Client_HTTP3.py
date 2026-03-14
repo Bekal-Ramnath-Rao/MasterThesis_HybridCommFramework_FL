@@ -117,28 +117,15 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
         """Handle QUIC events and convert to HTTP/3 events"""
         try:
             event_type = type(event).__name__
-            # Log important events
-            if event_type in ['ConnectionTerminated', 'StreamDataReceived', 'StreamReset']:
-                print(f"[HTTP/3] Client QUIC event: {event_type}")
-                if hasattr(event, 'stream_id'):
-                    print(f"  Stream ID: {event.stream_id}")
-                if event_type == 'ConnectionTerminated':
-                    if hasattr(event, 'error_code'):
-                        print(f"  Error code: {event.error_code}")
-                    if hasattr(event, 'reason_phrase'):
-                        print(f"  Reason: {event.reason_phrase}")
             
             # Initialize H3 connection on first event
             if self._http is None:
-                print(f"[HTTP/3] Client initializing H3Connection")
                 self._http = H3Connection(self._quic)
             
             # Convert QUIC events to HTTP/3 events
             if self._http is not None:
                 try:
                     h3_events = self._http.handle_event(event)
-                    if h3_events:
-                        print(f"[HTTP/3] Client generated {len(h3_events)} H3 event(s) from {event_type}")
                     for h3_event in h3_events:
                         self._handle_h3_event(h3_event)
                 except Exception as h3_error:
@@ -157,8 +144,6 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
                 stream_id = event.stream_id
                 headers = dict(event.headers)
                 status = headers.get(b":status", b"").decode()
-                method = headers.get(b":method", b"").decode()
-                print(f"[HTTP/3] Client received headers on stream {stream_id}, status: {status}, method: {method}")
                 
                 # Initialize buffer for this stream
                 if stream_id not in self._stream_buffers:
@@ -168,7 +153,6 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
                 if b"content-length" in headers:
                     content_length = int(headers.get(b"content-length", b"0"))
                     self._stream_content_lengths[stream_id] = content_length
-                    print(f"[HTTP/3] Client expecting {content_length} bytes on stream {stream_id}")
             except Exception as e:
                 print(f"[HTTP/3] Client error handling headers: {e}")
         
@@ -238,11 +222,17 @@ class FederatedLearningClient:
         self.train_generator = train_generator
         self.validation_generator = validation_generator
         self.current_round = 0
+        self.last_global_round = -1
+        self.last_training_round = -1
+        self.pending_start_training_round = None
         self.training_config = {"batch_size": 16, "local_epochs": 20}
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.has_converged = False
         self.running = True
+        self.training_in_progress = False
+        self.training_lock = asyncio.Lock()
+        self.training_task = None
         self.protocol = None
         self.stream_id = 0
         self.model_ready = asyncio.Event()  # Event to signal model is ready
@@ -350,22 +340,15 @@ class FederatedLearningClient:
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(payload)).encode()),
             ]
-            print(f"[HTTP/3] Client {self.client_id} sending {msg_type} on stream {self.stream_id}, payload size: {len(payload)} bytes")
             self.protocol._http.send_headers(stream_id=self.stream_id, headers=headers)
             if len(payload) <= HTTP3_MAX_STREAM_DATA_BYTES:
                 self.protocol._http.send_data(stream_id=self.stream_id, data=payload, end_stream=True)
             else:
-                total_chunks = (len(payload) + HTTP3_DATA_CHUNK_BYTES - 1) // HTTP3_DATA_CHUNK_BYTES
-                print(
-                    f"[HTTP/3] Client {self.client_id} chunking outbound {msg_type}: "
-                    f"{len(payload)} bytes across {total_chunks} chunks"
-                )
                 for offset in range(0, len(payload), HTTP3_DATA_CHUNK_BYTES):
                     chunk = payload[offset:offset + HTTP3_DATA_CHUNK_BYTES]
                     is_last = (offset + HTTP3_DATA_CHUNK_BYTES) >= len(payload)
                     self.protocol._http.send_data(stream_id=self.stream_id, data=chunk, end_stream=is_last)
             self.protocol.transmit()
-            print(f"[HTTP/3] Client {self.client_id} transmitted {msg_type} message")
             
             # FAIR FIX: Removed artificial delays (1.5s for large, 0.1s for small messages)
             # HTTP/3 handles flow control automatically, so manual delays are unnecessary
@@ -463,6 +446,9 @@ class FederatedLearningClient:
     async def handle_global_model(self, message):
         """Receive and set global model weights and architecture from server"""
         round_num = message['round']
+        if round_num <= self.last_global_round:
+            print(f"Client {self.client_id}: Ignoring duplicate global model for round {round_num}")
+            return
         print(f"Client {self.client_id}: Received global_model message for round {round_num}")
         
         # Decompress or deserialize weights
@@ -530,6 +516,7 @@ class FederatedLearningClient:
             self.model.set_weights(weights)
             print(f"Client {self.client_id} model initialized with server weights")
             self.current_round = 0
+            self.last_global_round = round_num
             self.model_ready.set()  # Signal that model is ready
         else:
             # Updated model after aggregation
@@ -541,15 +528,51 @@ class FederatedLearningClient:
                 print(f"Client {self.client_id} received global model for round {round_num}")
             else:
                 print(f"Client {self.client_id} received late global model for round {round_num} (currently at round {self.current_round}), updating weights only")
+            self.last_global_round = round_num
             self.model_ready.set()  # Signal that model is ready
+
+        if self.pending_start_training_round is not None and self.model_ready.is_set():
+            pending_round = self.pending_start_training_round
+            self.pending_start_training_round = None
+            await self._start_training_for_round(pending_round)
+
+    async def _training_runner(self, round_num):
+        async with self.training_lock:
+            self.training_in_progress = True
+            try:
+                await self.train_local_model()
+            except Exception as e:
+                print(f"Client {self.client_id} training error on round {round_num}: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                self.training_in_progress = False
+
+    async def _start_training_for_round(self, round_num):
+        if self.training_in_progress:
+            print(f"Client {self.client_id} training already in progress; ignoring start for round {round_num}")
+            return
+        if self.last_training_round == round_num:
+            print(f"Client {self.client_id} ignoring duplicate start_training for round {round_num}")
+            return
+
+        self.current_round = round_num
+        self.last_training_round = round_num
+        print(f"\nClient {self.client_id} starting training for round {round_num}...")
+        self.training_task = asyncio.create_task(self._training_runner(round_num))
     
     async def handle_start_training(self, message):
         """Start local training when server signals"""
         round_num = message['round']
+
+        if self.last_training_round == round_num:
+            print(f"Client {self.client_id} ignoring duplicate start_training for round {round_num}")
+            return
         
         # Wait for model to be initialized (optional timeout; no timeout in diagnostic pipeline)
         if not self.model_ready.is_set():
             print(f"Client {self.client_id} waiting for model initialization before training round {round_num}...")
+            self.pending_start_training_round = round_num
             if MODEL_INIT_TIMEOUT is None:
                 print(f"Client {self.client_id} no timeout (wait indefinitely; set MODEL_INIT_TIMEOUT for a limit)")
                 await self.model_ready.wait()
@@ -563,14 +586,12 @@ class FederatedLearningClient:
                     print(f"Client {self.client_id} ERROR: Timeout waiting for model initialization after {MODEL_INIT_TIMEOUT}s")
                     print(f"Client {self.client_id} TIP: Set MODEL_INIT_TIMEOUT=0 to wait indefinitely")
                     return
+            self.pending_start_training_round = None
         
         if self.current_round == 0 and round_num == 1:
-            self.current_round = round_num
-            print(f"\nClient {self.client_id} starting training for round {round_num} with initial global model...")
-            await self.train_local_model()
+            await self._start_training_for_round(round_num)
         elif round_num == self.current_round:
-            print(f"\nClient {self.client_id} starting training for round {round_num}...")
-            await self.train_local_model()
+            await self._start_training_for_round(round_num)
         else:
             print(f"Client {self.client_id} round mismatch - received signal for round {round_num}, currently at {self.current_round}")
     
@@ -619,14 +640,18 @@ class FederatedLearningClient:
         print(f"Training on {self.train_generator.n} samples for {epochs} epochs...")
         
         training_start = time.time()
-        # Train the model directly (synchronous call is faster, no executor overhead)
-        history = self.model.fit(
-            self.train_generator,
-            epochs=epochs,
-            steps_per_epoch=steps_per_epoch,
-            validation_data=self.validation_generator,
-            validation_steps=val_steps,
-            verbose=2
+        # Run fit in executor so HTTP/3 event loop remains responsive during long training.
+        loop = asyncio.get_running_loop()
+        history = await loop.run_in_executor(
+            None,
+            lambda: self.model.fit(
+                self.train_generator,
+                epochs=epochs,
+                steps_per_epoch=steps_per_epoch,
+                validation_data=self.validation_generator,
+                validation_steps=val_steps,
+                verbose=2
+            )
         )
         
         # Get updated weights

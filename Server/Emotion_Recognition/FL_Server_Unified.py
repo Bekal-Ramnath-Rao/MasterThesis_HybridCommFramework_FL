@@ -1136,7 +1136,6 @@ class UnifiedFederatedLearningServer:
             def create_protocol(*args, **kwargs):
                 protocol = HTTP3ServerProtocol(*args, **kwargs)
                 protocol.server = self
-                print(f"[HTTP/3] Server created protocol instance for new connection")
                 return protocol
             
             print(f"[HTTP/3] Server starting serve() on {HTTP3_HOST}:{HTTP3_PORT}")
@@ -1146,8 +1145,6 @@ class UnifiedFederatedLearningServer:
                 configuration=configuration,
                 create_protocol=create_protocol,
             )
-            print(f"[HTTP/3] ✓ Server serve() completed, now running indefinitely")
-            print(f"[HTTP/3] Server is ready to accept connections")
             # Keep server running indefinitely
             await asyncio.Future()  # Run forever
         except Exception as e:
@@ -1164,7 +1161,6 @@ class UnifiedFederatedLearningServer:
             # Store HTTP/3 protocol reference for ANY message (not just registration)
             if client_id and client_id != 'unknown':
                 self.http3_clients[client_id] = protocol
-                print(f"[HTTP/3] Stored protocol reference for client {client_id}")
             
             # Use asyncio.to_thread to call synchronous methods from async context
             # This ensures thread-safe execution of methods with locks
@@ -1172,18 +1168,14 @@ class UnifiedFederatedLearningServer:
             
             if msg_type == 'register':
                 await loop.run_in_executor(None, self.handle_client_registration, client_id, 'http3')
-                print(f"[HTTP/3] Received registration from client {client_id}")
             elif msg_type in ('update', 'model_update'):
                 await loop.run_in_executor(None, self.handle_client_update, message, 'http3')
-                print(f"[HTTP/3] Received update from client {client_id}")
             elif msg_type == 'update_chunk':
                 reconstructed = await loop.run_in_executor(None, self._handle_transport_update_chunk, message, 'http3')
                 if reconstructed is not None:
                     await loop.run_in_executor(None, self.handle_client_update, reconstructed, 'http3')
-                    print(f"[HTTP/3] Received reassembled update from client {client_id}")
             elif msg_type == 'metrics':
                 await loop.run_in_executor(None, self.handle_client_metrics, message, 'http3')
-                print(f"[HTTP/3] Received metrics from client {client_id}")
         except Exception as e:
             print(f"[HTTP/3] Error handling message: {e}")
             import traceback
@@ -1221,7 +1213,6 @@ class UnifiedFederatedLearningServer:
             protocol.transmit()
             
             msg_type = message.get('type')
-            print(f"[HTTP/3] Sent {msg_type} to client {client_id} on stream {stream_id} ({len(payload)} bytes)")
             
             log_sent_packet(
                 packet_size=len(payload),
@@ -2775,7 +2766,6 @@ if HTTP3_AVAILABLE:
             self._http = None  # H3Connection instance
             self._stream_buffers = {}  # Buffer data per stream ID (instance-specific)
             self._stream_content_lengths = {}
-            print(f"[HTTP/3] Protocol instance created")
         
         def quic_event_received(self, event):
             """Handle QUIC events and convert to HTTP/3 events"""
@@ -2794,9 +2784,6 @@ if HTTP3_AVAILABLE:
                     stream_id = event.stream_id
                     headers = dict(event.headers)
                     method = headers.get(b":method", b"").decode()
-                    path = headers.get(b":path", b"").decode()
-                    
-                    print(f"[HTTP/3] Received {method} request on stream {stream_id}, path: {path}")
                     
                     # Initialize buffer for this stream
                     if stream_id not in self._stream_buffers:
@@ -2806,7 +2793,6 @@ if HTTP3_AVAILABLE:
                     if method == "POST":
                         content_length = int(headers.get(b"content-length", b"0"))
                         self._stream_content_lengths[stream_id] = content_length
-                        print(f"[HTTP/3] Expecting {content_length} bytes on stream {stream_id}")
                     
                 except Exception as e:
                     print(f"[HTTP/3] Error handling headers: {e}")
@@ -2822,7 +2808,6 @@ if HTTP3_AVAILABLE:
                     
                     # Append new data to buffer
                     self._stream_buffers[stream_id] += event.data
-                    print(f"[HTTP/3] Stream {stream_id}: received {len(event.data)} bytes, buffer now {len(self._stream_buffers[stream_id])} bytes")
                     
                     # Send flow control updates to allow more data
                     self.transmit()
@@ -2834,9 +2819,8 @@ if HTTP3_AVAILABLE:
                         try:
                             data_str = self._stream_buffers[stream_id].decode('utf-8')
                             message = json.loads(data_str)
-                            msg_type = message.get('type', 'unknown')
                             client_id = message.get('client_id', 'unknown')
-                            print(f"[HTTP/3] Decoded complete message type '{msg_type}' from stream {stream_id}")
+                            msg_type = message.get('type', 'unknown')
                             
                             log_received_packet(
                                 packet_size=len(data_str),

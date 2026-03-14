@@ -45,6 +45,8 @@ from aioquic.h3.events import DataReceived, HeadersReceived, H3Event
 # Server Configuration (use 0.0.0.0 for host network mode; 127.0.0.1 for local only)
 HTTP3_HOST = os.getenv("HTTP3_HOST", "0.0.0.0")
 HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
+INITIAL_MODEL_BROADCAST_ATTEMPTS = max(1, int(os.getenv("HTTP3_INITIAL_MODEL_BROADCAST_ATTEMPTS", "1")))
+INITIAL_MODEL_BROADCAST_INTERVAL_SEC = float(os.getenv("HTTP3_INITIAL_MODEL_BROADCAST_INTERVAL_SEC", "1.0"))
 # Dynamic client configuration
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
@@ -76,7 +78,6 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
             try:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, QUIC_SOCKET_BUFFER_BYTES)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, QUIC_SOCKET_BUFFER_BYTES)
-                print(f"[HTTP/3] UDP socket buffers set to {QUIC_SOCKET_BUFFER_BYTES // 1_000_000}MB")
             except OSError as e:
                 print(f"[HTTP/3] Could not set socket buffers: {e}")
     
@@ -85,33 +86,12 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
         try:
             event_type = type(event).__name__
             
-            # Log all QUIC events for debugging (especially stream events)
-            if event_type in ['ConnectionIdIssued', 'ConnectionTerminated', 'StreamReset', 'StreamDataReceived', 'DatagramFrameReceived', 'StreamCreated', 'ConnectionEstablished', 'ProtocolNegotiated']:
-                print(f"[HTTP/3] QUIC event: {event_type}")
-                if hasattr(event, 'stream_id'):
-                    print(f"  Stream ID: {event.stream_id}")
-                if hasattr(event, 'data') and event.data:
-                    print(f"  Data size: {len(event.data)} bytes")
-                if event_type == 'ConnectionTerminated':
-                    if hasattr(event, 'error_code'):
-                        print(f"  Error code: {event.error_code}")
-                    if hasattr(event, 'reason_phrase'):
-                        print(f"  Reason: {event.reason_phrase}")
-                if event_type == 'ProtocolNegotiated':
-                    if hasattr(event, ' alpn_protocol'):
-                        print(f"  ALPN Protocol: {event.alpn_protocol}")
-            
-            # Also log StreamDataReceived events (these contain the actual HTTP/3 request data)
-            if event_type == 'StreamDataReceived':
-                print(f"[HTTP/3] Received stream data: stream_id={event.stream_id}, size={len(event.data)} bytes, end_stream={event.end_stream}")
-            
             # Initialize H3 connection on first event (but only if ALPN is negotiated)
             # For HTTP/3, we should wait for ProtocolNegotiated event, but H3Connection can be initialized earlier
             if self._http is None:
                 # Check if ALPN is negotiated (H3_ALPN should be in the negotiated protocol)
                 try:
                     # Initialize H3 connection - it will handle ALPN validation internally
-                    print(f"[HTTP/3] Initializing H3Connection for new client")
                     self._http = H3Connection(self._quic)
                 except Exception as init_error:
                     print(f"[HTTP/3] Error initializing H3Connection: {init_error}")
@@ -124,12 +104,8 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                 try:
                     h3_events = self._http.handle_event(event)
                     if h3_events:
-                        print(f"[HTTP/3] Generated {len(h3_events)} H3 event(s) from QUIC event {event_type}")
                         for h3_event in h3_events:
                             self._handle_h3_event(h3_event)
-                    elif event_type not in ['ConnectionIdIssued', 'ConnectionTerminated', 'ConnectionEstablished']:
-                        # Log if we're not generating H3 events from important QUIC events
-                        print(f"[HTTP/3] No H3 events generated from {event_type}")
                 except Exception as h3_error:
                     print(f"[HTTP/3] Error converting QUIC event to H3: {h3_error}")
                     import traceback
@@ -141,18 +117,11 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
     
     def _handle_h3_event(self, event: H3Event):
         """Handle HTTP/3 events"""
-        event_type = type(event).__name__
-        stream_id = getattr(event, 'stream_id', 'N/A')
-        print(f"[HTTP/3] H3 event: {event_type}, stream_id: {stream_id}, server: {self.server is not None}")
-        
         if isinstance(event, HeadersReceived):
             try:
                 stream_id = event.stream_id
                 headers = dict(event.headers)
                 method = headers.get(b":method", b"").decode()
-                path = headers.get(b":path", b"").decode()
-                
-                print(f"[HTTP/3] Received {method} request on stream {stream_id}, path: {path}")
                 
                 # Initialize buffer for this stream
                 if stream_id not in self._stream_buffers:
@@ -162,7 +131,6 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                 if method == "POST":
                     content_length = int(headers.get(b"content-length", b"0"))
                     self._stream_content_lengths[stream_id] = content_length
-                    print(f"[HTTP/3] Expecting {content_length} bytes on stream {stream_id}")
             except Exception as e:
                 print(f"[HTTP/3] Error handling headers: {e}")
                 import traceback
@@ -190,9 +158,7 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                     try:
                         data_str = self._stream_buffers[stream_id].decode('utf-8')
                         message = json.loads(data_str)
-                        msg_type = message.get('type', 'unknown')
                         client_id = message.get('client_id', 'unknown')
-                        print(f"[HTTP/3] Decoded complete message type '{msg_type}' from client {client_id} on stream {stream_id}")
                         
                         # Send HTTP/3 response
                         response_body = json.dumps({"status": "ok"}).encode('utf-8')
@@ -207,7 +173,6 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                         
                         # Handle message asynchronously
                         if self.server:
-                            print(f"[HTTP/3] Processing message type '{msg_type}' from client {client_id}")
                             asyncio.create_task(self.server.handle_message(message, self))
                         else:
                             print(f"[HTTP/3] ERROR: Server reference is None!")
@@ -364,7 +329,6 @@ class FederatedLearningServer:
         protocol = self.registered_clients[client_id]
         # Ensure HTTP connection is initialized
         if protocol._http is None:
-            print(f"[HTTP/3] Initializing H3Connection for client {client_id}")
             protocol._http = H3Connection(protocol._quic)
         
         # Get next available stream ID (bidirectional for server push)
@@ -389,20 +353,11 @@ class FederatedLearningServer:
             if len(payload) <= HTTP3_MAX_STREAM_DATA_BYTES:
                 protocol._http.send_data(stream_id=stream_id, data=payload, end_stream=True)
             else:
-                total_chunks = (len(payload) + HTTP3_DATA_CHUNK_BYTES - 1) // HTTP3_DATA_CHUNK_BYTES
-                print(
-                    f"[HTTP/3] Chunking outbound {message.get('type')} to client {client_id}: "
-                    f"{len(payload)} bytes across {total_chunks} chunks"
-                )
                 for offset in range(0, len(payload), HTTP3_DATA_CHUNK_BYTES):
                     chunk = payload[offset:offset + HTTP3_DATA_CHUNK_BYTES]
                     is_last = (offset + HTTP3_DATA_CHUNK_BYTES) >= len(payload)
                     protocol._http.send_data(stream_id=stream_id, data=chunk, end_stream=is_last)
             protocol.transmit()
-            
-            msg_type = message.get('type')
-            msg_size_mb = len(payload) / (1024 * 1024)
-            print(f"[HTTP/3] Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(payload)} bytes = {msg_size_mb:.2f} MB)")
         except Exception as e:
             print(f"[ERROR] Failed to send message to client {client_id}: {e}")
             import traceback
@@ -446,6 +401,13 @@ class FederatedLearningServer:
 
         buf = self.transport_update_chunks[key]
         buf['chunks'][chunk_index] = payload_chunk
+
+        # Chunk 0 carries authoritative metadata; it may arrive after other chunks.
+        if chunk_index == 0:
+            buf['num_samples'] = data.get('num_samples', buf.get('num_samples', 0))
+            buf['metrics'] = data.get('metrics', buf.get('metrics', {}))
+            if data.get('diagnostic_send_start_ts') is not None:
+                buf['diagnostic_send_start_ts'] = data.get('diagnostic_send_start_ts')
 
         received = len(buf['chunks'])
         if received % 20 == 0 or received == total_chunks:
@@ -678,16 +640,17 @@ class FederatedLearningServer:
             weights_data = self.serialize_weights(self.global_weights)
             weights_key = 'weights'
         
-        print("Publishing initial model to clients (sending multiple times for reliability)...")
-        for i in range(3):
+        print(f"Publishing initial model to clients ({INITIAL_MODEL_BROADCAST_ATTEMPTS} pass(es))...")
+        for i in range(INITIAL_MODEL_BROADCAST_ATTEMPTS):
             await self.broadcast_message({
                 'type': 'global_model',
                 'round': 0,
                 weights_key: weights_data,
                 'model_config': model_config
             })
-            print(f"  Attempt {i+1}/3: Initial model broadcast complete")
-            await asyncio.sleep(2.0)
+            print(f"  Attempt {i+1}/{INITIAL_MODEL_BROADCAST_ATTEMPTS}: Initial model broadcast complete")
+            if i < INITIAL_MODEL_BROADCAST_ATTEMPTS - 1:
+                await asyncio.sleep(INITIAL_MODEL_BROADCAST_INTERVAL_SEC)
         
         print("Initial global model (architecture + weights) sent to all clients")
         print("Waiting for clients to initialize their models (TensorFlow + CNN building)...")
@@ -707,9 +670,23 @@ class FederatedLearningServer:
     async def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
+
+        if not self.client_updates:
+            print("No client updates available to aggregate; waiting for next round signal.")
+            return
         
         total_samples = sum(update['num_samples'] 
                           for update in self.client_updates.values())
+
+        if total_samples <= 0:
+            print("Warning: total_samples is 0 during model aggregation; falling back to equal-weight averaging.")
+            total_samples = len(self.client_updates)
+            sample_weights = {cid: 1.0 / total_samples for cid in self.client_updates.keys()}
+        else:
+            sample_weights = {
+                cid: (update['num_samples'] / total_samples)
+                for cid, update in self.client_updates.items()
+            }
         
         aggregated_weights = []
         first_client_weights = list(self.client_updates.values())[0]['weights']
@@ -718,7 +695,7 @@ class FederatedLearningServer:
             layer_weights = np.zeros_like(first_client_weights[layer_idx])
             
             for client_id, update in self.client_updates.items():
-                weight = update['num_samples'] / total_samples
+                weight = sample_weights[client_id]
                 layer_weights += weight * update['weights'][layer_idx]
             
             aggregated_weights.append(layer_weights)
@@ -754,18 +731,30 @@ class FederatedLearningServer:
     async def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
         print(f"\nAggregating metrics from {len(self.client_metrics)} clients...")
+        if not self.client_metrics:
+            print("No client metrics available to aggregate; waiting for next round signal.")
+            return
         if getattr(self, 'round_start_time', None) is not None:
             self.ROUND_TIMES.append(time.time() - self.round_start_time)
         socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
         self.BATTERY_CONSUMPTION.append(1.0 - (sum(socs) / len(socs) if socs else 1.0))
         total_samples = sum(metric['num_samples'] 
                           for metric in self.client_metrics.values())
-        
-        aggregated_accuracy = sum(metric['metrics']['accuracy'] * metric['num_samples']
+
+        if total_samples <= 0:
+            print("Warning: total_samples is 0 during metrics aggregation; using simple mean over clients.")
+            aggregated_accuracy = float(np.mean([
+                metric['metrics']['accuracy'] for metric in self.client_metrics.values()
+            ]))
+            aggregated_loss = float(np.mean([
+                metric['metrics']['loss'] for metric in self.client_metrics.values()
+            ]))
+        else:
+            aggregated_accuracy = sum(metric['metrics']['accuracy'] * metric['num_samples']
+                                     for metric in self.client_metrics.values()) / total_samples
+            
+            aggregated_loss = sum(metric['metrics']['loss'] * metric['num_samples']
                                  for metric in self.client_metrics.values()) / total_samples
-        
-        aggregated_loss = sum(metric['metrics']['loss'] * metric['num_samples']
-                             for metric in self.client_metrics.values()) / total_samples
         
         self.ACCURACY.append(aggregated_accuracy)
         self.LOSS.append(aggregated_loss)
