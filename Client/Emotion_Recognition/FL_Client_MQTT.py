@@ -8,10 +8,12 @@ import base64
 import time
 import random
 import threading
+import queue
 import paho.mqtt.client as mqtt
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ.setdefault("XLA_FLAGS", "--xla_gpu_enable_command_buffer=")
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
 # Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
 # This ensures different clients use different GPUs in multi-GPU setups
@@ -110,6 +112,7 @@ NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "5"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
 
 # MQTT Topics
 TOPIC_GLOBAL_MODEL = "fl/global_model"
@@ -119,6 +122,9 @@ TOPIC_TRAINING_CONFIG = "fl/training_config"
 TOPIC_START_TRAINING = "fl/start_training"
 TOPIC_START_EVALUATION = "fl/start_evaluation"
 TOPIC_TRAINING_COMPLETE = "fl/training_complete"
+
+MQTT_MAX_PAYLOAD_BYTES = 128 * 1024
+MQTT_CHUNK_PAYLOAD_BYTES = 96 * 1024
 
 class FederatedLearningClient:
     def __init__(self, client_id, num_clients, train_generator=None, validation_generator=None):
@@ -144,6 +150,9 @@ class FederatedLearningClient:
         self.model = None
         self._pending_start_training_round = None  # set if start_training arrives before model ready
         self._model_lock = threading.Lock()
+        self._training_lock = threading.Lock()
+        self._training_thread = None
+        self.shutdown_requested = False
 
         # Initialize packet logger database
         init_db()
@@ -170,10 +179,14 @@ class FederatedLearningClient:
         # FAIR CONFIG: Limited queue to 1000 messages (aligned with AMQP/gRPC)
         self.mqtt_client.max_queued_messages_set(1000)
         # Realistic max payload: MQTT 128 KB
-        self.mqtt_client._max_packet_size = 128 * 1024  # 128 KB
+        self.mqtt_client._max_packet_size = MQTT_MAX_PAYLOAD_BYTES
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
         self.mqtt_client.on_disconnect = self.on_disconnect
+        self._global_model_chunk_buffers = {}
+        self._global_model_queue = queue.Queue()
+        self._global_model_worker = threading.Thread(target=self._global_model_worker_loop, daemon=True)
+        self._global_model_worker.start()
         
     
     def serialize_weights(self, weights):
@@ -187,6 +200,66 @@ class FederatedLearningClient:
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
+
+    def _apply_generator_batch_size(self, batch_size):
+        """Sync DirectoryIterator batch size with training config."""
+        try:
+            batch_size = int(batch_size)
+        except (TypeError, ValueError):
+            return
+        if batch_size <= 0:
+            return
+
+        changed = False
+        for gen_name in ("train_generator", "validation_generator"):
+            generator = getattr(self, gen_name, None)
+            if generator is None:
+                continue
+            current = getattr(generator, "batch_size", None)
+            if current != batch_size:
+                setattr(generator, "batch_size", batch_size)
+                changed = True
+        if changed:
+            print(f"Client {self.client_id} synchronized generator batch_size to {batch_size}")
+
+    def _global_model_worker_loop(self):
+        """Serialize global model processing to avoid multiple concurrent TF graphs."""
+        while True:
+            payload = self._global_model_queue.get()
+            if payload is None:
+                break
+            try:
+                self._handle_global_model_thread(payload)
+            except Exception as e:
+                print(f"Client {self.client_id} global model worker error: {e}")
+            finally:
+                self._global_model_queue.task_done()
+
+    def _launch_training_for_round(self, round_num):
+        """Start local training in a background thread so MQTT loop remains responsive."""
+        with self._training_lock:
+            if self._training_thread is not None and self._training_thread.is_alive():
+                print(f"Client {self.client_id} training already in progress; ignoring start for round {round_num}")
+                return
+
+            self.current_round = round_num
+            self.last_training_round = round_num
+            print(f"\nClient {self.client_id} starting training for round {round_num}...")
+
+            self._training_thread = threading.Thread(
+                target=self._train_local_model_safe,
+                args=(round_num,),
+                daemon=True,
+            )
+            self._training_thread.start()
+
+    def _train_local_model_safe(self, round_num):
+        try:
+            self.train_local_model()
+        except Exception as e:
+            print(f"Client {self.client_id} training thread error on round {round_num}: {e}")
+            import traceback
+            traceback.print_exc()
     
     def build_model_from_config(self, model_config):
         """Build CNN model from server-provided configuration"""
@@ -285,9 +358,9 @@ class FederatedLearningClient:
             )
 
             if msg.topic == TOPIC_GLOBAL_MODEL:
-                # Process large payload in a thread so the MQTT loop stays responsive (avoids timeout/disconnect)
+                # Queue payload for a single worker thread to avoid concurrent graph creation/OOM
                 payload_copy = bytes(msg.payload)
-                threading.Thread(target=self._handle_global_model_thread, args=(payload_copy,), daemon=True).start()
+                self._global_model_queue.put(payload_copy)
             elif msg.topic == TOPIC_TRAINING_CONFIG:
                 self.handle_training_config(msg.payload)
             elif msg.topic == TOPIC_START_TRAINING:
@@ -303,12 +376,11 @@ class FederatedLearningClient:
     
     def on_disconnect(self, client, userdata, rc):
         """Callback when disconnected from MQTT broker"""
-        if rc == 0:
+        if rc == 0 and self.shutdown_requested:
             print(f"Client {self.client_id} clean disconnect from broker")
             print(f"Client {self.client_id} exiting...")
             self.mqtt_client.loop_stop()
-            import sys
-            sys.exit(0)
+            return
         else:
             # rc=16: keepalive timeout (broker didn't see traffic in time). rc=7: duplicate client ID / connection lost.
             print(f"Client {self.client_id} unexpected disconnect, return code {rc}")
@@ -320,6 +392,157 @@ class FederatedLearningClient:
             else:
                 # rc=16 or other: let paho auto-reconnect (loop_forever with retry_first_connection=True)
                 print(f"Client {self.client_id} attempting to reconnect...")
+
+    def _assemble_global_model_chunk(self, data):
+        """Buffer and reassemble chunked global-model messages."""
+        try:
+            chunk_index = int(data.get("chunk_index", 0))
+            total_chunks = int(data.get("total_chunks", 1))
+            round_num = int(data["round"])
+            payload_key = data["payload_key"]
+            payload_chunk = data.get("payload_chunk", "")
+        except Exception as e:
+            print(f"Client {self.client_id} invalid global model chunk metadata: {e}")
+            return None
+
+        if total_chunks <= 1:
+            assembled = dict(data)
+            assembled[payload_key] = payload_chunk
+            assembled.pop("payload_chunk", None)
+            assembled.pop("payload_key", None)
+            assembled["message_type"] = "global_model"
+            assembled["type"] = "global_model"
+            return assembled
+
+        chunk_key = (round_num, payload_key)
+        entry = self._global_model_chunk_buffers.setdefault(
+            chunk_key,
+            {"chunks": {}, "total_chunks": total_chunks, "base": None, "updated_at": time.time()}
+        )
+
+        if entry["base"] is None:
+            entry["base"] = {
+                "round": round_num,
+                "message_type": "global_model",
+                "type": "global_model",
+                "model_config": data.get("model_config")
+            }
+            if "training_config" in data:
+                entry["base"]["training_config"] = data.get("training_config")
+
+        if data.get("model_config") and not entry["base"].get("model_config"):
+            entry["base"]["model_config"] = data.get("model_config")
+        if "training_config" in data and not entry["base"].get("training_config"):
+            entry["base"]["training_config"] = data.get("training_config")
+
+        if chunk_index not in entry["chunks"]:
+            entry["chunks"][chunk_index] = payload_chunk
+        entry["updated_at"] = time.time()
+
+        if len(entry["chunks"]) < total_chunks:
+            return None
+
+        assembled_payload = "".join(entry["chunks"].get(i, "") for i in range(total_chunks))
+        assembled = dict(entry["base"])
+        assembled[payload_key] = assembled_payload
+        self._global_model_chunk_buffers.pop(chunk_key, None)
+        print(
+            f"Client {self.client_id} reassembled global model for round {round_num} "
+            f"from {total_chunks} chunks"
+        )
+        return assembled
+
+    def _chunk_model_update_messages(self, update_message):
+        payload_key = "compressed_data" if "compressed_data" in update_message else "weights"
+        payload_text = update_message[payload_key]
+        if not isinstance(payload_text, str):
+            raise TypeError(f"Expected string payload for {payload_key}, got {type(payload_text).__name__}")
+
+        chunks = [
+            payload_text[i:i + MQTT_CHUNK_PAYLOAD_BYTES]
+            for i in range(0, len(payload_text), MQTT_CHUNK_PAYLOAD_BYTES)
+        ] or [payload_text]
+
+        chunk_messages = []
+        total_chunks = len(chunks)
+        for chunk_index, chunk_data in enumerate(chunks):
+            chunk_msg = {
+                "message_type": "model_update_chunk",
+                "type": "update_chunk",
+                "protocol": "mqtt",
+                "client_id": update_message["client_id"],
+                "round": update_message["round"],
+                "payload_key": payload_key,
+                "payload_chunk": chunk_data,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "num_samples": update_message["num_samples"] if chunk_index == 0 else 0,
+                "metrics": update_message["metrics"] if chunk_index == 0 else {},
+            }
+            if chunk_index == 0 and "diagnostic_send_start_ts" in update_message:
+                chunk_msg["diagnostic_send_start_ts"] = update_message["diagnostic_send_start_ts"]
+            chunk_messages.append(chunk_msg)
+        return chunk_messages
+
+    def _publish_update_with_chunking(self, update_message):
+        payload = json.dumps(update_message)
+        payload_bytes = len(payload.encode("utf-8"))
+
+        if payload_bytes <= MQTT_MAX_PAYLOAD_BYTES:
+            result = self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, payload, qos=1)
+            if result.rc == mqtt.MQTT_ERR_NO_CONN:
+                raise Exception("MQTT not connected")
+            result.wait_for_publish(timeout=30)
+            if not result.is_published():
+                raise TimeoutError("Timed out waiting for MQTT publish acknowledgment")
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise Exception(f"MQTT publish failed with rc={result.rc}")
+            log_sent_packet(
+                packet_size=len(payload),
+                peer=TOPIC_CLIENT_UPDATE,
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Model update"
+            )
+            return payload_bytes
+
+        chunk_messages = self._chunk_model_update_messages(update_message)
+        print(
+            f"Client {self.client_id} chunking model update: {payload_bytes} bytes total, "
+            f"{len(chunk_messages)} chunks"
+        )
+        bytes_sent = 0
+        for chunk_msg in chunk_messages:
+            chunk_payload = json.dumps(chunk_msg)
+            chunk_size = len(chunk_payload.encode("utf-8"))
+            if chunk_size > MQTT_MAX_PAYLOAD_BYTES:
+                raise ValueError(
+                    f"MQTT chunk exceeds 128KB limit: {chunk_size} bytes "
+                    f"(chunk {chunk_msg['chunk_index'] + 1}/{chunk_msg['total_chunks']})"
+                )
+            result = self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, chunk_payload, qos=1)
+            if result.rc == mqtt.MQTT_ERR_NO_CONN:
+                raise Exception("MQTT not connected")
+            result.wait_for_publish(timeout=30)
+            if not result.is_published():
+                raise TimeoutError(
+                    f"Timed out waiting for MQTT chunk publish acknowledgment "
+                    f"for chunk {chunk_msg['chunk_index'] + 1}/{chunk_msg['total_chunks']}"
+                )
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                raise Exception(
+                    f"MQTT chunk publish failed with rc={result.rc} "
+                    f"for chunk {chunk_msg['chunk_index'] + 1}/{chunk_msg['total_chunks']}"
+                )
+            bytes_sent += chunk_size
+            log_sent_packet(
+                packet_size=chunk_size,
+                peer=TOPIC_CLIENT_UPDATE,
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info=f"Model update chunk {chunk_msg['chunk_index'] + 1}/{chunk_msg['total_chunks']}"
+            )
+        return bytes_sent
     
     def handle_training_complete(self):
         """Handle training completion signal from server"""
@@ -327,6 +550,7 @@ class FederatedLearningClient:
         print(f"Client {self.client_id} - Training completed!")
         print("="*70)
         print("\nDisconnecting from server...")
+        self.shutdown_requested = True
         time.sleep(1)  # Brief delay before disconnect
         self.mqtt_client.disconnect()
         print(f"Client {self.client_id} disconnected successfully.")
@@ -340,14 +564,19 @@ class FederatedLearningClient:
                 self._pending_start_training_round = None
                 if self.model is not None:
                     print(f"Client {self.client_id} model ready; starting pending training for round {r}")
-                    self.current_round = r
-                    self.last_training_round = r
-                    self.train_local_model()
+                    self._launch_training_for_round(r)
 
     def handle_global_model(self, payload):
         """Receive and set global model weights and architecture from server"""
         try:
             data = json.loads(payload.decode())
+            message_type = data.get("message_type") or data.get("type")
+            if message_type == "global_model_chunk":
+                assembled = self._assemble_global_model_chunk(data)
+                if assembled is None:
+                    return
+                data = assembled
+
             round_num = data['round']
             # Ignore duplicate global model for the same round
             if round_num <= self.last_global_round:
@@ -432,7 +661,14 @@ class FederatedLearningClient:
     
     def handle_training_config(self, payload):
         """Update training configuration"""
-        self.training_config = json.loads(payload.decode())
+        new_config = json.loads(payload.decode())
+        if isinstance(new_config, dict):
+            self.training_config.update(new_config)
+        try:
+            self.training_config["batch_size"] = int(self.training_config.get("batch_size", DEFAULT_DATA_BATCH_SIZE))
+        except (TypeError, ValueError):
+            self.training_config["batch_size"] = DEFAULT_DATA_BATCH_SIZE
+        self._apply_generator_batch_size(self.training_config["batch_size"])
         print(f"Client {self.client_id} updated config: {self.training_config}")
     
     def handle_start_training(self, payload):
@@ -450,12 +686,8 @@ class FederatedLearningClient:
         if self.last_training_round == round_num:
             print(f"Client {self.client_id} ignoring duplicate start training for round {round_num}")
             return
-        
-        # Start training regardless of round number (generic approach)
-        self.current_round = round_num
-        self.last_training_round = round_num
-        print(f"\nClient {self.client_id} starting training for round {round_num}...")
-        self.train_local_model()
+
+        self._launch_training_for_round(round_num)
     
     def handle_start_evaluation(self, payload):
         """Start evaluation when server signals"""
@@ -482,6 +714,7 @@ class FederatedLearningClient:
     def train_local_model(self):
         """Train model on local data and send updates to server"""
         batch_size = self.training_config['batch_size']
+        self._apply_generator_batch_size(batch_size)
         epochs = self.training_config['local_epochs']
         # Limit steps per epoch for faster smoke tests (configurable via env)
         try:
@@ -556,36 +789,17 @@ class FederatedLearningClient:
         comm_start = time.time()
         # Serialize and send model update with error handling
         try:
-            payload = json.dumps(update_message)
-            payload_size_mb = len(payload) / (1024 * 1024)
+            payload_size_mb = len(json.dumps(update_message).encode('utf-8')) / (1024 * 1024)
             print(f"Client {self.client_id} serialized update size: {payload_size_mb:.2f} MB")
-            
-            # Use QoS 1 for reliable delivery of large model update messages
-            result = self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, payload, qos=1)
-            
-            log_sent_packet(
-                packet_size=len(payload),
-                peer=TOPIC_CLIENT_UPDATE,  # or client_id/server_id as appropriate
-                protocol="MQTT",
-                round=self.current_round if hasattr(self, 'current_round') else None,
-                extra_info="any additional info"
-            )
-            # FAIR FIX: Use shorter timeout (5s) aligned with other protocols
-            # MQTT QoS 1 ensures delivery, so we only need to wait for queue confirmation
-            if result.rc == mqtt.MQTT_ERR_NO_CONN:
-                raise Exception("MQTT not connected")
-            result.wait_for_publish(timeout=5)
+            bytes_sent = self._publish_update_with_chunking(update_message)
             
             if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
                 send_end_cpu = time.perf_counter()
                 O_send = send_end_cpu - send_start_cpu
-                print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={len(payload)} send_start_ts={send_start_ts:.9f}")
-            
-            if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                print(f"Client {self.client_id} sent model update for round {self.current_round}")
-                print(f"Training metrics - Loss: {metrics['loss']:.4f}, Accuracy: {metrics['accuracy']:.4f}")
-            else:
-                print(f"Client {self.client_id} ERROR: Failed to send model update, rc={result.rc}")
+                print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={bytes_sent} send_start_ts={send_start_ts:.9f}")
+
+            print(f"Client {self.client_id} sent model update for round {self.current_round}")
+            print(f"Training metrics - Loss: {metrics['loss']:.4f}, Accuracy: {metrics['accuracy']:.4f}")
         except Exception as e:
             print(f"Client {self.client_id} ERROR serializing/sending update: {e}")
             import traceback
@@ -661,7 +875,7 @@ class FederatedLearningClient:
             self.mqtt_client.disconnect()
     
     def start(self):
-        """Connect to MQTT broker and start listening"""
+        """Connect to MQTT broker and keep client alive (aligned with unified behavior)."""
         max_retries = 10
         retry_delay = 2
         self._reconnect_after_rc7 = 0
@@ -672,16 +886,12 @@ class FederatedLearningClient:
                 self.mqtt_client.reconnect_delay_set(min_delay=1, max_delay=120)
                 self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=MQTT_KEEPALIVE_SEC)
                 print(f"Successfully connected to MQTT broker!\n")
-                self.mqtt_client.loop_forever(retry_first_connection=True)
-                # If loop stopped due to rc=7 (duplicate client ID / connection lost), do one delayed reconnect
-                if getattr(self, "_reconnect_after_rc7", 0) > 0 and self._reconnect_after_rc7 <= 2:
-                    print(f"Client {self.client_id} reconnecting after 3s (rc=7 recovery)...")
-                    time.sleep(3)
-                    try:
-                        self.mqtt_client.reconnect()
-                        self.mqtt_client.loop_forever(retry_first_connection=True)
-                    except Exception as e:
-                        print(f"Reconnect failed: {e}")
+                self.mqtt_client.loop_start()
+                try:
+                    while not self.shutdown_requested:
+                        time.sleep(1)
+                finally:
+                    self.mqtt_client.loop_stop()
                 break
             except Exception as e:
                 print(f"Connection attempt {attempt + 1}/{max_retries} failed: {e}")
@@ -718,7 +928,7 @@ def load_data(client_id):
     train_generator = train_data_gen.flow_from_directory(
         train_path,
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode="grayscale",
         class_mode='categorical',
         shuffle=True
@@ -727,7 +937,7 @@ def load_data(client_id):
     validation_generator = validation_data_gen.flow_from_directory(
         validation_path,
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode="grayscale",
         class_mode='categorical',
         shuffle=False

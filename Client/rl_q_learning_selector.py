@@ -29,10 +29,10 @@ class QLearningProtocolSelector:
     PROTOCOLS = ['mqtt', 'amqp', 'grpc', 'http3', 'dds']
     
     # Environment state dimensions
-    NETWORK_CONDITIONS = ['excellent', 'good', 'moderate', 'poor', 'very_poor']
-    RESOURCE_LEVELS = ['high', 'medium', 'low']
+    NETWORK_CONDITIONS = ['excellent', 'moderate', 'poor']
+    RESOURCE_LEVELS = ['high', 'low']
     MODEL_SIZES = ['small', 'medium', 'large']
-    MOBILITY_LEVELS = ['static', 'low', 'medium', 'high']
+    MOBILITY_LEVELS = ['static', 'mobile']
     
     def __init__(
         self,
@@ -100,6 +100,9 @@ class QLearningProtocolSelector:
         # Q-value convergence tracking (for "end on Q convergence" mode)
         self._q_deltas = []  # abs(new_q - current_q) per update
         self._q_delta_window = 50  # keep last N deltas
+
+        # Last reward breakdown (exact values for dashboard/logging)
+        self._last_reward_breakdown = {}
         
     def get_state_index(self, state: Dict) -> Tuple[int, int, int, int]:
         """
@@ -178,8 +181,35 @@ class QLearningProtocolSelector:
         Returns:
             Calculated reward value
         """
+        # Exact reward-component tracking for dashboard visibility
+        cpu_usage = float(resource_consumption.get('cpu', 0.5))
+        memory_usage = float(resource_consumption.get('memory', 0.5))
+        bandwidth_usage = float(resource_consumption.get('bandwidth', 0.5))
+        battery_level = float(resource_consumption.get('battery', 1.0))
+        energy_norm = float(resource_consumption.get('energy', 0.0))
+
         # Base reward for successful communication
         if not success:
+            self._last_reward_breakdown = {
+                'communication_time': float(communication_time),
+                'convergence_time': float(convergence_time),
+                'accuracy': float(accuracy),
+                'success': False,
+                'cpu_usage': cpu_usage,
+                'memory_usage': memory_usage,
+                'bandwidth_usage': bandwidth_usage,
+                'battery_level': battery_level,
+                'energy_usage': energy_norm,
+                't_calc': float(t_calc) if t_calc is not None else None,
+                'reward_base': -10.0,
+                'reward_communication_time': 0.0,
+                'reward_convergence_time': 0.0,
+                'reward_accuracy': 0.0,
+                'reward_resource_penalty': 0.0,
+                'reward_battery_penalty': 0.0,
+                'reward_t_calc_penalty': 0.0,
+                'reward_total': -10.0,
+            }
             return -10.0  # Large penalty for failure
 
         reward = 10.0  # Base reward for success
@@ -198,16 +228,11 @@ class QLearningProtocolSelector:
         reward += accuracy_reward
 
         # 4. Resource consumption penalty (lower is better)
-        cpu_usage = resource_consumption.get('cpu', 0.5)
-        memory_usage = resource_consumption.get('memory', 0.5)
-        bandwidth_usage = resource_consumption.get('bandwidth', 0.5)
         avg_resource = (cpu_usage + memory_usage + bandwidth_usage) / 3.0
         resource_penalty = -5.0 * avg_resource
         reward += resource_penalty
 
         # 4b. Battery-aware penalty: when SoC is low, energy consumption hurts more
-        battery_level = resource_consumption.get('battery', 1.0)
-        energy_norm = resource_consumption.get('energy', 0.0)
         low_batt_penalty = -5.0 * (1.0 - battery_level) * energy_norm
         reward += low_batt_penalty
 
@@ -215,10 +240,32 @@ class QLearningProtocolSelector:
             use_communication_model_reward = self.use_communication_model_reward
 
         # 5. T_calc (communication model): higher T_calc -> more negative reward; lower T_calc -> less penalty
+        t_calc_penalty = 0.0
         if use_communication_model_reward and t_calc is not None and t_calc >= 0:
             # Penalty scale: e.g. T_calc 0->0 penalty, 10s->-2.5, 30s->-5 (cap)
             t_calc_penalty = min(5.0, t_calc * 0.5)
             reward -= t_calc_penalty
+
+        self._last_reward_breakdown = {
+            'communication_time': float(communication_time),
+            'convergence_time': float(convergence_time),
+            'accuracy': float(accuracy),
+            'success': bool(success),
+            'cpu_usage': cpu_usage,
+            'memory_usage': memory_usage,
+            'bandwidth_usage': bandwidth_usage,
+            'battery_level': battery_level,
+            'energy_usage': energy_norm,
+            't_calc': float(t_calc) if t_calc is not None else None,
+            'reward_base': 10.0,
+            'reward_communication_time': float(time_reward),
+            'reward_convergence_time': float(conv_reward),
+            'reward_accuracy': float(accuracy_reward),
+            'reward_resource_penalty': float(resource_penalty),
+            'reward_battery_penalty': float(low_batt_penalty),
+            'reward_t_calc_penalty': -float(t_calc_penalty),
+            'reward_total': float(reward),
+        }
 
         return reward
     
@@ -462,8 +509,13 @@ class QLearningProtocolSelector:
             'last_state': self.state_history[-1] if self.state_history else None,
             'last_action': self.action_history[-1] if self.action_history else None,
             'last_reward': self.reward_history[-1] if self.reward_history else None,
+            'last_reward_breakdown': self.get_last_reward_breakdown(),
         }
         return data
+
+    def get_last_reward_breakdown(self) -> Dict:
+        """Return exact last reward inputs and per-component contributions."""
+        return dict(self._last_reward_breakdown) if self._last_reward_breakdown else {}
 
     def check_q_converged(
         self,
@@ -517,6 +569,7 @@ class QLearningProtocolSelector:
         self.action_history = []
         self.reward_history = []
         self._q_deltas = []
+        self._last_reward_breakdown = {}
         
         # Delete saved Q-table file if it exists
         if os.path.exists(self.save_path):
@@ -593,16 +646,14 @@ class EnvironmentStateManager:
             Network condition string
         """
         # Classification based on latency and bandwidth
-        if latency_ms < 10 and bandwidth_mbps > 50:
+        if latency_ms < 20 and bandwidth_mbps > 50:
             return 'excellent'
-        elif latency_ms < 30 and bandwidth_mbps > 20:
-            return 'good'
-        elif latency_ms < 100 and bandwidth_mbps > 5:
+        elif latency_ms < 50 and bandwidth_mbps > 10:
             return 'moderate'
-        elif latency_ms < 300 and bandwidth_mbps > 1:
+        elif latency_ms < 120 and bandwidth_mbps > 1:
             return 'poor'
         else:
-            return 'very_poor'
+            return 'poor'
     
     def detect_resource_level(self, cpu_percent: float, memory_percent: float) -> str:
         """
@@ -619,8 +670,6 @@ class EnvironmentStateManager:
         
         if avg_usage < 30:
             return 'high'
-        elif avg_usage < 70:
-            return 'medium'
         else:
             return 'low'
     

@@ -4,8 +4,8 @@ with RL-based Protocol Selection
 
 Supports: MQTT, AMQP, gRPC, QUIC, DDS
 Uses Q-Learning to dynamically select the best protocol for DATA transmission
-Uses MQTT for CONTROL signals (always)
-Architecture: Event-driven, waits for server signals via MQTT callbacks
+Uses gRPC for CONTROL signals and protocol negotiation
+Architecture: Event-driven, polls gRPC control-plane for round signals/queries
              Data transmission uses RL-selected protocol
 """
 
@@ -338,6 +338,7 @@ except ImportError:
 
 # Suppress TensorFlow warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ.setdefault("XLA_FLAGS", "--xla_gpu_enable_command_buffer=")
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # Configure GPU - use GPU_DEVICE_ID env var if set, else CUDA_VISIBLE_DEVICES, else default to '0'
@@ -378,6 +379,7 @@ USE_RL_SELECTION = os.getenv("USE_RL_SELECTION", "true").lower() == "true"
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
 ENABLE_LOCAL_CONVERGENCE_STOP = os.getenv("ENABLE_LOCAL_CONVERGENCE_STOP", "false").lower() == "true"
 # When True, training ends when Q-learning value converges; when False, ends on accuracy convergence
 USE_QL_CONVERGENCE = os.getenv("USE_QL_CONVERGENCE", "false").lower() == "true"
@@ -532,9 +534,10 @@ class UnifiedFLClient_Emotion:
         # Track gRPC signals to avoid acting on persistent flags multiple times
         self.last_grpc_train_signal_round = -1
         self.last_grpc_eval_signal_round = -1
+        self.last_protocol_query_key = None
         
         # Training configuration
-        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        self.training_config = {"batch_size": 16, "local_epochs": 20}
         
         # RL Components (load from past experience when .pkl exists)
         if USE_RL_SELECTION and QLearningProtocolSelector is not None:
@@ -679,6 +682,7 @@ class UnifiedFLClient_Emotion:
         
         # Track selected protocol and metrics
         self.selected_protocol = None
+        self.selected_downlink_protocol = 'grpc'
         self.round_metrics = {
             'communication_time': 0.0,
             'training_time': 0.0,
@@ -806,7 +810,7 @@ class UnifiedFLClient_Emotion:
         self.grpc_stub = None
         self.grpc_lock = threading.Lock()  # Synchronize gRPC calls to prevent conflicts
         
-        # Initialize MQTT client for listening (always used for signal/sync)
+        # Initialize MQTT client for data-plane compatibility and fallback signaling
         self.mqtt_client = mqtt.Client(client_id=f"fl_client_{client_id}", protocol=mqtt.MQTTv311)
         self.mqtt_client.max_inflight_messages_set(20)
         # FAIR CONFIG: Limited queue to 1000 messages (aligned with AMQP/gRPC)
@@ -1301,6 +1305,9 @@ class UnifiedFLClient_Emotion:
                         # Poll control-plane status first (gRPC-only signaling in unified RL mode)
                         status_request = federated_learning_pb2.StatusRequest(client_id=self.client_id)
                         status = self.grpc_stub.CheckTrainingStatus(status_request)
+
+                        if getattr(status, 'has_protocol_query', False):
+                            self._handle_grpc_protocol_query(status.protocol_query)
                         
                         # Only act on signals if we haven't already acted on them for this round
                         if status.should_train and self.is_active and status.current_round != self.last_grpc_train_signal_round:
@@ -1538,6 +1545,13 @@ class UnifiedFLClient_Emotion:
 
     def _apply_global_model_weights(self, round_num, weights, model_config=None, source="UNKNOWN"):
         """Initialize model if needed and apply incoming global weights."""
+        if self.model is None and source != "gRPC":
+            print(
+                f"[{source}] Client {self.client_id} ignoring non-gRPC initial global model. "
+                f"Bootstrap requires gRPC."
+            )
+            return False
+
         if self.model is None:
             if model_config:
                 print(f"[{source}] Client {self.client_id} initializing model from received configuration...")
@@ -1571,10 +1585,38 @@ class UnifiedFLClient_Emotion:
             return True
 
         return False
+
+    def _apply_generator_batch_size(self, batch_size):
+        """Sync DirectoryIterator batch size with training config."""
+        try:
+            batch_size = int(batch_size)
+        except (TypeError, ValueError):
+            return
+        if batch_size <= 0:
+            return
+
+        changed = False
+        for gen_name in ("train_generator", "validation_generator"):
+            generator = getattr(self, gen_name, None)
+            if generator is None:
+                continue
+            current = getattr(generator, "batch_size", None)
+            if current != batch_size:
+                setattr(generator, "batch_size", batch_size)
+                changed = True
+        if changed:
+            print(f"Client {self.client_id} synchronized generator batch_size to {batch_size}")
     
     def handle_training_config(self, payload):
         """Update training configuration"""
-        self.training_config = json.loads(payload.decode())
+        new_config = json.loads(payload.decode())
+        if isinstance(new_config, dict):
+            self.training_config.update(new_config)
+        try:
+            self.training_config["batch_size"] = int(self.training_config.get("batch_size", DEFAULT_DATA_BATCH_SIZE))
+        except (TypeError, ValueError):
+            self.training_config["batch_size"] = DEFAULT_DATA_BATCH_SIZE
+        self._apply_generator_batch_size(self.training_config["batch_size"])
         print(f"Client {self.client_id} updated config: {self.training_config}")
     
     def handle_start_training(self, payload, source="MQTT"):
@@ -1686,6 +1728,102 @@ class UnifiedFLClient_Emotion:
         except Exception as e:
             print(f"[gRPC] Client {self.client_id} registration error: {e}")
             return False
+
+    def _is_protocol_available_for_downlink(self, protocol: str) -> bool:
+        """Check whether a requested downlink protocol can be used by this client."""
+        protocol = (protocol or '').lower()
+        if protocol == 'mqtt':
+            return True
+        if protocol == 'amqp':
+            return pika is not None
+        if protocol == 'grpc':
+            return grpc is not None and self.grpc_stub is not None
+        if protocol == 'quic':
+            return asyncio is not None and connect is not None
+        if protocol == 'http3':
+            return HTTP3_AVAILABLE and asyncio is not None and connect is not None
+        if protocol == 'dds':
+            return DDS_AVAILABLE and self.dds_participant is not None
+        return False
+
+    def _select_downlink_protocol(self, round_id: int, global_model_id: int) -> str:
+        """Select downlink protocol for server->client global model transfer."""
+        # Enforce gRPC bootstrap for initial model transfer.
+        if self.model is None or global_model_id <= 0:
+            return 'grpc'
+
+        previous_uplink_protocol = self.selected_protocol
+        selected = self.select_protocol()
+        # Keep uplink decision tracking untouched by downlink negotiation query.
+        self.selected_protocol = previous_uplink_protocol
+
+        if not self._is_protocol_available_for_downlink(selected):
+            print(
+                f"[gRPC] Client {self.client_id} downlink selection '{selected}' unavailable; "
+                f"falling back to gRPC"
+            )
+            return 'grpc'
+        return selected
+
+    def _handle_grpc_protocol_query(self, protocol_query):
+        """Respond to server ProtocolQuery via gRPC using RL-based downlink selection."""
+        if protocol_query is None:
+            return
+
+        query_key = (
+            int(getattr(protocol_query, 'round_id', -1)),
+            int(getattr(protocol_query, 'global_model_id', -1)),
+        )
+        if self.last_protocol_query_key == query_key:
+            return
+
+        round_id, global_model_id = query_key
+        selected_downlink_protocol = self._select_downlink_protocol(round_id, global_model_id)
+
+        with self.grpc_lock:
+            if self.grpc_stub is None:
+                return
+            response = self.grpc_stub.SendProtocolSelection(
+                federated_learning_pb2.ProtocolSelection(
+                    client_id=self.client_id,
+                    round_id=round_id,
+                    global_model_id=global_model_id,
+                    downlink_protocol_requested=selected_downlink_protocol,
+                )
+            )
+
+        if response.success:
+            self.selected_downlink_protocol = selected_downlink_protocol
+            self.last_protocol_query_key = query_key
+            if log_q_step is not None and self.env_manager is not None and self.rl_selector is not None:
+                st = self.env_manager.get_current_state()
+                avg_reward = (
+                    np.mean(self.rl_selector.total_rewards[-100:])
+                    if self.rl_selector.total_rewards else 0.0
+                )
+                log_q_step(
+                    client_id=self.client_id,
+                    round_num=round_id,
+                    episode=max(self.rl_selector.episode_count - 1, 0),
+                    state_network=st.get('network', ''),
+                    state_resource=st.get('resource', ''),
+                    state_model_size=st.get('model_size', ''),
+                    state_mobility=st.get('mobility', ''),
+                    action=selected_downlink_protocol,
+                    reward=0.0,
+                    q_delta=0.0,
+                    epsilon=self.rl_selector.epsilon,
+                    avg_reward_last_100=float(avg_reward),
+                    converged=False,
+                    link_direction='downlink',
+                )
+            print(
+                f"[gRPC] Client {self.client_id} replied ProtocolSelection: "
+                f"round={round_id}, global_model_id={global_model_id}, "
+                f"downlink={selected_downlink_protocol}"
+            )
+        else:
+            print(f"[gRPC] Client {self.client_id} ProtocolSelection rejected: {response.message}")
 
     def _defer_start_training(self, round_num: int, source: str):
         """Defer start_training until the initial/global model is available."""
@@ -2079,6 +2217,7 @@ class UnifiedFLClient_Emotion:
         start_time = time.time()
 
         batch_size = self.training_config['batch_size']
+        self._apply_generator_batch_size(batch_size)
         epochs = self.training_config['local_epochs']
         
         try:
@@ -2339,6 +2478,7 @@ class UnifiedFLClient_Emotion:
                     # Always log Q-step when RL is enabled so GUI Q-learning database stays updated
                     if log_q_step is not None and self._last_rl_state is not None:
                         st = self._last_rl_state
+                        reward_details = self.rl_selector.get_last_reward_breakdown()
                         log_q_step(
                             client_id=self.client_id,
                             round_num=self.current_round,
@@ -2353,6 +2493,25 @@ class UnifiedFLClient_Emotion:
                             epsilon=self.rl_selector.epsilon,
                             avg_reward_last_100=float(avg_reward),
                             converged=q_converged,
+                            metric_communication_time=reward_details.get('communication_time'),
+                            metric_convergence_time=reward_details.get('convergence_time'),
+                            metric_accuracy=reward_details.get('accuracy'),
+                            metric_success=reward_details.get('success'),
+                            metric_cpu_usage=reward_details.get('cpu_usage'),
+                            metric_memory_usage=reward_details.get('memory_usage'),
+                            metric_bandwidth_usage=reward_details.get('bandwidth_usage'),
+                            metric_battery_level=reward_details.get('battery_level'),
+                            metric_energy_usage=reward_details.get('energy_usage'),
+                            metric_t_calc=reward_details.get('t_calc'),
+                            reward_base=reward_details.get('reward_base'),
+                            reward_communication_time=reward_details.get('reward_communication_time'),
+                            reward_convergence_time=reward_details.get('reward_convergence_time'),
+                            reward_accuracy=reward_details.get('reward_accuracy'),
+                            reward_resource_penalty=reward_details.get('reward_resource_penalty'),
+                            reward_battery_penalty=reward_details.get('reward_battery_penalty'),
+                            reward_t_calc_penalty=reward_details.get('reward_t_calc_penalty'),
+                            reward_total=reward_details.get('reward_total'),
+                            link_direction='uplink',
                         )
                     # End training on Q-convergence only when USE_QL_CONVERGENCE is True
                     if USE_QL_CONVERGENCE and q_converged:
@@ -3742,7 +3901,7 @@ def load_emotion_data(client_id: int):
     train_generator = train_data_gen.flow_from_directory(
         train_path,
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode="grayscale",
         class_mode='categorical',
         shuffle=True
@@ -3751,7 +3910,7 @@ def load_emotion_data(client_id: int):
     validation_generator = validation_data_gen.flow_from_directory(
         validation_path,
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode="grayscale",
         class_mode='categorical',
         shuffle=False

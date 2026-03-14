@@ -8,8 +8,10 @@ import sys
 import os
 import json
 import shlex
+import signal
 import subprocess
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -240,6 +242,58 @@ class ExperimentRunner(QThread):
         super().__init__(parent)
         self.command = command
         self.process = None
+
+    def _terminate_process_tree(self, grace_seconds=3.0):
+        """Terminate the full process tree for the running experiment command."""
+        if not self.process:
+            return
+        if self.process.poll() is not None:
+            return
+
+        terminated = False
+        pgid = None
+        try:
+            pgid = os.getpgid(self.process.pid)
+        except Exception:
+            pgid = None
+
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
+                terminated = True
+            else:
+                self.process.terminate()
+                terminated = True
+        except ProcessLookupError:
+            return
+        except Exception:
+            try:
+                self.process.terminate()
+                terminated = True
+            except Exception:
+                pass
+
+        if not terminated:
+            return
+
+        deadline = time.time() + max(0.1, float(grace_seconds))
+        while time.time() < deadline:
+            if self.process.poll() is not None:
+                return
+            time.sleep(0.1)
+
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                self.process.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                self.process.kill()
+            except Exception:
+                pass
         
     def run(self):
         try:
@@ -259,7 +313,8 @@ class ExperimentRunner(QThread):
                 text=True,
                 bufsize=1,  # Line buffered
                 env=env,    # Force unbuffered Python output
-                universal_newlines=True
+                universal_newlines=True,
+                start_new_session=True
             )
             
             # Stream output in real-time
@@ -286,7 +341,7 @@ class ExperimentRunner(QThread):
     
     def stop(self):
         if self.process:
-            self.process.terminate()
+            self._terminate_process_tree(grace_seconds=3.0)
             self.progress_update.emit("\n⚠️ Experiment stopped by user\n")
 
 

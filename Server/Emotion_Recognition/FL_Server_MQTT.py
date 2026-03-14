@@ -73,6 +73,9 @@ TOPIC_START_TRAINING = "fl/start_training"
 TOPIC_START_EVALUATION = "fl/start_evaluation"
 TOPIC_TRAINING_COMPLETE = "fl/training_complete"
 
+MQTT_MAX_PAYLOAD_BYTES = 128 * 1024
+MQTT_CHUNK_PAYLOAD_BYTES = 96 * 1024
+
 
 class FederatedLearningServer:
     def __init__(self, min_clients, num_rounds, max_clients=100):
@@ -142,11 +145,12 @@ class FederatedLearningServer:
         _mqtt_client_id = f"fl_server_{os.getpid()}"
         self.mqtt_client = mqtt.Client(client_id=_mqtt_client_id, protocol=mqtt.MQTTv311, clean_session=True)
         # Realistic max payload: MQTT 128 KB
-        self.mqtt_client._max_packet_size = 128 * 1024  # 128 KB
+        self.mqtt_client._max_packet_size = MQTT_MAX_PAYLOAD_BYTES
         # Long keepalive to avoid client rc=16 in very_poor / diagnostic pipeline
         self.mqtt_client.keepalive = MQTT_KEEPALIVE_SEC
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
+        self._model_update_chunk_buffers = {}
 
 
     
@@ -265,6 +269,153 @@ class FederatedLearningServer:
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
+
+    def _chunk_model_payload(self, model_message):
+        payload_key = "quantized_data" if "quantized_data" in model_message else "weights"
+        payload_text = model_message[payload_key]
+        if not isinstance(payload_text, str):
+            raise TypeError(f"Expected string payload for {payload_key}, got {type(payload_text).__name__}")
+
+        chunks = [
+            payload_text[i:i + MQTT_CHUNK_PAYLOAD_BYTES]
+            for i in range(0, len(payload_text), MQTT_CHUNK_PAYLOAD_BYTES)
+        ] or [payload_text]
+
+        total_chunks = len(chunks)
+        chunk_messages = []
+        for chunk_index, chunk_data in enumerate(chunks):
+            chunk_msg = {
+                "message_type": "global_model_chunk",
+                "type": "global_model_chunk",
+                "round": model_message["round"],
+                "payload_key": payload_key,
+                "payload_chunk": chunk_data,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+            }
+            if chunk_index == 0:
+                if "model_config" in model_message:
+                    chunk_msg["model_config"] = model_message["model_config"]
+                if "training_config" in model_message:
+                    chunk_msg["training_config"] = model_message["training_config"]
+            chunk_messages.append(chunk_msg)
+        return chunk_messages
+
+    def _publish_global_model_with_chunking(self, model_message, extra_info):
+        """Publish global model while strictly respecting 128KB MQTT payload limit."""
+        payload = json.dumps(model_message)
+        payload_bytes = len(payload.encode("utf-8"))
+
+        if payload_bytes <= MQTT_MAX_PAYLOAD_BYTES:
+            result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, payload, qos=1)
+            log_sent_packet(
+                packet_size=len(payload),
+                peer=TOPIC_GLOBAL_MODEL,
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info=extra_info
+            )
+            return result, payload_bytes
+
+        chunks = self._chunk_model_payload(model_message)
+        print(
+            f"Chunking global model for MQTT: {payload_bytes} bytes total, "
+            f"{len(chunks)} chunks"
+        )
+
+        last_result = None
+        total_sent = 0
+        for chunk in chunks:
+            chunk_payload = json.dumps(chunk)
+            chunk_size = len(chunk_payload.encode("utf-8"))
+            if chunk_size > MQTT_MAX_PAYLOAD_BYTES:
+                raise ValueError(
+                    f"MQTT global-model chunk exceeds 128KB: {chunk_size} bytes "
+                    f"(chunk {chunk['chunk_index'] + 1}/{chunk['total_chunks']})"
+                )
+            last_result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, chunk_payload, qos=1)
+            total_sent += chunk_size
+            log_sent_packet(
+                packet_size=chunk_size,
+                peer=TOPIC_GLOBAL_MODEL,
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info=(
+                    f"{extra_info} chunk "
+                    f"{chunk['chunk_index'] + 1}/{chunk['total_chunks']}"
+                )
+            )
+
+        return last_result, total_sent
+
+    def _assemble_model_update_chunk(self, data):
+        """Buffer and reassemble chunked model updates from clients."""
+        try:
+            client_id = int(data["client_id"])
+            round_num = int(data["round"])
+            payload_key = data["payload_key"]
+            chunk_index = int(data.get("chunk_index", 0))
+            total_chunks = int(data.get("total_chunks", 1))
+            payload_chunk = data.get("payload_chunk", "")
+        except Exception as e:
+            print(f"Server invalid model-update chunk metadata: {e}")
+            return None
+
+        if total_chunks <= 1:
+            assembled = {
+                "client_id": client_id,
+                "round": round_num,
+                payload_key: payload_chunk,
+                "num_samples": data.get("num_samples", 0),
+                "metrics": data.get("metrics", {}),
+            }
+            if "diagnostic_send_start_ts" in data:
+                assembled["diagnostic_send_start_ts"] = data.get("diagnostic_send_start_ts")
+            return assembled
+
+        chunk_key = (client_id, round_num, payload_key)
+        entry = self._model_update_chunk_buffers.setdefault(
+            chunk_key,
+            {
+                "chunks": {},
+                "total_chunks": total_chunks,
+                "num_samples": data.get("num_samples", 0),
+                "metrics": data.get("metrics", {}),
+                "diagnostic_send_start_ts": data.get("diagnostic_send_start_ts"),
+                "updated_at": time.time(),
+            }
+        )
+
+        if chunk_index == 0:
+            entry["num_samples"] = data.get("num_samples", entry["num_samples"])
+            entry["metrics"] = data.get("metrics", entry["metrics"])
+            if "diagnostic_send_start_ts" in data:
+                entry["diagnostic_send_start_ts"] = data.get("diagnostic_send_start_ts")
+
+        if chunk_index not in entry["chunks"]:
+            entry["chunks"][chunk_index] = payload_chunk
+        entry["updated_at"] = time.time()
+
+        if len(entry["chunks"]) < total_chunks:
+            return None
+
+        assembled_payload = "".join(entry["chunks"].get(i, "") for i in range(total_chunks))
+        assembled = {
+            "client_id": client_id,
+            "round": round_num,
+            payload_key: assembled_payload,
+            "num_samples": entry["num_samples"],
+            "metrics": entry["metrics"],
+        }
+        if entry.get("diagnostic_send_start_ts") is not None:
+            assembled["diagnostic_send_start_ts"] = entry["diagnostic_send_start_ts"]
+
+        self._model_update_chunk_buffers.pop(chunk_key, None)
+        print(
+            f"Reassembled model update from client {client_id} for round {round_num} "
+            f"from {total_chunks} chunks"
+        )
+        return assembled
     
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
@@ -365,11 +516,13 @@ class FederatedLearningServer:
             
             # Broadcast to all clients on general topic (late-joiner will receive it)
             # This is simpler than client-specific topics and works with our generic model handling
-            payload = json.dumps(model_message).encode()
-            self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, payload, qos=1)
+            result, sent_bytes = self._publish_global_model_with_chunking(
+                model_message,
+                extra_info=f"Late-join model broadcast (for client {client_id})"
+            )
             
             log_sent_packet(
-                packet_size=len(payload),
+                packet_size=sent_bytes,
                 peer=f"client_{client_id}",
                 protocol="MQTT",
                 round=self.current_round,
@@ -408,6 +561,13 @@ class FederatedLearningServer:
         """Handle model update from client"""
         recv_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
         data = json.loads(payload.decode())
+
+        msg_type = data.get("message_type") or data.get("type")
+        if msg_type in ("model_update_chunk", "update_chunk"):
+            data = self._assemble_model_update_chunk(data)
+            if data is None:
+                return
+
         client_id = data['client_id']
         round_num = data['round']
         
@@ -531,16 +691,12 @@ class FederatedLearningServer:
         
         # Publish with QoS 1 so clients get at-least-once delivery (large payload)
         print("\nPublishing initial model to clients...")
-        result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, message_json, qos=1)
-        log_sent_packet(
-            packet_size=len(message_json),
-            peer=TOPIC_GLOBAL_MODEL,
-            protocol="MQTT",
-            round=self.current_round if hasattr(self, 'current_round') else None,
+        result, sent_bytes = self._publish_global_model_with_chunking(
+            initial_model_message,
             extra_info="Initial global model distribution"
         )
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
-            print("  Initial global model sent successfully (QoS 1)")
+            print(f"  Initial global model sent successfully (QoS 1), bytes sent: {sent_bytes}")
         else:
             print(f"  FAILED to send initial model (return code: {result.rc})")
 
@@ -621,14 +777,9 @@ class FederatedLearningServer:
         
         # Publish aggregated model (QoS 1 for at-least-once) and avoid duplicates
         print(f"Publishing aggregated model for round {self.current_round}...")
-        message_json = json.dumps(global_model_message)
         for i in range(3):
-            result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, message_json, qos=1)
-            log_sent_packet(
-                packet_size=len(message_json),
-                peer=TOPIC_GLOBAL_MODEL,  # or client_id/server_id as appropriate
-                protocol="MQTT",
-                round=self.current_round if hasattr(self, 'current_round') else None,
+            result, _ = self._publish_global_model_with_chunking(
+                global_model_message,
                 extra_info="Aggregated global model distribution"
             )
             if result.rc == mqtt.MQTT_ERR_SUCCESS:

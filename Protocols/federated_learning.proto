@@ -21,6 +21,9 @@ service FederatedLearning {
     
     // Check if training should start for a round
     rpc CheckTrainingStatus(StatusRequest) returns (TrainingStatus);
+
+    // Client responds to server protocol query for next global model downlink
+    rpc SendProtocolSelection(ProtocolSelection) returns (ProtocolSelectionResponse);
 }
 
 // Messages
@@ -105,4 +108,24 @@ message TrainingStatus {
     int32 current_round = 2;
     bool should_evaluate = 3;
     bool is_complete = 4;
+    bool has_protocol_query = 5;
+    ProtocolQuery protocol_query = 6;
+}
+
+message ProtocolQuery {
+    int32 client_id = 1;
+    int32 round_id = 2;
+    int32 global_model_id = 3;
+}
+
+message ProtocolSelection {
+    int32 client_id = 1;
+    int32 round_id = 2;
+    int32 global_model_id = 3;
+    string downlink_protocol_requested = 4;
+}
+
+message ProtocolSelectionResponse {
+    bool success = 1;
+    string message = 2;
 }

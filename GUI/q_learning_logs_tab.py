@@ -85,10 +85,18 @@ class QLearningLogsTab(QWidget):
         layout.addWidget(stats_group)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(14)
+        self.table.setColumnCount(32)
         self.table.setHorizontalHeaderLabels([
             "ID", "Timestamp", "Round", "Episode", "State (net)", "State (res)", "State (size)", "State (mob)",
-            "Action", "Reward", "Q Delta", "Epsilon", "Avg R(100)", "Converged"
+            "Action", "Reward", "Q Delta", "Epsilon", "Avg R(100)", "Converged",
+            "Comm Time", "R_comm",
+            "Conv Time", "R_conv",
+            "Accuracy", "R_acc",
+            "Success", "R_base",
+            "CPU", "Memory", "Bandwidth", "R_resource",
+            "Battery", "Energy", "R_battery",
+            "T_calc", "R_tcalc",
+            "R_total"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.setAlternatingRowColors(True)
@@ -132,9 +140,19 @@ class QLearningLogsTab(QWidget):
             cur.execute("""
                 SELECT id, timestamp, round_num, episode, state_network, state_resource,
                        state_model_size, state_mobility, action, reward, q_delta, epsilon,
-                       avg_reward_last_100, converged
+                       avg_reward_last_100, converged,
+                       metric_communication_time, reward_communication_time,
+                       metric_convergence_time, reward_convergence_time,
+                       metric_accuracy, reward_accuracy,
+                       metric_success, reward_base,
+                       metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage, reward_resource_penalty,
+                       metric_battery_level, metric_energy_usage, reward_battery_penalty,
+                       metric_t_calc, reward_t_calc_penalty,
+                       reward_total
                 FROM q_learning_log
-                ORDER BY id ASC
+                                ORDER BY round_num ASC,
+                                                 CASE WHEN link_direction = 'uplink' THEN 0 ELSE 1 END ASC,
+                                                 id ASC
             """)
             rows = cur.fetchall()
             conn.close()
@@ -200,7 +218,19 @@ class QLearningLogsTab(QWidget):
                 df = pd.read_sql_query(
                     """SELECT id, timestamp, round_num, episode, state_network, state_resource,
                        state_model_size, state_mobility, action, reward, q_delta, epsilon,
-                       avg_reward_last_100, converged FROM q_learning_log ORDER BY id""",
+                       avg_reward_last_100, converged,
+                       metric_communication_time, reward_communication_time,
+                       metric_convergence_time, reward_convergence_time,
+                       metric_accuracy, reward_accuracy,
+                       metric_success, reward_base,
+                       metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage, reward_resource_penalty,
+                       metric_battery_level, metric_energy_usage, reward_battery_penalty,
+                       metric_t_calc, reward_t_calc_penalty,
+                       reward_total
+                       FROM q_learning_log
+                       ORDER BY round_num ASC,
+                                CASE WHEN link_direction = 'uplink' THEN 0 ELSE 1 END ASC,
+                                id ASC""",
                     conn
                 )
                 conn.close()
@@ -278,7 +308,19 @@ class QLearningLogsTab(QWidget):
                         df = pd.read_sql_query(
                             """SELECT id, timestamp, round_num, episode, state_network, state_resource,
                                state_model_size, state_mobility, action, reward, q_delta, epsilon,
-                               avg_reward_last_100, converged FROM q_learning_log ORDER BY id""",
+                               avg_reward_last_100, converged,
+                               metric_communication_time, reward_communication_time,
+                               metric_convergence_time, reward_convergence_time,
+                               metric_accuracy, reward_accuracy,
+                               metric_success, reward_base,
+                               metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage, reward_resource_penalty,
+                               metric_battery_level, metric_energy_usage, reward_battery_penalty,
+                               metric_t_calc, reward_t_calc_penalty,
+                               reward_total
+                               FROM q_learning_log
+                               ORDER BY round_num ASC,
+                                        CASE WHEN link_direction = 'uplink' THEN 0 ELSE 1 END ASC,
+                                        id ASC""",
                             conn
                         )
                         conn.close()

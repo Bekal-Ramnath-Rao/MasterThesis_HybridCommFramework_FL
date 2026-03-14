@@ -54,6 +54,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             client_id INTEGER NOT NULL,
             timestamp TEXT NOT NULL,
+            link_direction TEXT DEFAULT 'uplink',
             round_num INTEGER NOT NULL,
             episode INTEGER NOT NULL,
             state_network TEXT,
@@ -65,9 +66,56 @@ def init_db():
             q_delta REAL,
             epsilon REAL NOT NULL,
             avg_reward_last_100 REAL,
-            converged INTEGER DEFAULT 0
+            converged INTEGER DEFAULT 0,
+            metric_communication_time REAL,
+            metric_convergence_time REAL,
+            metric_accuracy REAL,
+            metric_success INTEGER,
+            metric_cpu_usage REAL,
+            metric_memory_usage REAL,
+            metric_bandwidth_usage REAL,
+            metric_battery_level REAL,
+            metric_energy_usage REAL,
+            metric_t_calc REAL,
+            reward_base REAL,
+            reward_communication_time REAL,
+            reward_convergence_time REAL,
+            reward_accuracy REAL,
+            reward_resource_penalty REAL,
+            reward_battery_penalty REAL,
+            reward_t_calc_penalty REAL,
+            reward_total REAL
         )
     ''')
+
+    # Backward-compatible migration for existing DBs
+    c.execute("PRAGMA table_info(q_learning_log)")
+    existing_cols = {row[1] for row in c.fetchall()}
+    required_new_cols = {
+        'link_direction': "TEXT DEFAULT 'uplink'",
+        'metric_communication_time': 'REAL',
+        'metric_convergence_time': 'REAL',
+        'metric_accuracy': 'REAL',
+        'metric_success': 'INTEGER',
+        'metric_cpu_usage': 'REAL',
+        'metric_memory_usage': 'REAL',
+        'metric_bandwidth_usage': 'REAL',
+        'metric_battery_level': 'REAL',
+        'metric_energy_usage': 'REAL',
+        'metric_t_calc': 'REAL',
+        'reward_base': 'REAL',
+        'reward_communication_time': 'REAL',
+        'reward_convergence_time': 'REAL',
+        'reward_accuracy': 'REAL',
+        'reward_resource_penalty': 'REAL',
+        'reward_battery_penalty': 'REAL',
+        'reward_t_calc_penalty': 'REAL',
+        'reward_total': 'REAL',
+    }
+    for col, col_type in required_new_cols.items():
+        if col not in existing_cols:
+            c.execute(f"ALTER TABLE q_learning_log ADD COLUMN {col} {col_type}")
+
     conn.commit()
     conn.close()
 
@@ -86,20 +134,46 @@ def log_q_step(
     epsilon: float,
     avg_reward_last_100: float = None,
     converged: bool = False,
+    metric_communication_time: float = None,
+    metric_convergence_time: float = None,
+    metric_accuracy: float = None,
+    metric_success: bool = None,
+    metric_cpu_usage: float = None,
+    metric_memory_usage: float = None,
+    metric_bandwidth_usage: float = None,
+    metric_battery_level: float = None,
+    metric_energy_usage: float = None,
+    metric_t_calc: float = None,
+    reward_base: float = None,
+    reward_communication_time: float = None,
+    reward_convergence_time: float = None,
+    reward_accuracy: float = None,
+    reward_resource_penalty: float = None,
+    reward_battery_penalty: float = None,
+    reward_t_calc_penalty: float = None,
+    reward_total: float = None,
+    link_direction: str = 'uplink',
 ):
     """Log one Q-learning step. Auto-creates table if needed."""
     try:
+        init_db()
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute('''
             INSERT INTO q_learning_log (
-                client_id, timestamp, round_num, episode,
+                client_id, timestamp, link_direction, round_num, episode,
                 state_network, state_resource, state_model_size, state_mobility,
-                action, reward, q_delta, epsilon, avg_reward_last_100, converged
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                action, reward, q_delta, epsilon, avg_reward_last_100, converged,
+                metric_communication_time, metric_convergence_time, metric_accuracy, metric_success,
+                metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage, metric_battery_level,
+                metric_energy_usage, metric_t_calc,
+                reward_base, reward_communication_time, reward_convergence_time, reward_accuracy,
+                reward_resource_penalty, reward_battery_penalty, reward_t_calc_penalty, reward_total
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             client_id,
             datetime.now().isoformat(),
+            (link_direction or 'uplink').strip().lower(),
             round_num,
             episode,
             state_network or '',
@@ -112,6 +186,24 @@ def log_q_step(
             epsilon,
             avg_reward_last_100 if avg_reward_last_100 is not None else 0.0,
             1 if converged else 0,
+            metric_communication_time,
+            metric_convergence_time,
+            metric_accuracy,
+            None if metric_success is None else (1 if metric_success else 0),
+            metric_cpu_usage,
+            metric_memory_usage,
+            metric_bandwidth_usage,
+            metric_battery_level,
+            metric_energy_usage,
+            metric_t_calc,
+            reward_base,
+            reward_communication_time,
+            reward_convergence_time,
+            reward_accuracy,
+            reward_resource_penalty,
+            reward_battery_penalty,
+            reward_t_calc_penalty,
+            reward_total,
         ))
         conn.commit()
         conn.close()
@@ -122,6 +214,12 @@ def log_q_step(
                 client_id, round_num, episode,
                 state_network, state_resource, state_model_size, state_mobility,
                 action, reward, q_delta, epsilon, avg_reward_last_100, converged,
+                metric_communication_time, metric_convergence_time, metric_accuracy, metric_success,
+                metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage, metric_battery_level,
+                metric_energy_usage, metric_t_calc,
+                reward_base, reward_communication_time, reward_convergence_time, reward_accuracy,
+                reward_resource_penalty, reward_battery_penalty, reward_t_calc_penalty, reward_total,
+                link_direction,
             )
         else:
             print(f"[QLearningLogger] Error: {e}")

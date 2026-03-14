@@ -16,6 +16,7 @@ from aioquic.asyncio.protocol import QuicConnectionProtocol
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ.setdefault("XLA_FLAGS", "--xla_gpu_enable_command_buffer=")
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
 # Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
 # This ensures different clients use different GPUs in multi-GPU setups
@@ -92,6 +93,10 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
+HTTP3_MAX_STREAM_DATA_BYTES = 16 * 1024
+HTTP3_DATA_CHUNK_BYTES = 12 * 1024
+HTTP3_UPDATE_CHUNK_BYTES = 12 * 1024
 
 # Model initialization timeout (seconds). 0 / none / inf = wait indefinitely (for diagnostic pipeline).
 # Default: no timeout when FL_DIAGNOSTIC_PIPELINE=1, else 300s
@@ -242,6 +247,7 @@ class FederatedLearningClient:
         self.stream_id = 0
         self.model_ready = asyncio.Event()  # Event to signal model is ready
         self.battery_model = BatteryModel(protocol="http3")
+        self._global_model_chunk_buffers = {}
         
         print(f"Client {self.client_id} initialized with:")
         print(f"  Training samples: {self.train_generator.n}")
@@ -259,6 +265,27 @@ class FederatedLearningClient:
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
+
+    def _apply_generator_batch_size(self, batch_size):
+        """Sync DirectoryIterator batch size with training config."""
+        try:
+            batch_size = int(batch_size)
+        except (TypeError, ValueError):
+            return
+        if batch_size <= 0:
+            return
+
+        changed = False
+        for gen_name in ("train_generator", "validation_generator"):
+            generator = getattr(self, gen_name, None)
+            if generator is None:
+                continue
+            current = getattr(generator, "batch_size", None)
+            if current != batch_size:
+                setattr(generator, "batch_size", batch_size)
+                changed = True
+        if changed:
+            print(f"Client {self.client_id} synchronized generator batch_size to {batch_size}")
     
     def build_model_from_config(self, model_config):
         """Build model from server-provided configuration"""
@@ -325,7 +352,18 @@ class FederatedLearningClient:
             ]
             print(f"[HTTP/3] Client {self.client_id} sending {msg_type} on stream {self.stream_id}, payload size: {len(payload)} bytes")
             self.protocol._http.send_headers(stream_id=self.stream_id, headers=headers)
-            self.protocol._http.send_data(stream_id=self.stream_id, data=payload, end_stream=True)
+            if len(payload) <= HTTP3_MAX_STREAM_DATA_BYTES:
+                self.protocol._http.send_data(stream_id=self.stream_id, data=payload, end_stream=True)
+            else:
+                total_chunks = (len(payload) + HTTP3_DATA_CHUNK_BYTES - 1) // HTTP3_DATA_CHUNK_BYTES
+                print(
+                    f"[HTTP/3] Client {self.client_id} chunking outbound {msg_type}: "
+                    f"{len(payload)} bytes across {total_chunks} chunks"
+                )
+                for offset in range(0, len(payload), HTTP3_DATA_CHUNK_BYTES):
+                    chunk = payload[offset:offset + HTTP3_DATA_CHUNK_BYTES]
+                    is_last = (offset + HTTP3_DATA_CHUNK_BYTES) >= len(payload)
+                    self.protocol._http.send_data(stream_id=self.stream_id, data=chunk, end_stream=is_last)
             self.protocol.transmit()
             print(f"[HTTP/3] Client {self.client_id} transmitted {msg_type} message")
             
@@ -335,6 +373,59 @@ class FederatedLearningClient:
             # The transmit() call above is sufficient for immediate transmission
             
             #print(f"[DEBUG] Client {self.client_id} sent {msg_type} on stream {self.stream_id}")
+
+    def _chunk_model_update_messages(self, update_message):
+        payload_key = 'compressed_data' if 'compressed_data' in update_message else 'weights'
+        payload_text = update_message[payload_key]
+        if not isinstance(payload_text, str):
+            raise TypeError(f"Expected string payload for {payload_key}, got {type(payload_text).__name__}")
+
+        chunks = [
+            payload_text[i:i + HTTP3_UPDATE_CHUNK_BYTES]
+            for i in range(0, len(payload_text), HTTP3_UPDATE_CHUNK_BYTES)
+        ] or [payload_text]
+
+        total_chunks = len(chunks)
+        chunk_messages = []
+        for chunk_index, chunk_data in enumerate(chunks):
+            chunk_msg = {
+                'type': 'update_chunk',
+                'message_type': 'model_update_chunk',
+                'protocol': 'http3',
+                'client_id': update_message['client_id'],
+                'round': update_message['round'],
+                'payload_key': payload_key,
+                'payload_chunk': chunk_data,
+                'chunk_index': chunk_index,
+                'total_chunks': total_chunks,
+                'num_samples': update_message['num_samples'] if chunk_index == 0 else 0,
+                'metrics': update_message['metrics'] if chunk_index == 0 else {},
+            }
+            if chunk_index == 0 and 'diagnostic_send_start_ts' in update_message:
+                chunk_msg['diagnostic_send_start_ts'] = update_message['diagnostic_send_start_ts']
+            chunk_messages.append(chunk_msg)
+        return chunk_messages
+
+    async def _send_update_with_chunking(self, update_message):
+        payload = json.dumps(update_message)
+        payload_bytes = len(payload.encode('utf-8'))
+
+        if payload_bytes <= HTTP3_MAX_STREAM_DATA_BYTES:
+            await self.send_message(update_message)
+            return payload_bytes
+
+        chunk_messages = self._chunk_model_update_messages(update_message)
+        print(
+            f"Client {self.client_id} chunking HTTP/3 model update: {payload_bytes} bytes total, "
+            f"{len(chunk_messages)} chunks"
+        )
+        sent_bytes = 0
+        for chunk in chunk_messages:
+            chunk_payload = json.dumps(chunk)
+            chunk_size = len(chunk_payload.encode('utf-8'))
+            await self.send_message(chunk)
+            sent_bytes += chunk_size
+        return sent_bytes
     
     async def handle_message(self, message):
         """Handle incoming messages from server"""
@@ -360,7 +451,13 @@ class FederatedLearningClient:
     
     async def handle_training_config(self, message):
         """Update training configuration"""
-        self.training_config = message['config']
+        if isinstance(message.get('config'), dict):
+            self.training_config.update(message['config'])
+        try:
+            self.training_config["batch_size"] = int(self.training_config.get("batch_size", DEFAULT_DATA_BATCH_SIZE))
+        except (TypeError, ValueError):
+            self.training_config["batch_size"] = DEFAULT_DATA_BATCH_SIZE
+        self._apply_generator_batch_size(self.training_config["batch_size"])
         print(f"Client {self.client_id} updated config: {self.training_config}")
     
     async def handle_global_model(self, message):
@@ -509,6 +606,7 @@ class FederatedLearningClient:
     async def train_local_model(self):
         """Train model on local data and send updates to server"""
         batch_size = self.training_config['batch_size']
+        self._apply_generator_batch_size(batch_size)
         epochs = self.training_config['local_epochs']
         # Limit steps per epoch for faster training (configurable via env)
         try:
@@ -571,13 +669,12 @@ class FederatedLearningClient:
             send_start_cpu = time.perf_counter()
             update_message["diagnostic_send_start_ts"] = send_start_ts
         comm_start = time.time()
-        await self.send_message(update_message)
+        sent_payload_bytes = await self._send_update_with_chunking(update_message)
         communication_time = time.time() - comm_start
-        payload_bytes = len(json.dumps(update_message).encode('utf-8'))
-        self.battery_model.update(payload_bytes, 0, training_time, communication_time)
+        self.battery_model.update(sent_payload_bytes, 0, training_time, communication_time)
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
             O_send = time.perf_counter() - send_start_cpu
-            print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={payload_bytes} send_start_ts={send_start_ts:.9f}")
+            print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={sent_payload_bytes} send_start_ts={send_start_ts:.9f}")
     
     async def evaluate_model(self):
         """Evaluate model on validation data and send metrics to server"""
@@ -679,7 +776,7 @@ async def main():
     train_generator = train_datagen.flow_from_directory(
         os.path.join(client_data_dir, 'train'),
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode='grayscale',
         class_mode='categorical',
         shuffle=True
@@ -688,7 +785,7 @@ async def main():
     validation_generator = val_datagen.flow_from_directory(
         os.path.join(client_data_dir, 'validation'),
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode='grayscale',
         class_mode='categorical',
         shuffle=False

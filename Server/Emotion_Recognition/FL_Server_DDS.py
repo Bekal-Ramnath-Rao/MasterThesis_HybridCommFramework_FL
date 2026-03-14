@@ -69,6 +69,7 @@ MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
 
 # Chunking configuration for large messages
+CHUNK_SIZE = 64 * 1024
 
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -112,10 +113,31 @@ class GlobalModel(IdlStruct):
 
 
 @dataclass
+class GlobalModelChunk(IdlStruct):
+    round: int
+    chunk_id: int
+    total_chunks: int
+    payload: sequence[int]
+    model_config_json: str = ""
+
+
+@dataclass
 class ModelUpdate(IdlStruct):
     client_id: int
     round: int
     weights: sequence[int]
+    num_samples: int
+    loss: float
+    accuracy: float
+
+
+@dataclass
+class ModelUpdateChunk(IdlStruct):
+    client_id: int
+    round: int
+    chunk_id: int
+    total_chunks: int
+    payload: sequence[int]
     num_samples: int
     loss: float
     accuracy: float
@@ -157,6 +179,8 @@ class FederatedLearningServer:
         self.global_weights = None
         
         # Chunk reassembly buffers
+        self.model_update_chunks = {}
+        self.model_update_metadata = {}
         
         # Metrics storage for classification
         self.ACCURACY = []
@@ -263,6 +287,13 @@ class FederatedLearningServer:
         """Deserialize model weights received from DDS"""
         # Convert list of ints back to bytes
         return pickle.loads(bytes(serialized_weights))
+
+    def split_into_chunks(self, data):
+        """Split serialized payload into bounded DDS chunks."""
+        chunks = []
+        for i in range(0, len(data), CHUNK_SIZE):
+            chunks.append(data[i:i + CHUNK_SIZE])
+        return chunks
     
     @staticmethod
     def _config_to_octets(s: str):
@@ -288,6 +319,26 @@ class FederatedLearningServer:
         )
         self.writers['global_model'].write(msg)
         print(f"Sent global model for round {round_num} ({len(serialized_weights)} bytes)")
+
+    def send_global_model_chunked(self, round_num, serialized_weights, model_config):
+        """Send global model as chunked DDS messages to enforce bounded payload size."""
+        chunks = self.split_into_chunks(serialized_weights)
+        total_chunks = len(chunks)
+        print(
+            f"Sending global model in {total_chunks} chunks "
+            f"({len(serialized_weights)} bytes total)"
+        )
+        for chunk_id, chunk_data in enumerate(chunks):
+            chunk = GlobalModelChunk(
+                round=round_num,
+                chunk_id=chunk_id,
+                total_chunks=total_chunks,
+                payload=chunk_data,
+                model_config_json=model_config if chunk_id == 0 else "",
+            )
+            self.writers['global_model_chunk'].write(chunk)
+            if (chunk_id + 1) % 20 == 0:
+                print(f"  Sent {chunk_id + 1}/{total_chunks} chunks")
     
     def setup_dds(self):
         """Initialize DDS participant, topics, readers, and writers"""
@@ -315,13 +366,15 @@ class FederatedLearningServer:
             Policy.Durability.TransientLocal,
             Policy.ResourceLimits(max_samples=10, max_instances=10, max_samples_per_instance=10),
         )
-        # Create topics (no chunk topics; single-message GlobalModel and ModelUpdate)
+        # Create topics (single-message + chunked for bounded payloads)
         topic_registration = Topic(self.participant, "ClientRegistration", ClientRegistration)
         topic_ready = Topic(self.participant, "ClientReady", ClientReady)
         topic_config = Topic(self.participant, "TrainingConfig", TrainingConfig)
         topic_command = Topic(self.participant, "TrainingCommand", TrainingCommand)
         topic_global_model = Topic(self.participant, "GlobalModel", GlobalModel)
+        topic_global_model_chunk = Topic(self.participant, "GlobalModelChunk", GlobalModelChunk)
         topic_model_update = Topic(self.participant, "ModelUpdate", ModelUpdate)
+        topic_model_update_chunk = Topic(self.participant, "ModelUpdateChunk", ModelUpdateChunk)
         topic_metrics = Topic(self.participant, "EvaluationMetrics", EvaluationMetrics)
         topic_status = Topic(self.participant, "ServerStatus", ServerStatus)
         
@@ -340,12 +393,14 @@ class FederatedLearningServer:
         self.readers['registration'] = DataReader(self.participant, topic_registration, qos=reliable_qos)
         self.readers['ready'] = DataReader(self.participant, topic_ready, qos=reliable_qos)
         self.readers['model_update'] = DataReader(self.participant, topic_model_update, qos=reliable_qos_large)
+        self.readers['model_update_chunk'] = DataReader(self.participant, topic_model_update_chunk, qos=reliable_qos_large)
         self.readers['metrics'] = DataReader(self.participant, topic_metrics, qos=reliable_qos)
         
         # Create writers (for sending to clients) — all Reliable
         self.writers['config'] = DataWriter(self.participant, topic_config, qos=reliable_qos)
         self.writers['command'] = DataWriter(self.participant, topic_command, qos=reliable_qos)
         self.writers['global_model'] = DataWriter(self.participant, topic_global_model, qos=reliable_qos)
+        self.writers['global_model_chunk'] = DataWriter(self.participant, topic_global_model_chunk, qos=reliable_qos)
         self.writers['status'] = DataWriter(self.participant, topic_status, qos=reliable_qos)
         
         print("DDS setup complete (Reliable QoS; model_update reader 10 min for large uploads)\n")
@@ -541,9 +596,9 @@ class FederatedLearningServer:
         if len(self.ready_clients) < self.num_clients:
             print(f"[WARNING] Only {len(self.ready_clients)}/{self.num_clients} clients signaled ready. Proceeding anyway.")
 
-        # Send initial global model in a single message
+        # Send initial global model in chunked messages
         print("Publishing initial model to clients...")
-        self.send_global_model(0, serialized_weights, json.dumps(model_config))
+        self.send_global_model_chunked(0, serialized_weights, json.dumps(model_config))
         print("Initial global model sent to all clients")
         
         # Wait for clients to receive and set the initial model
@@ -566,7 +621,71 @@ class FederatedLearningServer:
         print("Start training signal sent successfully\n")
     
     def check_model_updates(self):
-        """Check for model updates from clients (single-message ModelUpdate)."""
+        """Check for model updates from clients (chunked + legacy single-message paths)."""
+        chunk_samples = self.readers['model_update_chunk'].take()
+        for sample in chunk_samples:
+            if not sample or not hasattr(sample, 'round') or sample.round != self.current_round:
+                continue
+            client_id = sample.client_id
+            if client_id not in self.active_clients or client_id in self.client_updates:
+                continue
+
+            chunk_id = sample.chunk_id
+            total_chunks = sample.total_chunks
+            if client_id not in self.model_update_chunks:
+                self.model_update_chunks[client_id] = {}
+                self.model_update_metadata[client_id] = {
+                    'total_chunks': total_chunks,
+                    'num_samples': sample.num_samples,
+                    'loss': sample.loss,
+                    'accuracy': sample.accuracy,
+                }
+            self.model_update_chunks[client_id][chunk_id] = sample.payload
+
+            if len(self.model_update_chunks[client_id]) == total_chunks:
+                reassembled_data = []
+                missing_chunk = False
+                for index in range(total_chunks):
+                    if index in self.model_update_chunks[client_id]:
+                        reassembled_data.extend(self.model_update_chunks[client_id][index])
+                    else:
+                        missing_chunk = True
+                        print(f"Server: Missing update chunk {index} from client {client_id}")
+                        break
+                if not missing_chunk and len(reassembled_data) > 0:
+                    recv_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
+                    try:
+                        if self.quantization_handler is not None:
+                            try:
+                                compressed_data = pickle.loads(bytes(reassembled_data))
+                                weights = self.quantization_handler.decompress_client_update(client_id, compressed_data)
+                                print(f"Server: Received and decompressed update from client {client_id}")
+                            except Exception as e:
+                                print(f"Server: Failed to decompress from client {client_id}, falling back: {e}")
+                                weights = self.deserialize_weights(reassembled_data)
+                        else:
+                            weights = self.deserialize_weights(reassembled_data)
+                    except Exception as e:
+                        print(f"Server: Failed to deserialize chunked update from client {client_id}: {e}")
+                        weights = None
+
+                    if weights is not None:
+                        if recv_start_cpu is not None:
+                            O_recv = time.perf_counter() - recv_start_cpu
+                            recv_end_ts = time.time()
+                            print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f}")
+                        metadata = self.model_update_metadata[client_id]
+                        self.client_updates[client_id] = {
+                            'weights': weights,
+                            'num_samples': metadata['num_samples'],
+                            'metrics': {'loss': metadata['loss'], 'accuracy': metadata['accuracy']}
+                        }
+                        print(f"Received update from client {client_id} ({len(self.client_updates)}/{len(self.active_clients)})")
+
+                self.model_update_chunks.pop(client_id, None)
+                self.model_update_metadata.pop(client_id, None)
+
+        # Legacy single-message fallback
         samples = self.readers['model_update'].take()
         for sample in samples:
             if not sample or not hasattr(sample, 'round') or sample.round != self.current_round:
@@ -608,6 +727,8 @@ class FederatedLearningServer:
             self.active_clients.discard(client_id)
             self.client_updates.pop(client_id, None)
             self.client_metrics.pop(client_id, None)
+            self.model_update_chunks.pop(client_id, None)
+            self.model_update_metadata.pop(client_id, None)
             print(f"Client {client_id} converged and disconnected. Active clients remaining: {len(self.active_clients)}")
             if not self.active_clients:
                 self.converged = True
@@ -726,7 +847,7 @@ class FederatedLearningServer:
                 {'type': 'Dense', 'units': self.num_classes, 'activation': 'softmax'}
             ]
         }
-        self.send_global_model(self.current_round, serialized_weights, json.dumps(model_config))
+        self.send_global_model_chunked(self.current_round, serialized_weights, json.dumps(model_config))
         
         # Send evaluation command
         time.sleep(1)

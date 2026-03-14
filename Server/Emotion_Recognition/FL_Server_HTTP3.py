@@ -54,6 +54,8 @@ NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+HTTP3_MAX_STREAM_DATA_BYTES = 16 * 1024
+HTTP3_DATA_CHUNK_BYTES = 12 * 1024
 
 
 QUIC_SOCKET_BUFFER_BYTES = 7_500_000  # 7.5MB for SO_RCVBUF/SO_SNDBUF (poor network)
@@ -257,6 +259,7 @@ class FederatedLearningServer:
         self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
+        self.transport_update_chunks = {}  # {(protocol, client_id, round): {'chunks': {}, ...}}
         self.global_weights = None
         
         # Metrics storage for classification
@@ -383,7 +386,18 @@ class FederatedLearningServer:
         
         try:
             protocol._http.send_headers(stream_id=stream_id, headers=headers)
-            protocol._http.send_data(stream_id=stream_id, data=payload, end_stream=True)
+            if len(payload) <= HTTP3_MAX_STREAM_DATA_BYTES:
+                protocol._http.send_data(stream_id=stream_id, data=payload, end_stream=True)
+            else:
+                total_chunks = (len(payload) + HTTP3_DATA_CHUNK_BYTES - 1) // HTTP3_DATA_CHUNK_BYTES
+                print(
+                    f"[HTTP/3] Chunking outbound {message.get('type')} to client {client_id}: "
+                    f"{len(payload)} bytes across {total_chunks} chunks"
+                )
+                for offset in range(0, len(payload), HTTP3_DATA_CHUNK_BYTES):
+                    chunk = payload[offset:offset + HTTP3_DATA_CHUNK_BYTES]
+                    is_last = (offset + HTTP3_DATA_CHUNK_BYTES) >= len(payload)
+                    protocol._http.send_data(stream_id=stream_id, data=chunk, end_stream=is_last)
             protocol.transmit()
             
             msg_type = message.get('type')
@@ -409,6 +423,57 @@ class FederatedLearningServer:
         msg_type = message.get('type')
         for client_id in self.registered_clients.keys():
             await self.send_message(client_id, message)
+
+    def _handle_transport_update_chunk(self, data, protocol):
+        """Reassemble chunked updates received over HTTP/3 text transport."""
+        client_id = data['client_id']
+        round_num = data['round']
+        total_chunks = int(data.get('total_chunks', 1) or 1)
+        chunk_index = int(data.get('chunk_index', 0) or 0)
+        payload_chunk = data.get('payload_chunk', '')
+        payload_key = data.get('payload_key', 'compressed_data')
+        key = (protocol, client_id, round_num)
+
+        if key not in self.transport_update_chunks:
+            self.transport_update_chunks[key] = {
+                'chunks': {},
+                'total_chunks': total_chunks,
+                'payload_key': payload_key,
+                'num_samples': data.get('num_samples', 0),
+                'metrics': data.get('metrics', {}),
+                'diagnostic_send_start_ts': data.get('diagnostic_send_start_ts'),
+            }
+
+        buf = self.transport_update_chunks[key]
+        buf['chunks'][chunk_index] = payload_chunk
+
+        received = len(buf['chunks'])
+        if received % 20 == 0 or received == total_chunks:
+            print(f"[{protocol.upper()}] Received {received}/{total_chunks} update chunks from client {client_id}")
+
+        if received < total_chunks:
+            return None
+
+        try:
+            payload = ''.join(buf['chunks'][i] for i in range(total_chunks))
+        except KeyError as e:
+            print(f"[{protocol.upper()}] Missing chunk {e} for client {client_id}, round {round_num}")
+            return None
+
+        reconstructed = {
+            'type': 'model_update',
+            'client_id': client_id,
+            'round': round_num,
+            'num_samples': buf['num_samples'],
+            'metrics': buf['metrics'],
+            payload_key: payload,
+        }
+        if buf.get('diagnostic_send_start_ts') is not None:
+            reconstructed['diagnostic_send_start_ts'] = buf['diagnostic_send_start_ts']
+
+        del self.transport_update_chunks[key]
+        print(f"[{protocol.upper()}] Reassembled chunked update from client {client_id} for round {round_num}")
+        return reconstructed
     
     async def handle_message(self, message, protocol):
         """Handle incoming messages from clients"""
@@ -418,8 +483,12 @@ class FederatedLearningServer:
             
             if msg_type == 'register':
                 await self.handle_client_registration(message, protocol)
-            elif msg_type == 'model_update':
+            elif msg_type in ('model_update', 'update'):
                 await self.handle_client_update(message)
+            elif msg_type in ('update_chunk', 'model_update_chunk'):
+                reconstructed = self._handle_transport_update_chunk(message, 'http3')
+                if reconstructed is not None:
+                    await self.handle_client_update(reconstructed)
             elif msg_type == 'metrics':
                 await self.handle_client_metrics(message)
         except Exception as e:

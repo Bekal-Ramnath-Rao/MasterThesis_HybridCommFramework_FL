@@ -22,6 +22,15 @@ import logging
 import paho.mqtt.client as mqtt_client
 import pika  # AMQP
 import grpc  # gRPC
+try:
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'Protocols'))
+    import federated_learning_pb2
+    import federated_learning_pb2_grpc
+    GRPC_PROTO_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    federated_learning_pb2 = None
+    federated_learning_pb2_grpc = None
+    GRPC_PROTO_AVAILABLE = False
 from cyclonedds.domain import DomainParticipant
 from cyclonedds.topic import Topic
 from cyclonedds.pub import DataWriter
@@ -31,6 +40,20 @@ from cyclonedds.sub import DataReader
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from rl_q_learning_selector import QLearningProtocolSelector, EnvironmentStateManager
 from dynamic_network_controller import DynamicNetworkController
+
+# q_learning_logger lives in scripts/utilities (Docker: /app/scripts/utilities, local: project_root/scripts/utilities)
+if os.path.exists('/app'):
+    _project_root = '/app'
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '../..'))
+_utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+try:
+    from q_learning_logger import init_db as init_qlearning_db, log_q_step
+except ImportError:
+    init_qlearning_db = None
+    log_q_step = None
 
 # Suppress TensorFlow warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -51,6 +74,7 @@ USE_COMMUNICATION_MODEL_REWARD = os.getenv("USE_COMMUNICATION_MODEL_REWARD", "tr
 
 TOPIC_CLIENT_UPDATE = f"fl/client/{CLIENT_ID}/update"
 TOPIC_CLIENT_METRICS = f"fl/client/{CLIENT_ID}/metrics"
+GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(4 * 1024 * 1024)))
 
 
 class UnifiedFLClient_Temperature:
@@ -105,6 +129,8 @@ class UnifiedFLClient_Temperature:
             )
             self.env_manager = EnvironmentStateManager()
             self.env_manager.update_model_size('small')  # Temperature (small model)
+            if init_qlearning_db is not None:
+                init_qlearning_db()
         else:
             self.rl_selector = None
             self.env_manager = None
@@ -125,6 +151,12 @@ class UnifiedFLClient_Temperature:
             'accuracy': 0.0,
             'success': False
         }
+        self.current_round = 0
+        self.selected_downlink_protocol = 'grpc'
+        self.initial_global_model_downloaded = False
+        self.last_protocol_query_key = None
+        self.grpc_host = os.getenv("GRPC_HOST", "fl-server-unified-temperature")
+        self.grpc_port = int(os.getenv("GRPC_PORT", "50051"))
         
         print(f"\n{'='*70}")
         print(f"UNIFIED FL CLIENT - TEMPERATURE REGULATION")
@@ -220,6 +252,99 @@ class UnifiedFLClient_Temperature:
             return get_t_calc_for_reward(protocol, payload_bytes, json_path=path)
         except Exception:
             return None
+
+    def _open_grpc_stub(self):
+        if not GRPC_PROTO_AVAILABLE:
+            return None, None
+        options = [
+            ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
+            ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
+        ]
+        channel = grpc.insecure_channel(f"{self.grpc_host}:{self.grpc_port}", options=options)
+        stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
+        return channel, stub
+
+    def _select_downlink_protocol(self, round_id: int, global_model_id: int) -> str:
+        # First global model bootstrap is always forced to gRPC.
+        if round_id <= 1 or global_model_id <= 1 or not self.initial_global_model_downloaded:
+            return 'grpc'
+        selected = self.select_protocol()
+        return selected if selected in {'mqtt', 'amqp', 'grpc', 'quic', 'http3', 'dds'} else 'grpc'
+
+    def _poll_and_respond_protocol_query_via_grpc(self):
+        channel, stub = self._open_grpc_stub()
+        if stub is None:
+            return
+        try:
+            status = stub.CheckTrainingStatus(
+                federated_learning_pb2.StatusRequest(client_id=self.client_id, current_round=self.current_round)
+            )
+            if not getattr(status, 'has_protocol_query', False):
+                return
+            query = status.protocol_query
+            query_key = (int(query.round_id), int(query.global_model_id))
+            if self.last_protocol_query_key == query_key:
+                return
+            selected = self._select_downlink_protocol(query.round_id, query.global_model_id)
+            response = stub.SendProtocolSelection(
+                federated_learning_pb2.ProtocolSelection(
+                    client_id=self.client_id,
+                    round_id=int(query.round_id),
+                    global_model_id=int(query.global_model_id),
+                    downlink_protocol_requested=selected,
+                )
+            )
+            if response.success:
+                self.selected_downlink_protocol = selected
+                self.last_protocol_query_key = query_key
+                if log_q_step is not None and self.env_manager is not None and self.rl_selector is not None:
+                    st = self.env_manager.get_current_state()
+                    avg_reward = (
+                        np.mean(self.rl_selector.total_rewards[-100:])
+                        if self.rl_selector.total_rewards else 0.0
+                    )
+                    log_q_step(
+                        client_id=self.client_id,
+                        round_num=int(query.round_id),
+                        episode=max(self.rl_selector.episode_count - 1, 0),
+                        state_network=st.get('network', ''),
+                        state_resource=st.get('resource', ''),
+                        state_model_size=st.get('model_size', ''),
+                        state_mobility=st.get('mobility', ''),
+                        action=selected,
+                        reward=0.0,
+                        q_delta=0.0,
+                        epsilon=self.rl_selector.epsilon,
+                        avg_reward_last_100=float(avg_reward),
+                        converged=False,
+                        link_direction='downlink',
+                    )
+                print(
+                    f"[gRPC] Client {self.client_id} protocol selection sent: "
+                    f"round={query.round_id}, global_model_id={query.global_model_id}, downlink={selected}"
+                )
+        except Exception as e:
+            print(f"[gRPC] Client {self.client_id} protocol query handling failed: {e}")
+        finally:
+            channel.close()
+
+    def _ensure_initial_global_model_via_grpc(self):
+        if self.initial_global_model_downloaded:
+            return
+        channel, stub = self._open_grpc_stub()
+        if stub is None:
+            return
+        try:
+            response = stub.GetGlobalModel(
+                federated_learning_pb2.ModelRequest(client_id=self.client_id, round=0, chunk_index=0)
+            )
+            if response.available and response.weights:
+                self.initial_global_model_downloaded = True
+                print(f"[gRPC] Client {self.client_id} downloaded initial global model via gRPC")
+        except Exception as e:
+            print(f"[gRPC] Client {self.client_id} initial global model download failed: {e}")
+        finally:
+            channel.close()
 
     def train_local_model(self) -> Dict:
         """Train model locally using real temperature data"""
@@ -332,6 +457,10 @@ class UnifiedFLClient_Temperature:
     def federated_learning_round(self, protocol: Optional[str] = None) -> Dict:
         """Execute one round of federated learning"""
         round_start = time.time()
+
+        # Ensure first-round model bootstrap and handle pending protocol negotiation over gRPC.
+        self._ensure_initial_global_model_via_grpc()
+        self._poll_and_respond_protocol_query_via_grpc()
         
         if protocol is None:
             protocol = self.select_protocol()
@@ -365,6 +494,46 @@ class UnifiedFLClient_Temperature:
                     t_calc=t_calc,
                 )
                 self.rl_selector.update_q_value(reward, done=False)
+                if log_q_step is not None:
+                    st = self.env_manager.get_current_state()
+                    q_delta = self.rl_selector.get_last_q_delta()
+                    avg_reward = (np.mean(self.rl_selector.total_rewards[-100:])
+                                 if self.rl_selector.total_rewards else 0.0)
+                    reward_details = self.rl_selector.get_last_reward_breakdown()
+                    log_q_step(
+                        client_id=self.client_id,
+                        round_num=int(getattr(self, 'current_round', 0)),
+                        episode=self.rl_selector.episode_count,
+                        state_network=st.get('network', ''),
+                        state_resource=st.get('resource', ''),
+                        state_model_size=st.get('model_size', ''),
+                        state_mobility=st.get('mobility', ''),
+                        action=protocol,
+                        reward=reward,
+                        q_delta=q_delta,
+                        epsilon=self.rl_selector.epsilon,
+                        avg_reward_last_100=float(avg_reward),
+                        converged=self.rl_selector.check_q_converged(),
+                        metric_communication_time=reward_details.get('communication_time'),
+                        metric_convergence_time=reward_details.get('convergence_time'),
+                        metric_accuracy=reward_details.get('accuracy'),
+                        metric_success=reward_details.get('success'),
+                        metric_cpu_usage=reward_details.get('cpu_usage'),
+                        metric_memory_usage=reward_details.get('memory_usage'),
+                        metric_bandwidth_usage=reward_details.get('bandwidth_usage'),
+                        metric_battery_level=reward_details.get('battery_level'),
+                        metric_energy_usage=reward_details.get('energy_usage'),
+                        metric_t_calc=reward_details.get('t_calc'),
+                        reward_base=reward_details.get('reward_base'),
+                        reward_communication_time=reward_details.get('reward_communication_time'),
+                        reward_convergence_time=reward_details.get('reward_convergence_time'),
+                        reward_accuracy=reward_details.get('reward_accuracy'),
+                        reward_resource_penalty=reward_details.get('reward_resource_penalty'),
+                        reward_battery_penalty=reward_details.get('reward_battery_penalty'),
+                        reward_t_calc_penalty=reward_details.get('reward_t_calc_penalty'),
+                        reward_total=reward_details.get('reward_total'),
+                        link_direction='uplink',
+                    )
                 print(f"[RL] Reward: {reward:.2f}")
             
             return {
@@ -384,6 +553,7 @@ class UnifiedFLClient_Temperature:
         print(f"{'='*70}\n")
         
         for round_num in range(num_rounds):
+            self.current_round = round_num
             print(f"\n{'#'*70}")
             print(f"# ROUND {round_num + 1}/{num_rounds}")
             print(f"{'#'*70}\n")

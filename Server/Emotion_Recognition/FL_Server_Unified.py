@@ -178,6 +178,8 @@ HTTP3_MAX_STREAM_DATA = 16 * 1024     # HTTP/3: 16 KB per stream
 CHUNK_SIZE = 64 * 1024                # DDS: 64 KB per chunk
 # QUIC flow control (separate from HTTP/3; 128 MB for QUIC stream)
 QUIC_HTTP3_MAX_DATA_BYTES = 128 * 1024 * 1024  # 128 MB for QUIC
+PROTOCOL_NEGOTIATION_TIMEOUT_SEC = float(os.getenv("PROTOCOL_NEGOTIATION_TIMEOUT_SEC", "3.0"))
+PROTOCOL_NEGOTIATION_POLL_SEC = float(os.getenv("PROTOCOL_NEGOTIATION_POLL_SEC", "0.1"))
 
 # DDS Data Structures (must be defined at module level for Python 3.8)
 if DDS_AVAILABLE:
@@ -247,8 +249,10 @@ class UnifiedFederatedLearningServer:
         self.num_rounds = num_rounds
         self.current_round = 0
         self.registered_clients = {}  # Maps client_id -> control-plane registration protocol
-        self.client_delivery_protocols = {}  # Maps client_id -> preferred protocol for next global model
+        self.client_delivery_protocols = {}  # Maps client_id -> preferred protocol for next global model downlink
+        self.client_uplink_protocols = {}  # Maps client_id -> last protocol used for local model upload
         self.client_metric_protocols = {}  # Maps client_id -> last protocol used for metrics
+        self.client_protocol_queries = {}  # Maps client_id -> {'round_id', 'global_model_id'} when negotiation query is pending
         self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
@@ -1724,7 +1728,9 @@ class UnifiedFederatedLearningServer:
             is_late_join = self.training_started
             
             self.registered_clients[client_id] = protocol
-            self.client_delivery_protocols.setdefault(client_id, protocol)
+            # Keep control-plane/bootstrap robust: default downlink preference is gRPC
+            # until the client explicitly negotiates a different protocol.
+            self.client_delivery_protocols.setdefault(client_id, 'grpc')
             self.active_clients.add(client_id)
             
             if is_late_join:
@@ -1798,8 +1804,8 @@ class UnifiedFederatedLearningServer:
                       f"(round {round_num} > current {self.current_round})")
                 return
             
-            # Track the protocol that can deliver the next aggregated model back to the client.
-            self.client_delivery_protocols[client_id] = protocol
+            # Track client uplink protocol separately from negotiated downlink preference.
+            self.client_uplink_protocols[client_id] = protocol
 
             if client_id not in self.active_clients:
                 print(f"[{protocol.upper()}] Ignoring update from inactive client {client_id}")
@@ -2016,11 +2022,57 @@ class UnifiedFederatedLearningServer:
                 pass
 
     def _get_delivery_protocol(self, client_id):
-        """Prefer the protocol used for the latest model update."""
+        """Resolve negotiated downlink protocol for a specific client."""
         return self.client_delivery_protocols.get(
             client_id,
-            self.registered_clients.get(client_id, 'grpc')
+            'grpc'
         )
+
+    def _normalize_protocol_name(self, protocol_name):
+        """Normalize and validate protocol names used for downlink negotiation."""
+        if protocol_name is None:
+            return None
+        normalized = str(protocol_name).strip().lower()
+        allowed = {'mqtt', 'amqp', 'grpc', 'quic', 'http3', 'dds'}
+        return normalized if normalized in allowed else None
+
+    def prepare_downlink_protocol_negotiation(self, target_client_ids, round_id, global_model_id):
+        """Queue per-client protocol queries and wait briefly for gRPC selections."""
+        target_clients = [cid for cid in target_client_ids if cid in self.active_clients]
+        if not target_clients:
+            return
+
+        print(
+            f"[gRPC] Negotiating downlink protocol for global model {global_model_id} "
+            f"(round {round_id}, clients={len(target_clients)})"
+        )
+
+        for client_id in target_clients:
+            self.client_protocol_queries[client_id] = {
+                'round_id': int(round_id),
+                'global_model_id': int(global_model_id),
+            }
+
+        deadline = time.time() + max(PROTOCOL_NEGOTIATION_TIMEOUT_SEC, 0.0)
+        while time.time() < deadline:
+            pending = [cid for cid in target_clients if cid in self.client_protocol_queries]
+            if not pending:
+                break
+            time.sleep(max(PROTOCOL_NEGOTIATION_POLL_SEC, 0.01))
+
+        pending_after_wait = [cid for cid in target_clients if cid in self.client_protocol_queries]
+        for client_id in pending_after_wait:
+            # Fallback remains robust gRPC when no fresh selection arrives.
+            self.client_delivery_protocols[client_id] = 'grpc'
+            self.client_protocol_queries.pop(client_id, None)
+
+        if pending_after_wait:
+            print(
+                f"[gRPC] Protocol negotiation timeout for clients {pending_after_wait}; "
+                f"falling back to gRPC downlink"
+            )
+        else:
+            print("[gRPC] Protocol negotiation complete for all target clients")
 
     def _payload_fits_protocol(self, protocol, message):
         """Check whether a JSON message fits the transport's payload budget."""
@@ -2157,6 +2209,14 @@ class UnifiedFederatedLearningServer:
         
         # Clear updates
         self.client_updates.clear()
+
+        # Query each active client for its preferred downlink protocol before sending
+        # the next global model snapshot for this round.
+        self.prepare_downlink_protocol_negotiation(
+            target_client_ids=list(self.active_clients),
+            round_id=self.current_round,
+            global_model_id=self.current_round,
+        )
         
         # Broadcast new global model
         self.broadcast_global_model()
@@ -2619,12 +2679,28 @@ if GRPC_AVAILABLE:
                 # Don't clear flags immediately - let them persist for multiple polls
                 # This prevents race conditions where signals are lost if client has guards
                 # Flags will be cleared when next round's signals are set
+                pending_query = self.server.client_protocol_queries.get(client_id)
+                has_protocol_query = pending_query is not None
+                protocol_query = None
+                if has_protocol_query:
+                    protocol_query = federated_learning_pb2.ProtocolQuery(
+                        client_id=client_id,
+                        round_id=int(pending_query.get('round_id', self.server.current_round)),
+                        global_model_id=int(pending_query.get('global_model_id', self.server.current_round)),
+                    )
                 
+                status_kwargs = {
+                    'should_train': should_train,
+                    'should_evaluate': should_evaluate,
+                    'current_round': self.server.current_round,
+                    'is_complete': self.server.converged,
+                    'has_protocol_query': has_protocol_query,
+                }
+                if protocol_query is not None:
+                    status_kwargs['protocol_query'] = protocol_query
+
                 return federated_learning_pb2.TrainingStatus(
-                    should_train=should_train,
-                    should_evaluate=should_evaluate,
-                    current_round=self.server.current_round,
-                    is_complete=self.server.converged
+                    **status_kwargs
                 )
             except Exception as e:
                 print(f"[gRPC] Error in CheckTrainingStatus: {e}")
@@ -2632,7 +2708,56 @@ if GRPC_AVAILABLE:
                     should_train=False,
                     should_evaluate=False,
                     current_round=0,
-                    is_complete=True
+                    is_complete=True,
+                    has_protocol_query=False,
+                )
+
+        def SendProtocolSelection(self, request, context):
+            """Receive client's negotiated downlink protocol preference over gRPC control plane."""
+            try:
+                client_id = request.client_id
+                selected_protocol = self.server._normalize_protocol_name(request.downlink_protocol_requested)
+                if selected_protocol is None:
+                    return federated_learning_pb2.ProtocolSelectionResponse(
+                        success=False,
+                        message=f"Unsupported downlink protocol: {request.downlink_protocol_requested}",
+                    )
+
+                pending_query = self.server.client_protocol_queries.get(client_id)
+                if pending_query is None:
+                    # Accept as best-effort preference refresh even if query already timed out/cleared.
+                    self.server.client_delivery_protocols[client_id] = selected_protocol
+                    return federated_learning_pb2.ProtocolSelectionResponse(
+                        success=True,
+                        message="Selection accepted (no pending query)",
+                    )
+
+                expected_round = int(pending_query.get('round_id', self.server.current_round))
+                expected_model_id = int(pending_query.get('global_model_id', self.server.current_round))
+                if request.round_id != expected_round or request.global_model_id != expected_model_id:
+                    return federated_learning_pb2.ProtocolSelectionResponse(
+                        success=False,
+                        message=(
+                            f"Selection mismatch: expected round={expected_round}, "
+                            f"global_model_id={expected_model_id}"
+                        ),
+                    )
+
+                self.server.client_delivery_protocols[client_id] = selected_protocol
+                self.server.client_protocol_queries.pop(client_id, None)
+                print(
+                    f"[gRPC] Client {client_id} selected downlink protocol '{selected_protocol}' "
+                    f"for round {request.round_id}, global model {request.global_model_id}"
+                )
+                return federated_learning_pb2.ProtocolSelectionResponse(
+                    success=True,
+                    message="Protocol selection recorded",
+                )
+            except Exception as e:
+                print(f"[gRPC] Error in SendProtocolSelection: {e}")
+                return federated_learning_pb2.ProtocolSelectionResponse(
+                    success=False,
+                    message=str(e),
                 )
 
 

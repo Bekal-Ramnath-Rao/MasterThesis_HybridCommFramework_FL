@@ -11,6 +11,7 @@ import grpc
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ.setdefault("XLA_FLAGS", "--xla_gpu_enable_command_buffer=")
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
 # Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
 # This ensures different clients use different GPUs in multi-GPU setups
@@ -109,6 +110,7 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
 
 
 class FederatedLearningClient:
@@ -137,6 +139,9 @@ class FederatedLearningClient:
         self.channel = None
         self.stub = None
         self.running = True
+        self.last_training_round = -1
+        self._training_lock = threading.Lock()
+        self._training_thread = None
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.has_converged = False
@@ -145,6 +150,27 @@ class FederatedLearningClient:
         print(f"  Training samples: {self.train_generator.n}")
         print(f"  Validation samples: {self.validation_generator.n}")
         print(f"  Waiting for initial global model from server...")
+
+    def _apply_generator_batch_size(self, batch_size):
+        """Sync DirectoryIterator batch size with training config."""
+        try:
+            batch_size = int(batch_size)
+        except (TypeError, ValueError):
+            return
+        if batch_size <= 0:
+            return
+
+        changed = False
+        for gen_name in ("train_generator", "validation_generator"):
+            generator = getattr(self, gen_name, None)
+            if generator is None:
+                continue
+            current = getattr(generator, "batch_size", None)
+            if current != batch_size:
+                setattr(generator, "batch_size", batch_size)
+                changed = True
+        if changed:
+            print(f"Client {self.client_id} synchronized generator batch_size to {batch_size}")
         
     def connect(self):
         """Connect to gRPC server"""
@@ -183,6 +209,7 @@ class FederatedLearningClient:
                         "batch_size": config.batch_size,
                         "local_epochs": config.local_epochs
                     }
+                    self._apply_generator_batch_size(self.training_config["batch_size"])
                     print(f"Client {self.client_id} received config: {self.training_config}")
                     
                     return True
@@ -198,6 +225,35 @@ class FederatedLearningClient:
                     print(f"  1. gRPC server is running")
                     print(f"  2. Server address is correct: {GRPC_HOST}:{GRPC_PORT}")
                     raise
+
+    def _launch_training_for_round(self, round_num):
+        """Start local training in a background thread to keep gRPC polling responsive."""
+        with self._training_lock:
+            if self._training_thread is not None and self._training_thread.is_alive():
+                print(f"Client {self.client_id} training already in progress; ignoring start for round {round_num}")
+                return
+            if self.last_training_round == round_num:
+                print(f"Client {self.client_id} ignoring duplicate start training for round {round_num}")
+                return
+
+            self.current_round = round_num
+            self.last_training_round = round_num
+            print(f"\nClient {self.client_id} starting training for round {round_num}...")
+
+            self._training_thread = threading.Thread(
+                target=self._train_local_model_safe,
+                args=(round_num,),
+                daemon=True,
+            )
+            self._training_thread.start()
+
+    def _train_local_model_safe(self, round_num):
+        try:
+            self.train_local_model()
+        except Exception as e:
+            print(f"Client {self.client_id} training thread error on round {round_num}: {e}")
+            import traceback
+            traceback.print_exc()
     
     def run(self):
         """Main client loop - poll server for instructions"""
@@ -257,11 +313,7 @@ class FederatedLearningClient:
                     
                     if model_update.round == status.current_round:
                         self.receive_global_model(model_update)
-                        self.current_round = status.current_round
-                        
-                        # Train on local data
-                        print(f"\nClient {self.client_id} starting training for round {self.current_round}...")
-                        self.train_local_model()
+                        self._launch_training_for_round(status.current_round)
                 
                 # Check if we should evaluate
                 elif status.should_evaluate and status.current_round == self.current_round:
@@ -429,6 +481,7 @@ class FederatedLearningClient:
         """Train model on local data and send updates to server"""
         try:
             batch_size = self.training_config['batch_size']
+            self._apply_generator_batch_size(batch_size)
             epochs = self.training_config['local_epochs']
             # Limit steps per epoch for faster training (configurable via env)
             try:
@@ -475,10 +528,7 @@ class FederatedLearningClient:
             send_start_ts = time.time()
             send_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
             comm_start = time.time()
-            # Random delay before sending
-            delay = random.uniform(0.5, 3.0)
-            print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
-            time.sleep(delay)
+            # FAIR FIX: no artificial pre-send delay; align behavior with unified and other protocols.
             
             # Build metrics for server (include diagnostic_send_start_ts for pipeline T_actual)
             metrics_for_server = {
@@ -645,7 +695,7 @@ def load_data(client_id):
     train_generator = train_data_gen.flow_from_directory(
         train_path,
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode="grayscale",
         class_mode='categorical',
         shuffle=True
@@ -654,7 +704,7 @@ def load_data(client_id):
     validation_generator = validation_data_gen.flow_from_directory(
         validation_path,
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode="grayscale",
         class_mode='categorical',
         shuffle=False

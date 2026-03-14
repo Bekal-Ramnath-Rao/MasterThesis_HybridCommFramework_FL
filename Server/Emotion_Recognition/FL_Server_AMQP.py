@@ -73,6 +73,9 @@ QUEUE_CLIENT_REGISTER = "fl.client.register"
 QUEUE_CLIENT_UPDATE = "fl.client.update"
 QUEUE_CLIENT_METRICS = "fl.client.metrics"
 
+AMQP_MAX_FRAME_BYTES = 128 * 1024
+AMQP_CHUNK_PAYLOAD_BYTES = 96 * 1024
+
 
 class FederatedLearningServer:
     def __init__(self, min_clients, num_rounds, max_clients=100):
@@ -135,6 +138,7 @@ class FederatedLearningServer:
         self.connection = None
         self.channel = None
         self.consuming = False
+        self._model_update_chunk_buffers = {}
     
     def initialize_global_model(self):
         """Initialize the global CNN model for emotion recognition"""
@@ -208,6 +212,149 @@ class FederatedLearningServer:
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
+
+    def _chunk_model_payload(self, model_message):
+        payload_key = "quantized_data" if "quantized_data" in model_message else "weights"
+        payload_text = model_message[payload_key]
+        if not isinstance(payload_text, str):
+            raise TypeError(f"Expected string payload for {payload_key}, got {type(payload_text).__name__}")
+
+        chunks = [
+            payload_text[i:i + AMQP_CHUNK_PAYLOAD_BYTES]
+            for i in range(0, len(payload_text), AMQP_CHUNK_PAYLOAD_BYTES)
+        ] or [payload_text]
+
+        total_chunks = len(chunks)
+        chunk_messages = []
+        for chunk_index, chunk_data in enumerate(chunks):
+            chunk_msg = {
+                "message_type": "global_model_chunk",
+                "type": "global_model_chunk",
+                "round": model_message["round"],
+                "payload_key": payload_key,
+                "payload_chunk": chunk_data,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+            }
+            if chunk_index == 0 and "model_config" in model_message:
+                chunk_msg["model_config"] = model_message["model_config"]
+            chunk_messages.append(chunk_msg)
+        return chunk_messages
+
+    def _publish_global_model_with_chunking(self, model_message, extra_info):
+        message_json = json.dumps(model_message)
+        message_size = len(message_json.encode("utf-8"))
+
+        if message_size <= AMQP_MAX_FRAME_BYTES:
+            self.channel.basic_publish(
+                exchange=EXCHANGE_BROADCAST,
+                routing_key='',
+                body=message_json,
+                properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
+            )
+            log_sent_packet(
+                packet_size=message_size,
+                peer=EXCHANGE_BROADCAST,
+                protocol="AMQP",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info=extra_info
+            )
+            return message_size
+
+        chunks = self._chunk_model_payload(model_message)
+        print(f"Chunking AMQP global model: {message_size} bytes total, {len(chunks)} chunks")
+        sent_bytes = 0
+        for chunk in chunks:
+            chunk_payload = json.dumps(chunk)
+            chunk_size = len(chunk_payload.encode("utf-8"))
+            if chunk_size > AMQP_MAX_FRAME_BYTES:
+                raise ValueError(
+                    f"AMQP global-model chunk exceeds 128KB: {chunk_size} bytes "
+                    f"(chunk {chunk['chunk_index'] + 1}/{chunk['total_chunks']})"
+                )
+            self.channel.basic_publish(
+                exchange=EXCHANGE_BROADCAST,
+                routing_key='',
+                body=chunk_payload,
+                properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
+            )
+            sent_bytes += chunk_size
+            log_sent_packet(
+                packet_size=chunk_size,
+                peer=EXCHANGE_BROADCAST,
+                protocol="AMQP",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info=f"{extra_info} chunk {chunk['chunk_index'] + 1}/{chunk['total_chunks']}"
+            )
+        return sent_bytes
+
+    def _assemble_model_update_chunk(self, data):
+        try:
+            client_id = int(data["client_id"])
+            round_num = int(data["round"])
+            payload_key = data["payload_key"]
+            chunk_index = int(data.get("chunk_index", 0))
+            total_chunks = int(data.get("total_chunks", 1))
+            payload_chunk = data.get("payload_chunk", "")
+        except Exception as e:
+            print(f"Server invalid AMQP update chunk metadata: {e}")
+            return None
+
+        if total_chunks <= 1:
+            assembled = {
+                "client_id": client_id,
+                "round": round_num,
+                payload_key: payload_chunk,
+                "num_samples": data.get("num_samples", 0),
+                "metrics": data.get("metrics", {}),
+            }
+            if "diagnostic_send_start_ts" in data:
+                assembled["diagnostic_send_start_ts"] = data.get("diagnostic_send_start_ts")
+            return assembled
+
+        chunk_key = (client_id, round_num, payload_key)
+        entry = self._model_update_chunk_buffers.setdefault(
+            chunk_key,
+            {
+                "chunks": {},
+                "total_chunks": total_chunks,
+                "num_samples": data.get("num_samples", 0),
+                "metrics": data.get("metrics", {}),
+                "diagnostic_send_start_ts": data.get("diagnostic_send_start_ts"),
+                "updated_at": time.time(),
+            }
+        )
+
+        if chunk_index == 0:
+            entry["num_samples"] = data.get("num_samples", entry["num_samples"])
+            entry["metrics"] = data.get("metrics", entry["metrics"])
+            if "diagnostic_send_start_ts" in data:
+                entry["diagnostic_send_start_ts"] = data.get("diagnostic_send_start_ts")
+
+        if chunk_index not in entry["chunks"]:
+            entry["chunks"][chunk_index] = payload_chunk
+        entry["updated_at"] = time.time()
+
+        if len(entry["chunks"]) < total_chunks:
+            return None
+
+        assembled_payload = "".join(entry["chunks"].get(i, "") for i in range(total_chunks))
+        assembled = {
+            "client_id": client_id,
+            "round": round_num,
+            payload_key: assembled_payload,
+            "num_samples": entry["num_samples"],
+            "metrics": entry["metrics"],
+        }
+        if entry.get("diagnostic_send_start_ts") is not None:
+            assembled["diagnostic_send_start_ts"] = entry["diagnostic_send_start_ts"]
+
+        self._model_update_chunk_buffers.pop(chunk_key, None)
+        print(
+            f"Reassembled AMQP model update from client {client_id} for round {round_num} "
+            f"from {total_chunks} chunks"
+        )
+        return assembled
     
     def connect(self):
         """Connect to RabbitMQ broker"""
@@ -225,7 +372,7 @@ class FederatedLearningServer:
                     credentials=credentials,
                     heartbeat=600,  # 10 minutes for very_poor network
                     blocked_connection_timeout=600,  # Aligned with heartbeat
-                    frame_max=128 * 1024  # Realistic max payload: AMQP 128 KB
+                    frame_max=AMQP_MAX_FRAME_BYTES  # Realistic max payload: AMQP 128 KB
                 )
                 self.connection = pika.BlockingConnection(parameters)
                 self.channel = self.connection.channel()
@@ -339,6 +486,11 @@ class FederatedLearningServer:
         )
         try:
             data = json.loads(body.decode())
+            msg_type = data.get("message_type") or data.get("type")
+            if msg_type in ("model_update_chunk", "update_chunk"):
+                data = self._assemble_model_update_chunk(data)
+                if data is None:
+                    return
             client_id = data['client_id']
             round_num = data['round']
             
@@ -489,21 +641,12 @@ class FederatedLearningServer:
         print(f"Model config: {len(initial_model_message.get('model_config', {}).get('layers', []))} layers")
         
         print("\nPublishing initial model to clients...")
-        self.channel.basic_publish(
-            exchange=EXCHANGE_BROADCAST,
-            routing_key='',
-            body=message_json,
-            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
-        )
-        log_sent_packet(
-            packet_size=message_size,
-            peer=EXCHANGE_BROADCAST,
-            protocol="AMQP",
-            round=self.current_round if hasattr(self, 'current_round') else None,
+        sent_bytes = self._publish_global_model_with_chunking(
+            initial_model_message,
             extra_info="Initial global model distribution"
         )
         
-        print("Initial global model sent to all clients")
+        print(f"Initial global model sent to all clients ({sent_bytes} bytes transmitted)")
         
         # Wait for clients to receive and set the initial model
         print("Waiting for clients to receive and build the model...")
@@ -546,11 +689,9 @@ class FederatedLearningServer:
                 "weights": self.serialize_weights(self.global_weights),
                 "model_config": self.model_config
             }
-        self.channel.basic_publish(
-            exchange=EXCHANGE_BROADCAST,
-            routing_key='',
-            body=json.dumps(msg),
-            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
+        self._publish_global_model_with_chunking(
+            msg,
+            extra_info=f"Late-join model broadcast (for client {client_id})"
         )
         print(f"Current global model (round {self.current_round}) sent to client {client_id} (broadcast)")
     
@@ -599,18 +740,8 @@ class FederatedLearningServer:
                 "weights": self.serialize_weights(self.global_weights)
         }
         
-        self.channel.basic_publish(
-            exchange=EXCHANGE_BROADCAST,
-            routing_key='',
-            body=json.dumps(global_model_message),
-            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
-        )
-        message_size = len(json.dumps(global_model_message).encode('utf-8'))
-        log_sent_packet(
-            packet_size=message_size,
-            peer=EXCHANGE_BROADCAST,
-            protocol="AMQP",
-            round=self.current_round if hasattr(self, 'current_round') else None,
+        message_size = self._publish_global_model_with_chunking(
+            global_model_message,
             extra_info="Aggregated global model distribution"
         )
         

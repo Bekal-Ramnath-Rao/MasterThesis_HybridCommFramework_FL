@@ -14,6 +14,7 @@ from aioquic.asyncio.protocol import QuicConnectionProtocol
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ.setdefault("XLA_FLAGS", "--xla_gpu_enable_command_buffer=")
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
 # Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
 # This ensures different clients use different GPUs in multi-GPU setups
@@ -84,6 +85,7 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
 
 # Model initialization timeout (seconds) - longer for poor network conditions
 # Default: 300s (5 minutes) for very poor network conditions with large models
@@ -177,6 +179,27 @@ class FederatedLearningClient:
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
+
+    def _apply_generator_batch_size(self, batch_size):
+        """Sync DirectoryIterator batch size with training config."""
+        try:
+            batch_size = int(batch_size)
+        except (TypeError, ValueError):
+            return
+        if batch_size <= 0:
+            return
+
+        changed = False
+        for gen_name in ("train_generator", "validation_generator"):
+            generator = getattr(self, gen_name, None)
+            if generator is None:
+                continue
+            current = getattr(generator, "batch_size", None)
+            if current != batch_size:
+                setattr(generator, "batch_size", batch_size)
+                changed = True
+        if changed:
+            print(f"Client {self.client_id} synchronized generator batch_size to {batch_size}")
     
     def build_model_from_config(self, model_config):
         """Build model from server-provided configuration"""
@@ -265,7 +288,13 @@ class FederatedLearningClient:
     
     async def handle_training_config(self, message):
         """Update training configuration"""
-        self.training_config = message['config']
+        if isinstance(message.get('config'), dict):
+            self.training_config.update(message['config'])
+        try:
+            self.training_config["batch_size"] = int(self.training_config.get("batch_size", DEFAULT_DATA_BATCH_SIZE))
+        except (TypeError, ValueError):
+            self.training_config["batch_size"] = DEFAULT_DATA_BATCH_SIZE
+        self._apply_generator_batch_size(self.training_config["batch_size"])
         print(f"Client {self.client_id} updated config: {self.training_config}")
     
     async def handle_global_model(self, message):
@@ -409,6 +438,7 @@ class FederatedLearningClient:
     async def train_local_model(self):
         """Train model on local data and send updates to server"""
         batch_size = self.training_config['batch_size']
+        self._apply_generator_batch_size(batch_size)
         epochs = self.training_config['local_epochs']
         # Limit steps per epoch for faster training (configurable via env)
         try:
@@ -569,7 +599,7 @@ async def main():
     train_generator = train_datagen.flow_from_directory(
         os.path.join(client_data_dir, 'train'),
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode='grayscale',
         class_mode='categorical',
         shuffle=True
@@ -578,7 +608,7 @@ async def main():
     validation_generator = val_datagen.flow_from_directory(
         os.path.join(client_data_dir, 'validation'),
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode='grayscale',
         class_mode='categorical',
         shuffle=False
