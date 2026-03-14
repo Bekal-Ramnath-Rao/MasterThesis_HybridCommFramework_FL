@@ -757,12 +757,9 @@ class UnifiedFLClient_Emotion:
         if init_qlearning_db is not None:
             init_qlearning_db()
 
-        # Pruning and quantization (flow: receive global model -> train -> prune -> quantize -> send)
+        # Pruning and quantization (flow when both enabled: receive global model -> train -> prune -> quantize -> send)
         use_pruning = os.getenv("USE_PRUNING", "0").strip() in ("1", "true", "yes")
         use_quantization = os.getenv("USE_QUANTIZATION", "false").lower() in ("true", "1", "yes")
-        if use_quantization and not use_pruning:
-            use_pruning = True
-            print(f"[Client {client_id}] Quantization enabled: pruning auto-enabled (pruning -> quantization order)")
         self.use_pruning = use_pruning
         self.use_quantization = use_quantization
         self.pruner = None
@@ -3785,20 +3782,14 @@ class UnifiedFLClient_Emotion:
                         'total_chunks': total_chunks,
                         'model_config_json': sample.model_config_json if hasattr(sample, 'model_config_json') else ''
                     }
-                    print(f"Client {self.client_id}: Receiving global model in {total_chunks} chunks...")
                 
                 # Store chunk
                 self.global_model_chunks[chunk_id] = sample.payload
                 
-                # Progress logging - show every 20 chunks to reduce spam
                 chunks_received = len(self.global_model_chunks)
-                if chunks_received % 20 == 0 or chunks_received == total_chunks:
-                    print(f"Client {self.client_id}: Received {chunks_received}/{total_chunks} chunks")
                 
                 # Check if all chunks received
                 if chunks_received == total_chunks:
-                    print(f"Client {self.client_id}: All chunks received, reassembling...")
-                    
                     try:
                         # Reassemble chunks in order
                         reassembled_data = []

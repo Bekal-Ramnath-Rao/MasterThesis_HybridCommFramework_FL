@@ -2257,14 +2257,8 @@ class FLExperimentGUI(QMainWindow):
         return group
     
     def toggle_quantization_options(self, enabled):
-        """Toggle quantization options. If quantization is enabled, pruning is required (pruning -> quantization flow)."""
+        """Toggle quantization options."""
         self.quant_options_widget.setEnabled(enabled)
-        if enabled and not self.pruning_enabled.isChecked():
-            self.pruning_enabled.setChecked(True)
-            self.pruning_options_widget.setEnabled(True)
-            self.output_text.append(
-                "Note: Pruning was auto-enabled because quantization requires pruning to run first (pruning → quantization).\n"
-            )
     
     def toggle_compression_options(self, enabled):
         """Toggle compression options"""
@@ -2559,21 +2553,19 @@ class FLExperimentGUI(QMainWindow):
         
         # Native vs Docker specific options
         if self.exec_mode_native.isChecked():
-            # Native runner: one protocol, one scenario, explicit client count.
+            # Native runner: one or more protocols/scenarios, explicit client count.
             protocols = self.get_selected_protocols()
             if protocols:
-                # Native runner currently optimized for gRPC; pass whichever protocol is selected,
-                # validation happens in start_experiment.
-                cmd_parts.extend(["--protocol", protocols[0]])
+                cmd_parts.extend(["--protocols"] + protocols)
             
             scenarios = self.get_selected_scenarios()
             if scenarios:
-                cmd_parts.extend(["--scenario", scenarios[0]])
+                cmd_parts.extend(["--scenarios"] + scenarios)
             
             # Rounds and client count (native: all clients run on this machine)
             cmd_parts.extend(["--rounds", str(self.rounds_spinbox.value())])
             cmd_parts.extend(["--num-clients", str(self.min_clients.value())])
-            # Pruning (native mode) — required when quantization is on
+            # Pruning (native mode)
             if self.pruning_enabled.isChecked():
                 cmd_parts.append("--use-pruning")
                 sparsity = self.pruning_ratio.value() / 100.0
@@ -2727,36 +2719,15 @@ class FLExperimentGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please select at least one network scenario!")
             return
 
-        # Quantization requires pruning (flow: pruning -> quantization)
-        if self.quantization_enabled.isChecked() and not self.pruning_enabled.isChecked():
-            self.pruning_enabled.setChecked(True)
-            self.pruning_options_widget.setEnabled(True)
-            QMessageBox.information(
-                self,
-                "Pruning auto-enabled",
-                "Quantization is enabled. Pruning has been auto-enabled because the client flow must run "
-                "pruning first, then quantization (pruning → quantization)."
-            )
-
         # Additional validation for native (no Docker) mode
         if self.exec_mode_native.isChecked():
             protocols = self.get_selected_protocols()
             scenarios = self.get_selected_scenarios()
-            if len(protocols) != 1:
-                QMessageBox.warning(
-                    self,
-                    "Native Mode",
-                    "Native (no Docker) mode currently supports running exactly ONE protocol at a time.\n\n"
-                    "Please select a single protocol (e.g., gRPC)."
-                )
+            if not protocols:
+                QMessageBox.warning(self, "Native Mode", "Please select at least one protocol for native mode.")
                 return
-            if len(scenarios) != 1:
-                QMessageBox.warning(
-                    self,
-                    "Native Mode",
-                    "Native (no Docker) mode currently supports running exactly ONE network scenario at a time.\n\n"
-                    "Please select a single network scenario."
-                )
+            if not scenarios:
+                QMessageBox.warning(self, "Native Mode", "Please select at least one network scenario for native mode.")
                 return
         
         # Build command
@@ -2832,15 +2803,6 @@ class FLExperimentGUI(QMainWindow):
             )
         if not pipeline_selected:
             return
-        # Quantization requires pruning (pruning -> quantization)
-        if self.quantization_enabled.isChecked() and not self.pruning_enabled.isChecked():
-            self.pruning_enabled.setChecked(True)
-            self.pruning_options_widget.setEnabled(True)
-            QMessageBox.information(
-                self,
-                "Pruning auto-enabled",
-                "Quantization is enabled. Pruning has been auto-enabled for the diagnostic pipeline (pruning → quantization)."
-            )
         scenarios = self.get_selected_scenarios()
         if not scenarios:
             QMessageBox.warning(
@@ -2862,7 +2824,7 @@ class FLExperimentGUI(QMainWindow):
                 cmd_parts.extend(["--dds-impl", dds_impl_value])
         if self.gpu_enabled.isChecked():
             cmd_parts.append("--enable-gpu")
-        # Pruning and quantization for diagnostic pipeline (pruning -> quantization)
+        # Pruning and quantization for diagnostic pipeline (independent; if both enabled, client flow is prune -> quantize)
         if self.pruning_enabled.isChecked():
             cmd_parts.append("--use-pruning")
             sparsity = self.pruning_ratio.value() / 100.0

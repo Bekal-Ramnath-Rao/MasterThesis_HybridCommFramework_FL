@@ -393,6 +393,12 @@ class FederatedLearningClient:
             Policy.Durability.TransientLocal,
             Policy.ResourceLimits(max_samples=10, max_instances=10, max_samples_per_instance=10),  # allow 9MB samples
         )
+        # Dedicated QoS for chunked model transfer (matches unified path)
+        chunk_qos = Qos(
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.History.KeepLast(2048),
+            Policy.Durability.TransientLocal,
+        )
         # Create topics (single-message + chunked for bounded payloads)
         topic_registration = Topic(self.participant, "ClientRegistration", ClientRegistration)
         topic_ready = Topic(self.participant, "ClientReady", ClientReady)
@@ -420,14 +426,14 @@ class FederatedLearningClient:
         self.readers['config'] = DataReader(self.participant, topic_config, qos=reliable_qos)
         self.readers['command'] = DataReader(self.participant, topic_command, qos=reliable_qos)
         self.readers['global_model'] = DataReader(self.participant, topic_global_model, qos=reliable_qos)
-        self.readers['global_model_chunk'] = DataReader(self.participant, topic_global_model_chunk, qos=reliable_qos)
+        self.readers['global_model_chunk'] = DataReader(self.participant, topic_global_model_chunk, qos=chunk_qos)
         self.readers['status'] = DataReader(self.participant, topic_status, qos=reliable_qos)
         
         # Create writers (for sending to server) — Reliable; model_update uses long timeout for large payload
         self.writers['registration'] = DataWriter(self.participant, topic_registration, qos=reliable_qos)
         self.writers['ready'] = DataWriter(self.participant, topic_ready, qos=reliable_qos)
         self.writers['model_update'] = DataWriter(self.participant, topic_model_update, qos=reliable_qos_large)
-        self.writers['model_update_chunk'] = DataWriter(self.participant, topic_model_update_chunk, qos=reliable_qos_large)
+        self.writers['model_update_chunk'] = DataWriter(self.participant, topic_model_update_chunk, qos=chunk_qos)
         self.writers['metrics'] = DataWriter(self.participant, topic_metrics, qos=reliable_qos)
 
         print(f"Client {self.client_id} DDS setup complete (Reliable QoS; model_update 10 min blocking for large uploads)")
@@ -482,15 +488,8 @@ class FederatedLearningClient:
         
         print(f"Client {self.client_id} waiting for training to start...\n")
         
-        loop_count = 0
         try:
             while self.running:
-                loop_count += 1
-                
-                # Heartbeat every 5 seconds (50 iterations * 0.1s)
-                if loop_count % 50 == 0:
-                    print(f"[ClientLoop] Client {self.client_id} iteration {loop_count}, model={'received' if self.model else 'waiting'}, round={self.current_round}")
-                
                 # Check for global model updates
                 self.check_global_model()
                 
@@ -555,8 +554,6 @@ class FederatedLearningClient:
             if status and not self.current_round and status.training_started and not status.training_complete:
                 if self.model is not None:
                     self._launch_training_for_round(max(1, status.current_round))
-                else:
-                    print(f"[Fallback] Client {self.client_id} awaiting model before starting training...")
     
     def _apply_global_model_payload(self, round_num, serialized_weights, config_json=""):
         """Deserialize and apply global model payload (supports both single and chunked DDS paths)."""
@@ -774,9 +771,6 @@ class FederatedLearningClient:
         
         while time.time() - start_time < timeout:
             check_count += 1
-            
-            if check_count % 50 == 0:  # Log every 5 seconds
-                print(f"Client {self.client_id} still waiting... (checked {check_count} times)")
             self.check_global_model()
             if self._last_evaluated_round == self.current_round:
                 return

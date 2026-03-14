@@ -366,6 +366,12 @@ class FederatedLearningServer:
             Policy.Durability.TransientLocal,
             Policy.ResourceLimits(max_samples=10, max_instances=10, max_samples_per_instance=10),
         )
+        # Dedicated QoS for chunked model transfer (matches unified path)
+        chunk_qos = Qos(
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.History.KeepLast(2048),
+            Policy.Durability.TransientLocal,
+        )
         # Create topics (single-message + chunked for bounded payloads)
         topic_registration = Topic(self.participant, "ClientRegistration", ClientRegistration)
         topic_ready = Topic(self.participant, "ClientReady", ClientReady)
@@ -393,14 +399,14 @@ class FederatedLearningServer:
         self.readers['registration'] = DataReader(self.participant, topic_registration, qos=reliable_qos)
         self.readers['ready'] = DataReader(self.participant, topic_ready, qos=reliable_qos)
         self.readers['model_update'] = DataReader(self.participant, topic_model_update, qos=reliable_qos_large)
-        self.readers['model_update_chunk'] = DataReader(self.participant, topic_model_update_chunk, qos=reliable_qos_large)
+        self.readers['model_update_chunk'] = DataReader(self.participant, topic_model_update_chunk, qos=chunk_qos)
         self.readers['metrics'] = DataReader(self.participant, topic_metrics, qos=reliable_qos)
         
         # Create writers (for sending to clients) — all Reliable
         self.writers['config'] = DataWriter(self.participant, topic_config, qos=reliable_qos)
         self.writers['command'] = DataWriter(self.participant, topic_command, qos=reliable_qos)
         self.writers['global_model'] = DataWriter(self.participant, topic_global_model, qos=reliable_qos)
-        self.writers['global_model_chunk'] = DataWriter(self.participant, topic_global_model_chunk, qos=reliable_qos)
+        self.writers['global_model_chunk'] = DataWriter(self.participant, topic_global_model_chunk, qos=chunk_qos)
         self.writers['status'] = DataWriter(self.participant, topic_status, qos=reliable_qos)
         
         print("DDS setup complete (Reliable QoS; model_update reader 10 min for large uploads)\n")
@@ -443,16 +449,9 @@ class FederatedLearningServer:
         )
         self.writers['config'].write(config)
         
-        loop_count = 0
         try:
             while not self.training_complete:
                 try:
-                    loop_count += 1
-                    # Print heartbeat every 10 iterations (5 seconds)
-                    if loop_count % 10 == 0:
-                        print(f"[ServerLoop] Iteration {loop_count}, registered={len(self.registered_clients)}/{self.num_clients}, training_started={self.training_started}")
-                        sys.stdout.flush()
-                    
                     # Publish current status
                     try:
                         self.publish_status()
@@ -483,14 +482,13 @@ class FederatedLearningServer:
                     time.sleep(0.05)
                     
                 except Exception as loop_error:
-                    print(f"[FATAL] Unhandled exception in server main loop iteration {loop_count}: {loop_error}")
+                    print(f"[FATAL] Unhandled exception in server main loop: {loop_error}")
                     import traceback
                     traceback.print_exc()
                     sys.stdout.flush()
                     # Continue loop despite error
                     time.sleep(1)
-            
-            #print(f"\n[ServerLoop] Loop exited normally: training_complete={self.training_complete}")
+
             sys.stdout.flush()
             print("\nServer shutting down...")
             
@@ -508,11 +506,6 @@ class FederatedLearningServer:
     def check_registrations(self):
         """Check for new client registrations"""
         samples = self.readers['registration'].take()
-        
-        # Debug: Always log to show we're checking (every 20th call to avoid spam)
-        if not hasattr(self, '_reg_check_count'):
-            self._reg_check_count = 0
-        self._reg_check_count += 1
         
         for sample in samples:
             # Some DDS implementations may emit InvalidSample entries; guard against those

@@ -693,11 +693,8 @@ class DistributedClientGUI(QMainWindow):
         return self.protocol_mode.currentData() == "rl_unified" and self.rl_mode_training.isChecked()
 
     def toggle_quantization_options(self, enabled):
-        """Toggle quantization options and keep pruning aligned with experiment GUI"""
+        """Toggle quantization options"""
         self.quant_options_widget.setEnabled(enabled)
-        if enabled and not self.pruning_enabled.isChecked():
-            self.pruning_enabled.setChecked(True)
-            self.log_text.append("Note: Pruning was auto-enabled because quantization uses pruning -> quantization flow.\n")
 
     def toggle_compression_options(self, enabled):
         """Toggle compression options"""
@@ -888,10 +885,6 @@ class DistributedClientGUI(QMainWindow):
             QMessageBox.warning(self, "Error", "Please enter server IP address!")
             return
 
-        if self.quantization_enabled.isChecked() and not self.pruning_enabled.isChecked():
-            self.pruning_enabled.setChecked(True)
-            self.log_text.append("Note: Pruning was auto-enabled because quantization requires pruning first.\n")
-        
         # Determine if using unified or single protocol
         is_unified = (protocol == "rl_unified")
         

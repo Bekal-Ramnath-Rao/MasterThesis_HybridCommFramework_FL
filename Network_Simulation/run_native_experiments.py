@@ -14,10 +14,9 @@ Key properties:
         * server namespace interface (server -> clients direction)
         * each client namespace interface (clients -> server direction)
 
-Currently this runner is intentionally conservative:
-  - It supports running ONE protocol and ONE scenario at a time.
-  - It is primarily tested with the gRPC protocol.
-  - Other protocols can be wired in later using the same pattern.
+This runner supports native execution for one or more protocols and scenarios.
+When multiple protocols/scenarios are provided, it runs each protocol × scenario
+combination sequentially.
 """
 
 import argparse
@@ -839,7 +838,7 @@ class NativeExperimentRunner:
                 if self.pruning_sparsity is not None:
                     env["PRUNING_SPARSITY"] = str(self.pruning_sparsity)
                 env["PRUNING_STRUCTURED"] = "true" if self.pruning_structured else env.get("PRUNING_STRUCTURED", "false")
-            # Quantization (client side; when enabled, pruning is required and is applied first)
+            # Quantization (client side; independent of pruning. If both enabled, pruning happens first in client flow.)
             if self.use_quantization:
                 env["USE_QUANTIZATION"] = "1"
                 env["QUANTIZATION_BITS"] = str(self.quantization_bits)
@@ -1152,6 +1151,19 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    protocol_choices = ["mqtt", "amqp", "grpc", "quic", "http3", "dds", "rl_unified"]
+    scenario_choices = [
+        "excellent",
+        "good",
+        "moderate",
+        "poor",
+        "very_poor",
+        "satellite",
+        "congested_light",
+        "congested_moderate",
+        "congested_heavy",
+    ]
+
     parser.add_argument(
         "--use-case",
         "-u",
@@ -1159,29 +1171,32 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Use case to run experiments for.",
     )
-    parser.add_argument(
+    protocol_group = parser.add_mutually_exclusive_group(required=True)
+    protocol_group.add_argument(
         "--protocol",
         "-p",
-        choices=["mqtt", "amqp", "grpc", "quic", "http3", "dds", "rl_unified"],
-        required=True,
-        help="Communication protocol.",
+        choices=protocol_choices,
+        help="Single communication protocol.",
     )
-    parser.add_argument(
+    protocol_group.add_argument(
+        "--protocols",
+        nargs="+",
+        choices=protocol_choices,
+        help="One or more communication protocols; runs each protocol × scenario combination.",
+    )
+
+    scenario_group = parser.add_mutually_exclusive_group(required=True)
+    scenario_group.add_argument(
         "--scenario",
         "-s",
-        choices=[
-            "excellent",
-            "good",
-            "moderate",
-            "poor",
-            "very_poor",
-            "satellite",
-            "congested_light",
-            "congested_moderate",
-            "congested_heavy",
-        ],
-        required=True,
-        help="Base network scenario to apply.",
+        choices=scenario_choices,
+        help="Single base network scenario to apply.",
+    )
+    scenario_group.add_argument(
+        "--scenarios",
+        nargs="+",
+        choices=scenario_choices,
+        help="One or more network scenarios; runs each protocol × scenario combination.",
     )
     parser.add_argument(
         "--downstream-scenario",
@@ -1228,7 +1243,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use-quantization",
         action="store_true",
-        help="Enable model quantization (sets USE_QUANTIZATION). Requires pruning; client flow: prune then quantize.",
+        help="Enable model quantization (sets USE_QUANTIZATION). If pruning is also enabled, flow is prune then quantize.",
     )
     parser.add_argument(
         "--quantization-bits",
@@ -1282,43 +1297,61 @@ def main() -> None:
     _load_local_privileged_env()
     args = parse_args()
 
-    # RL unified training: use a single client (Q-learning / policy training).
-    if args.protocol == "rl_unified" and args.use_ql_convergence and args.num_clients != 1:
-        print(f"[INFO] RL unified: forcing num_clients=1 for training (was {args.num_clients}).")
-        args.num_clients = 1
+    protocols = list(dict.fromkeys((args.protocols or [args.protocol]) if hasattr(args, "protocols") else [args.protocol]))
+    scenarios = list(dict.fromkeys((args.scenarios or [args.scenario]) if hasattr(args, "scenarios") else [args.scenario]))
 
     # Propagate DDS implementation choice so native DDS server/clients can switch vendor based on DDS_IMPL
     if getattr(args, "dds_impl", None):
         os.environ["DDS_IMPL"] = args.dds_impl
 
     use_quant = getattr(args, "use_quantization", False)
-    if use_quant and not args.use_pruning:
-        args.use_pruning = True
-        print("[INFO] Quantization enabled: pruning auto-enabled (pruning -> quantization).")
-    runner = NativeExperimentRunner(
-        use_case=args.use_case,
-        protocol=args.protocol,
-        scenario=args.scenario,
-        num_rounds=args.rounds,
-        num_clients=args.num_clients,
-        downstream_scenario=args.downstream_scenario,
-        upstream_scenario=args.upstream_scenario,
-        enable_gpu=args.enable_gpu,
-        use_pruning=args.use_pruning,
-        pruning_sparsity=args.pruning_sparsity,
-        pruning_structured=args.pruning_structured,
-        use_quantization=use_quant,
-        quantization_bits=getattr(args, "quantization_bits", 8),
-        quantization_strategy=getattr(args, "quantization_strategy", "parameter_quantization"),
-        quantization_symmetric=getattr(args, "quantization_symmetric", False),
-        use_ql_convergence=getattr(args, "use_ql_convergence", False),
-        rl_reward_scenario=getattr(args, "rl_reward_scenario", None),
-        use_communication_model_reward=not getattr(args, "disable_communication_model_reward", False),
-        reset_epsilon=not getattr(args, "no_reset_epsilon", False),  # Default True (reset), --no-reset-epsilon makes it False
-    )
-    _install_signal_handlers(runner)
-    code = runner.run()
-    sys.exit(code)
+    run_results: List[Tuple[str, str, int]] = []
+
+    for protocol in protocols:
+        for scenario in scenarios:
+            run_num_clients = args.num_clients
+            if protocol == "rl_unified" and args.use_ql_convergence and run_num_clients != 1:
+                print(f"[INFO] RL unified: forcing num_clients=1 for training (was {run_num_clients}) for protocol={protocol}, scenario={scenario}.")
+                run_num_clients = 1
+
+            print(
+                f"\n[RUN] Starting native experiment {len(run_results) + 1}/{len(protocols) * len(scenarios)}"
+                f" -> protocol={protocol}, scenario={scenario}\n"
+            )
+
+            runner = NativeExperimentRunner(
+                use_case=args.use_case,
+                protocol=protocol,
+                scenario=scenario,
+                num_rounds=args.rounds,
+                num_clients=run_num_clients,
+                downstream_scenario=args.downstream_scenario,
+                upstream_scenario=args.upstream_scenario,
+                enable_gpu=args.enable_gpu,
+                use_pruning=args.use_pruning,
+                pruning_sparsity=args.pruning_sparsity,
+                pruning_structured=args.pruning_structured,
+                use_quantization=use_quant,
+                quantization_bits=getattr(args, "quantization_bits", 8),
+                quantization_strategy=getattr(args, "quantization_strategy", "parameter_quantization"),
+                quantization_symmetric=getattr(args, "quantization_symmetric", False),
+                use_ql_convergence=getattr(args, "use_ql_convergence", False),
+                rl_reward_scenario=getattr(args, "rl_reward_scenario", None),
+                use_communication_model_reward=not getattr(args, "disable_communication_model_reward", False),
+                reset_epsilon=not getattr(args, "no_reset_epsilon", False),  # Default True (reset), --no-reset-epsilon makes it False
+            )
+            _install_signal_handlers(runner)
+            code = runner.run()
+            run_results.append((protocol, scenario, code))
+
+    if len(run_results) > 1:
+        print("\n=== Native experiment summary ===")
+        for protocol, scenario, code in run_results:
+            status = "OK" if code == 0 else f"FAIL({code})"
+            print(f"  - protocol={protocol}, scenario={scenario}: {status}")
+
+    failed = [item for item in run_results if item[2] != 0]
+    sys.exit(1 if failed else 0)
 
 
 if __name__ == "__main__":

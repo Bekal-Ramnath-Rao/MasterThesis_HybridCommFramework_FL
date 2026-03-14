@@ -1519,14 +1519,8 @@ class UnifiedFederatedLearningServer:
                                 # Store chunk
                                 self.model_update_chunks[client_id][chunk_id] = sample.payload
                                 
-                                # Progress update every 20 chunks to reduce console spam
-                                if (chunk_id + 1) % 20 == 0 or (chunk_id + 1) == total_chunks:
-                                    print(f"Received {chunk_id + 1}/{total_chunks} chunks from client {client_id}")
-                                
                                 # Check if all chunks received for this client
                                 if len(self.model_update_chunks[client_id]) == total_chunks:
-                                    print(f"All chunks received from client {client_id}, reassembling...")
-                                    
                                     # Reassemble chunks in order
                                     reassembled_data = []
                                     for i in range(total_chunks):
