@@ -863,10 +863,165 @@ class ExperimentRunner:
                 continue
         return None
 
+    def _parse_training_results_from_server_logs(self, exp_dir: str) -> Optional[Dict]:
+        """Parse rounds/loss/accuracy/convergence from server_logs.txt.
+
+        Used as fallback when copied `*_training_results.json` is missing/stale.
+        """
+        server_log_path = os.path.join(exp_dir, "server_logs.txt")
+        if not os.path.exists(server_log_path):
+            return None
+
+        try:
+            with open(server_log_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception:
+            return None
+
+        # Parse multiple protocol-specific summary formats
+        rounds = []
+        loss = []
+        accuracy = []
+        metrics_by_round = {}
+
+        # Pattern 1: Round X - Aggregated Metrics:
+        # Pattern 2: Round X Aggregated Metrics:
+        # followed by two lines: Loss / Accuracy
+        aggregated_patterns = [
+            re.compile(
+                r"Round\s+(\d+)\s*-\s*Aggregated\s+Metrics:\s*"
+                r"(?:\n|\r\n)+\s*Loss:\s*([\d.]+)\s*"
+                r"(?:\n|\r\n)+\s*Accuracy:\s*([\d.]+)",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"Round\s+(\d+)\s+Aggregated\s+Metrics:\s*"
+                r"(?:\n|\r\n)+\s*Loss:\s*([\d.]+)\s*"
+                r"(?:\n|\r\n)+\s*Accuracy:\s*([\d.]+)",
+                re.IGNORECASE,
+            ),
+        ]
+
+        for pattern in aggregated_patterns:
+            for round_str, loss_str, acc_str in pattern.findall(content):
+                round_num = int(round_str)
+                metrics_by_round[round_num] = (float(loss_str), float(acc_str))
+
+        # Pattern 3 (gRPC):
+        # ROUND X SUMMARY ... Average Loss: Y ... Average Accuracy: Z
+        grpc_summary_pattern = re.compile(
+            r"ROUND\s+(\d+)\s+SUMMARY\s*"
+            r"(?:.|\n|\r\n)*?Average\s+Loss:\s*([\d.]+)\s*"
+            r"(?:.|\n|\r\n)*?Average\s+Accuracy:\s*([\d.]+)",
+            re.IGNORECASE,
+        )
+        for round_str, loss_str, acc_str in grpc_summary_pattern.findall(content):
+            round_num = int(round_str)
+            metrics_by_round[round_num] = (float(loss_str), float(acc_str))
+
+        if not metrics_by_round:
+            return None
+
+        for round_num in sorted(metrics_by_round.keys()):
+            loss_val, acc_val = metrics_by_round[round_num]
+            rounds.append(round_num)
+            loss.append(loss_val)
+            accuracy.append(acc_val / 100.0 if acc_val > 1.0 else acc_val)
+
+        if not rounds:
+            return None
+
+        convergence_time = None
+        conv_patterns = [
+            re.compile(r"Convergence\s*time\s*:\s*([\d.]+)\s*seconds", re.IGNORECASE),
+            re.compile(r"Total\s+Training\s+Time\s*:\s*([\d.]+)\s*seconds", re.IGNORECASE),
+            re.compile(r"Time\s+to\s+Convergence\s*:\s*([\d.]+)\s*seconds", re.IGNORECASE),
+        ]
+        for pattern in conv_patterns:
+            m = pattern.search(content)
+            if m:
+                convergence_time = float(m.group(1))
+                break
+
+        if convergence_time is None:
+            # Estimate from recorded RTTs if available
+            try:
+                for name in os.listdir(exp_dir):
+                    if name.endswith("_rtt.json"):
+                        with open(os.path.join(exp_dir, name), "r", encoding="utf-8") as f:
+                            rtt_data = json.load(f)
+                        if isinstance(rtt_data, dict) and rtt_data.get("total_rtt"):
+                            convergence_time = float(rtt_data.get("total_rtt"))
+                            break
+            except Exception:
+                pass
+
+        return {
+            "rounds": rounds,
+            "loss": loss,
+            "accuracy": accuracy,
+            "convergence_time_seconds": convergence_time,
+            "convergence_time_minutes": (convergence_time / 60.0) if convergence_time is not None else None,
+            "total_rounds": len(rounds),
+            "final_accuracy": accuracy[-1] if accuracy else None,
+            "final_loss": loss[-1] if loss else None,
+        }
+
+    def _resolve_training_results(self, exp_dir: str, protocol: str) -> Optional[Dict]:
+        """Resolve best available training results, preferring data consistent with server logs."""
+        json_results = self._read_training_results(exp_dir, protocol)
+        log_results = self._parse_training_results_from_server_logs(exp_dir)
+
+        if json_results is None and log_results is None:
+            return None
+        if json_results is None:
+            return log_results
+        if log_results is None:
+            return json_results
+
+        # If JSON rounds are stale/incomplete, trust server log parse
+        json_rounds = json_results.get("rounds", []) or []
+        log_rounds = log_results.get("rounds", []) or []
+        if len(log_rounds) > len(json_rounds):
+            merged = dict(log_results)
+            # preserve richer fields from json when present
+            if json_results.get("num_clients") is not None:
+                merged["num_clients"] = json_results.get("num_clients")
+            # merge battery-related series if JSON has them
+            for key in ("battery_consumption", "battery_soc", "avg_battery_soc", "round_times_seconds"):
+                if json_results.get(key):
+                    merged[key] = json_results.get(key)
+            return merged
+
+        return json_results
+
+    def _persist_training_results(self, exp_dir: str, protocol: str, training: Optional[Dict]):
+        """Persist corrected training results to protocol JSON in experiment folder."""
+        if not training:
+            return
+        path = os.path.join(exp_dir, f"{protocol}_training_results.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(training, f, indent=2)
+        except Exception:
+            pass
+
     def _extract_model_size_series_mb(self, exp_dir: str) -> List[float]:
         """Extract per-round model serialized size (MB) from client logs."""
         series_by_client = []
-        size_pattern = re.compile(r"serialized\s+update\s+size\s*:\s*([\d.]+)\s*MB", re.IGNORECASE)
+        size_pattern_mb = re.compile(r"serialized\s+update\s+size\s*:\s*([\d.]+)\s*MB", re.IGNORECASE)
+        size_pattern_bytes = re.compile(
+            r"chunking\s+.*?model\s+update\s*:\s*(\d+)\s+bytes\s+total",
+            re.IGNORECASE,
+        )
+        size_pattern_bytes_alt = re.compile(
+            r"model\s+update.*?\((\d+)\s+bytes(?:\s+total)?\)",
+            re.IGNORECASE,
+        )
+        size_pattern_bytes_sent = re.compile(
+            r"sent\s+update\s+in\s+\d+\s+chunks\s*\((\d+)\s+bytes(?:\s+total)?\)",
+            re.IGNORECASE,
+        )
 
         for name in os.listdir(exp_dir):
             if not name.endswith("_logs.txt") or "client" not in name.lower():
@@ -875,7 +1030,13 @@ class ExperimentRunner:
             try:
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
-                sizes = [float(m) for m in size_pattern.findall(content)]
+                sizes = [float(m) for m in size_pattern_mb.findall(content)]
+                if not sizes:
+                    sizes = [int(m) / (1024.0 * 1024.0) for m in size_pattern_bytes.findall(content)]
+                if not sizes:
+                    sizes = [int(m) / (1024.0 * 1024.0) for m in size_pattern_bytes_alt.findall(content)]
+                if not sizes:
+                    sizes = [int(m) / (1024.0 * 1024.0) for m in size_pattern_bytes_sent.findall(content)]
                 if sizes:
                     series_by_client.append(sizes)
             except Exception:
@@ -907,7 +1068,18 @@ class ExperimentRunner:
         cpu_util_fraction = 0.5  # conservative fallback when exact runtime CPU is unavailable
 
         round_start_pattern = re.compile(r"starting training for round\s+(\d+)", re.IGNORECASE)
-        send_size_pattern = re.compile(r"chunking model update:\s*(\d+)\s+bytes total", re.IGNORECASE)
+        send_size_pattern = re.compile(
+            r"chunking\s+.*?model\s+update:\s*(\d+)\s+bytes\s+total",
+            re.IGNORECASE,
+        )
+        send_size_pattern_alt = re.compile(
+            r"model\s+update.*?\((\d+)\s+bytes(?:\s+total)?\)",
+            re.IGNORECASE,
+        )
+        send_size_pattern_sent = re.compile(
+            r"sent\s+update\s+in\s+\d+\s+chunks\s*\((\d+)\s+bytes(?:\s+total)?\)",
+            re.IGNORECASE,
+        )
         epoch_time_pattern = re.compile(r"-\s*([\d.]+)(ms|s)/epoch", re.IGNORECASE)
 
         per_client_series = []
@@ -936,6 +1108,10 @@ class ExperimentRunner:
                                 training_times[current_round] = training_times.get(current_round, 0.0) + (val / 1000.0 if unit == "ms" else val)
 
                             m_send = send_size_pattern.search(line)
+                            if not m_send:
+                                m_send = send_size_pattern_alt.search(line)
+                            if not m_send:
+                                m_send = send_size_pattern_sent.search(line)
                             if m_send:
                                 bytes_sent[current_round] = int(m_send.group(1))
 
@@ -1112,7 +1288,8 @@ class ExperimentRunner:
     def _finalize_experiment_artifacts(self, server_container: str, protocol: str, exp_dir: str):
         """Copy/generate all expected artifacts for an experiment folder."""
         self._copy_server_plots_to_experiment_folder(server_container, protocol, exp_dir)
-        training = self._read_training_results(exp_dir, protocol)
+        training = self._resolve_training_results(exp_dir, protocol)
+        self._persist_training_results(exp_dir, protocol, training)
         self._generate_standard_plots(protocol, exp_dir, training)
         self._ensure_battery_plot_alias(exp_dir)
     
