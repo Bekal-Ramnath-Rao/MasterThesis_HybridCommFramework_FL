@@ -45,6 +45,7 @@ RUN cd Protocols && \
 
 # Copy the Server directory and scripts (DDS discovery server)
 COPY scripts/utilities/packet_logger.py ./
+COPY scripts/utilities/experiment_results_path.py ./
 COPY scripts/dds_discovery_server.py ./scripts/
 COPY Server/ ./Server/
 

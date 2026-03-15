@@ -6,9 +6,9 @@ services:
   mqtt-broker-unified:
     image: eclipse-mosquitto:latest
     container_name: mqtt-broker-unified
-    ports:
-      - "1883:1883"
-      - "9001:9001"
+    expose:
+      - "1883"
+      - "9001"
     volumes:
       - ./mqtt-config:/mosquitto/config
     networks:
@@ -18,9 +18,9 @@ services:
   amqp-broker-unified:
     image: rabbitmq:3-management
     container_name: amqp-broker-unified
-    ports:
-      - "5672:5672"
-      - "15672:15672"
+    expose:
+      - "5672"
+      - "15672"
     environment:
       - RABBITMQ_DEFAULT_USER=guest
       - RABBITMQ_DEFAULT_PASS=guest

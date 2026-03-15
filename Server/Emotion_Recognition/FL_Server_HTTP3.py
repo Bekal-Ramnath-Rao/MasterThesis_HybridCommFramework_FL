@@ -22,7 +22,16 @@ else:
 _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
-from experiment_results_path import get_experiment_results_dir
+try:
+    from experiment_results_path import get_experiment_results_dir
+except ModuleNotFoundError:
+    def get_experiment_results_dir(use_case: str, protocol: str, scenario: str = None) -> Path:
+        if scenario is None:
+            scenario = os.getenv("NETWORK_SCENARIO", "default").strip() or "default"
+        root = Path("/app") if os.path.exists("/app") else Path(_project_root)
+        path = root / "experiment_results" / use_case / protocol / scenario
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')

@@ -7,9 +7,14 @@ import numpy as np
 import sys
 import os
 
-# Add paths
-client_compression_path = os.path.join(os.path.dirname(__file__), 'Client', 'Compression_Technique')
-server_compression_path = os.path.join(os.path.dirname(__file__), 'Server', 'Compression_Technique')
+# Add paths (works for both native checkout and Docker /app mount)
+project_root = '/app' if os.path.exists('/app') else os.path.abspath(
+    os.path.join(os.path.dirname(__file__), '..', '..')
+)
+client_compression_path = os.path.join(project_root, 'Client', 'Compression_Technique')
+server_compression_path = os.path.join(project_root, 'Server', 'Compression_Technique')
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 sys.path.insert(0, client_compression_path)
 sys.path.insert(0, server_compression_path)
 

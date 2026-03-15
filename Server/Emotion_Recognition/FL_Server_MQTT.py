@@ -33,7 +33,10 @@ if _utilities_path not in sys.path:
 
 print(f"Project root set to: {project_root}")
 from packet_logger import init_db, log_sent_packet, log_received_packet
-from experiment_results_path import get_experiment_results_dir
+try:
+    from experiment_results_path import get_experiment_results_dir
+except ModuleNotFoundError:
+    from scripts.utilities.experiment_results_path import get_experiment_results_dir
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')

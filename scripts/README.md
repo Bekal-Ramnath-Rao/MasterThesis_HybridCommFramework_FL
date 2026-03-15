@@ -100,6 +100,12 @@ General utility scripts for common tasks.
 
 # Test quantization
 python scripts/testing/test_quantization.py
+
+# Run complete native-style test suite
+bash scripts/testing/run_native_style_tests.sh
+
+# Run the same suite inside Docker
+docker compose -f Docker/docker-compose-tests.yml up --build --abort-on-container-exit
 ```
 
 ### Utilities

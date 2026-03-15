@@ -10,6 +10,8 @@ import time
 import json
 import os
 import sys
+import re
+import shutil
 from datetime import datetime
 from typing import List, Dict, Optional
 import argparse
@@ -355,7 +357,7 @@ class ExperimentRunner:
                 compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"]
             
             print(f"Starting unified FL system for {self.use_case}...")
-            result = self.run_command(compose_cmd)
+            result = self.run_command(compose_cmd, check=False)
             
             if result.returncode != 0:
                 print(f"[ERROR] Failed to start unified containers:")
@@ -417,7 +419,7 @@ class ExperimentRunner:
         if broker:
             print(f"\n[Stage 1/4] Starting broker: {broker}")
             cmd_broker = compose_cmd_base + ["up", "-d", broker]
-            result = self.run_command(cmd_broker)
+            result = self.run_command(cmd_broker, check=False)
             if result.returncode != 0:
                 print(f"[ERROR] Failed to start broker")
                 print(f"[ERROR] stdout: {result.stdout}")
@@ -432,7 +434,7 @@ class ExperimentRunner:
             stage_num = "[Stage 2/4]" if broker else "[Stage 1/4]"
             print(f"\n{stage_num} Starting server: {server}")
             cmd_server = compose_cmd_base + ["up", "-d", server]
-            result = self.run_command(cmd_server)
+            result = self.run_command(cmd_server, check=False)
             if result.returncode != 0:
                 print(f"[ERROR] Failed to start server")
                 print(f"[ERROR] stdout: {result.stdout}")
@@ -460,7 +462,7 @@ class ExperimentRunner:
             stage_num = "[Stage 4/4]" if (broker and self.enable_congestion and congestion_level != "none") else "[Stage 3/4]"
             print(f"\n{stage_num} Starting clients ({num_local} local): {', '.join(clients_to_start)}")
             cmd_clients = compose_cmd_base + ["up", "-d"] + clients_to_start
-            result = self.run_command(cmd_clients)
+            result = self.run_command(cmd_clients, check=False)
             if result.returncode != 0:
                 print(f"[ERROR] Failed to start clients")
                 print(f"[ERROR] stdout: {result.stdout}")
@@ -830,8 +832,289 @@ class ExperimentRunner:
                     print(f"  Pruning memory plot saved: {plot_path}")
             except Exception as e:
                 print(f"  [WARNING] Could not generate pruning memory plot: {e}")
+
+        # Finalize plots/artifacts for this experiment folder
+        try:
+            self._finalize_experiment_artifacts(
+                server_container=server_container,
+                protocol=protocol,
+                exp_dir=exp_dir,
+            )
+        except Exception as e:
+            print(f"  [WARNING] Could not finalize experiment artifacts: {e}")
         
         print(f"Results saved to: {exp_dir}")
+
+    def _read_training_results(self, exp_dir: str, protocol: str) -> Optional[Dict]:
+        """Load training results JSON if available."""
+        candidates = [
+            os.path.join(exp_dir, f"{protocol}_training_results.json"),
+            os.path.join(exp_dir, "fl_results.json"),
+        ]
+        for path in candidates:
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                continue
+        return None
+
+    def _extract_model_size_series_mb(self, exp_dir: str) -> List[float]:
+        """Extract per-round model serialized size (MB) from client logs."""
+        series_by_client = []
+        size_pattern = re.compile(r"serialized\s+update\s+size\s*:\s*([\d.]+)\s*MB", re.IGNORECASE)
+
+        for name in os.listdir(exp_dir):
+            if not name.endswith("_logs.txt") or "client" not in name.lower():
+                continue
+            path = os.path.join(exp_dir, name)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                sizes = [float(m) for m in size_pattern.findall(content)]
+                if sizes:
+                    series_by_client.append(sizes)
+            except Exception:
+                continue
+
+        if not series_by_client:
+            return []
+
+        max_len = max(len(s) for s in series_by_client)
+        avg_series = []
+        for idx in range(max_len):
+            vals = [s[idx] for s in series_by_client if idx < len(s)]
+            if vals:
+                avg_series.append(sum(vals) / len(vals))
+        return avg_series
+
+    def _estimate_battery_series_from_logs(self, exp_dir: str) -> List[float]:
+        """Estimate cumulative battery consumption per round from saved client logs.
+
+        Fallback for historical experiments where the server generated a battery plot
+        but the timestamped experiment folder did not receive either the plot or the
+        `battery_consumption` series in copied JSON.
+        """
+        # Shared battery model constants used by clients
+        k_tx = 1e-8
+        E_fixed = 0.1
+        P_CPU_MAX = 10.0
+        BATTERY_CAP_J = 60.0 * 3600.0
+        cpu_util_fraction = 0.5  # conservative fallback when exact runtime CPU is unavailable
+
+        round_start_pattern = re.compile(r"starting training for round\s+(\d+)", re.IGNORECASE)
+        send_size_pattern = re.compile(r"chunking model update:\s*(\d+)\s+bytes total", re.IGNORECASE)
+        epoch_time_pattern = re.compile(r"-\s*([\d.]+)(ms|s)/epoch", re.IGNORECASE)
+
+        per_client_series = []
+        for name in os.listdir(exp_dir):
+            if not name.endswith("_logs.txt") or "client" not in name.lower():
+                continue
+
+            path = os.path.join(exp_dir, name)
+            current_round = None
+            training_times = {}
+            bytes_sent = {}
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        m_round = round_start_pattern.search(line)
+                        if m_round:
+                            current_round = int(m_round.group(1))
+                            training_times.setdefault(current_round, 0.0)
+                            continue
+
+                        if current_round is not None:
+                            m_epoch = epoch_time_pattern.search(line)
+                            if m_epoch:
+                                val = float(m_epoch.group(1))
+                                unit = m_epoch.group(2).lower()
+                                training_times[current_round] = training_times.get(current_round, 0.0) + (val / 1000.0 if unit == "ms" else val)
+
+                            m_send = send_size_pattern.search(line)
+                            if m_send:
+                                bytes_sent[current_round] = int(m_send.group(1))
+
+                rounds = sorted(set(training_times.keys()) & set(bytes_sent.keys()))
+                if not rounds:
+                    continue
+
+                cumulative = 0.0
+                series = []
+                for rnd in rounds:
+                    bits_tx = bytes_sent[rnd] * 8
+                    e_radio = (k_tx * bits_tx) + E_fixed
+                    e_cpu = P_CPU_MAX * cpu_util_fraction * training_times.get(rnd, 0.0)
+                    e_total = e_radio + e_cpu
+                    cumulative += e_total / BATTERY_CAP_J
+                    series.append(cumulative)
+
+                if series:
+                    per_client_series.append(series)
+            except Exception:
+                continue
+
+        if not per_client_series:
+            return []
+
+        max_len = max(len(s) for s in per_client_series)
+        avg_series = []
+        for idx in range(max_len):
+            vals = [s[idx] for s in per_client_series if idx < len(s)]
+            if vals:
+                avg_series.append(sum(vals) / len(vals))
+        return avg_series
+
+    def _copy_server_plots_to_experiment_folder(self, server_container: str, protocol: str, exp_dir: str):
+        """Copy server-side generated plots into this experiment folder when available."""
+        protocol_alias = "unified" if protocol == "rl_unified" else protocol
+        use_case_aliases = [self.use_case.lower()]
+        if self.use_case.lower() == "mentalstate":
+            use_case_aliases.append("mental_state")
+
+        candidate_dirs = []
+        for uc in use_case_aliases:
+            candidate_dirs.extend([
+                f"/app/experiment_results/{uc}/{protocol_alias}/default",
+                f"/app/experiment_results/{uc}/{protocol_alias}",
+            ])
+
+        cmd_parts = [f'if [ -d "{d}" ]; then find "{d}" -maxdepth 1 -type f \\( -iname "*.png" -o -iname "*.jpg" -o -iname "*.jpeg" \\); fi' for d in candidate_dirs]
+        list_cmd = " ; ".join(cmd_parts)
+        found = self.run_command([
+            "docker", "exec", server_container, "sh", "-lc", list_cmd
+        ], check=False)
+
+        if found.returncode != 0:
+            return
+
+        copied_any = False
+        for line in (found.stdout or "").splitlines():
+            src = line.strip()
+            if not src:
+                continue
+            dst = os.path.join(exp_dir, os.path.basename(src))
+            self.run_command(["docker", "cp", f"{server_container}:{src}", dst], check=False)
+            copied_any = True
+
+        if copied_any:
+            print("  Copied server-generated plots into experiment folder")
+
+    def _generate_standard_plots(self, protocol: str, exp_dir: str, training: Optional[Dict]):
+        """Generate standard plots in each experiment folder."""
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as e:
+            print(f"  [WARNING] matplotlib unavailable for local plot generation: {e}")
+            return
+
+        if not training:
+            return
+
+        rounds = training.get("rounds", []) or []
+        loss = training.get("loss", []) or []
+        accuracy = training.get("accuracy", []) or []
+        total_rounds = int(training.get("total_rounds", len(rounds) if rounds else 0) or 0)
+        convergence_time_sec = float(training.get("convergence_time_seconds", 0.0) or 0.0)
+
+        if rounds and loss and accuracy and len(rounds) == len(loss) == len(accuracy):
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+            ax1.plot(rounds, loss, marker="o", linewidth=2)
+            ax1.set_title("Loss per Round")
+            ax1.set_xlabel("Round")
+            ax1.set_ylabel("Loss")
+            ax1.grid(True, alpha=0.3)
+
+            acc_plot = [a * 100.0 if a <= 1.0 else a for a in accuracy]
+            ax2.plot(rounds, acc_plot, marker="s", linewidth=2)
+            ax2.set_title("Accuracy per Round")
+            ax2.set_xlabel("Round")
+            ax2.set_ylabel("Accuracy (%)")
+            ax2.grid(True, alpha=0.3)
+
+            fig.tight_layout()
+            fig.savefig(os.path.join(exp_dir, "accuracy_loss_per_round.png"), dpi=180, bbox_inches="tight")
+            plt.close(fig)
+
+        # Training rounds + convergence time summary plot
+        if total_rounds > 0 or convergence_time_sec > 0:
+            fig, ax = plt.subplots(figsize=(7, 4.5))
+            labels = ["Training Rounds", "Convergence Time (s)"]
+            values = [max(total_rounds, 0), max(convergence_time_sec, 0.0)]
+            bars = ax.bar(labels, values)
+            for b in bars:
+                h = b.get_height()
+                ax.text(b.get_x() + b.get_width()/2.0, h, f"{h:.2f}", ha="center", va="bottom")
+            ax.set_title("FL Completion Summary")
+            ax.grid(True, axis="y", alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(os.path.join(exp_dir, "training_rounds_and_convergence_time.png"), dpi=180, bbox_inches="tight")
+            plt.close(fig)
+
+        # Model size (memory) per round from client logs
+        model_sizes_mb = self._extract_model_size_series_mb(exp_dir)
+        if model_sizes_mb:
+            rounds_model = list(range(1, len(model_sizes_mb) + 1))
+            fig, ax = plt.subplots(figsize=(8, 4.5))
+            ax.plot(rounds_model, model_sizes_mb, marker="o", linewidth=2)
+            ax.set_title("Model Size per Round")
+            ax.set_xlabel("Round")
+            ax.set_ylabel("Serialized Model Size (MB)")
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(os.path.join(exp_dir, "model_size_per_round.png"), dpi=180, bbox_inches="tight")
+            plt.close(fig)
+
+        # Optional battery plot if battery data exists in training JSON
+        battery_series = training.get("battery_consumption", []) or training.get("battery_soc", []) or training.get("avg_battery_soc", [])
+        battery_title = "Battery Consumption / SoC per Round"
+        if not battery_series:
+            battery_series = self._estimate_battery_series_from_logs(exp_dir)
+            if battery_series:
+                battery_title = "Estimated Battery Consumption per Round"
+        if rounds and battery_series and len(battery_series) != len(rounds):
+            if len(battery_series) > len(rounds):
+                battery_series = battery_series[:len(rounds)]
+            else:
+                battery_series = list(battery_series) + [battery_series[-1]] * (len(rounds) - len(battery_series))
+        if rounds and battery_series and len(rounds) == len(battery_series):
+            fig, ax = plt.subplots(figsize=(8, 4.5))
+            bat_vals = [b * 100.0 if b <= 1.0 else b for b in battery_series]
+            ax.plot(rounds, bat_vals, marker="o", linewidth=2)
+            ax.set_title(battery_title)
+            ax.set_xlabel("Round")
+            ax.set_ylabel("Battery (%)")
+            ax.grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(os.path.join(exp_dir, "battery_consumption_per_round.png"), dpi=180, bbox_inches="tight")
+            plt.close(fig)
+
+    def _ensure_battery_plot_alias(self, exp_dir: str):
+        """Ensure a canonical battery plot exists when server plot was copied with protocol-specific name."""
+        canonical = os.path.join(exp_dir, "battery_consumption_per_round.png")
+        if os.path.exists(canonical):
+            return
+        for name in os.listdir(exp_dir):
+            lower = name.lower()
+            if ("battery" in lower) and (lower.endswith(".png") or lower.endswith(".jpg") or lower.endswith(".jpeg")):
+                try:
+                    shutil.copyfile(os.path.join(exp_dir, name), canonical)
+                    return
+                except Exception:
+                    return
+
+    def _finalize_experiment_artifacts(self, server_container: str, protocol: str, exp_dir: str):
+        """Copy/generate all expected artifacts for an experiment folder."""
+        self._copy_server_plots_to_experiment_folder(server_container, protocol, exp_dir)
+        training = self._read_training_results(exp_dir, protocol)
+        self._generate_standard_plots(protocol, exp_dir, training)
+        self._ensure_battery_plot_alias(exp_dir)
     
     def run_single_experiment(self, protocol: str, scenario: str, congestion_level: str = "none"):
         """Run a single experiment with specific protocol and network scenario"""

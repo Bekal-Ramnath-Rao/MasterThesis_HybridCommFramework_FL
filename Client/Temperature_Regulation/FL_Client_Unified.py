@@ -11,6 +11,13 @@ import sys
 import time
 import numpy as np
 import pandas as pd
+_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+if _xla_flags:
+    sanitized_flags = [f for f in _xla_flags.split() if f != "--xla_gpu_enable_command_buffer="]
+    if sanitized_flags:
+        os.environ["XLA_FLAGS"] = " ".join(sanitized_flags)
+    else:
+        os.environ.pop("XLA_FLAGS", None)
 import tensorflow as tf
 from tensorflow import keras
 from typing import Dict, Tuple, Optional
@@ -104,34 +111,69 @@ class UnifiedFLClient_Temperature:
         self.local_epochs = 5
         self.batch_size = 16
         
-        # RL Components: training = single client saves to shared path; inference = all clients load from same path
+        # RL Components: two SEPARATE agents for UPLINK and DOWNLINK, each with own Q-table
         if USE_RL_SELECTION:
+            # --- Uplink agent ---
             if os.path.exists("/shared_data"):
-                shared_q_path = "/shared_data/q_table_temperature_trained.pkl"
-                save_path = shared_q_path
+                save_path_uplink = "/shared_data/q_table_temperature_uplink_trained.pkl"
             else:
-                save_path = f"q_table_temperature_client_{client_id}.pkl"
-            initial_load_path = None
-            if os.path.exists("/shared_data") and os.path.exists("/shared_data/q_table_temperature_trained.pkl"):
-                initial_load_path = "/shared_data/q_table_temperature_trained.pkl"
-            if initial_load_path is None:
+                save_path_uplink = f"q_table_temperature_uplink_client_{client_id}.pkl"
+            initial_load_path_uplink = None
+            if os.path.exists("/shared_data"):
+                for _ul_cand in ("/shared_data/q_table_temperature_uplink_trained.pkl",
+                                 "/shared_data/q_table_temperature_trained.pkl"):
+                    if os.path.exists(_ul_cand):
+                        initial_load_path_uplink = _ul_cand
+                        break
+            if initial_load_path_uplink is None:
                 pretrained_dir = os.getenv("PRETRAINED_Q_TABLE_DIR")
                 if pretrained_dir:
-                    for candidate in (os.path.join(pretrained_dir, "q_table_temperature_trained.pkl"),
-                                     os.path.join(pretrained_dir, f"q_table_temperature_client_{client_id}.pkl")):
+                    for candidate in (
+                        os.path.join(pretrained_dir, "q_table_temperature_uplink_trained.pkl"),
+                        os.path.join(pretrained_dir, "q_table_temperature_trained.pkl"),
+                        os.path.join(pretrained_dir, f"q_table_temperature_uplink_client_{client_id}.pkl"),
+                        os.path.join(pretrained_dir, f"q_table_temperature_client_{client_id}.pkl"),
+                    ):
                         if os.path.exists(candidate):
-                            initial_load_path = candidate
+                            initial_load_path_uplink = candidate
                             break
-            self.rl_selector = QLearningProtocolSelector(
-                save_path=save_path,
-                initial_load_path=initial_load_path,
+            self.rl_selector_uplink = QLearningProtocolSelector(
+                save_path=save_path_uplink,
+                initial_load_path=initial_load_path_uplink,
                 use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
             )
+            # --- Downlink agent ---
+            if os.path.exists("/shared_data"):
+                save_path_downlink = "/shared_data/q_table_temperature_downlink_trained.pkl"
+            else:
+                save_path_downlink = f"q_table_temperature_downlink_client_{client_id}.pkl"
+            initial_load_path_downlink = None
+            if os.path.exists("/shared_data") and os.path.exists("/shared_data/q_table_temperature_downlink_trained.pkl"):
+                initial_load_path_downlink = "/shared_data/q_table_temperature_downlink_trained.pkl"
+            if initial_load_path_downlink is None:
+                pretrained_dir = os.getenv("PRETRAINED_Q_TABLE_DIR")
+                if pretrained_dir:
+                    for candidate in (
+                        os.path.join(pretrained_dir, "q_table_temperature_downlink_trained.pkl"),
+                        os.path.join(pretrained_dir, f"q_table_temperature_downlink_client_{client_id}.pkl"),
+                    ):
+                        if os.path.exists(candidate):
+                            initial_load_path_downlink = candidate
+                            break
+            self.rl_selector_downlink = QLearningProtocolSelector(
+                save_path=save_path_downlink,
+                initial_load_path=initial_load_path_downlink,
+                use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
+            )
+            # Backward-compat alias
+            self.rl_selector = self.rl_selector_uplink
             self.env_manager = EnvironmentStateManager()
             self.env_manager.update_model_size('small')  # Temperature (small model)
             if init_qlearning_db is not None:
                 init_qlearning_db()
         else:
+            self.rl_selector_uplink = None
+            self.rl_selector_downlink = None
             self.rl_selector = None
             self.env_manager = None
         
@@ -155,6 +197,9 @@ class UnifiedFLClient_Temperature:
         self.selected_downlink_protocol = 'grpc'
         self.initial_global_model_downloaded = False
         self.last_protocol_query_key = None
+        # Downlink RL tracking
+        self._last_downlink_rl_state = None
+        self._downlink_select_time = None
         self.grpc_host = os.getenv("GRPC_HOST", "fl-server-unified-temperature")
         self.grpc_port = int(os.getenv("GRPC_PORT", "50051"))
         
@@ -210,8 +255,8 @@ class UnifiedFLClient_Temperature:
         return model
     
     def select_protocol(self) -> str:
-        """Select protocol using RL (runs on CPU) or fallback to default"""
-        if USE_RL_SELECTION and self.rl_selector and self.env_manager:
+        """Select UPLINK protocol using the dedicated UPLINK RL agent (CPU-only Q-learning)"""
+        if USE_RL_SELECTION and self.rl_selector_uplink and self.env_manager:
             try:
                 # RL logic runs on CPU only (no GPU); keeps Q-table updates off GPU
                 with tf.device('/CPU:0'):
@@ -224,14 +269,15 @@ class UnifiedFLClient_Temperature:
                     
                     state = self.env_manager.get_current_state()
                     # Inference: use learned Q-table only (training=False); training: epsilon-greedy (training=True)
-                    protocol = self.rl_selector.select_protocol(state, training=USE_QL_CONVERGENCE)
+                    protocol = self.rl_selector_uplink.select_protocol(state, training=USE_QL_CONVERGENCE)
                 
-                print(f"\n[RL Selection] State: {state}")
-                print(f"[RL Selection] Selected Protocol: {protocol.upper()}")
+                print(f"\n[Uplink RL Selection] State: {state}")
+                print(f"[Uplink RL Selection] Selected Protocol: {protocol.upper()}")
+                print(f"[Uplink RL Selection] Epsilon: {self.rl_selector_uplink.epsilon:.4f}")
                 
                 return protocol
             except Exception as e:
-                print(f"[RL Selection] Error: {e}, falling back to MQTT")
+                print(f"[Uplink RL Selection] Error: {e}, falling back to MQTT")
                 return 'mqtt'
         else:
             return os.getenv("DEFAULT_PROTOCOL", "mqtt").lower()
@@ -253,6 +299,81 @@ class UnifiedFLClient_Temperature:
         except Exception:
             return None
 
+    def _update_downlink_rl_after_reception(self, round_num: int = 0):
+        """Compute and log downlink Q-learning reward after global model is received."""
+        if (not USE_RL_SELECTION
+                or self.rl_selector_downlink is None
+                or self._downlink_select_time is None
+                or self._last_downlink_rl_state is None):
+            return
+        try:
+            comm_time = time.time() - self._downlink_select_time
+            self._downlink_select_time = None
+            downlink_state = self._last_downlink_rl_state
+            self._last_downlink_rl_state = None
+            protocol = self.selected_downlink_protocol or 'grpc'
+            resources = self.env_manager.get_resource_consumption() if self.env_manager else {}
+            payload_bytes = 12 * 1024 * 1024
+            t_calc = self._get_t_calc_for_reward(protocol, payload_bytes) if USE_COMMUNICATION_MODEL_REWARD else None
+            accuracy_for_reward = self.round_metrics.get('accuracy', 0.0)
+            reward = self.rl_selector_downlink.calculate_reward(
+                communication_time=comm_time,
+                success=True,
+                convergence_time=0.0,
+                accuracy=accuracy_for_reward,
+                resource_consumption=resources,
+                t_calc=t_calc,
+            )
+            self.rl_selector_downlink.update_q_value(reward, next_state=None, done=True)
+            q_delta = self.rl_selector_downlink.get_last_q_delta()
+            avg_reward = (
+                float(np.mean(self.rl_selector_downlink.total_rewards[-100:]))
+                if self.rl_selector_downlink.total_rewards else 0.0
+            )
+            self.rl_selector_downlink.end_episode()
+            q_converged = self.rl_selector_downlink.check_q_converged()
+            print(f"[Downlink RL] round={round_num} | protocol={protocol.upper()} | "
+                  f"comm_time={comm_time:.3f}s | reward={reward:.2f} | "
+                  f"epsilon={self.rl_selector_downlink.epsilon:.4f}")
+            if log_q_step is not None:
+                reward_details = self.rl_selector_downlink.get_last_reward_breakdown()
+                log_q_step(
+                    client_id=self.client_id,
+                    round_num=round_num or int(getattr(self, 'current_round', 0)),
+                    episode=self.rl_selector_downlink.episode_count - 1,
+                    state_network=downlink_state.get('network', ''),
+                    state_resource=downlink_state.get('resource', ''),
+                    state_model_size=downlink_state.get('model_size', ''),
+                    state_mobility=downlink_state.get('mobility', ''),
+                    action=protocol,
+                    reward=reward,
+                    q_delta=q_delta,
+                    epsilon=self.rl_selector_downlink.epsilon,
+                    avg_reward_last_100=avg_reward,
+                    converged=q_converged,
+                    metric_communication_time=reward_details.get('communication_time'),
+                    metric_convergence_time=reward_details.get('convergence_time'),
+                    metric_accuracy=reward_details.get('accuracy'),
+                    metric_success=reward_details.get('success'),
+                    metric_cpu_usage=reward_details.get('cpu_usage'),
+                    metric_memory_usage=reward_details.get('memory_usage'),
+                    metric_bandwidth_usage=reward_details.get('bandwidth_usage'),
+                    metric_battery_level=reward_details.get('battery_level'),
+                    metric_energy_usage=reward_details.get('energy_usage'),
+                    metric_t_calc=reward_details.get('t_calc'),
+                    reward_base=reward_details.get('reward_base'),
+                    reward_communication_time=reward_details.get('reward_communication_time'),
+                    reward_convergence_time=reward_details.get('reward_convergence_time'),
+                    reward_accuracy=reward_details.get('reward_accuracy'),
+                    reward_resource_penalty=reward_details.get('reward_resource_penalty'),
+                    reward_battery_penalty=reward_details.get('reward_battery_penalty'),
+                    reward_t_calc_penalty=reward_details.get('reward_t_calc_penalty'),
+                    reward_total=reward_details.get('reward_total'),
+                    link_direction='downlink',
+                )
+        except Exception as e:
+            print(f"[Downlink RL] reward update error: {e}")
+
     def _open_grpc_stub(self):
         if not GRPC_PROTO_AVAILABLE:
             return None, None
@@ -268,7 +389,25 @@ class UnifiedFLClient_Temperature:
         # First global model bootstrap is always forced to gRPC.
         if round_id <= 1 or global_model_id <= 1 or not self.initial_global_model_downloaded:
             return 'grpc'
-        selected = self.select_protocol()
+        # Use the dedicated DOWNLINK RL agent
+        if USE_RL_SELECTION and self.rl_selector_downlink and self.env_manager:
+            try:
+                with tf.device('/CPU:0'):
+                    state = self.env_manager.get_current_state()
+                    selected = self.rl_selector_downlink.select_protocol(state, training=USE_QL_CONVERGENCE)
+                self._last_downlink_rl_state = state
+                self._downlink_select_time = time.time()
+                print(f"[Downlink RL] selected {selected.upper()} "
+                      f"(epsilon={self.rl_selector_downlink.epsilon:.4f})")
+            except Exception as e:
+                print(f"[Downlink RL] Error: {e}, using default")
+                selected = self.select_protocol()
+                self._last_downlink_rl_state = None
+                self._downlink_select_time = None
+        else:
+            selected = self.select_protocol()
+            self._last_downlink_rl_state = None
+            self._downlink_select_time = None
         return selected if selected in {'mqtt', 'amqp', 'grpc', 'quic', 'http3', 'dds'} else 'grpc'
 
     def _poll_and_respond_protocol_query_via_grpc(self):
@@ -297,31 +436,12 @@ class UnifiedFLClient_Temperature:
             if response.success:
                 self.selected_downlink_protocol = selected
                 self.last_protocol_query_key = query_key
-                if log_q_step is not None and self.env_manager is not None and self.rl_selector is not None:
-                    st = self.env_manager.get_current_state()
-                    avg_reward = (
-                        np.mean(self.rl_selector.total_rewards[-100:])
-                        if self.rl_selector.total_rewards else 0.0
-                    )
-                    log_q_step(
-                        client_id=self.client_id,
-                        round_num=int(query.round_id),
-                        episode=max(self.rl_selector.episode_count - 1, 0),
-                        state_network=st.get('network', ''),
-                        state_resource=st.get('resource', ''),
-                        state_model_size=st.get('model_size', ''),
-                        state_mobility=st.get('mobility', ''),
-                        action=selected,
-                        reward=0.0,
-                        q_delta=0.0,
-                        epsilon=self.rl_selector.epsilon,
-                        avg_reward_last_100=float(avg_reward),
-                        converged=False,
-                        link_direction='downlink',
-                    )
+                # Real downlink reward is computed in _update_downlink_rl_after_reception()
+                # after global model arrives. We do NOT log reward=0.0 here.
                 print(
                     f"[gRPC] Client {self.client_id} protocol selection sent: "
-                    f"round={query.round_id}, global_model_id={query.global_model_id}, downlink={selected}"
+                    f"round={query.round_id}, global_model_id={query.global_model_id}, downlink={selected} "
+                    f"(downlink RL epsilon={self.rl_selector_downlink.epsilon:.4f if self.rl_selector_downlink else 'N/A'})"
                 )
         except Exception as e:
             print(f"[gRPC] Client {self.client_id} protocol query handling failed: {e}")
@@ -480,12 +600,13 @@ class UnifiedFLClient_Temperature:
             self.round_metrics['accuracy'] = train_metrics['val_accuracy']
             self.round_metrics['success'] = True
             
-            # Update RL only during training (USE_QL_CONVERGENCE); inference clients use loaded Q-table only
-            if USE_RL_SELECTION and self.rl_selector and self.env_manager and USE_QL_CONVERGENCE:
+            # Update RL unconditionally so GUI always shows Q-learning data
+            # (USE_QL_CONVERGENCE only controls the *stopping* condition)
+            if USE_RL_SELECTION and self.rl_selector_uplink and self.env_manager:
                 resources = self.env_manager.get_resource_consumption()
                 payload_bytes = self.round_metrics.get('payload_bytes', 12 * 1024 * 1024)
                 t_calc = self._get_t_calc_for_reward(protocol, payload_bytes) if USE_COMMUNICATION_MODEL_REWARD else None
-                reward = self.rl_selector.calculate_reward(
+                reward = self.rl_selector_uplink.calculate_reward(
                     self.round_metrics['communication_time'],
                     self.round_metrics['success'],
                     self.round_metrics['convergence_time'],
@@ -493,17 +614,17 @@ class UnifiedFLClient_Temperature:
                     resources,
                     t_calc=t_calc,
                 )
-                self.rl_selector.update_q_value(reward, done=False)
+                self.rl_selector_uplink.update_q_value(reward, done=False)
                 if log_q_step is not None:
                     st = self.env_manager.get_current_state()
-                    q_delta = self.rl_selector.get_last_q_delta()
-                    avg_reward = (np.mean(self.rl_selector.total_rewards[-100:])
-                                 if self.rl_selector.total_rewards else 0.0)
-                    reward_details = self.rl_selector.get_last_reward_breakdown()
+                    q_delta = self.rl_selector_uplink.get_last_q_delta()
+                    avg_reward = (np.mean(self.rl_selector_uplink.total_rewards[-100:])
+                                 if self.rl_selector_uplink.total_rewards else 0.0)
+                    reward_details = self.rl_selector_uplink.get_last_reward_breakdown()
                     log_q_step(
                         client_id=self.client_id,
                         round_num=int(getattr(self, 'current_round', 0)),
-                        episode=self.rl_selector.episode_count,
+                        episode=self.rl_selector_uplink.episode_count,
                         state_network=st.get('network', ''),
                         state_resource=st.get('resource', ''),
                         state_model_size=st.get('model_size', ''),
@@ -511,9 +632,9 @@ class UnifiedFLClient_Temperature:
                         action=protocol,
                         reward=reward,
                         q_delta=q_delta,
-                        epsilon=self.rl_selector.epsilon,
+                        epsilon=self.rl_selector_uplink.epsilon,
                         avg_reward_last_100=float(avg_reward),
-                        converged=self.rl_selector.check_q_converged(),
+                        converged=self.rl_selector_uplink.check_q_converged(),
                         metric_communication_time=reward_details.get('communication_time'),
                         metric_convergence_time=reward_details.get('convergence_time'),
                         metric_accuracy=reward_details.get('accuracy'),
@@ -534,7 +655,9 @@ class UnifiedFLClient_Temperature:
                         reward_total=reward_details.get('reward_total'),
                         link_direction='uplink',
                     )
-                print(f"[RL] Reward: {reward:.2f}")
+                print(f"[Uplink RL] Reward: {reward:.2f}, epsilon: {self.rl_selector_uplink.epsilon:.4f}")
+                # Compute and log downlink reward if a downlink selection was made this round
+                self._update_downlink_rl_after_reception(round_num=int(getattr(self, 'current_round', 0)))
             
             return {
                 'protocol': protocol,
@@ -565,8 +688,8 @@ class UnifiedFLClient_Temperature:
                 print(f"  {key}: {value}")
             
             if USE_RL_SELECTION and self.rl_selector and USE_QL_CONVERGENCE:
-                self.rl_selector.end_episode()
-        
+                self.rl_selector_uplink.end_episode()
+                self.rl_selector_downlink.end_episode()
         if USE_RL_SELECTION and self.rl_selector:
             self.rl_selector.print_statistics()
 

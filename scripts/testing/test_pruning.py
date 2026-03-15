@@ -5,7 +5,12 @@ Verifies pruning works correctly with CNN, CNN+BiLSTM+MHA, and LSTM models
 
 import sys
 import os
-sys.path.append(os.path.dirname(__file__))
+
+project_root = '/app' if os.path.exists('/app') else os.path.abspath(
+    os.path.join(os.path.dirname(__file__), '..', '..')
+)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 import numpy as np
 import tensorflow as tf

@@ -85,9 +85,10 @@ class QLearningLogsTab(QWidget):
         layout.addWidget(stats_group)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(32)
+        self.table.setColumnCount(33)
         self.table.setHorizontalHeaderLabels([
-            "ID", "Timestamp", "Round", "Episode", "State (net)", "State (res)", "State (size)", "State (mob)",
+            "ID", "Timestamp", "Round", "Episode", "Direction",
+            "State (net)", "State (res)", "State (size)", "State (mob)",
             "Action", "Reward", "Q Delta", "Epsilon", "Avg R(100)", "Converged",
             "Comm Time", "R_comm",
             "Conv Time", "R_conv",
@@ -138,7 +139,9 @@ class QLearningLogsTab(QWidget):
             conn = sqlite3.connect(db_path)
             cur = conn.cursor()
             cur.execute("""
-                SELECT id, timestamp, round_num, episode, state_network, state_resource,
+                SELECT id, timestamp, round_num, episode,
+                       COALESCE(link_direction, 'uplink') AS link_direction,
+                       state_network, state_resource,
                        state_model_size, state_mobility, action, reward, q_delta, epsilon,
                        avg_reward_last_100, converged,
                        metric_communication_time, reward_communication_time,
@@ -150,9 +153,9 @@ class QLearningLogsTab(QWidget):
                        metric_t_calc, reward_t_calc_penalty,
                        reward_total
                 FROM q_learning_log
-                                ORDER BY round_num ASC,
-                                                 CASE WHEN link_direction = 'uplink' THEN 0 ELSE 1 END ASC,
-                                                 id ASC
+                ORDER BY round_num ASC,
+                         CASE WHEN COALESCE(link_direction,'uplink') = 'uplink' THEN 0 ELSE 1 END ASC,
+                         id ASC
             """)
             rows = cur.fetchall()
             conn.close()
@@ -160,16 +163,43 @@ class QLearningLogsTab(QWidget):
             print(f"Q-Learning tab error: {e}")
             return
         self.table.setRowCount(0)
+        # Column index where 'link_direction' lives (0-based, index 4)
+        DIR_COL = 4
+        CONVERGED_COL = 14  # shifted by 1 due to new column
+        REWARD_COL = 10
         for r in rows:
             self.table.insertRow(self.table.rowCount())
+            row_idx = self.table.rowCount() - 1
+            direction = str(r[DIR_COL]).strip().lower() if r[DIR_COL] else 'uplink'
+            reward_val = r[REWARD_COL]
             for c, val in enumerate(r):
-                item = QTableWidgetItem(str(val) if val is not None else "")
-                if c == 13 and val == 1:
+                # Format numeric reward columns to 4 decimal places for readability
+                if isinstance(val, float):
+                    display = f"{val:.4f}" if val != 0.0 else "0.0000"
+                else:
+                    display = str(val) if val is not None else ""
+                item = QTableWidgetItem(display)
+                # Colour converged rows green
+                if c == CONVERGED_COL and val == 1:
                     item.setBackground(QColor(200, 255, 200))
-                self.table.setItem(self.table.rowCount() - 1, c, item)
+                self.table.setItem(row_idx, c, item)
+            # Colour entire row by direction: uplink = light blue, downlink = light yellow
+            if reward_val is not None and reward_val != 0.0:
+                bg = QColor(220, 235, 255) if direction == 'uplink' else QColor(255, 250, 200)
+                for c in range(self.table.columnCount()):
+                    existing = self.table.item(row_idx, c)
+                    if existing:
+                        existing.setBackground(bg)
+                # Re-apply converged highlight on top (it takes priority)
+                if CONVERGED_COL < len(r) and r[CONVERGED_COL] == 1:
+                    conv_item = self.table.item(row_idx, CONVERGED_COL)
+                    if conv_item:
+                        conv_item.setBackground(QColor(200, 255, 200))
         max_ep = max((r[3] for r in rows), default=0)
-        converged = any(r[13] == 1 for r in rows)
-        self.rows_label.setText(f"Rows: {len(rows)}")
+        converged = any(r[CONVERGED_COL] == 1 for r in rows)
+        uplink_rows = sum(1 for r in rows if str(r[DIR_COL]).strip().lower() == 'uplink')
+        downlink_rows = len(rows) - uplink_rows
+        self.rows_label.setText(f"Rows: {len(rows)} (UL:{uplink_rows} DL:{downlink_rows})")
         self.episodes_label.setText(f"Episodes: {max_ep + 1}")
         self.converged_label.setText("Converged: Yes" if converged else "Converged: No")
 
@@ -216,7 +246,9 @@ class QLearningLogsTab(QWidget):
             try:
                 conn = sqlite3.connect(db_path)
                 df = pd.read_sql_query(
-                    """SELECT id, timestamp, round_num, episode, state_network, state_resource,
+                    """SELECT id, timestamp, round_num, episode,
+                       COALESCE(link_direction, 'uplink') AS link_direction,
+                       state_network, state_resource,
                        state_model_size, state_mobility, action, reward, q_delta, epsilon,
                        avg_reward_last_100, converged,
                        metric_communication_time, reward_communication_time,
@@ -229,7 +261,7 @@ class QLearningLogsTab(QWidget):
                        reward_total
                        FROM q_learning_log
                        ORDER BY round_num ASC,
-                                CASE WHEN link_direction = 'uplink' THEN 0 ELSE 1 END ASC,
+                                CASE WHEN COALESCE(link_direction,'uplink') = 'uplink' THEN 0 ELSE 1 END ASC,
                                 id ASC""",
                     conn
                 )
@@ -306,7 +338,9 @@ class QLearningLogsTab(QWidget):
                     try:
                         conn = sqlite3.connect(db_path)
                         df = pd.read_sql_query(
-                            """SELECT id, timestamp, round_num, episode, state_network, state_resource,
+                            """SELECT id, timestamp, round_num, episode,
+                               COALESCE(link_direction, 'uplink') AS link_direction,
+                               state_network, state_resource,
                                state_model_size, state_mobility, action, reward, q_delta, epsilon,
                                avg_reward_last_100, converged,
                                metric_communication_time, reward_communication_time,
@@ -319,7 +353,7 @@ class QLearningLogsTab(QWidget):
                                reward_total
                                FROM q_learning_log
                                ORDER BY round_num ASC,
-                                        CASE WHEN link_direction = 'uplink' THEN 0 ELSE 1 END ASC,
+                                        CASE WHEN COALESCE(link_direction,'uplink') = 'uplink' THEN 0 ELSE 1 END ASC,
                                         id ASC""",
                             conn
                         )

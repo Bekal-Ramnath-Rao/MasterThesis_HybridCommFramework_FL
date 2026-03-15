@@ -178,6 +178,24 @@ docker-compose -f docker-compose-temperature.yml down
 docker-compose stop fl-server-mqtt-emotion fl-client-mqtt-emotion-1 fl-client-mqtt-emotion-2
 ```
 
+## 🧪 Native-Style Test Environment in Docker
+
+Run the same core test scripts used natively, but inside Docker:
+
+```bash
+docker compose -f docker-compose-tests.yml up --build --abort-on-container-exit
+```
+
+This starts:
+- `rabbitmq-test` (for AMQP direct messaging test)
+- `native-style-test-runner` (executes `scripts/testing/run_native_style_tests.sh`)
+
+Stop and clean up after test run:
+
+```bash
+docker compose -f docker-compose-tests.yml down
+```
+
 ## 📊 Accessing Results
 
 Results are stored in mounted volumes and persist on your host machine:

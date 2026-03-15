@@ -333,7 +333,13 @@ except ImportError:
 
 # Suppress TensorFlow warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ.setdefault("XLA_FLAGS", "--xla_gpu_enable_command_buffer=")
+_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+if _xla_flags:
+    sanitized_flags = [f for f in _xla_flags.split() if f != "--xla_gpu_enable_command_buffer="]
+    if sanitized_flags:
+        os.environ["XLA_FLAGS"] = " ".join(sanitized_flags)
+    else:
+        os.environ.pop("XLA_FLAGS", None)
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # Configure GPU - use GPU_DEVICE_ID env var if set, else CUDA_VISIBLE_DEVICES, else default to '0'
@@ -534,32 +540,66 @@ class UnifiedFLClient_Emotion:
         # Training configuration
         self.training_config = {"batch_size": 16, "local_epochs": 20}
         
-        # RL Components (load from past experience when .pkl exists)
+        # RL Components: two SEPARATE agents - one for UPLINK, one for DOWNLINK
+        # Each has its own Q-table (.pkl), episode history, and reward parameters
         if USE_RL_SELECTION and QLearningProtocolSelector is not None:
-            # Training (USE_QL_CONVERGENCE): single client saves to shared path. Inference: all clients load from same path.
+            # --- Uplink agent paths (client -> server model uploads) ---
             if os.path.exists("/shared_data"):
-                shared_q_path = "/shared_data/q_table_emotion_trained.pkl"
-                save_path = shared_q_path  # all clients use same path; inference clients only read, training client writes
+                save_path_uplink = "/shared_data/q_table_emotion_uplink_trained.pkl"
             else:
-                save_path = f"q_table_emotion_client_{client_id}.pkl"
-            # Load from shared trained table first (inference), then optional pretrained dir, then save_path
-            initial_load_path = None
+                save_path_uplink = f"q_table_emotion_uplink_client_{client_id}.pkl"
+            initial_load_path_uplink = None
             if os.path.exists("/shared_data"):
-                if os.path.exists("/shared_data/q_table_emotion_trained.pkl"):
-                    initial_load_path = "/shared_data/q_table_emotion_trained.pkl"
-            if initial_load_path is None:
+                # Prefer new uplink-specific table; fall back to old shared table for backwards compat
+                for _ul_cand in ("/shared_data/q_table_emotion_uplink_trained.pkl",
+                                 "/shared_data/q_table_emotion_trained.pkl"):
+                    if os.path.exists(_ul_cand):
+                        initial_load_path_uplink = _ul_cand
+                        break
+            if initial_load_path_uplink is None:
                 pretrained_dir = os.getenv("PRETRAINED_Q_TABLE_DIR")
                 if pretrained_dir:
-                    for candidate in (os.path.join(pretrained_dir, "q_table_emotion_trained.pkl"),
-                                     os.path.join(pretrained_dir, f"q_table_emotion_client_{client_id}.pkl")):
+                    for candidate in (
+                        os.path.join(pretrained_dir, "q_table_emotion_uplink_trained.pkl"),
+                        os.path.join(pretrained_dir, "q_table_emotion_trained.pkl"),
+                        os.path.join(pretrained_dir, f"q_table_emotion_uplink_client_{client_id}.pkl"),
+                        os.path.join(pretrained_dir, f"q_table_emotion_client_{client_id}.pkl"),
+                    ):
                         if os.path.exists(candidate):
-                            initial_load_path = candidate
+                            initial_load_path_uplink = candidate
                             break
-            self.rl_selector = QLearningProtocolSelector(
-                save_path=save_path,
-                initial_load_path=initial_load_path,
+            self.rl_selector_uplink = QLearningProtocolSelector(
+                save_path=save_path_uplink,
+                initial_load_path=initial_load_path_uplink,
                 use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
             )
+
+            # --- Downlink agent paths (server -> client model downloads) ---
+            if os.path.exists("/shared_data"):
+                save_path_downlink = "/shared_data/q_table_emotion_downlink_trained.pkl"
+            else:
+                save_path_downlink = f"q_table_emotion_downlink_client_{client_id}.pkl"
+            initial_load_path_downlink = None
+            if os.path.exists("/shared_data") and os.path.exists("/shared_data/q_table_emotion_downlink_trained.pkl"):
+                initial_load_path_downlink = "/shared_data/q_table_emotion_downlink_trained.pkl"
+            if initial_load_path_downlink is None:
+                pretrained_dir = os.getenv("PRETRAINED_Q_TABLE_DIR")
+                if pretrained_dir:
+                    for candidate in (
+                        os.path.join(pretrained_dir, "q_table_emotion_downlink_trained.pkl"),
+                        os.path.join(pretrained_dir, f"q_table_emotion_downlink_client_{client_id}.pkl"),
+                    ):
+                        if os.path.exists(candidate):
+                            initial_load_path_downlink = candidate
+                            break
+            self.rl_selector_downlink = QLearningProtocolSelector(
+                save_path=save_path_downlink,
+                initial_load_path=initial_load_path_downlink,
+                use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
+            )
+
+            # Backward-compat alias: self.rl_selector always points to the uplink agent
+            self.rl_selector = self.rl_selector_uplink
             
             # Reset epsilon if RESET_EPSILON environment variable is set OR reset flag file exists
             # This handles both new experiments and late-joining clients
@@ -611,37 +651,44 @@ class UnifiedFLClient_Emotion:
             
             # Check if we need to reset based on experiment ID change and reset_epsilon flag
             # Using experiment_id ensures epsilon resets for EACH new GUI experiment (when reset is enabled)
+            # Both uplink and downlink agents get reset together
             if should_reset:
                 # Check if this is a new experiment (avoid resetting multiple times for same experiment)
-                last_experiment_id = getattr(self.rl_selector, 'last_experiment_id', None)
+                last_experiment_id = getattr(self.rl_selector_uplink, 'last_experiment_id', None)
                 if experiment_id and experiment_id == last_experiment_id:
                     print(f"[Client {client_id}] Already processed experiment '{experiment_id}', skipping reset")
                     print(f"[Client {client_id}] Scenario: {scenario_info}")
                     should_reset = False
                 else:
                     print(f"\n{'='*70}")
-                    print(f"[Client {client_id}] 🔄 RESETTING EPSILON TO 1.0 (Fresh Training)")
+                    print(f"[Client {client_id}] 🔄 RESETTING EPSILON TO 1.0 (Fresh Training) for UPLINK + DOWNLINK agents")
                     if experiment_id:
                         print(f"[Client {client_id}]   New experiment ID: {experiment_id}")
                         if last_experiment_id:
                             print(f"[Client {client_id}]   Previous experiment ID: {last_experiment_id}")
                     if scenario_info:
                         print(f"[Client {client_id}]   Training scenario: {scenario_info}")
-                    print(f"[Client {client_id}]   Current epsilon before reset: {self.rl_selector.epsilon:.4f}")
-                    self.rl_selector.reset_epsilon(experiment_id=experiment_id, scenario=scenario_info)
-                    print(f"[Client {client_id}]   ✓ Epsilon reset to: {self.rl_selector.epsilon:.4f}")
-                    print(f"[Client {client_id}]   📊 Q-table will accumulate learning across all scenarios")
+                    print(f"[Client {client_id}]   Uplink epsilon before reset: {self.rl_selector_uplink.epsilon:.4f}")
+                    print(f"[Client {client_id}]   Downlink epsilon before reset: {self.rl_selector_downlink.epsilon:.4f}")
+                    self.rl_selector_uplink.reset_epsilon(experiment_id=experiment_id, scenario=scenario_info)
+                    self.rl_selector_downlink.reset_epsilon(experiment_id=experiment_id, scenario=scenario_info)
+                    print(f"[Client {client_id}]   ✓ Uplink epsilon reset to: {self.rl_selector_uplink.epsilon:.4f}")
+                    print(f"[Client {client_id}]   ✓ Downlink epsilon reset to: {self.rl_selector_downlink.epsilon:.4f}")
+                    print(f"[Client {client_id}]   📊 Q-tables will accumulate learning across all scenarios")
                     print(f"{'='*70}\n")
-                    
-                    # Save Q-table immediately to persist the reset and experiment tracking
-                    # The Q-table itself is NOT reset, only epsilon - this allows multi-scenario training
+
+                    # Save both Q-tables immediately to persist the reset and experiment tracking
                     try:
-                        self.rl_selector.save_q_table()
+                        self.rl_selector_uplink.save_q_table()
                     except Exception as e:
-                        print(f"[Client {client_id}] Warning: Could not save Q-table after epsilon reset: {e}")
+                        print(f"[Client {client_id}] Warning: Could not save uplink Q-table after epsilon reset: {e}")
+                    try:
+                        self.rl_selector_downlink.save_q_table()
+                    except Exception as e:
+                        print(f"[Client {client_id}] Warning: Could not save downlink Q-table after epsilon reset: {e}")
             elif reset_flag_file and experiment_id:
                 # Flag file exists but reset is disabled - this is resume mode
-                last_experiment_id = getattr(self.rl_selector, 'last_experiment_id', None)
+                last_experiment_id = getattr(self.rl_selector_uplink, 'last_experiment_id', None)
                 if experiment_id != last_experiment_id:
                     print(f"\n{'='*70}")
                     print(f"[Client {client_id}] 📍 CONTINUING WITH PREVIOUS EPSILON (Resume Mode)")
@@ -649,18 +696,25 @@ class UnifiedFLClient_Emotion:
                         print(f"[Client {client_id}]   Experiment ID: {experiment_id}")
                     if scenario_info:
                         print(f"[Client {client_id}]   Training scenario: {scenario_info}")
-                    print(f"[Client {client_id}]   Current epsilon (preserved): {self.rl_selector.epsilon:.4f}")
-                    print(f"[Client {client_id}]   📊 Q-table, rewards, and learning progress will continue from previous state")
+                    print(f"[Client {client_id}]   Uplink epsilon (preserved): {self.rl_selector_uplink.epsilon:.4f}")
+                    print(f"[Client {client_id}]   Downlink epsilon (preserved): {self.rl_selector_downlink.epsilon:.4f}")
+                    print(f"[Client {client_id}]   📊 Q-tables, rewards, and learning progress continue from previous state")
                     print(f"{'='*70}\n")
-                    # Update experiment ID to prevent repeated logging
-                    self.rl_selector.last_experiment_id = experiment_id
+                    # Update experiment ID on both agents
+                    self.rl_selector_uplink.last_experiment_id = experiment_id
+                    self.rl_selector_downlink.last_experiment_id = experiment_id
                     if scenario_info:
-                        self.rl_selector.last_scenario = scenario_info
-                    # Save Q-table to persist the tracking
+                        self.rl_selector_uplink.last_scenario = scenario_info
+                        self.rl_selector_downlink.last_scenario = scenario_info
+                    # Save both Q-tables to persist the tracking
                     try:
-                        self.rl_selector.save_q_table()
+                        self.rl_selector_uplink.save_q_table()
                     except Exception as e:
-                        print(f"[Client {client_id}] Warning: Could not save Q-table: {e}")
+                        print(f"[Client {client_id}] Warning: Could not save uplink Q-table: {e}")
+                    try:
+                        self.rl_selector_downlink.save_q_table()
+                    except Exception as e:
+                        print(f"[Client {client_id}] Warning: Could not save downlink Q-table: {e}")
             
             # Note: We DON'T delete the flag file here because:
                 # 1. Late-joining clients also need to reset epsilon
@@ -669,6 +723,8 @@ class UnifiedFLClient_Emotion:
             
             self.env_manager = EnvironmentStateManager()
         else:
+            self.rl_selector_uplink = None
+            self.rl_selector_downlink = None
             self.rl_selector = None
             self.env_manager = None
 
@@ -684,8 +740,10 @@ class UnifiedFLClient_Emotion:
             'accuracy': 0.0,
             'success': False
         }
-        self._last_rl_state = None  # for Q-learning log (state at time of action)
+        self._last_rl_state = None  # for Q-learning log (state at time of uplink action)
         self._last_update_protocol = None  # protocol used to send local model update
+        self._last_downlink_rl_state = None  # state at time of downlink protocol selection
+        self._downlink_select_time = None    # wall-clock time when downlink was selected (for comm-time reward)
         
         # DDS chunk reassembly buffers (FAIR CONFIG: matching standalone)
         self.global_model_chunks = {}  # {chunk_id: payload}
@@ -1560,6 +1618,9 @@ class UnifiedFLClient_Emotion:
             self.waiting_for_aggregated_model = False
             print(f"[{source}] Client {self.client_id} updated model weights (round {round_num})")
 
+            # Compute downlink RL reward now that the model has arrived
+            self._update_downlink_rl_after_reception(round_num=round_num)
+
             if self.pending_start_training_round is not None:
                 pending_round = self.pending_start_training_round
                 self.pending_start_training_round = None
@@ -1577,6 +1638,103 @@ class UnifiedFLClient_Emotion:
             return True
 
         return False
+
+    def _update_downlink_rl_after_reception(self, round_num: int = 0):
+        """
+        Compute and log the downlink Q-learning reward after the global model is received.
+        Called from _apply_global_model_weights() on successful model reception.
+        Uses the dedicated DOWNLINK RL agent (separate Q-table from uplink).
+        """
+        if (not USE_RL_SELECTION
+                or self.rl_selector_downlink is None
+                or self._downlink_select_time is None
+                or self._last_downlink_rl_state is None):
+            return
+        try:
+            comm_time = time.time() - self._downlink_select_time
+            self._downlink_select_time = None  # reset so it won't fire again for this selection
+            downlink_state = self._last_downlink_rl_state
+            self._last_downlink_rl_state = None  # reset
+
+            protocol = self.selected_downlink_protocol or 'grpc'
+            resources = self.env_manager.get_resource_consumption() if self.env_manager else {}
+            # Estimate payload of received global model (model weights size)
+            payload_bytes = getattr(self, '_downlink_payload_bytes', None) or (12 * 1024 * 1024)
+            t_calc = None
+            if USE_COMMUNICATION_MODEL_REWARD:
+                try:
+                    reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
+                    if reward_scenario:
+                        t_calc = self._get_t_calc_for_scenario(protocol, payload_bytes, reward_scenario)
+                    if t_calc is None:
+                        t_calc = self._get_t_calc_for_reward(protocol, payload_bytes)
+                except Exception:
+                    t_calc = None
+
+            # Accuracy from previous round (0.0 on first round since not yet evaluated)
+            accuracy_for_reward = self.round_metrics.get('accuracy', 0.0)
+
+            reward = self.rl_selector_downlink.calculate_reward(
+                communication_time=comm_time,
+                success=True,
+                convergence_time=0.0,   # convergence time not applicable for downlink
+                accuracy=accuracy_for_reward,
+                resource_consumption=resources,
+                t_calc=t_calc,
+            )
+            self.rl_selector_downlink.update_q_value(reward, next_state=None, done=True)
+            q_delta = self.rl_selector_downlink.get_last_q_delta()
+            avg_reward = (
+                float(np.mean(self.rl_selector_downlink.total_rewards[-100:]))
+                if self.rl_selector_downlink.total_rewards else 0.0
+            )
+            self.rl_selector_downlink.end_episode()
+            q_converged = self.rl_selector_downlink.check_q_converged()
+
+            print(f"[Downlink RL] Client {self.client_id} | round={round_num} | protocol={protocol.upper()} | "
+                  f"comm_time={comm_time:.3f}s | reward={reward:.2f} | q_delta={q_delta:.4f} | "
+                  f"epsilon={self.rl_selector_downlink.epsilon:.4f}")
+
+            if log_q_step is not None:
+                reward_details = self.rl_selector_downlink.get_last_reward_breakdown()
+                log_q_step(
+                    client_id=self.client_id,
+                    round_num=round_num or self.current_round,
+                    episode=self.rl_selector_downlink.episode_count - 1,
+                    state_network=downlink_state.get('network', ''),
+                    state_resource=downlink_state.get('resource', ''),
+                    state_model_size=downlink_state.get('model_size', ''),
+                    state_mobility=downlink_state.get('mobility', ''),
+                    action=protocol,
+                    reward=reward,
+                    q_delta=q_delta,
+                    epsilon=self.rl_selector_downlink.epsilon,
+                    avg_reward_last_100=avg_reward,
+                    converged=q_converged,
+                    metric_communication_time=reward_details.get('communication_time'),
+                    metric_convergence_time=reward_details.get('convergence_time'),
+                    metric_accuracy=reward_details.get('accuracy'),
+                    metric_success=reward_details.get('success'),
+                    metric_cpu_usage=reward_details.get('cpu_usage'),
+                    metric_memory_usage=reward_details.get('memory_usage'),
+                    metric_bandwidth_usage=reward_details.get('bandwidth_usage'),
+                    metric_battery_level=reward_details.get('battery_level'),
+                    metric_energy_usage=reward_details.get('energy_usage'),
+                    metric_t_calc=reward_details.get('t_calc'),
+                    reward_base=reward_details.get('reward_base'),
+                    reward_communication_time=reward_details.get('reward_communication_time'),
+                    reward_convergence_time=reward_details.get('reward_convergence_time'),
+                    reward_accuracy=reward_details.get('reward_accuracy'),
+                    reward_resource_penalty=reward_details.get('reward_resource_penalty'),
+                    reward_battery_penalty=reward_details.get('reward_battery_penalty'),
+                    reward_t_calc_penalty=reward_details.get('reward_t_calc_penalty'),
+                    reward_total=reward_details.get('reward_total'),
+                    link_direction='downlink',
+                )
+        except Exception as e:
+            print(f"[Downlink RL] Client {self.client_id} reward update error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _apply_generator_batch_size(self, batch_size):
         """Sync DirectoryIterator batch size with training config."""
@@ -1739,21 +1897,53 @@ class UnifiedFLClient_Emotion:
         return False
 
     def _select_downlink_protocol(self, round_id: int, global_model_id: int) -> str:
-        """Select downlink protocol for server->client global model transfer."""
+        """Select downlink protocol using the DEDICATED downlink RL agent."""
         # Enforce gRPC bootstrap for initial model transfer.
         if self.model is None or global_model_id <= 0:
             return 'grpc'
 
-        previous_uplink_protocol = self.selected_protocol
-        selected = self.select_protocol()
-        # Keep uplink decision tracking untouched by downlink negotiation query.
-        self.selected_protocol = previous_uplink_protocol
+        # Use the dedicated DOWNLINK Q-learning agent (separate Q-table from uplink)
+        if USE_RL_SELECTION and self.rl_selector_downlink and self.env_manager:
+            try:
+                with tf.device('/CPU:0'):
+                    import psutil
+                    cpu = psutil.cpu_percent(interval=0.1)
+                    memory = psutil.virtual_memory().percent
+                    resource_level = self.env_manager.detect_resource_level(cpu, memory)
+                    self.env_manager.update_resource_level(resource_level)
+                    if USE_QL_CONVERGENCE:
+                        reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
+                        if reward_scenario and reward_scenario in self.rl_selector_downlink.NETWORK_CONDITIONS:
+                            self.env_manager.update_network_condition(reward_scenario)
+                        else:
+                            self.measure_network_condition()
+                    else:
+                        self.measure_network_condition()
+                    state = self.env_manager.get_current_state()
+                    training_mode = USE_QL_CONVERGENCE
+                    selected = self.rl_selector_downlink.select_protocol(state, training=training_mode)
+                # Store downlink state and selection time so reward can be computed after model arrives
+                self._last_downlink_rl_state = state
+                self._downlink_select_time = time.time()
+                print(f"[Downlink RL] Client {self.client_id} selected {selected.upper()} "
+                      f"(downlink agent, epsilon={self.rl_selector_downlink.epsilon:.4f})")
+            except Exception as e:
+                print(f"[Downlink RL] Error: {e}, falling back to uplink agent")
+                selected = self.select_protocol()
+                self._last_downlink_rl_state = None
+                self._downlink_select_time = None
+        else:
+            selected = self.select_protocol()
+            self._last_downlink_rl_state = None
+            self._downlink_select_time = None
 
         if not self._is_protocol_available_for_downlink(selected):
             print(
                 f"[gRPC] Client {self.client_id} downlink selection '{selected}' unavailable; "
                 f"falling back to gRPC"
             )
+            self._last_downlink_rl_state = None
+            self._downlink_select_time = None
             return 'grpc'
         return selected
 
@@ -1787,32 +1977,14 @@ class UnifiedFLClient_Emotion:
         if response.success:
             self.selected_downlink_protocol = selected_downlink_protocol
             self.last_protocol_query_key = query_key
-            if log_q_step is not None and self.env_manager is not None and self.rl_selector is not None:
-                st = self.env_manager.get_current_state()
-                avg_reward = (
-                    np.mean(self.rl_selector.total_rewards[-100:])
-                    if self.rl_selector.total_rewards else 0.0
-                )
-                log_q_step(
-                    client_id=self.client_id,
-                    round_num=round_id,
-                    episode=max(self.rl_selector.episode_count - 1, 0),
-                    state_network=st.get('network', ''),
-                    state_resource=st.get('resource', ''),
-                    state_model_size=st.get('model_size', ''),
-                    state_mobility=st.get('mobility', ''),
-                    action=selected_downlink_protocol,
-                    reward=0.0,
-                    q_delta=0.0,
-                    epsilon=self.rl_selector.epsilon,
-                    avg_reward_last_100=float(avg_reward),
-                    converged=False,
-                    link_direction='downlink',
-                )
+            # Note: we do NOT log reward=0.0 here anymore.
+            # The real downlink reward is computed and logged in _update_downlink_rl_after_reception()
+            # once the global model actually arrives via the selected protocol.
             print(
                 f"[gRPC] Client {self.client_id} replied ProtocolSelection: "
                 f"round={round_id}, global_model_id={global_model_id}, "
-                f"downlink={selected_downlink_protocol}"
+                f"downlink={selected_downlink_protocol} "
+                f"(downlink RL agent epsilon={self.rl_selector_downlink.epsilon:.4f if self.rl_selector_downlink else 'N/A'})"
             )
         else:
             print(f"[gRPC] Client {self.client_id} ProtocolSelection rejected: {response.message}")
@@ -2055,12 +2227,10 @@ class UnifiedFLClient_Emotion:
 
     def select_protocol(self) -> str:
         """
-        Select protocol using RL (runs on CPU) based on current environment and network conditions
-        
-        Returns:
-            Selected protocol name: 'mqtt', 'amqp', 'grpc', 'quic', or 'dds'
+        Select UPLINK protocol using the dedicated UPLINK RL agent (CPU-only Q-learning).
+        Returns: Selected protocol name: 'mqtt', 'amqp', 'grpc', 'quic', or 'dds'
         """
-        if USE_RL_SELECTION and self.rl_selector and self.env_manager:
+        if USE_RL_SELECTION and self.rl_selector_uplink and self.env_manager:
             try:
                 # RL logic runs on CPU only (no GPU); keeps Q-table updates off GPU
                 with tf.device('/CPU:0'):
@@ -2075,7 +2245,7 @@ class UnifiedFLClient_Emotion:
                     # Otherwise use actual measured network so we learn/select for real conditions.
                     if USE_QL_CONVERGENCE:
                         reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
-                        if reward_scenario and reward_scenario in self.rl_selector.NETWORK_CONDITIONS:
+                        if reward_scenario and reward_scenario in self.rl_selector_uplink.NETWORK_CONDITIONS:
                             self.env_manager.update_network_condition(reward_scenario)
                         else:
                             self.measure_network_condition()
@@ -2086,18 +2256,19 @@ class UnifiedFLClient_Emotion:
                     # During RL-table training we keep epsilon-greedy exploration enabled.
                     # Once training is done, clients load and use the converged Q-table greedily.
                     training_mode = USE_QL_CONVERGENCE
-                    protocol = self.rl_selector.select_protocol(state, training=training_mode)
+                    protocol = self.rl_selector_uplink.select_protocol(state, training=training_mode)
                 
-                print(f"\n[RL Protocol Selection]")
+                print(f"\n[Uplink RL Protocol Selection]")
                 print(f"  CPU: {cpu:.1f}%, Memory: {memory:.1f}%")
                 print(f"  State: {state}")
                 print(f"  Selected Protocol: {protocol.upper()}")
-                print(f"  Round: {self.current_round}\n")
+                print(f"  Round: {self.current_round}")
+                print(f"  Uplink epsilon: {self.rl_selector_uplink.epsilon:.4f}\n")
                 
                 self.selected_protocol = protocol
                 return protocol
             except Exception as e:
-                print(f"[RL Selection] Error: {e}, using MQTT as fallback")
+                print(f"[Uplink RL Selection] Error: {e}, using MQTT as fallback")
                 return 'mqtt'
         else:
             # Default to MQTT if RL not enabled
@@ -2433,7 +2604,8 @@ class UnifiedFLClient_Emotion:
             # RL update and optional Q-convergence end condition (battery already updated above for metrics)
             # When RL is enabled: always update Q and log to DB (so GUI shows data and agent learns).
             # Only the *stopping* condition differs: USE_QL_CONVERGENCE -> stop when Q converges; else stop on loss.
-            if USE_RL_SELECTION and self.rl_selector and self.env_manager:
+            # Uses the dedicated UPLINK Q-learning agent.
+            if USE_RL_SELECTION and self.rl_selector_uplink and self.env_manager:
                 try:
                     resources = self.env_manager.get_resource_consumption()
                     payload_bytes = self.round_metrics.get('payload_bytes') or (12 * 1024 * 1024)
@@ -2450,7 +2622,7 @@ class UnifiedFLClient_Emotion:
                             t_calc_for_reward = self._get_t_calc_for_reward(protocol, payload_bytes)
                     elif USE_COMMUNICATION_MODEL_REWARD:
                         t_calc_for_reward = self._get_t_calc_for_reward(protocol, payload_bytes)
-                    reward = self.rl_selector.calculate_reward(
+                    reward = self.rl_selector_uplink.calculate_reward(
                         comm_time_for_reward,
                         self.round_metrics['success'],
                         self.round_metrics.get('training_time', 0.0),
@@ -2458,23 +2630,23 @@ class UnifiedFLClient_Emotion:
                         resources,
                         t_calc=t_calc_for_reward,
                     )
-                    self.rl_selector.update_q_value(reward, next_state=None, done=True)
-                    q_delta = self.rl_selector.get_last_q_delta()
-                    avg_reward = (np.mean(self.rl_selector.total_rewards[-100:])
-                                 if self.rl_selector.total_rewards else 0.0)
-                    self.rl_selector.end_episode()
-                    q_converged = self.rl_selector.check_q_converged(
+                    self.rl_selector_uplink.update_q_value(reward, next_state=None, done=True)
+                    q_delta = self.rl_selector_uplink.get_last_q_delta()
+                    avg_reward = (np.mean(self.rl_selector_uplink.total_rewards[-100:])
+                                 if self.rl_selector_uplink.total_rewards else 0.0)
+                    self.rl_selector_uplink.end_episode()
+                    q_converged = self.rl_selector_uplink.check_q_converged(
                         threshold=Q_CONVERGENCE_THRESHOLD,
                         patience=Q_CONVERGENCE_PATIENCE,
                     )
-                    # Always log Q-step when RL is enabled so GUI Q-learning database stays updated
+                    # Always log uplink Q-step so GUI Q-learning database stays updated
                     if log_q_step is not None and self._last_rl_state is not None:
                         st = self._last_rl_state
-                        reward_details = self.rl_selector.get_last_reward_breakdown()
+                        reward_details = self.rl_selector_uplink.get_last_reward_breakdown()
                         log_q_step(
                             client_id=self.client_id,
                             round_num=self.current_round,
-                            episode=self.rl_selector.episode_count - 1,
+                            episode=self.rl_selector_uplink.episode_count - 1,
                             state_network=st.get('network', ''),
                             state_resource=st.get('resource', ''),
                             state_model_size=st.get('model_size', ''),
@@ -2482,7 +2654,7 @@ class UnifiedFLClient_Emotion:
                             action=self._last_update_protocol or self.selected_protocol or 'mqtt',
                             reward=reward,
                             q_delta=q_delta,
-                            epsilon=self.rl_selector.epsilon,
+                            epsilon=self.rl_selector_uplink.epsilon,
                             avg_reward_last_100=float(avg_reward),
                             converged=q_converged,
                             metric_communication_time=reward_details.get('communication_time'),
@@ -2510,14 +2682,18 @@ class UnifiedFLClient_Emotion:
                         self.has_converged = True
                         print(f"[Client {self.client_id}] Q-learning convergence reached at round {self.current_round}")
                         try:
-                            self.rl_selector.save_q_table()
+                            self.rl_selector_uplink.save_q_table()
                         except Exception as e:
-                            print(f"[Client {self.client_id}] Warning: could not save Q-table on convergence: {e}")
+                            print(f"[Client {self.client_id}] Warning: could not save uplink Q-table on convergence: {e}")
+                        try:
+                            self.rl_selector_downlink.save_q_table()
+                        except Exception as e:
+                            print(f"[Client {self.client_id}] Warning: could not save downlink Q-table on convergence: {e}")
                         self._notify_convergence_to_server()
                         self._disconnect_after_convergence()
                         return
                 except Exception as rl_e:
-                    print(f"[Client {self.client_id}] RL update error: {rl_e}")
+                    print(f"[Client {self.client_id}] Uplink RL update error: {rl_e}")
             if not USE_QL_CONVERGENCE and ENABLE_LOCAL_CONVERGENCE_STOP:
                 self._update_client_convergence_and_maybe_disconnect(loss)
         except Exception as e:
