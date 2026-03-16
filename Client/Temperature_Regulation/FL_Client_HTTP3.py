@@ -23,6 +23,14 @@ from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import DataReceived, HeadersReceived, H3Event
 from aioquic.asyncio.protocol import Http3ConnectionProtocol
 
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in os.sys.path:
+    os.sys.path.insert(0, compression_path)
+
+from quantization_client import Quantization, QuantizationConfig
+from pruning_client import ModelPruning, PruningConfig
+
 # GPU Configuration - Must be done BEFORE TensorFlow import
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
 # Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
@@ -104,6 +112,15 @@ class FederatedLearningClient:
         else:
             self.quantizer = None
             print(f"Client {self.client_id}: Quantization disabled")
+
+        up_env = os.getenv("USE_PRUNING", "false")
+        use_pruning = up_env.lower() in ("true", "1", "yes", "y")
+        if use_pruning:
+            self.pruner = ModelPruning(PruningConfig())
+            print(f"Client {self.client_id}: Pruning enabled")
+        else:
+            self.pruner = None
+            print(f"Client {self.client_id}: Pruning disabled")
         self.x_train = None
         self.y_train = None
         self.x_test = None
@@ -228,16 +245,22 @@ class FederatedLearningClient:
     async def handle_global_model(self, message):
         """Receive and set global model weights and architecture from server"""
         round_num = message['round']
-        encoded_weights = message['weights']
         
         # Decompress or deserialize weights
         if 'quantized_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['quantized_data'])
+            compressed_data = message['quantized_data']
+            if isinstance(compressed_data, str):
+                compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
+            weights = self.quantizer.decompress(compressed_data)
             print(f"Client {self.client_id}: Received and decompressed quantized global model")
         elif 'compressed_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['compressed_data'])
+            compressed_data = message['compressed_data']
+            if isinstance(compressed_data, str):
+                compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
+            weights = self.quantizer.decompress(compressed_data)
             print(f"Client {self.client_id}: Received and decompressed quantized global model")
         else:
+            encoded_weights = message['weights']
             weights = self.deserialize_weights(encoded_weights)
         
         # Initialize model if not yet created (works for any round)
@@ -344,6 +367,16 @@ class FederatedLearningClient:
         )
         
         updated_weights = self.model.get_weights()
+
+        # Apply pruning before quantization/transmission when enabled
+        if self.pruner is not None:
+            updated_weights = self.pruner.prune_weights(updated_weights, step=self.current_round)
+            pruning_stats = self.pruner.get_pruning_statistics(updated_weights)
+            print(
+                f"Client {self.client_id}: Pruned weights - "
+                f"Sparsity: {pruning_stats['overall_sparsity']:.2%}, "
+                f"Compression: {pruning_stats['compression_ratio']:.2f}x"
+            )
         num_samples = len(self.x_train)
         
         metrics = {
@@ -361,15 +394,38 @@ class FederatedLearningClient:
         delay = random.uniform(0.5, 3.0)
         print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
         await asyncio.sleep(delay)
-        
-        update_message = {
-            "type": "model_update",
-            "client_id": self.client_id,
-            "round": self.current_round,
-            "weights": self.serialize_weights(updated_weights),
-            "num_samples": num_samples,
-            "metrics": metrics
-        }
+
+        if self.quantizer is not None:
+            compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
+            stats = self.quantizer.get_compression_stats(updated_weights, compressed_data)
+            print(
+                f"Client {self.client_id}: Quantized update - "
+                f"Ratio: {stats['compression_ratio']:.2f}x, "
+                f"Size: {stats['compressed_size_mb']:.2f}MB"
+            )
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
+            model_payload_bytes = len(serialized.encode('utf-8'))
+            update_message = {
+                "type": "model_update",
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "compressed_data": serialized,
+                "model_payload_bytes": model_payload_bytes,
+                "num_samples": num_samples,
+                "metrics": metrics
+            }
+        else:
+            weights_encoded = self.serialize_weights(updated_weights)
+            model_payload_bytes = len(weights_encoded.encode('utf-8'))
+            update_message = {
+                "type": "model_update",
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "weights": weights_encoded,
+                "model_payload_bytes": model_payload_bytes,
+                "num_samples": num_samples,
+                "metrics": metrics
+            }
         
         await self.send_message(update_message)
         print(f"Client {self.client_id} sent model update for round {self.current_round}")

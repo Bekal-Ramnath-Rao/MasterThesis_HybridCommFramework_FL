@@ -33,6 +33,9 @@ Quantization = client_quantization.Quantization
 QuantizationConfig = client_quantization.QuantizationConfig
 QuantizationStrategy = client_quantization.QuantizationStrategy
 
+PruningConfig = getattr(client_quantization, "PruningConfig", None)
+ModelPruning = getattr(client_quantization, "ModelPruning", None)
+
 
 class ServerQuantizationHandler:
     """
@@ -45,6 +48,16 @@ class ServerQuantizationHandler:
         self.quantizer = Quantization(self.config)
         self.client_quantization_params = {}  # Store per-client quantization params
         self.client_quantizers = {}  # Optional per-client Quantization instances
+        self.pruner = None
+        self.pruning_step = 0
+
+        use_pruning = os.getenv("USE_PRUNING", "false").lower() in ("true", "1", "yes", "y")
+        if use_pruning and ModelPruning is not None and PruningConfig is not None:
+            try:
+                self.pruner = ModelPruning(PruningConfig())
+                print("Server Quantization Handler: pruning enabled (prune -> quantize)")
+            except Exception as e:
+                print(f"Server Quantization Handler: pruning init failed - {e}")
         
         print(f"\n{'='*70}")
         print(f"Server Quantization Handler Initialized")
@@ -91,6 +104,10 @@ class ServerQuantizationHandler:
 
         # Decompress using the selected quantizer
         weights = quant.decompress(compressed_data)
+
+        if self.pruner is not None:
+            weights = self.pruner.prune_weights(weights, step=self.pruning_step)
+            self.pruning_step += 1
 
         return weights
 
@@ -237,7 +254,12 @@ class ServerQuantizationHandler:
         Returns:
             Compressed data dictionary
         """
-        compressed = self.quantizer.compress(weights, data_type="weights")
+        model_weights = weights
+        if self.pruner is not None:
+            model_weights = self.pruner.prune_weights(model_weights, step=self.pruning_step)
+            self.pruning_step += 1
+
+        compressed = self.quantizer.compress(model_weights, data_type="weights")
         
         return compressed
     

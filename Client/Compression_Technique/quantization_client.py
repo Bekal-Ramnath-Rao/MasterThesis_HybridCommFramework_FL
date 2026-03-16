@@ -14,6 +14,14 @@ import json
 import os
 from enum import Enum
 
+try:
+    from pruning_client import ModelPruning, PruningConfig
+    PRUNING_MODULE_AVAILABLE = True
+except Exception:
+    ModelPruning = None
+    PruningConfig = None
+    PRUNING_MODULE_AVAILABLE = False
+
 
 class QuantizationStrategy(Enum):
     """Quantization strategy types"""
@@ -64,6 +72,8 @@ class Quantization:
         self.config = config or QuantizationConfig()
         self.qat_model = None  # For QAT strategy
         self.quantization_params = {}  # Store quantization parameters
+        self.pruner = None
+        self.pruning_step = 0
         
         print(f"\n{'='*70}")
         print(f"Quantization Module Initialized")
@@ -73,6 +83,42 @@ class Quantization:
         print(f"Symmetric: {self.config.symmetric}")
         print(f"Per-channel: {self.config.per_channel}")
         print(f"{'='*70}\n")
+
+        use_pruning = os.getenv("USE_PRUNING", "false").lower() in ("true", "1", "yes", "y")
+        if use_pruning and PRUNING_MODULE_AVAILABLE:
+            self.pruner = ModelPruning(PruningConfig())
+            print("Quantization module: pruning enabled (prune -> quantize pipeline)")
+        elif use_pruning and not PRUNING_MODULE_AVAILABLE:
+            print("Quantization module: pruning requested but pruning module unavailable")
+
+    def _maybe_prune_before_quantization(self, data: Any, data_type: str) -> Any:
+        """Apply optional pruning before quantization to support global prune->quantize flow."""
+        if self.pruner is None or data_type not in ("weights", "gradients"):
+            return data
+
+        weights = None
+        if isinstance(data, tf.keras.Model):
+            weights = data.get_weights()
+        elif isinstance(data, list):
+            weights = data
+
+        if weights is None:
+            return data
+
+        pruned_weights = self.pruner.prune_weights(weights, step=self.pruning_step)
+        self.pruning_step += 1
+
+        try:
+            pruning_stats = self.pruner.get_pruning_statistics(pruned_weights)
+            print(
+                f"Pruning before quantization - "
+                f"Sparsity: {pruning_stats['overall_sparsity']:.2%}, "
+                f"Compression: {pruning_stats['compression_ratio']:.2f}x"
+            )
+        except Exception:
+            pass
+
+        return pruned_weights
     
     # ==================== Strategy 1: Quantization-Aware Training (QAT) ====================
     
@@ -441,12 +487,14 @@ class Quantization:
         Returns:
             Dictionary with compressed data and metadata
         """
+        input_data = self._maybe_prune_before_quantization(data, data_type)
+
         if self.config.strategy == QuantizationStrategy.QAT.value:
-            return self._compress_qat(data, data_type)
+            return self._compress_qat(input_data, data_type)
         elif self.config.strategy == QuantizationStrategy.PTQ.value:
-            return self._compress_ptq(data, data_type)
+            return self._compress_ptq(input_data, data_type)
         else:  # Parameter quantization
-            return self._compress_param(data, data_type)
+            return self._compress_param(input_data, data_type)
     
     def _compress_qat(self, data: Any, data_type: str) -> Dict:
         """Compress using QAT strategy"""

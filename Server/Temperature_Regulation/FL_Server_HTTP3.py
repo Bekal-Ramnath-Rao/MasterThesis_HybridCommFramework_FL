@@ -22,6 +22,14 @@ except ImportError:
     print("Warning: Quantization module not available")
     QUANTIZATION_AVAILABLE = False
 
+try:
+    from pruning_server import ServerPruning
+    from pruning_client import PruningConfig
+    PRUNING_AVAILABLE = True
+except ImportError:
+    print("Warning: Pruning module not available")
+    PRUNING_AVAILABLE = False
+
 from aioquic.asyncio import QuicConnectionProtocol, serve
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import QuicEvent, StreamReset
@@ -201,6 +209,18 @@ class FederatedLearningServer:
                 print("Server: Quantization requested but not available")
             else:
                 print("Server: Quantization disabled")
+
+        up_env = os.getenv("USE_PRUNING", "false")
+        use_pruning = up_env.lower() in ("true", "1", "yes", "y")
+        if use_pruning and PRUNING_AVAILABLE:
+            self.pruning_handler = ServerPruning(PruningConfig())
+            print("Server: Pruning enabled")
+        else:
+            self.pruning_handler = None
+            if use_pruning and not PRUNING_AVAILABLE:
+                print("Server: Pruning requested but not available")
+            else:
+                print("Server: Pruning disabled")
         
         # Initialize global model
         self.initialize_global_model()
@@ -388,6 +408,10 @@ class FederatedLearningServer:
                 'num_samples': message['num_samples'],
                 'metrics': message['metrics']
             }
+
+            model_payload_bytes = message.get('model_payload_bytes')
+            if model_payload_bytes is not None:
+                print(f"Client {client_id} model payload bytes: {model_payload_bytes}")
             
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{len(self.active_clients)})")
@@ -513,6 +537,19 @@ class FederatedLearningServer:
             aggregated_weights.append(layer_weights)
         
         self.global_weights = aggregated_weights
+
+        # Optionally apply server-side pruning before broadcast
+        if self.pruning_handler is not None:
+            self.global_weights = self.pruning_handler.pruning_engine.prune_weights(
+                self.global_weights,
+                step=self.current_round
+            )
+            pruning_stats = self.pruning_handler.get_compression_stats(self.global_weights)
+            print(
+                f"Server: Pruned global model - "
+                f"Sparsity: {pruning_stats['overall_sparsity']:.2%}, "
+                f"Compression: {pruning_stats['compression_ratio']:.2f}x"
+            )
         
         # Prepare global model (compress if quantization enabled)
         if self.quantization_handler is not None:

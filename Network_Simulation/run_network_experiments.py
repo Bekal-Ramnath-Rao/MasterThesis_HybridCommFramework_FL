@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import List, Dict, Optional
 import argparse
 from pathlib import Path
+import tempfile
 
 # Set UTF-8 encoding for Windows console
 if sys.platform == 'win32':
@@ -79,6 +80,7 @@ class ExperimentRunner:
         self.quantization_params = quantization_params or {}
         # pruning_params expected to be a dict of simple string values
         self.pruning_params = pruning_params or {}
+        self._runtime_compose_files: Dict[str, str] = {}
         
         # Map use_case values to actual Server directory names
         self.use_case_dir_map = {
@@ -88,6 +90,14 @@ class ExperimentRunner:
         }
         self.use_case_dir = self.use_case_dir_map.get(use_case, f"{use_case.title()}_Recognition")
         
+        # Enforce quantization when pruning is enabled in Docker experiments,
+        # so pruning can be consistently applied in the shared compression path.
+        if self.use_pruning and not self.use_quantization:
+            self.use_quantization = True
+            self.quantization_params.setdefault("QUANTIZATION_STRATEGY", "parameter_quantization")
+            self.quantization_params.setdefault("QUANTIZATION_BITS", "8")
+            print("[INFO] Pruning requested without quantization; enabling quantization automatically.")
+
         # Print compression (quantization + pruning) status
         print(f"\n{'='*70}")
         if self.use_quantization:
@@ -306,6 +316,58 @@ class ExperimentRunner:
         if cwd is None:
             cwd = str(Path(__file__).parent.parent)
         return subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', check=check, env=env, cwd=cwd)
+
+    def _compose_requires_runtime_patch(self) -> bool:
+        """Whether compose files should be patched at runtime to expose pruning env vars."""
+        return bool(getattr(self, "use_pruning", False))
+
+    def _patch_compose_pruning_env(self, compose_file: str) -> str:
+        """Create a runtime compose file that injects pruning env placeholders next to quantization vars."""
+        if compose_file in self._runtime_compose_files:
+            return self._runtime_compose_files[compose_file]
+
+        src_path = Path(compose_file)
+        if not src_path.exists():
+            return compose_file
+
+        try:
+            original = src_path.read_text(encoding="utf-8")
+        except Exception:
+            return compose_file
+
+        lines = original.splitlines()
+        patched_lines: List[str] = []
+
+        for idx, line in enumerate(lines):
+            patched_lines.append(line)
+            if "USE_QUANTIZATION=${USE_QUANTIZATION:-false}" in line:
+                window = "\n".join(lines[idx + 1: idx + 8])
+                indent = line.split("-", 1)[0]
+                if "USE_PRUNING=${USE_PRUNING:-false}" not in window:
+                    patched_lines.append(f"{indent}- USE_PRUNING=${{USE_PRUNING:-false}}")
+                if "PRUNING_SPARSITY=${PRUNING_SPARSITY:-0.5}" not in window:
+                    patched_lines.append(f"{indent}- PRUNING_SPARSITY=${{PRUNING_SPARSITY:-0.5}}")
+                if "PRUNING_STRUCTURED=${PRUNING_STRUCTURED:-false}" not in window:
+                    patched_lines.append(f"{indent}- PRUNING_STRUCTURED=${{PRUNING_STRUCTURED:-false}}")
+
+        patched = "\n".join(patched_lines) + ("\n" if original.endswith("\n") else "")
+        if patched == original:
+            self._runtime_compose_files[compose_file] = compose_file
+            return compose_file
+
+        tmp_dir = Path(tempfile.gettempdir()) / "fl_runtime_compose"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        patched_path = tmp_dir / f"{src_path.stem}.runtime-pruning{src_path.suffix}"
+        patched_path.write_text(patched, encoding="utf-8")
+        self._runtime_compose_files[compose_file] = str(patched_path)
+        print(f"[INFO] Using runtime patched compose file: {patched_path}")
+        return str(patched_path)
+
+    def _get_runtime_compose_file(self, compose_file: str) -> str:
+        """Return compose file path used at runtime (possibly patched)."""
+        if self._compose_requires_runtime_patch():
+            return self._patch_compose_pruning_env(compose_file)
+        return compose_file
     
     def start_containers(self, protocol: str, scenario: str = "excellent", congestion_level: str = "none"):
         """Start Docker containers for a specific protocol with staged startup"""
@@ -324,7 +386,7 @@ class ExperimentRunner:
                 print("End condition: accuracy convergence (current behavior)")
             print("="*70 + "\n")
             
-            compose_file = self.unified_compose_files[self.use_case]
+            compose_file = self._get_runtime_compose_file(self.unified_compose_files[self.use_case])
             if self.use_ql_convergence:
                 os.environ["USE_QL_CONVERGENCE"] = "true"
                 # RL training: only one client runs; server waits for 1 client; run until Q converges and exit
@@ -377,7 +439,7 @@ class ExperimentRunner:
             return True
         
         # Regular protocol handling (existing code)
-        compose_file = self.compose_files[self.use_case]
+        compose_file = self._get_runtime_compose_file(self.compose_files[self.use_case])
         
         # host_macvlan: ensure fl-macvlan network exists before up
         if self.network_mode == "host_macvlan":
@@ -488,9 +550,9 @@ class ExperimentRunner:
 
         # Use unified compose file for rl_unified
         if protocol == "rl_unified":
-            compose_file = self.unified_compose_files[self.use_case]
+            compose_file = self._get_runtime_compose_file(self.unified_compose_files[self.use_case])
         else:
-            compose_file = self.compose_files[self.use_case]
+            compose_file = self._get_runtime_compose_file(self.compose_files[self.use_case])
         services = self.service_patterns[self.use_case][protocol]
         
         print(f"\nStopping containers for {protocol.upper()} protocol...")

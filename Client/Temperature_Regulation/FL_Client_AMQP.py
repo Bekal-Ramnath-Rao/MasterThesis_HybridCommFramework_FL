@@ -47,6 +47,7 @@ if compression_path not in sys.path:
     sys.path.insert(0, compression_path)
 
 from quantization_client import Quantization, QuantizationConfig
+from pruning_client import ModelPruning, PruningConfig
 
 # Make TensorFlow logs less verbose
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -84,6 +85,15 @@ class FederatedLearningClient:
         else:
             self.quantizer = None
             print(f"Client {self.client_id}: Quantization disabled")
+
+        up_env = os.getenv("USE_PRUNING", "false")
+        use_pruning = up_env.lower() in ("true", "1", "yes", "y")
+        if use_pruning:
+            self.pruner = ModelPruning(PruningConfig())
+            print(f"Client {self.client_id}: Pruning enabled")
+        else:
+            self.pruner = None
+            print(f"Client {self.client_id}: Pruning disabled")
         self.x_train = None
         self.y_train = None
         self.x_test = None
@@ -408,6 +418,16 @@ class FederatedLearningClient:
         
         # Get updated weights
         updated_weights = self.model.get_weights()
+
+        # Apply pruning before quantization/transmission when enabled
+        if self.pruner is not None:
+            updated_weights = self.pruner.prune_weights(updated_weights, step=self.current_round)
+            pruning_stats = self.pruner.get_pruning_statistics(updated_weights)
+            print(
+                f"Client {self.client_id}: Pruned weights - "
+                f"Sparsity: {pruning_stats['overall_sparsity']:.2%}, "
+                f"Compression: {pruning_stats['compression_ratio']:.2f}x"
+            )
         num_samples = len(self.x_train)
         
         # Prepare training metrics
@@ -432,19 +452,24 @@ class FederatedLearningClient:
             
             # Serialize compressed data to JSON-safe base64 string
             serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
+            model_payload_bytes = len(serialized.encode('utf-8'))
             update_message = {
                 "client_id": self.client_id,
                 "round": self.current_round,
                 "compressed_data": serialized,
+                "model_payload_bytes": model_payload_bytes,
                 "num_samples": num_samples,
                 "metrics": metrics
             }
         else:
+            weights_encoded = self.serialize_weights(updated_weights)
+            model_payload_bytes = len(weights_encoded.encode('utf-8'))
             # Send model update without compression
             update_message = {
                 "client_id": self.client_id,
                 "round": self.current_round,
-                "weights": self.serialize_weights(updated_weights),
+                "weights": weights_encoded,
+                "model_payload_bytes": model_payload_bytes,
             "num_samples": num_samples,
             "metrics": metrics
         }
