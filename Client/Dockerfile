@@ -47,6 +47,8 @@ COPY scripts/utilities/packet_logger.py ./
 COPY scripts/utilities/q_learning_logger.py ./
 # Copy the Client directory
 COPY Client/ ./Client/
+# T_calc / R_tcalc in Q-learning rewards (communication_model, scenario tables)
+COPY Network_Simulation/ ./Network_Simulation/
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

@@ -103,6 +103,9 @@ services:
       - USE_QL_CONVERGENCE=${USE_QL_CONVERGENCE:-false}
       - Q_CONVERGENCE_THRESHOLD=${Q_CONVERGENCE_THRESHOLD:-0.01}
       - Q_CONVERGENCE_PATIENCE=${Q_CONVERGENCE_PATIENCE:-5}
+      # Parallel scenario training: RL_QTABLE_MERGE=1 + RL_QTABLE_OVERLAY_SCENARIOS=excellent (per stack)
+      - RL_QTABLE_MERGE=${RL_QTABLE_MERGE:-false}
+      - RL_QTABLE_OVERLAY_SCENARIOS=${RL_QTABLE_OVERLAY_SCENARIOS:-}
       - DEFAULT_PROTOCOL=mqtt
       - MQTT_BROKER=mqtt-broker-unified
       - AMQP_BROKER=amqp-broker-unified
@@ -118,6 +121,7 @@ services:
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
+      - ../Network_Simulation:/app/Network_Simulation:ro
       - ../shared_data:/shared_data
       - ../experiment_results:/app/results
       - ../certs:/app/certs:ro
@@ -137,7 +141,7 @@ services:
             - driver: nvidia
               device_ids: ['0']
               capabilities: [gpu]
-  
+
   fl-client-unified-emotion-2:
     build:
       context: ..
@@ -154,6 +158,9 @@ services:
       - USE_QL_CONVERGENCE=${USE_QL_CONVERGENCE:-false}
       - Q_CONVERGENCE_THRESHOLD=${Q_CONVERGENCE_THRESHOLD:-0.01}
       - Q_CONVERGENCE_PATIENCE=${Q_CONVERGENCE_PATIENCE:-5}
+      # Parallel scenario training: RL_QTABLE_MERGE=1 + RL_QTABLE_OVERLAY_SCENARIOS=excellent (per stack)
+      - RL_QTABLE_MERGE=${RL_QTABLE_MERGE:-false}
+      - RL_QTABLE_OVERLAY_SCENARIOS=${RL_QTABLE_OVERLAY_SCENARIOS:-}
       - DEFAULT_PROTOCOL=mqtt
       - MQTT_BROKER=mqtt-broker-unified
       - AMQP_BROKER=amqp-broker-unified
@@ -169,6 +176,7 @@ services:
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
+      - ../Network_Simulation:/app/Network_Simulation:ro
       - ../shared_data:/shared_data
       - ../experiment_results:/app/results
       - ../certs:/app/certs:ro

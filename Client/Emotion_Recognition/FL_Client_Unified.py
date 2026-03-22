@@ -391,6 +391,10 @@ Q_CONVERGENCE_THRESHOLD = float(os.getenv("Q_CONVERGENCE_THRESHOLD", "0.01"))
 Q_CONVERGENCE_PATIENCE = int(os.getenv("Q_CONVERGENCE_PATIENCE", "5"))
 USE_COMMUNICATION_MODEL_REWARD = os.getenv("USE_COMMUNICATION_MODEL_REWARD", "true").lower() == "true"
 
+# One-shot hints when T_calc / R_tcalc stay zero in q_learning_log
+_T_CALC_IMPORT_WARNED = False
+_T_CALC_IPERF_MISSING_WARNED = False
+
 
 def _coarse_network_bucket_for_scenario(name: str) -> str:
     """Map NetworkSimulator-style scenario names onto the three RL ``network`` buckets (for logs/metrics)."""
@@ -1150,6 +1154,7 @@ class UnifiedFLClient_Emotion:
             else:
                 weights = self.deserialize_weights(data['weights'])
             
+            self._global_model_receive_t0 = time.time()
             self._apply_global_model_weights(
                 round_num=round_num,
                 weights=weights,
@@ -1456,6 +1461,7 @@ class UnifiedFLClient_Emotion:
     def on_grpc_global_model(self, response):
         """gRPC callback: received global model"""
         try:
+            self._global_model_receive_t0 = time.time()
             round_num = response.round
             print(f"[gRPC] Client {self.client_id} received global model for round {round_num}")
             
@@ -1581,6 +1587,7 @@ class UnifiedFLClient_Emotion:
                 print(f"Client {self.client_id} ignoring duplicate global model for round {round_num}")
                 return
             
+            self._global_model_receive_t0 = time.time()
             print(f"Client {self.client_id} received global model (round {round_num})")
             
             # Decompress/deserialize weights
@@ -1624,6 +1631,10 @@ class UnifiedFLClient_Emotion:
 
     def _apply_global_model_weights(self, round_num, weights, model_config=None, source="UNKNOWN"):
         """Initialize model if needed and apply incoming global weights."""
+        recv_t0 = getattr(self, "_global_model_receive_t0", None)
+        if recv_t0 is not None:
+            self._global_model_receive_t0 = None
+
         if self.model is None and source != "gRPC":
             print(
                 f"[{source}] Client {self.client_id} ignoring non-gRPC initial global model. "
@@ -1647,6 +1658,11 @@ class UnifiedFLClient_Emotion:
             self.waiting_for_aggregated_model = False
             print(f"[{source}] Client {self.client_id} updated model weights (round {round_num})")
 
+            # If gRPC protocol negotiation did not arm state/time (timeout, bootstrap, race), align
+            # downlink Q-learning with the actual delivery path so updates match uplink cadence per round.
+            t0_for_dl = recv_t0 if recv_t0 is not None else time.time()
+            self._arm_downlink_rl_if_missing(source=source, receive_started_at=t0_for_dl)
+
             # Compute downlink RL reward now that the model has arrived
             self._update_downlink_rl_after_reception(round_num=round_num)
 
@@ -1667,6 +1683,78 @@ class UnifiedFLClient_Emotion:
             return True
 
         return False
+
+    def _gather_state_for_downlink_rl(self):
+        """Build env state dict for downlink Q-learning (same signals as protocol negotiation)."""
+        if not self.env_manager:
+            return None
+        with tf.device('/CPU:0'):
+            import psutil
+            cpu = psutil.cpu_percent(interval=0.1)
+            memory = psutil.virtual_memory().percent
+            resource_level = self.env_manager.detect_resource_level(cpu, memory)
+            self.env_manager.update_resource_level(resource_level)
+            if USE_QL_CONVERGENCE:
+                reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
+                if reward_scenario:
+                    self.env_manager.update_network_scenario(reward_scenario)
+                    self.env_manager.update_network_condition(
+                        _coarse_network_bucket_for_scenario(reward_scenario)
+                    )
+                else:
+                    self.env_manager.update_network_scenario(None)
+                    self.measure_network_condition()
+            else:
+                self.measure_network_condition()
+            return self.env_manager.get_current_state()
+
+    def _downlink_protocol_from_delivery_source(self, source: str) -> str:
+        """Map global-model receive path to a Q-table action name."""
+        s = (source or "").strip().upper().replace(" ", "")
+        if s == "GRPC":
+            return "grpc"
+        if s == "MQTT":
+            return "mqtt"
+        if s == "AMQP":
+            return "amqp"
+        if s == "QUIC":
+            return "http3"
+        if s in ("HTTP/3", "HTTP3"):
+            return "http3"
+        if s == "DDS":
+            return "dds"
+        fallback = (self.selected_downlink_protocol or "grpc").strip().lower()
+        if self.rl_selector_downlink is not None and fallback in self.rl_selector_downlink.PROTOCOLS:
+            return fallback
+        return "grpc"
+
+    def _arm_downlink_rl_if_missing(self, source: str, receive_started_at: float) -> None:
+        """
+        When gRPC protocol negotiation did not run (or timed out before the client polled),
+        still arm state/time + register (state, actual protocol) so downlink Q-updates run
+        once per global model like uplink does per round.
+        """
+        if not USE_RL_SELECTION or self.rl_selector_downlink is None or self.env_manager is None:
+            return
+        if self._downlink_select_time is not None and self._last_downlink_rl_state is not None:
+            return
+        try:
+            state = self._gather_state_for_downlink_rl()
+            if state is None:
+                return
+            proto = self._downlink_protocol_from_delivery_source(source)
+            if proto not in self.rl_selector_downlink.PROTOCOLS:
+                proto = "grpc"
+            self.rl_selector_downlink.register_selection(state, proto)
+            self._last_downlink_rl_state = state
+            self._downlink_select_time = receive_started_at
+            self.selected_downlink_protocol = proto
+            print(
+                f"[Downlink RL] Client {self.client_id} armed Q-update from delivery "
+                f"(protocol={proto}, source={source})"
+            )
+        except Exception as e:
+            print(f"[Downlink RL] Client {self.client_id} fallback arm failed: {e}")
 
     def _update_downlink_rl_after_reception(self, round_num: int = 0):
         """
@@ -1725,11 +1813,14 @@ class UnifiedFLClient_Emotion:
                 if self.rl_selector_downlink.total_rewards else 0.0
             )
             self.rl_selector_downlink.end_episode()
-            q_converged = self.rl_selector_downlink.check_q_converged()
+            q_converged = self.rl_selector_downlink.check_q_converged(
+                threshold=Q_CONVERGENCE_THRESHOLD,
+                patience=Q_CONVERGENCE_PATIENCE,
+            )
 
             print(f"[Downlink RL] Client {self.client_id} | round={round_num} | protocol={protocol.upper()} | "
                   f"comm_time={comm_time:.3f}s | reward={reward:.2f} | q_delta={q_delta:.4f} | "
-                  f"epsilon={self.rl_selector_downlink.epsilon:.4f}")
+                  f"epsilon={self.rl_selector_downlink.epsilon:.4f} | q_conv_dl={q_converged}")
 
             if log_q_step is not None:
                 reward_details = self.rl_selector_downlink.get_last_reward_breakdown()
@@ -1938,6 +2029,8 @@ class UnifiedFLClient_Emotion:
         if self.model is None or global_model_id <= 0:
             return 'grpc'
 
+        state = None
+        downlink_rl_armed = False
         # Use the dedicated DOWNLINK Q-learning agent (separate Q-table from uplink)
         if USE_RL_SELECTION and self.rl_selector_downlink and self.env_manager:
             try:
@@ -1965,6 +2058,7 @@ class UnifiedFLClient_Emotion:
                 # Store downlink state and selection time so reward can be computed after model arrives
                 self._last_downlink_rl_state = state
                 self._downlink_select_time = time.time()
+                downlink_rl_armed = True
                 print(f"[Downlink RL] Client {self.client_id} selected {selected.upper()} "
                       f"(downlink agent, epsilon={self.rl_selector_downlink.epsilon:.4f})")
             except Exception as e:
@@ -1982,8 +2076,18 @@ class UnifiedFLClient_Emotion:
                 f"[gRPC] Client {self.client_id} downlink selection '{selected}' unavailable; "
                 f"falling back to gRPC"
             )
-            self._last_downlink_rl_state = None
-            self._downlink_select_time = None
+            if (
+                downlink_rl_armed
+                and state is not None
+                and self.rl_selector_downlink is not None
+                and self.rl_selector_downlink.pop_last_selection()
+            ):
+                self.rl_selector_downlink.register_selection(state, 'grpc')
+                self._last_downlink_rl_state = state
+                self._downlink_select_time = time.time()
+            else:
+                self._last_downlink_rl_state = None
+                self._downlink_select_time = None
             return 'grpc'
         return selected
 
@@ -2137,24 +2241,55 @@ class UnifiedFLClient_Emotion:
 
     def _get_t_calc_for_reward(self, protocol: str, payload_bytes: int) -> Optional[float]:
         """Get T_calc from communication model (iperf3 JSON) for reward; None if unavailable."""
+        global _T_CALC_IMPORT_WARNED, _T_CALC_IPERF_MISSING_WARNED
         try:
             sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "Network_Simulation"))
             from communication_model import get_t_calc_for_reward
             from pathlib import Path
             shared = self._shared_data_dir()
             path = Path(shared) / "iperf3_network_params.json"
-            return get_t_calc_for_reward(protocol, payload_bytes, json_path=path)
-        except Exception:
+            out = get_t_calc_for_reward(protocol, payload_bytes, json_path=path)
+            if (
+                out is None
+                and USE_COMMUNICATION_MODEL_REWARD
+                and not _T_CALC_IPERF_MISSING_WARNED
+            ):
+                _T_CALC_IPERF_MISSING_WARNED = True
+                if not path.is_file():
+                    print(
+                        f"[RL] T_calc / R_tcalc will stay 0: missing {path}. "
+                        "Populate via iperf3 (diagnostic pipeline) or set RL_REWARD_SCENARIO for analytic T_calc."
+                    )
+                else:
+                    print(
+                        f"[RL] T_calc / R_tcalc: {path} present but model returned None "
+                        "(empty JSON or missing bandwidth_bps / unusable params)."
+                    )
+            return out
+        except Exception as e:
+            if not _T_CALC_IMPORT_WARNED:
+                _T_CALC_IMPORT_WARNED = True
+                print(
+                    f"[RL] T_calc / R_tcalc will stay 0: could not load communication_model ({e!r}). "
+                    "Ensure /app/Network_Simulation exists in the container (Dockerfile COPY or compose volume)."
+                )
             return None
 
     def _get_t_calc_for_scenario(self, protocol: str, payload_bytes: int, scenario_name: str) -> Optional[float]:
         """Get T_calc for a named network scenario (e.g. good, moderate, poor) for simulated reward.
         Used when RL_REWARD_SCENARIO is set: train in excellent conditions but reward as if in that scenario."""
+        global _T_CALC_IMPORT_WARNED
         try:
             sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "Network_Simulation"))
             from communication_model import get_t_calc_for_scenario
             return get_t_calc_for_scenario(protocol, payload_bytes, scenario_name)
-        except Exception:
+        except Exception as e:
+            if not _T_CALC_IMPORT_WARNED:
+                _T_CALC_IMPORT_WARNED = True
+                print(
+                    f"[RL] T_calc (scenario) unavailable ({e!r}). "
+                    "Ensure Network_Simulation is on PYTHONPATH or mounted at /app/Network_Simulation."
+                )
             return None
 
     def _protocol_payload_limit_bytes(self, protocol: str) -> Optional[int]:
@@ -2724,10 +2859,19 @@ class UnifiedFLClient_Emotion:
                     avg_reward = (np.mean(self.rl_selector_uplink.total_rewards[-100:])
                                  if self.rl_selector_uplink.total_rewards else 0.0)
                     self.rl_selector_uplink.end_episode()
-                    q_converged = self.rl_selector_uplink.check_q_converged(
+                    q_uplink_converged = self.rl_selector_uplink.check_q_converged(
                         threshold=Q_CONVERGENCE_THRESHOLD,
                         patience=Q_CONVERGENCE_PATIENCE,
                     )
+                    q_downlink_converged = (
+                        self.rl_selector_downlink.check_q_converged(
+                            threshold=Q_CONVERGENCE_THRESHOLD,
+                            patience=Q_CONVERGENCE_PATIENCE,
+                        )
+                        if self.rl_selector_downlink is not None
+                        else True
+                    )
+                    q_both_converged = q_uplink_converged and q_downlink_converged
                     # Always log uplink Q-step so GUI Q-learning database stays updated
                     if log_q_step is not None and self._last_rl_state is not None:
                         st = self._last_rl_state
@@ -2745,7 +2889,11 @@ class UnifiedFLClient_Emotion:
                             q_delta=q_delta,
                             epsilon=self.rl_selector_uplink.epsilon,
                             avg_reward_last_100=float(avg_reward),
-                            converged=q_converged,
+                            converged=(
+                                q_both_converged
+                                if USE_QL_CONVERGENCE
+                                else q_uplink_converged
+                            ),
                             metric_communication_time=reward_details.get('communication_time'),
                             metric_convergence_time=None,
                             metric_accuracy=reward_details.get('accuracy'),
@@ -2766,13 +2914,22 @@ class UnifiedFLClient_Emotion:
                             reward_total=reward_details.get('reward_total', reward),
                             link_direction='uplink',
                         )
-                    # End training on Q-convergence only when USE_QL_CONVERGENCE is True
-                    if USE_QL_CONVERGENCE and q_converged and STOP_ON_CLIENT_CONVERGENCE:
+                    if (
+                        USE_QL_CONVERGENCE
+                        and q_uplink_converged
+                        and not q_downlink_converged
+                    ):
+                        print(
+                            f"[Client {self.client_id}] Uplink Q converged at round {report_round} but downlink "
+                            f"has not; continuing (uplink Q-updates unchanged)."
+                        )
+                    # End training only when both uplink and downlink Q-learning converged
+                    if USE_QL_CONVERGENCE and q_both_converged and STOP_ON_CLIENT_CONVERGENCE:
                         self.has_converged = True
                         print(
                             f"[Client {self.client_id}] RL convergence reached at round {report_round} "
                             f"(epsilon<{os.getenv('RL_CONVERGENCE_EPSILON_CAP', '0.1')}, "
-                            f"last {Q_CONVERGENCE_PATIENCE} uplink protocols identical)"
+                            f"last {Q_CONVERGENCE_PATIENCE} protocols identical on uplink AND downlink)"
                         )
                         try:
                             self.rl_selector_uplink.save_q_table()
@@ -3362,6 +3519,7 @@ class UnifiedFLClient_Emotion:
             else:
                 weights = self.deserialize_weights(message['weights'])
             
+            self._global_model_receive_t0 = time.time()
             self._apply_global_model_weights(
                 round_num=round_num,
                 weights=weights,
@@ -3770,6 +3928,7 @@ class UnifiedFLClient_Emotion:
             else:
                 weights = self.deserialize_weights(message['weights'])
             
+            self._global_model_receive_t0 = time.time()
             self._apply_global_model_weights(
                 round_num=round_num,
                 weights=weights,

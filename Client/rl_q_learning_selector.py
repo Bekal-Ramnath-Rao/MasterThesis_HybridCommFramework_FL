@@ -18,6 +18,14 @@ import time
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 import pickle
+import tempfile
+
+try:
+    import fcntl  # type: ignore
+    _HAS_FCNTL = True
+except ImportError:
+    fcntl = None  # type: ignore
+    _HAS_FCNTL = False
 
 
 # --- Reward budget (success): base 10 + accuracy 10 + comm 10 + resource ≥ -5 + battery ≥ -5 → max 40 ---
@@ -239,6 +247,31 @@ class QLearningProtocolSelector:
         self.action_history.append(action_idx)
         
         return protocol
+
+    def pop_last_selection(self) -> bool:
+        """Remove the most recent (state, action) pair from learning history (e.g. after replacing an unavailable action)."""
+        if not self.state_history or not self.action_history:
+            return False
+        self.state_history.pop()
+        action_idx = self.action_history.pop()
+        protocol = self.PROTOCOLS[action_idx]
+        self.protocol_usage[protocol] = max(0, int(self.protocol_usage.get(protocol, 0)) - 1)
+        return True
+
+    def register_selection(self, state: Dict, protocol: str) -> str:
+        """
+        Record a fixed (state, protocol) pair for the next update_q_value, without epsilon-greedy sampling.
+        Used when the actual transport is known (e.g. gRPC fallback) or to align history with delivery.
+        """
+        p = (protocol or "grpc").strip().lower()
+        if p not in self.PROTOCOLS:
+            p = "grpc"
+        state_idx = self.get_state_index(state)
+        action_idx = self.PROTOCOLS.index(p)
+        self.protocol_usage[p] = int(self.protocol_usage.get(p, 0)) + 1
+        self.state_history.append(state_idx)
+        self.action_history.append(action_idx)
+        return p
     
     def calculate_reward(
         self,
@@ -461,25 +494,194 @@ class QLearningProtocolSelector:
         # Save Q-table periodically
         if self.episode_count % 10 == 0:
             self.save_q_table()
-    
-    def save_q_table(self):
-        """Save Q-table and statistics to disk"""
-        data = {
-            'q_table': self.q_table,
-            'scenario_order': list(self.scenario_order),
-            'epsilon': self.epsilon,
-            'episode_count': self.episode_count,
-            'total_rewards': self.total_rewards,
-            'protocol_usage': self.protocol_usage,
-            'protocol_success': self.protocol_success,
-            'protocol_failures': self.protocol_failures,
-            'last_scenario': getattr(self, 'last_scenario', None)  # Track last scenario
-        }
-        
+
+    def _merge_env_overlay_scenarios(self) -> List[str]:
+        """
+        Scenario names this process may overwrite when merging into a shared on-disk Q-table.
+        Set RL_QTABLE_MERGE=1 and either RL_QTABLE_OVERLAY_SCENARIOS=excellent,moderate or rely on
+        last_scenario (e.g. from reset_epsilon / experiment flag) so parallel runs only touch
+        their slice and do not zero out rows trained by other processes.
+        """
+        raw = os.getenv("RL_QTABLE_OVERLAY_SCENARIOS", "").strip()
+        if raw:
+            return [s.strip().lower() for s in raw.split(",") if s.strip()]
+        merge_on = os.getenv("RL_QTABLE_MERGE", "").lower() in ("1", "true", "yes")
+        if merge_on:
+            ls = getattr(self, "last_scenario", None)
+            if ls is not None and str(ls).strip():
+                return [str(ls).strip().lower()]
+        return []
+
+    def _read_q_table_pickle(self, path: str) -> Optional[Dict]:
+        if not path or not os.path.exists(path):
+            return None
         try:
-            with open(self.save_path, 'wb') as f:
+            with open(path, "rb") as f:
+                return pickle.load(f)
+        except Exception as e:
+            print(f"[Q-Learning] Warning: could not read Q-table for merge at {path}: {e}")
+            return None
+
+    def _tail_shape(self) -> Tuple[int, int, int, int]:
+        return (
+            len(self.RESOURCE_LEVELS),
+            len(self.MODEL_SIZES),
+            len(self.MOBILITY_LEVELS),
+            len(self.PROTOCOLS),
+        )
+
+    def _merge_disk_and_self_payload(self, disk: Optional[Dict], overlay: List[str]) -> Dict:
+        """Build pickle dict: disk baseline + this process's rows for overlay / new scenarios."""
+        tail = self._tail_shape()
+        self_data = {
+            "q_table": self.q_table,
+            "scenario_order": list(self.scenario_order),
+            "epsilon": self.epsilon,
+            "episode_count": self.episode_count,
+            "total_rewards": self.total_rewards,
+            "protocol_usage": dict(self.protocol_usage),
+            "protocol_success": dict(self.protocol_success),
+            "protocol_failures": dict(self.protocol_failures),
+            "last_scenario": getattr(self, "last_scenario", None),
+        }
+        if disk is None:
+            return self_data
+
+        dq = disk.get("q_table")
+        if dq is None or dq.ndim != 5 or dq.shape[1:] != tail:
+            print("[Q-Learning] Merge skipped: disk Q-table shape mismatch; writing this process only")
+            return self_data
+
+        n_disk = int(dq.shape[0])
+        saved_order = disk.get("scenario_order")
+        if saved_order is not None and len(saved_order) == n_disk:
+            disk_order = [str(s).strip().lower() for s in saved_order]
+        elif n_disk == len(self.NETWORK_CONDITIONS):
+            disk_order = list(self.NETWORK_CONDITIONS)
+        else:
+            print("[Q-Learning] Merge skipped: cannot map disk scenario_order; writing this process only")
+            return self_data
+
+        disk_set = set(disk_order)
+        merged_order: List[str] = []
+        seen: set = set()
+        for s in disk_order:
+            if s not in seen:
+                merged_order.append(s)
+                seen.add(s)
+        for s in self.scenario_order:
+            s = str(s).strip().lower()
+            if s not in seen:
+                merged_order.append(s)
+                seen.add(s)
+
+        r, m, mob, p = tail
+        merged_q = np.zeros((len(merged_order), r, m, mob, p))
+        merged_idx = {s: i for i, s in enumerate(merged_order)}
+
+        for i, s in enumerate(disk_order):
+            j = merged_idx[s]
+            merged_q[j] = np.array(dq[i], copy=True)
+
+        for s in self.scenario_order:
+            s = str(s).strip().lower()
+            if s not in disk_set and s in self._scenario_to_idx:
+                j = merged_idx[s]
+                merged_q[j] = np.array(self.q_table[self._scenario_to_idx[s]], copy=True)
+
+        overlay_set = {str(x).strip().lower() for x in overlay if str(x).strip()}
+        for s in overlay_set:
+            if s in self._scenario_to_idx:
+                j = merged_idx[s]
+                merged_q[j] = np.array(self.q_table[self._scenario_to_idx[s]], copy=True)
+
+        def _sum_maps(a: Dict, b: Dict) -> Dict:
+            out = {k: int(v) for k, v in (a or {}).items()}
+            for k, v in (b or {}).items():
+                out[k] = out.get(k, 0) + int(v)
+            return out
+
+        disk_ep = int(disk.get("episode_count", 0) or 0)
+        ep_merged = max(disk_ep, int(self.episode_count))
+        tr_disk = disk.get("total_rewards") or []
+        tr_self = self.total_rewards or []
+        total_rewards_merged = list(tr_self) if self.episode_count >= disk_ep else list(tr_disk)
+
+        merged = {
+            "q_table": merged_q,
+            "scenario_order": merged_order,
+            "epsilon": self.epsilon if self.episode_count >= disk_ep else disk.get("epsilon", self.epsilon),
+            "episode_count": ep_merged,
+            "total_rewards": total_rewards_merged,
+            "protocol_usage": _sum_maps(disk.get("protocol_usage"), self.protocol_usage),
+            "protocol_success": _sum_maps(disk.get("protocol_success"), self.protocol_success),
+            "protocol_failures": _sum_maps(disk.get("protocol_failures"), self.protocol_failures),
+            "last_scenario": getattr(self, "last_scenario", None) or disk.get("last_scenario"),
+        }
+        return merged
+
+    def _atomic_pickle_dump(self, path: str, data: Dict) -> None:
+        d = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".qtable_", suffix=".tmp", dir=d)
+        try:
+            with os.fdopen(fd, "wb") as f:
                 pickle.dump(data, f)
-            print(f"[Q-Learning] Saved Q-table to {self.save_path}")
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+    def save_q_table(self):
+        """
+        Save Q-table and statistics to disk.
+
+        Parallel training (several containers/processes, one network scenario each)::
+
+            RL_QTABLE_MERGE=1
+            RL_QTABLE_OVERLAY_SCENARIOS=excellent   # or moderate, poor, congested_light, ...
+
+        Uses a file lock and merges this process's scenario slice(s) into the existing file so other
+        scenarios' rows are preserved.         Without RL_QTABLE_MERGE, behavior is a single-process
+        overwrite (unchanged).
+        """
+        overlay = self._merge_env_overlay_scenarios()
+        try:
+            if overlay and _HAS_FCNTL:
+                lock_path = f"{self.save_path}.lock"
+                with open(lock_path, "a+") as lock_f:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                    try:
+                        disk = self._read_q_table_pickle(self.save_path)
+                        payload = self._merge_disk_and_self_payload(disk, overlay)
+                        self._atomic_pickle_dump(self.save_path, payload)
+                    finally:
+                        fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+                print(f"[Q-Learning] Saved Q-table (merge, overlay={overlay}) to {self.save_path}")
+            elif overlay and not _HAS_FCNTL:
+                disk = self._read_q_table_pickle(self.save_path)
+                payload = self._merge_disk_and_self_payload(disk, overlay)
+                self._atomic_pickle_dump(self.save_path, payload)
+                print(
+                    f"[Q-Learning] Saved Q-table (merge, no fcntl lock) to {self.save_path}"
+                )
+            else:
+                data = {
+                    "q_table": self.q_table,
+                    "scenario_order": list(self.scenario_order),
+                    "epsilon": self.epsilon,
+                    "episode_count": self.episode_count,
+                    "total_rewards": self.total_rewards,
+                    "protocol_usage": self.protocol_usage,
+                    "protocol_success": self.protocol_success,
+                    "protocol_failures": self.protocol_failures,
+                    "last_scenario": getattr(self, "last_scenario", None),
+                }
+                self._atomic_pickle_dump(self.save_path, data)
+                print(f"[Q-Learning] Saved Q-table to {self.save_path}")
         except Exception as e:
             print(f"[Q-Learning] Error saving Q-table: {e}")
     
