@@ -11,6 +11,16 @@ from typing import List, Dict
 import matplotlib.pyplot as plt
 from pathlib import Path
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
@@ -38,6 +48,7 @@ NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenari
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))  # Loss improvement threshold
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))  # Rounds to wait for improvement
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))  # Minimum rounds before checking convergence
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # MQTT Topics
 TOPIC_GLOBAL_MODEL = "fl/global_model"
@@ -224,6 +235,10 @@ class FederatedLearningServer:
     
     def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore convergence-triggered removal/disconnect.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         if client_id in self.active_clients:
             self.active_clients.discard(client_id)
             self.client_updates.pop(client_id, None)
@@ -243,7 +258,7 @@ class FederatedLearningServer:
         
         if client_id not in self.active_clients:
             return
-        if float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+        if STOP_ON_CLIENT_CONVERGENCE and float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
@@ -256,19 +271,20 @@ class FederatedLearningServer:
                         compressed_update = pickle.loads(base64.b64decode(compressed_update.encode('utf-8')))
                     except Exception as e:
                         print(f"Server error decoding compressed_data from client {client_id}: {e}")
-                weights = self.quantization_handler.decompress_client_update(
-                    client_id, 
-                    compressed_update
-                )
-                print(f"Received and decompressed update from client {client_id}")
+                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                self.client_updates[client_id] = {
+                    'compressed_data': compressed_update,
+                    'num_samples': data['num_samples'],
+                    'metrics': data['metrics']
+                }
+                print(f"Received quantized update from client {client_id} (kept quantized)")
             else:
                 weights = self.deserialize_weights(data['weights'])
-            
-            self.client_updates[client_id] = {
-                'weights': weights,
-                'num_samples': data['num_samples'],
-                'metrics': data['metrics']
-            }
+                self.client_updates[client_id] = {
+                    'weights': weights,
+                    'num_samples': data['num_samples'],
+                    'metrics': data['metrics']
+                }
             
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{len(self.active_clients)})")
@@ -284,7 +300,7 @@ class FederatedLearningServer:
         
         if client_id not in self.active_clients:
             return
-        if float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+        if STOP_ON_CLIENT_CONVERGENCE and float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
@@ -317,6 +333,8 @@ class FederatedLearningServer:
             compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
             stats = self.quantization_handler.get_compression_stats(self.global_weights, compressed_data)
             print(f"Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
+            # Keep quantized global model state for later rounds (no re-quantize)
+            self.global_compressed = compressed_data
             
             # Serialize compressed data to JSON-safe base64 string
             serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
@@ -371,6 +389,30 @@ class FederatedLearningServer:
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
+
+        # Quantization end-to-end path: aggregate directly on compressed quantized tensors.
+        if self.quantization_handler is not None and len(self.client_updates) > 0 and 'compressed_data' in list(self.client_updates.values())[0]:
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            serialized = base64.b64encode(pickle.dumps(self.global_compressed)).decode('utf-8')
+            global_model_message = {
+                "round": self.current_round,
+                "quantized_data": serialized,
+                "model_config": self.model_config
+            }
+
+            self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, json.dumps(global_model_message))
+            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients")
+
+            # Request evaluation from clients
+            time.sleep(1)
+            self.mqtt_client.publish(TOPIC_START_EVALUATION, json.dumps({"round": self.current_round}))
+            return
         
         # Calculate total samples
         total_samples = sum(update['num_samples'] 
@@ -477,9 +519,12 @@ class FederatedLearningServer:
         # Stop only when no active clients remain or max rounds reached (no server-side convergence)
         if len(self.active_clients) == 0:
             self.convergence_time = time.time() - self.start_time if self.start_time else 0
-            self.converged = True
+            self.converged = bool(STOP_ON_CLIENT_CONVERGENCE)
             print("\n" + "="*70)
-            print("All clients converged locally. Training complete.")
+            if STOP_ON_CLIENT_CONVERGENCE:
+                print("All clients converged locally. Training complete.")
+            else:
+                print("All clients became inactive. Training complete (fixed-round mode).")
             print("="*70 + "\n")
             self._finish_training()
             return
@@ -563,12 +608,14 @@ class FederatedLearningServer:
         plt.tight_layout()
         
         # Save to results folder
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "mqtt")
         plt.savefig(results_dir / 'mqtt_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'mqtt_training_metrics.png'}")
-        plt.show(block=False)  # Non-blocking show
-        
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            plt.close()
+        else:
+            plt.show(block=False)  # Non-blocking show
+
         # Disconnect and exit
         print("\nTraining complete. Disconnecting...")
         time.sleep(2)  # Give time for message delivery
@@ -580,8 +627,7 @@ class FederatedLearningServer:
     
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "mqtt")
         
         results = {
             "rounds": self.ROUNDS,
@@ -595,7 +641,7 @@ class FederatedLearningServer:
             "num_clients": self.num_clients
         }
         
-        results_file = results_dir / f'mqtt_{NETWORK_SCENARIO}_training_results.json'
+        results_file = results_dir / 'mqtt_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
         

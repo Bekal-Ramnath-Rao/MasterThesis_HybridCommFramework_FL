@@ -11,6 +11,13 @@ import base64
 import time
 import logging
 import numpy as np
+_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+if _xla_flags:
+    sanitized_flags = [f for f in _xla_flags.split() if f != "--xla_gpu_enable_command_buffer="]
+    if sanitized_flags:
+        os.environ["XLA_FLAGS"] = " ".join(sanitized_flags)
+    else:
+        os.environ.pop("XLA_FLAGS", None)
 import tensorflow as tf
 import paho.mqtt.client as mqtt
 
@@ -20,6 +27,13 @@ if compression_path not in sys.path:
     sys.path.insert(0, compression_path)
 
 from quantization_client import Quantization, QuantizationConfig
+try:
+    from pruning_client import ModelPruning, PruningConfig
+    PRUNING_AVAILABLE = True
+except Exception:
+    ModelPruning = None
+    PruningConfig = None
+    PRUNING_AVAILABLE = False
 
 from collections import Counter
 
@@ -101,6 +115,19 @@ class FederatedLearningClient:
         else:
             self.quantizer = None
             print(f"Client {self.client_id}: Quantization disabled")
+
+        # Initialize pruning compression (default: disabled unless explicitly enabled)
+        up_env = os.getenv("USE_PRUNING", "false")
+        use_pruning = up_env.lower() in ("true", "1", "yes", "y")
+        if use_pruning and PRUNING_AVAILABLE and ModelPruning is not None:
+            self.pruner = ModelPruning(PruningConfig())
+            print(f"Client {self.client_id}: Pruning enabled")
+        else:
+            self.pruner = None
+            if use_pruning and not PRUNING_AVAILABLE:
+                print(f"Client {self.client_id}: Pruning requested but pruning module not available")
+            else:
+                print(f"Client {self.client_id}: Pruning disabled")
         self.x_train = None
         self.y_train = None
         self.current_round = 0
@@ -309,20 +336,25 @@ class FederatedLearningClient:
             
             print(f"Client {self.client_id} received global model (round {round_num})")
             
-            # Decompress/deserialize weights
-            if 'quantized_data' in data:
+            # Decompress/deserialize weights (priority: pruned_data -> quantized_data -> raw weights)
+            if 'pruned_data' in data and PRUNING_AVAILABLE and ModelPruning is not None:
+                compressed_bytes = base64.b64decode(data['pruned_data'].encode('utf-8'))
+                pruning_codec = self.pruner or ModelPruning(PruningConfig())
+                weights = pruning_codec.decompress_pruned_weights(compressed_bytes)
+                print(f"Client {self.client_id} decompressed pruned model")
+            elif 'quantized_data' in data:
                 # Handle quantized/compressed data
                 compressed_data = data['quantized_data']
                 if isinstance(compressed_data, str):
                     import base64, pickle
                     compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
                 if hasattr(self, 'quantization') and self.quantization is not None:
-                    weights = self.quantization.decompress(compressed_data)
+                    weights = self.quantization.as_training_weights(compressed_data)
                 elif hasattr(self, 'quantizer') and self.quantizer is not None:
-                    weights = self.quantizer.decompress(compressed_data)
+                    weights = self.quantizer.as_training_weights(compressed_data)
                 else:
                     weights = compressed_data
-                print(f"Client {self.client_id} decompressed quantized model")
+                print(f"Client {self.client_id} received quantized model (kept quantized)")
             else:
                 # Normal weights
                 if 'weights' in data:

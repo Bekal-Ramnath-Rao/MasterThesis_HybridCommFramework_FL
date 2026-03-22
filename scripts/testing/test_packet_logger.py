@@ -39,10 +39,11 @@ print(f"✓ Database initialized: {os.path.exists(packet_logger.DB_PATH)}")
 
 # Log a test packet
 packet_logger.log_sent_packet(
+    packet_size=1024,
+    peer="test/topic",
     protocol="MQTT",
-    message_type="test_message",
-    size_bytes=1024,
-    destination="test/topic"
+    round=1,
+    extra_info="test_message"
 )
 print("✓ Logged test packet to sent_packets table")
 
@@ -68,10 +69,11 @@ print(f"✓ Database initialized: {os.path.exists(packet_logger_client.DB_PATH)}
 
 # Log a test packet
 packet_logger_client.log_received_packet(
+    packet_size=5242880,
+    peer="server",
     protocol="gRPC",
-    message_type="model_update",
-    size_bytes=5242880,
-    source="server"
+    round=1,
+    extra_info="model_update"
 )
 print("✓ Logged test packet to received_packets table")
 
@@ -81,6 +83,7 @@ print("TEST 3: Checking shared_data Directory")
 print("=" * 60)
 
 shared_data_dir = os.path.join(os.path.dirname(__file__), 'shared_data')
+shared_data_dir = os.path.join(_project_root, 'shared_data')
 print(f"Expected directory: {shared_data_dir}")
 print(f"Directory exists: {os.path.exists(shared_data_dir)}")
 

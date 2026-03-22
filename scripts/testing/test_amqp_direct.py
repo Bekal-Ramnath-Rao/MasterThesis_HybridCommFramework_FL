@@ -4,11 +4,12 @@ import pika
 import json
 import time
 import threading
+import os
 
 # Test configuration
-AMQP_HOST = 'localhost'
-AMQP_PORT = 5672
-CLIENT_ID = 99
+AMQP_HOST = os.environ.get('AMQP_HOST', 'localhost')
+AMQP_PORT = int(os.environ.get('AMQP_PORT', '5672'))
+CLIENT_ID = int(os.environ.get('CLIENT_ID', '99'))
 
 def send_amqp_message():
     """Send a test message via AMQP"""

@@ -12,6 +12,13 @@ import time
 import asyncio
 import logging
 import numpy as np
+_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+if _xla_flags:
+    sanitized_flags = [f for f in _xla_flags.split() if f != "--xla_gpu_enable_command_buffer="]
+    if sanitized_flags:
+        os.environ["XLA_FLAGS"] = " ".join(sanitized_flags)
+    else:
+        os.environ.pop("XLA_FLAGS", None)
 import tensorflow as tf
 from collections import Counter
 from aioquic.asyncio import connect
@@ -69,6 +76,7 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Model initialization timeout (seconds) - longer for poor network conditions
 # Default: 300s (5 minutes) for very poor network conditions with large models
@@ -92,8 +100,6 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
                 self._stream_buffers[event.stream_id] = b''
             
             self._stream_buffers[event.stream_id] += event.data
-            buffer_size = len(self._stream_buffers[event.stream_id])
-            print(f"[DEBUG] Client stream {event.stream_id}: received {len(event.data)} bytes, buffer now {buffer_size} bytes, end_stream={event.end_stream}")
             
             # Send flow control updates to allow more data (critical for poor networks)
             self.transmit()
@@ -104,8 +110,6 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
                     try:
                         data = message_data.decode('utf-8')
                         message = json.loads(data)
-                        msg_type = message.get('type', 'unknown')
-                        print(f"[DEBUG] Client decoded message from stream {event.stream_id}: type={msg_type}, size={len(message_data)} bytes")
                         if self.client:
                             asyncio.create_task(self.client.handle_message(message))
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -113,12 +117,9 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             
             # If stream ended and buffer has remaining data, try to process it
             if event.end_stream and self._stream_buffers[event.stream_id]:
-                print(f"[DEBUG] Client stream {event.stream_id} ended with {len(self._stream_buffers[event.stream_id])} bytes remaining")
                 try:
                     data = self._stream_buffers[event.stream_id].decode('utf-8')
                     message = json.loads(data)
-                    msg_type = message.get('type', 'unknown')
-                    print(f"[DEBUG] Client decoded end-of-stream message: type={msg_type}")
                     if self.client:
                         asyncio.create_task(self.client.handle_message(message))
                     self._stream_buffers[event.stream_id] = b''
@@ -396,27 +397,17 @@ class FederatedLearningClient:
         """Send message to server via QUIC stream"""
         if self.protocol:
             msg_type = message.get('type')
-            print(f"[DEBUG] Client {self.client_id} sending message type: {msg_type}")
-            
             data = (json.dumps(message) + '\n').encode('utf-8')
-            print(f"[DEBUG] Client {self.client_id} message size: {len(data)} bytes")
             
             self.stream_id = self.protocol._quic.get_next_available_stream_id()
             # End stream to ensure data is flushed and processed
             self.protocol._quic.send_stream_data(self.stream_id, data, end_stream=True)
             self.protocol.transmit()
-            
-            # FAIR FIX: Removed artificial delays (1.5s for large, 0.1s for small messages)
-            # QUIC handles flow control automatically, so manual delays are unnecessary
-            # This makes QUIC behavior similar to other protocols which don't have artificial delays
-            print(f"[DEBUG] Client {self.client_id} sent {msg_type} on stream {self.stream_id}")
     
     async def handle_message(self, message):
         """Handle incoming messages from server"""
         try:
             msg_type = message.get('type')
-            print(f"[DEBUG] Client {self.client_id} received message type: {msg_type}")
-            
             if msg_type == 'training_config':
                 await self.handle_training_config(message)
             elif msg_type == 'global_model':
@@ -442,15 +433,13 @@ class FederatedLearningClient:
         round_num = message['round']
         encoded_weights = message['weights']
         
-        print(f"[DEBUG] Client {self.client_id} handle_global_model - round={round_num}, has_config={bool(message.get('model_config'))}, model_exists={self.model is not None}")
-        
         # Decompress or deserialize weights
         if 'quantized_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['quantized_data'])
-            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            weights = self.quantizer.as_training_weights(message['quantized_data'])
+            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
         elif 'compressed_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['compressed_data'])
-            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            weights = self.quantizer.as_training_weights(message['compressed_data'])
+            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
         else:
             weights = self.deserialize_weights(encoded_weights)
         
@@ -493,8 +482,6 @@ class FederatedLearningClient:
     async def handle_start_training(self, message):
         """Start local training when server signals"""
         round_num = message['round']
-        
-        print(f"[DEBUG] Client {self.client_id} received start_training - round={round_num}, model_ready={self.model_ready.is_set()}, current_round={self.current_round}")
         
         if not self.model_ready.is_set():
             print(f"Client {self.client_id} waiting for model initialization before training round {round_num}...")
@@ -569,7 +556,7 @@ class FederatedLearningClient:
             'loss': final_loss,
             'accuracy': final_acc
         }
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             metrics_dict['client_converged'] = 1.0
         
         print(f"Client {self.client_id} training complete - "
@@ -598,7 +585,7 @@ class FederatedLearningClient:
             'num_samples': int(len(self.y_train)),
             'metrics': metrics_dict
         })
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             await asyncio.sleep(2)
             import sys

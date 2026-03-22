@@ -13,6 +13,16 @@ from concurrent import futures
 import threading
 import tensorflow as tf
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
@@ -41,6 +51,7 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "16"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # EEG Settings
 SEED = 42
@@ -257,7 +268,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         model = build_model()
         self.global_weights = model.get_weights()
         print(f"Model initialized with {len(self.global_weights)} weight layers")
-        print(f"[DEBUG] Global weights initialized: {self.global_weights is not None}")
 
     def load_test_data(self):
         """Load and prepare test data for evaluation"""
@@ -296,10 +306,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
     def RegisterClient(self, request, context):
         """Handle client registration"""
-        print(f"[DEBUG] RegisterClient called - Received registration request from client {request.client_id}")
         with self.lock:
             client_id = request.client_id
-            print(f"[DEBUG] Acquired lock. Processing client {client_id}")
             self.registered_clients.add(client_id)
             self.active_clients.add(client_id)
             print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
@@ -307,7 +315,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         # Update total client count if more clients join
         if len(self.registered_clients) > self.num_clients:
             self.update_client_count(len(self.registered_clients))
-            print(f"[DEBUG] Currently registered clients: {sorted(self.registered_clients)}")
 
             if len(self.registered_clients) == self.num_clients and not self.training_started:
                 print("\nAll clients registered. Distributing initial global model...\n")
@@ -341,8 +348,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             client_id = request.client_id
             client_round = request.current_round
 
-            print(f"[DEBUG] CheckTrainingStatus - Client {client_id}, client_round={client_round}, server_round={self.current_round}, training_started={self.training_started}")
-
             if self.training_complete:
                 return federated_learning_pb2.TrainingStatus(
                     should_train=False,
@@ -359,7 +364,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             # 2. Client is at current round but hasn't submitted update yet
             if self.training_started and not self.evaluation_phase:
                 if client_round < self.current_round or (client_round == self.current_round and not client_has_submitted):
-                    print(f"[DEBUG] Telling client {client_id} to train for round {self.current_round}")
                     return federated_learning_pb2.TrainingStatus(
                         should_train=True,
                         current_round=self.current_round,
@@ -367,7 +371,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                         is_complete=False
                     )
 
-            print(f"[DEBUG] Telling client {client_id} to wait (evaluation_phase={self.evaluation_phase}, has_submitted={client_has_submitted})")
             return federated_learning_pb2.TrainingStatus(
                 should_train=False,
                 current_round=self.current_round,
@@ -377,12 +380,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
     def GetGlobalModel(self, request, context):
         """Send global model to client"""
-        print(f"[DEBUG] GetGlobalModel called - client_id={request.client_id}, request.round={request.round}")
         with self.lock:
-            print(f"[DEBUG] GetGlobalModel - training_started={self.training_started}, global_weights is None={self.global_weights is None}")
-            
             if not self.training_started:
-                print(f"[DEBUG] GetGlobalModel - Training not started yet, returning unavailable")
                 return federated_learning_pb2.GlobalModel(
                     round=0,
                     weights=b'',
@@ -402,8 +401,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 }
                 model_config_json = json.dumps(model_config)
 
-                print(f"[DEBUG] GetGlobalModel - Sending round {round_to_send} to client {request.client_id} (request.round={request.round})")
-                
                 # Compress or serialize global weights
                 if self.quantization_handler is not None:
                     compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
@@ -421,7 +418,6 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     model_config=model_config_json
                 )
             else:
-                print(f"[DEBUG] GetGlobalModel - global_weights is None!")
                 return federated_learning_pb2.GlobalModel(
                     round=self.current_round,
                     weights=b'',
@@ -430,6 +426,10 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
     def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore convergence-triggered removal.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         with self.lock:
             if client_id in self.active_clients:
                 self.active_clients.discard(client_id)
@@ -446,7 +446,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             client_id = request.client_id
             round_num = request.round
             metrics = dict(request.metrics)
-            if float(metrics.get('client_converged', 0.0)) >= 1.0:
+            if STOP_ON_CLIENT_CONVERGENCE and float(metrics.get('client_converged', 0.0)) >= 1.0:
                 self.mark_client_converged(client_id)
                 return federated_learning_pb2.UpdateResponse(
                     success=True,
@@ -464,8 +464,14 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                         try:
                             candidate = pickle.loads(request.weights)
                             if isinstance(candidate, dict) and 'compressed_data' in candidate:
-                                weights = self.quantization_handler.decompress_client_update(request.client_id, candidate)
-                                print(f"Server: Received and decompressed update from client {request.client_id}")
+                                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                                self.client_updates[client_id] = {
+                                    'compressed_data': candidate,
+                                    'num_samples': request.num_samples,
+                                    'round': round_num
+                                }
+                                print(f"Server: Received quantized update from client {request.client_id} (kept quantized)")
+                                weights = None
                             else:
                                 weights = candidate
                         except Exception:
@@ -475,11 +481,12 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 else:
                     weights = None
                 
-                self.client_updates[client_id] = {
-                    'weights': weights,
-                    'num_samples': request.num_samples,
-                    'round': round_num
-                }
+                if client_id not in self.client_updates:
+                    self.client_updates[client_id] = {
+                        'weights': weights,
+                        'num_samples': request.num_samples,
+                        'round': round_num
+                    }
 
                 print(f"Received update from client {client_id} "
                       f"({len(self.client_updates)}/{len(self.active_clients)})")
@@ -514,6 +521,33 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
         # Calculate total samples
         total_samples = sum(update['num_samples'] for update in self.client_updates.values())
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            # Keep a float-cast view for evaluation (no dequantization scaling applied)
+            try:
+                self.global_weights = [np.asarray(w, dtype=np.float32) for w in aggregated_compressed.get('compressed_data', [])]
+            except Exception:
+                self.global_weights = self.global_weights
+
+            # Evaluate on global test set (captures impact of quantized training pipeline)
+            self.evaluate_global_model()
+
+            print(f"Aggregated global model from round {self.current_round} (kept quantized)")
+            print(f"Global model ready for clients (kept quantized)\n")
+            self.continue_training()
+            return
 
         # Initialize aggregated weights
         aggregated_weights = []
@@ -575,7 +609,10 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
         if len(self.active_clients) == 0:
             print("\n" + "=" * 70)
-            print("All clients converged locally. Training complete.")
+            if STOP_ON_CLIENT_CONVERGENCE:
+                print("All clients converged locally. Training complete.")
+            else:
+                print("All clients became inactive. Training complete (fixed-round mode).")
             print("=" * 70 + "\n")
             self.training_complete = True
             self.save_results()
@@ -610,9 +647,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             "num_rounds": self.num_rounds
         }
 
-        results_dir = os.path.join(os.path.dirname(__file__), "results")
-        os.makedirs(results_dir, exist_ok=True)
-        results_file = os.path.join(results_dir, "grpc_training_results.json")
+        results_dir = get_experiment_results_dir("mental_state", "grpc")
+        results_file = results_dir / "grpc_training_results.json"
 
         with open(results_file, "w") as f:
             json.dump(results, f, indent=2)

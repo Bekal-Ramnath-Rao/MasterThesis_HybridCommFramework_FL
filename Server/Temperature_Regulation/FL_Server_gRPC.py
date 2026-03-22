@@ -24,6 +24,14 @@ except ImportError:
     print("Warning: Quantization module not available")
     QUANTIZATION_AVAILABLE = False
 
+try:
+    from pruning_server import ServerPruning
+    from pruning_client import PruningConfig
+    PRUNING_AVAILABLE = True
+except ImportError:
+    print("Warning: Pruning module not available")
+    PRUNING_AVAILABLE = False
+
 
 # Add Protocols directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'Protocols'))
@@ -41,10 +49,21 @@ MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
 NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 
 class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningServicer):
@@ -101,6 +120,25 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.training_started = False
         self.training_complete = False
         self.evaluation_phase = False
+
+        # Optional compression handlers
+        uq_env = os.getenv("USE_QUANTIZATION", "false")
+        use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
+        if use_quantization and QUANTIZATION_AVAILABLE:
+            self.quantization_handler = ServerQuantizationHandler(QuantizationConfig())
+            print("Server: Quantization enabled")
+        else:
+            self.quantization_handler = None
+            print("Server: Quantization disabled")
+
+        up_env = os.getenv("USE_PRUNING", "false")
+        use_pruning = up_env.lower() in ("true", "1", "yes", "y")
+        if use_pruning and PRUNING_AVAILABLE:
+            self.pruning_handler = ServerPruning(PruningConfig())
+            print("Server: Pruning enabled")
+        else:
+            self.pruning_handler = None
+            print("Server: Pruning disabled")
     
     def initialize_global_model(self):
         """Initialize the global model structure (LSTM for FL)"""
@@ -144,29 +182,36 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         # Update total client count if more clients join
         if len(self.registered_clients) > self.num_clients:
             self.update_client_count(len(self.registered_clients))
-            
-            # If all clients registered, start distributing initial global model
-            if len(self.registered_clients) == self.num_clients and not self.training_started:
-                print("\nAll clients registered. Distributing initial global model...\n")
-                self.training_started = True
-                self.current_round = 1
-                
-                print(f"\n{'='*70}")
-                print(f"Distributing Initial Global Model")
-                print(f"{'='*70}\n")
-                print("Initial global model ready for clients")
-                
-                print(f"\n{'='*70}")
-                print(f"Starting Round {self.current_round}/{self.num_rounds}")
-                print(f"{'='*70}\n")
-            
-            return federated_learning_pb2.RegistrationResponse(
-                success=True,
-                message=f"Client {client_id} registered successfully"
-                )
+
+        # Start when we have at least min_clients; after one converges we proceed with remaining active clients
+        if len(self.registered_clients) >= self.min_clients and not self.training_started:
+            print("\nMinimum clients reached. Distributing initial global model...\n")
+            self.training_started = True
+            self.current_round = 1
+
+            print(f"\n{'='*70}")
+            print(f"Distributing Initial Global Model")
+            print(f"{'='*70}\n")
+            print("Initial global model ready for clients")
+
+            print(f"\n{'='*70}")
+            print(f"Starting Round {self.current_round}/{self.num_rounds}")
+            print(f"{'='*70}\n")
+
+        return federated_learning_pb2.RegistrationResponse(
+            success=True,
+            message=f"Client {client_id} registered successfully"
+        )
     
     def mark_client_converged(self, client_id):
-        """Remove converged client from active federation."""
+        """Remove converged client from active federation; proceed with remaining clients."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore convergence signals for stopping/disconnecting.
+            # Client implementations should also respect STOP_ON_CLIENT_CONVERGENCE and keep training.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
+        do_aggregate_metrics = False
+        do_aggregate_models = False
         with self.lock:
             if client_id in self.active_clients:
                 self.active_clients.discard(client_id)
@@ -181,6 +226,17 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     self.convergence_time = time.time() - self.start_time if self.start_time else 0
                     self.plot_results()
                     self.save_results()
+                else:
+                    # Re-check: remaining active clients may have already sent updates/metrics
+                    if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
+                        do_aggregate_metrics = True
+                    if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
+                        do_aggregate_models = True
+        if do_aggregate_metrics:
+            self.aggregate_metrics()
+            self.continue_training()
+        if do_aggregate_models:
+            self.aggregate_models()
     
     def GetTrainingConfig(self, request, context):
         """Return training configuration"""
@@ -286,13 +342,17 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 }
                 model_config_json = json.dumps(model_config)
                 
-                # Compress or serialize global weights
+                # Compress or serialize global weights (prune -> quantize order if both enabled).
+                # If quantization is enabled, send quantized payload (may already apply pruning within handler).
                 if self.quantization_handler is not None:
                     compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
                     stats = self.quantization_handler.quantizer.get_compression_stats(self.global_weights, compressed_data)
                     print(f"Server: Compressed global model - Ratio: {stats['compression_ratio']:.2f}x")
                     # Send pickled compressed dict so clients receive metadata
                     serialized_weights = pickle.dumps(compressed_data)
+                elif self.pruning_handler is not None:
+                    pruned_bytes, _ = self.pruning_handler.compress_for_broadcast(self.global_weights)
+                    serialized_weights = pickle.dumps({"pruned_data": pruned_bytes})
                 else:
                     serialized_weights = self.serialize_weights(self.global_weights)
                 
@@ -315,7 +375,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             client_id = request.client_id
             round_num = request.round
             metrics = dict(request.metrics)
-            if float(metrics.get('client_converged', 0.0)) >= 1.0:
+            if STOP_ON_CLIENT_CONVERGENCE and float(metrics.get('client_converged', 0.0)) >= 1.0:
                 self.mark_client_converged(client_id)
                 return federated_learning_pb2.UpdateResponse(
                     success=True,
@@ -327,33 +387,45 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     message=f"Client {client_id} already inactive"
                 )
             if round_num == self.current_round:
-                # Decompress or deserialize client weights
-                if self.quantization_handler is not None and request.weights:
-                    # request.weights may be raw serialized weights or a pickled compressed_data dict
+                # Decompress or deserialize client weights.
+                # Priority: quantized dict -> pruned_data dict -> raw weights list.
+                weights = []
+                try:
+                    candidate = pickle.loads(request.weights) if request.weights else None
+                    if isinstance(candidate, dict) and 'compressed_data' in candidate and self.quantization_handler is not None:
+                        # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                        self.client_updates[client_id] = {
+                            'compressed_data': candidate,
+                            'num_samples': request.num_samples,
+                            'metrics': metrics
+                        }
+                        print(f"Server: Received quantized update from client {request.client_id} (kept quantized)")
+                        candidate = None
+                    elif isinstance(candidate, dict) and 'quantization_params' in candidate and self.quantization_handler is not None:
+                        self.client_updates[client_id] = {
+                            'compressed_data': candidate,
+                            'num_samples': request.num_samples,
+                            'metrics': metrics
+                        }
+                        print(f"Server: Received quantized update from client {request.client_id} (kept quantized)")
+                        candidate = None
+                    elif isinstance(candidate, dict) and 'pruned_data' in candidate and self.pruning_handler is not None:
+                        weights = self.pruning_handler.decompress_client_update(candidate['pruned_data'])
+                        print(f"Server: Received and decompressed pruned update from client {request.client_id}")
+                    else:
+                        weights = candidate if candidate is not None else self.deserialize_weights(request.weights)
+                except Exception:
                     try:
-                        candidate = pickle.loads(request.weights)
-                        if isinstance(candidate, dict) and 'compressed_data' in candidate:
-                            # it's a compressed_data dict produced by client
-                            weights = self.quantization_handler.decompress_client_update(request.client_id, candidate)
-                            print(f"Server: Received and decompressed compressed dict update from client {request.client_id}")
-                        else:
-                            # it's raw serialized weights
-                            weights = self.deserialize_weights(request.weights)
+                        weights = self.deserialize_weights(request.weights)
                     except Exception:
-                        # If unpickle fails, try regular deserialization
-                        try:
-                            weights = self.deserialize_weights(request.weights)
-                        except Exception:
-                            # As a final fallback, treat request.weights as empty list
-                            weights = []
-                else:
-                    weights = self.deserialize_weights(request.weights)
-                
-                self.client_updates[client_id] = {
-                    'weights': weights,
-                    'num_samples': request.num_samples,
-                    'metrics': metrics
-                }
+                        weights = []
+
+                if client_id not in self.client_updates:
+                    self.client_updates[client_id] = {
+                        'weights': weights,
+                        'num_samples': request.num_samples,
+                        'metrics': metrics
+                    }
                 
                 print(f"Received update from client {client_id} "
                       f"({len(self.client_updates)}/{len(self.active_clients)})")
@@ -382,7 +454,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     success=True,
                     message=f"Client {client_id} already inactive"
                 )
-            if float(metrics.get('client_converged', 0.0)) >= 1.0:
+            if STOP_ON_CLIENT_CONVERGENCE and float(metrics.get('client_converged', 0.0)) >= 1.0:
                 self.mark_client_converged(client_id)
                 return federated_learning_pb2.MetricsResponse(
                     success=True,
@@ -415,6 +487,23 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+            print(f"Aggregated (kept-quantized) global model from round {self.current_round}")
+            print(f"Global model ready for clients (kept quantized)\n")
+            self.evaluation_phase = True
+            return
         
         # Calculate total samples
         total_samples = sum(update['num_samples'] 
@@ -438,6 +527,12 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             aggregated_weights.append(layer_weights)
         
         self.global_weights = aggregated_weights
+
+        # Optionally apply server-side pruning to global weights (pruning-only mode or alongside quantization handler)
+        if self.pruning_handler is not None and (self.quantization_handler is None):
+            self.global_weights = self.pruning_handler.pruning_engine.prune_weights(
+                self.global_weights, step=self.current_round
+            )
         
         print(f"Aggregated global model from round {self.current_round}")
         print(f"Global model ready for clients\n")
@@ -490,11 +585,17 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         # Stop only when no active clients remain or max rounds reached (no server-side convergence)
         if len(self.active_clients) == 0:
             self.convergence_time = time.time() - self.start_time if self.start_time else 0
-            self.converged = True
+            # If convergence-stopping is disabled, this indicates clients disconnected unexpectedly.
+            self.converged = bool(STOP_ON_CLIENT_CONVERGENCE)
             self.training_complete = True
-            print("\n" + "="*70)
-            print("All clients converged locally. Training complete.")
-            print("="*70 + "\n")
+            if STOP_ON_CLIENT_CONVERGENCE:
+                print("\n" + "="*70)
+                print("All clients converged locally. Training complete.")
+                print("="*70 + "\n")
+            else:
+                print("\n" + "="*70)
+                print("All clients became inactive. Training complete (fixed-round mode).")
+                print("="*70 + "\n")
             self.plot_results()
             self.save_results()
             return
@@ -578,18 +679,19 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         plt.tight_layout()
         
         # Save plot
-        results_dir = Path(__file__).parent.parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "grpc")
         plt.savefig(results_dir / 'grpc_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Training metrics plot saved to {results_dir / 'grpc_training_metrics.png'}")
-        plt.show()
-        
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            plt.close()
+        else:
+            plt.show()
+
         print("\nPlot closed. Training complete.")
     
     def save_results(self):
         """Save training results to CSV"""
-        results_dir = Path(__file__).parent.parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "grpc")
         
         results_df = pd.DataFrame({
             'Round': self.ROUNDS,
@@ -614,7 +716,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         
         results_df = pd.concat([results_df, summary_df], ignore_index=True)
         
-        results_file = results_dir / f'grpc_{NETWORK_SCENARIO}_training_results.csv'
+        results_file = results_dir / 'grpc_training_results.csv'
         results_df.to_csv(results_file, index=False)
         print(f"Training results saved to {results_file}")
 

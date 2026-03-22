@@ -1,11 +1,14 @@
+import os
+import sys
+# Server uses CPU only (aggregation is numpy-only); saves GPU memory for clients
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
 import numpy as np
 import pandas as pd
 import json
 import pickle
 import base64
 import time
-import os
-import sys
 import paho.mqtt.client as mqtt
 from typing import List, Dict
 import matplotlib.pyplot as plt
@@ -30,6 +33,10 @@ if _utilities_path not in sys.path:
 
 print(f"Project root set to: {project_root}")
 from packet_logger import init_db, log_sent_packet, log_received_packet
+try:
+    from experiment_results_path import get_experiment_results_dir
+except ModuleNotFoundError:
+    from scripts.utilities.experiment_results_path import get_experiment_results_dir
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -48,10 +55,14 @@ except ImportError:
 # Auto-detect environment: Docker (/app exists) or local
 MQTT_BROKER = os.getenv("MQTT_BROKER", 'mqtt-broker' if os.path.exists('/app') else 'localhost')
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))  # MQTT broker port
+# Keepalive (seconds). Long value avoids client rc=16 in very_poor / diagnostic pipeline. Max 65535.
+_def_keepalive = 3600 if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else 600
+MQTT_KEEPALIVE_SEC = min(65535, max(10, int(os.getenv("MQTT_KEEPALIVE_SEC", str(_def_keepalive)))))
 # Dynamic client configuration
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))  # Loss improvement threshold
@@ -65,6 +76,9 @@ TOPIC_TRAINING_CONFIG = "fl/training_config"
 TOPIC_START_TRAINING = "fl/start_training"
 TOPIC_START_EVALUATION = "fl/start_evaluation"
 TOPIC_TRAINING_COMPLETE = "fl/training_complete"
+
+MQTT_MAX_PAYLOAD_BYTES = 128 * 1024
+MQTT_CHUNK_PAYLOAD_BYTES = 96 * 1024
 
 
 class FederatedLearningServer:
@@ -87,7 +101,10 @@ class FederatedLearningServer:
         self.ACCURACY = []
         self.LOSS = []
         self.ROUNDS = []
-        
+        # Per-round time (sec) and battery consumption (0–1, from client-reported SoC)
+        self.ROUND_TIMES = []
+        self.BATTERY_CONSUMPTION = []
+
         # Convergence tracking
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
@@ -97,9 +114,10 @@ class FederatedLearningServer:
         self.start_time = None
         self.convergence_time = None
         
-        # Training timeout tracking (prevent waiting forever for stuck clients)
+        # Training timeout tracking (prevent waiting forever for stuck clients). Long in diagnostic/very_poor.
         self.round_start_time = None
-        self.training_timeout = int(os.getenv("TRAINING_TIMEOUT", "600"))  # 10 minutes default
+        _def_training_timeout = 3600 if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else 600
+        self.training_timeout = int(os.getenv("TRAINING_TIMEOUT", str(_def_training_timeout)))
         
         # Initialize quantization handler (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
@@ -123,19 +141,20 @@ class FederatedLearningServer:
         # Training configuration
         # Training configuration broadcast to MQTT clients
         self.training_config = {
-            "batch_size": 32,
-            "local_epochs": 20  # Reduced from 20 for faster experiments (configurable via env)
+            "batch_size": int(os.getenv("BATCH_SIZE", "16")),
+            "local_epochs": 20
         }
         
-        # Initialize MQTT client with fair comparison settings
-        # clean_session=True for stateless operation (like other protocols)
-        self.mqtt_client = mqtt.Client(client_id="fl_server", protocol=mqtt.MQTTv311, clean_session=True)
-        # FAIR CONFIG: Set max packet size to 128MB (aligned with AMQP default)
-        self.mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
-        # FAIR CONFIG: Set keepalive to 600s for very_poor network scenarios
-        self.mqtt_client.keepalive = 600
+        # Unique MQTT client_id per process to avoid broker "already connected" (rc=7) reconnect loop
+        _mqtt_client_id = f"fl_server_{os.getpid()}"
+        self.mqtt_client = mqtt.Client(client_id=_mqtt_client_id, protocol=mqtt.MQTTv311, clean_session=True)
+        # Realistic max payload: MQTT 128 KB
+        self.mqtt_client._max_packet_size = MQTT_MAX_PAYLOAD_BYTES
+        # Long keepalive to avoid client rc=16 in very_poor / diagnostic pipeline
+        self.mqtt_client.keepalive = MQTT_KEEPALIVE_SEC
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
+        self._model_update_chunk_buffers = {}
 
 
     
@@ -163,8 +182,8 @@ class FederatedLearningServer:
                 self.send_global_model_to_client(client_id)
     
     def get_active_clients(self):
-        """Get list of currently active clients"""
-        return list(self.registered_clients)
+        """Get list of currently active (non-converged) clients; after one converges we proceed with the rest."""
+        return list(self.active_clients)
     
     def adaptive_wait_for_clients(self, client_dict, timeout=300):
         """
@@ -254,6 +273,153 @@ class FederatedLearningServer:
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
+
+    def _chunk_model_payload(self, model_message):
+        payload_key = "quantized_data" if "quantized_data" in model_message else "weights"
+        payload_text = model_message[payload_key]
+        if not isinstance(payload_text, str):
+            raise TypeError(f"Expected string payload for {payload_key}, got {type(payload_text).__name__}")
+
+        chunks = [
+            payload_text[i:i + MQTT_CHUNK_PAYLOAD_BYTES]
+            for i in range(0, len(payload_text), MQTT_CHUNK_PAYLOAD_BYTES)
+        ] or [payload_text]
+
+        total_chunks = len(chunks)
+        chunk_messages = []
+        for chunk_index, chunk_data in enumerate(chunks):
+            chunk_msg = {
+                "message_type": "global_model_chunk",
+                "type": "global_model_chunk",
+                "round": model_message["round"],
+                "payload_key": payload_key,
+                "payload_chunk": chunk_data,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+            }
+            if chunk_index == 0:
+                if "model_config" in model_message:
+                    chunk_msg["model_config"] = model_message["model_config"]
+                if "training_config" in model_message:
+                    chunk_msg["training_config"] = model_message["training_config"]
+            chunk_messages.append(chunk_msg)
+        return chunk_messages
+
+    def _publish_global_model_with_chunking(self, model_message, extra_info):
+        """Publish global model while strictly respecting 128KB MQTT payload limit."""
+        payload = json.dumps(model_message)
+        payload_bytes = len(payload.encode("utf-8"))
+
+        if payload_bytes <= MQTT_MAX_PAYLOAD_BYTES:
+            result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, payload, qos=1)
+            log_sent_packet(
+                packet_size=len(payload),
+                peer=TOPIC_GLOBAL_MODEL,
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info=extra_info
+            )
+            return result, payload_bytes
+
+        chunks = self._chunk_model_payload(model_message)
+        print(
+            f"Chunking global model for MQTT: {payload_bytes} bytes total, "
+            f"{len(chunks)} chunks"
+        )
+
+        last_result = None
+        total_sent = 0
+        for chunk in chunks:
+            chunk_payload = json.dumps(chunk)
+            chunk_size = len(chunk_payload.encode("utf-8"))
+            if chunk_size > MQTT_MAX_PAYLOAD_BYTES:
+                raise ValueError(
+                    f"MQTT global-model chunk exceeds 128KB: {chunk_size} bytes "
+                    f"(chunk {chunk['chunk_index'] + 1}/{chunk['total_chunks']})"
+                )
+            last_result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, chunk_payload, qos=1)
+            total_sent += chunk_size
+            log_sent_packet(
+                packet_size=chunk_size,
+                peer=TOPIC_GLOBAL_MODEL,
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info=(
+                    f"{extra_info} chunk "
+                    f"{chunk['chunk_index'] + 1}/{chunk['total_chunks']}"
+                )
+            )
+
+        return last_result, total_sent
+
+    def _assemble_model_update_chunk(self, data):
+        """Buffer and reassemble chunked model updates from clients."""
+        try:
+            client_id = int(data["client_id"])
+            round_num = int(data["round"])
+            payload_key = data["payload_key"]
+            chunk_index = int(data.get("chunk_index", 0))
+            total_chunks = int(data.get("total_chunks", 1))
+            payload_chunk = data.get("payload_chunk", "")
+        except Exception as e:
+            print(f"Server invalid model-update chunk metadata: {e}")
+            return None
+
+        if total_chunks <= 1:
+            assembled = {
+                "client_id": client_id,
+                "round": round_num,
+                payload_key: payload_chunk,
+                "num_samples": data.get("num_samples", 0),
+                "metrics": data.get("metrics", {}),
+            }
+            if "diagnostic_send_start_ts" in data:
+                assembled["diagnostic_send_start_ts"] = data.get("diagnostic_send_start_ts")
+            return assembled
+
+        chunk_key = (client_id, round_num, payload_key)
+        entry = self._model_update_chunk_buffers.setdefault(
+            chunk_key,
+            {
+                "chunks": {},
+                "total_chunks": total_chunks,
+                "num_samples": data.get("num_samples", 0),
+                "metrics": data.get("metrics", {}),
+                "diagnostic_send_start_ts": data.get("diagnostic_send_start_ts"),
+                "updated_at": time.time(),
+            }
+        )
+
+        if chunk_index == 0:
+            entry["num_samples"] = data.get("num_samples", entry["num_samples"])
+            entry["metrics"] = data.get("metrics", entry["metrics"])
+            if "diagnostic_send_start_ts" in data:
+                entry["diagnostic_send_start_ts"] = data.get("diagnostic_send_start_ts")
+
+        if chunk_index not in entry["chunks"]:
+            entry["chunks"][chunk_index] = payload_chunk
+        entry["updated_at"] = time.time()
+
+        if len(entry["chunks"]) < total_chunks:
+            return None
+
+        assembled_payload = "".join(entry["chunks"].get(i, "") for i in range(total_chunks))
+        assembled = {
+            "client_id": client_id,
+            "round": round_num,
+            payload_key: assembled_payload,
+            "num_samples": entry["num_samples"],
+            "metrics": entry["metrics"],
+        }
+        if entry.get("diagnostic_send_start_ts") is not None:
+            assembled["diagnostic_send_start_ts"] = entry["diagnostic_send_start_ts"]
+
+        self._model_update_chunk_buffers.pop(chunk_key, None)
+        print(
+            f"Reassembled model update from client {client_id} for round {round_num} "
+            f"from {total_chunks} chunks"
+        )
+        return assembled
     
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
@@ -354,11 +520,13 @@ class FederatedLearningServer:
             
             # Broadcast to all clients on general topic (late-joiner will receive it)
             # This is simpler than client-specific topics and works with our generic model handling
-            payload = json.dumps(model_message).encode()
-            self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, payload, qos=1)
+            result, sent_bytes = self._publish_global_model_with_chunking(
+                model_message,
+                extra_info=f"Late-join model broadcast (for client {client_id})"
+            )
             
             log_sent_packet(
-                packet_size=len(payload),
+                packet_size=sent_bytes,
                 peer=f"client_{client_id}",
                 protocol="MQTT",
                 round=self.current_round,
@@ -372,6 +540,10 @@ class FederatedLearningServer:
     
     def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore client-local convergence removal/disconnect.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         if client_id in self.active_clients:
             self.active_clients.discard(client_id)
             self.client_updates.pop(client_id, None)
@@ -383,43 +555,68 @@ class FederatedLearningServer:
                 print("All clients converged. Ending training.")
                 self.convergence_time = time.time() - self.start_time if self.start_time else 0
                 self._send_training_complete_and_exit()
+                return
+            # Re-check: remaining active clients may have already sent metrics/updates
+            if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
+                self.aggregate_metrics()
+                self.continue_training()
+                return
+            active_in_round = self.round_participants & self.active_clients
+            if len(self.client_updates) >= len(active_in_round) and len(active_in_round) > 0:
+                self.aggregate_models()
     
     def handle_client_update(self, payload):
         """Handle model update from client"""
+        recv_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
         data = json.loads(payload.decode())
+
+        msg_type = data.get("message_type") or data.get("type")
+        if msg_type in ("model_update_chunk", "update_chunk"):
+            data = self._assemble_model_update_chunk(data)
+            if data is None:
+                return
+
         client_id = data['client_id']
         round_num = data['round']
         
         if client_id not in self.active_clients:
             return
-        converged = float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
+        converged = STOP_ON_CLIENT_CONVERGENCE and float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
         if converged:
             self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
             # Check if update is compressed
             if 'compressed_data' in data and self.quantization_handler is not None:
-                # Decompress quantized weights (handle base64-serialized payloads)
+                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
                 compressed_update = data['compressed_data']
                 if isinstance(compressed_update, str):
                     try:
                         compressed_update = pickle.loads(base64.b64decode(compressed_update.encode('utf-8')))
                     except Exception as e:
                         print(f"Server error decoding compressed_data from client {client_id}: {e}")
-                weights = self.quantization_handler.decompress_client_update(
-                    client_id, 
-                    compressed_update
-                )
-                print(f"Received and decompressed update from client {client_id}")
+                self.client_updates[client_id] = {
+                    'compressed_data': compressed_update,
+                    'num_samples': data['num_samples'],
+                    'metrics': data['metrics']
+                }
+                print(f"Received quantized update from client {client_id} (kept quantized)")
             else:
                 # Standard deserialization
                 weights = self.deserialize_weights(data['weights'])
             
-            self.client_updates[client_id] = {
-                'weights': weights,
-                'num_samples': data['num_samples'],
-                'metrics': data['metrics']
-            }
+            if recv_start_cpu is not None:
+                O_recv = time.perf_counter() - recv_start_cpu
+                recv_end_ts = time.time()
+                send_start_ts = data.get("diagnostic_send_start_ts", recv_end_ts)
+                print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={send_start_ts:.9f}")
+            
+            if 'compressed_data' not in data or self.quantization_handler is None:
+                self.client_updates[client_id] = {
+                    'weights': weights,
+                    'num_samples': data['num_samples'],
+                    'metrics': data['metrics']
+                }
             
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{len(self.round_participants)})")
@@ -437,7 +634,7 @@ class FederatedLearningServer:
         
         if client_id not in self.active_clients:
             return
-        converged = float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
+        converged = STOP_ON_CLIENT_CONVERGENCE and float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
         if converged:
             self.mark_client_converged(client_id)
             return
@@ -502,33 +699,24 @@ class FederatedLearningServer:
         print(f"Initial model message size: {message_size / 1024:.2f} KB ({message_size} bytes)")
         print(f"Model config: {len(self.model_config['layers'])} layers, {self.model_config['num_classes']} classes")
         
-        # Publish multiple times to ensure delivery (QoS 0 can lose messages)
+        # Publish with QoS 1 so clients get at-least-once delivery (large payload)
         print("\nPublishing initial model to clients...")
-        for i in range(3):  # Send 3 times for reliability
-            result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, 
-                                             message_json,
-                                             qos=0)
-            log_sent_packet(
-                packet_size=len(message_json),
-                peer=TOPIC_GLOBAL_MODEL,  # or client_id/server_id as appropriate
-                protocol="MQTT",
-                round=self.current_round if hasattr(self, 'current_round') else None,
-                extra_info="Initial global model distribution"
-            )
-            
-            if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                print(f"  Attempt {i+1}/3: Initial model sent successfully")
-            else:
-                print(f"  Attempt {i+1}/3: FAILED (return code: {result.rc})")
-            
-            time.sleep(0.5)  # Small delay between sends
-        
-        # Wait for clients to receive and build the model...
+        result, sent_bytes = self._publish_global_model_with_chunking(
+            initial_model_message,
+            extra_info="Initial global model distribution"
+        )
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            print(f"  Initial global model sent successfully (QoS 1), bytes sent: {sent_bytes}")
+        else:
+            print(f"  FAILED to send initial model (return code: {result.rc})")
+
+        # Give clients time to receive and build the model (large payload + model init)
         print("\nWaiting for clients to receive and build the model...")
-        time.sleep(3)
+        time.sleep(10)
         
         # Capture which active clients will participate in this round
         self.round_participants = self.active_clients.copy()
+        self.round_start_time = time.time()
         print(f"Round {self.current_round} participants: {sorted(list(self.round_participants))}")
         
         print(f"\n{'='*70}")
@@ -555,6 +743,53 @@ class FederatedLearningServer:
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            serialized = base64.b64encode(pickle.dumps(self.global_compressed)).decode('utf-8')
+            global_model_message = {
+                "round": self.current_round,
+                "quantized_data": serialized,
+                "model_config": self.model_config
+            }
+
+            print(f"Publishing kept-quantized aggregated model for round {self.current_round}...")
+            for i in range(3):
+                result, _ = self._publish_global_model_with_chunking(
+                    global_model_message,
+                    extra_info="Aggregated global model distribution (kept quantized)"
+                )
+                if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                    print(f"  Attempt {i+1}/3: Aggregated model sent")
+                    break
+                else:
+                    print(f"  Attempt {i+1}/3: FAILED (rc={result.rc})")
+                    time.sleep(0.5)
+
+            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients")
+
+            time.sleep(2)
+            print("Requesting client evaluation...")
+            self.mqtt_client.publish(TOPIC_START_EVALUATION, json.dumps({"round": self.current_round}), qos=1)
+            log_sent_packet(
+                packet_size=len(json.dumps({"round": self.current_round})),
+                peer=TOPIC_START_EVALUATION,
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Start evaluation signal"
+            )
+            return
         
         # Calculate total samples
         total_samples = sum(update['num_samples'] 
@@ -599,14 +834,9 @@ class FederatedLearningServer:
         
         # Publish aggregated model (QoS 1 for at-least-once) and avoid duplicates
         print(f"Publishing aggregated model for round {self.current_round}...")
-        message_json = json.dumps(global_model_message)
         for i in range(3):
-            result = self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, message_json, qos=1)
-            log_sent_packet(
-                packet_size=len(message_json),
-                peer=TOPIC_GLOBAL_MODEL,  # or client_id/server_id as appropriate
-                protocol="MQTT",
-                round=self.current_round if hasattr(self, 'current_round') else None,
+            result, _ = self._publish_global_model_with_chunking(
+                global_model_message,
                 extra_info="Aggregated global model distribution"
             )
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
@@ -634,6 +864,16 @@ class FederatedLearningServer:
     def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
         print(f"\nAggregating metrics from {len(self.client_metrics)} clients...")
+
+        # Round duration and battery (from client-reported metrics)
+        if getattr(self, 'round_start_time', None) is not None:
+            self.ROUND_TIMES.append(time.time() - self.round_start_time)
+        socs = [m['metrics'].get('battery_soc', 1.0) for m in self.client_metrics.values() if isinstance(m.get('metrics'), dict)]
+        if socs:
+            avg_soc = sum(socs) / len(socs)
+            self.BATTERY_CONSUMPTION.append(1.0 - avg_soc)  # consumption = 1 - SoC
+        else:
+            self.BATTERY_CONSUMPTION.append(0.0)
         
         # Calculate total samples
         total_samples = sum(metric['num_samples'] 
@@ -676,6 +916,7 @@ class FederatedLearningServer:
         # Check if more rounds needed
         if self.current_round < self.num_rounds:
             self.current_round += 1
+            self.round_start_time = time.time()
             
             # Capture active participants for this new round
             self.round_participants = self.active_clients.copy()
@@ -753,34 +994,68 @@ class FederatedLearningServer:
             return False
     
     def plot_results(self):
-        """Plot training metrics"""
-        plt.figure(figsize=(12, 5))
-        
-        # Loss Plot
-        plt.subplot(1, 2, 1)
-        plt.plot(self.ROUNDS, self.LOSS, marker='o', linewidth=2, markersize=8, color='red')
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Loss (Categorical Crossentropy)', fontsize=12)
-        plt.title('Loss over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        # Accuracy Plot
-        plt.subplot(1, 2, 2)
-        plt.plot(self.ROUNDS, [acc*100 for acc in self.ACCURACY], marker='s', linewidth=2, markersize=8, color='green')
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Accuracy (%)', fontsize=12)
-        plt.title('Accuracy over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Save to results folder
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
-        plt.savefig(results_dir / 'mqtt_training_metrics.png', dpi=300, bbox_inches='tight')
+        """Plot training metrics: battery consumption, round/convergence time, loss & accuracy."""
+        results_dir = get_experiment_results_dir("emotion", "mqtt")
+        rounds = self.ROUNDS
+        n = len(rounds)
+        conv_time = self.convergence_time if self.convergence_time is not None else (time.time() - self.start_time if self.start_time else 0)
+
+        # 1) Battery consumption till end of FL training
+        fig1, ax1 = plt.subplots(figsize=(7, 4))
+        if self.BATTERY_CONSUMPTION and len(self.BATTERY_CONSUMPTION) == n:
+            ax1.plot(rounds, [c * 100 for c in self.BATTERY_CONSUMPTION], marker='o', linewidth=2, markersize=6, color='#2e86ab')
+        else:
+            bc = self.BATTERY_CONSUMPTION if len(self.BATTERY_CONSUMPTION) >= n else (self.BATTERY_CONSUMPTION + [0.0] * (n - len(self.BATTERY_CONSUMPTION)))[:n]
+            if bc:
+                ax1.plot(rounds, [c * 100 for c in bc], marker='o', linewidth=2, markersize=6, color='#2e86ab')
+        ax1.set_xlabel('Round', fontsize=12)
+        ax1.set_ylabel('Battery consumption (%)', fontsize=12)
+        ax1.set_title('Battery consumption till end of FL training', fontsize=14)
+        ax1.grid(True, alpha=0.3)
+        fig1.tight_layout()
+        fig1.savefig(results_dir / 'mqtt_battery_consumption.png', dpi=300, bbox_inches='tight')
+        plt.close(fig1)
+        print(f"Battery plot saved to {results_dir / 'mqtt_battery_consumption.png'}")
+
+        # 2) Total time per round and convergence time
+        fig2, ax2 = plt.subplots(figsize=(7, 4))
+        if self.ROUND_TIMES and len(self.ROUND_TIMES) == n:
+            ax2.bar(rounds, self.ROUND_TIMES, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        else:
+            rt = self.ROUND_TIMES if len(self.ROUND_TIMES) >= n else (self.ROUND_TIMES + [0.0] * (n - len(self.ROUND_TIMES)))[:n]
+            if rt:
+                ax2.bar(rounds, rt, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        ax2.axhline(y=conv_time, color='#f18f01', linestyle='--', linewidth=2, label=f'Total convergence time: {conv_time:.1f} s')
+        ax2.set_xlabel('Round', fontsize=12)
+        ax2.set_ylabel('Time (s)', fontsize=12)
+        ax2.set_title('Time per round and total convergence time', fontsize=14)
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        fig2.tight_layout()
+        fig2.savefig(results_dir / 'mqtt_round_and_convergence_time.png', dpi=300, bbox_inches='tight')
+        plt.close(fig2)
+        print(f"Time plot saved to {results_dir / 'mqtt_round_and_convergence_time.png'}")
+
+        # 3) Loss and Accuracy after each FL round
+        fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(12, 5))
+        ax3a.plot(rounds, self.LOSS, marker='o', linewidth=2, markersize=8, color='red')
+        ax3a.set_xlabel('Round', fontsize=12)
+        ax3a.set_ylabel('Loss (Categorical Crossentropy)', fontsize=12)
+        ax3a.set_title('Loss over Federated Learning Rounds', fontsize=14)
+        ax3a.grid(True, alpha=0.3)
+        ax3b.plot(rounds, [acc * 100 for acc in self.ACCURACY], marker='s', linewidth=2, markersize=8, color='green')
+        ax3b.set_xlabel('Round', fontsize=12)
+        ax3b.set_ylabel('Accuracy (%)', fontsize=12)
+        ax3b.set_title('Accuracy over Federated Learning Rounds', fontsize=14)
+        ax3b.grid(True, alpha=0.3)
+        fig3.tight_layout()
+        fig3.savefig(results_dir / 'mqtt_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'mqtt_training_metrics.png'}")
-        plt.show(block=False)  # Non-blocking show
-        
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            plt.close('all')
+        else:
+            plt.show(block=False)  # Non-blocking show
+
         # Disconnect and exit
         print("\nTraining complete. Disconnecting...")
         time.sleep(2)  # Give time for message delivery
@@ -792,13 +1067,14 @@ class FederatedLearningServer:
     
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("emotion", "mqtt")
         
         results = {
             "rounds": self.ROUNDS,
             "accuracy": self.ACCURACY,
             "loss": self.LOSS,
+            "round_times_seconds": getattr(self, 'ROUND_TIMES', []),
+            "battery_consumption": getattr(self, 'BATTERY_CONSUMPTION', []),
             "convergence_time_seconds": self.convergence_time,
             "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
             "total_rounds": len(self.ROUNDS),
@@ -821,8 +1097,7 @@ class FederatedLearningServer:
         for attempt in range(max_retries):
             try:
                 print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
-                # FAIR CONFIG: keepalive 600s for very_poor network
-                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=600)
+                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=MQTT_KEEPALIVE_SEC)
                 print(f"Successfully connected to MQTT broker!\n")
                 self.mqtt_client.loop_forever()
                 break

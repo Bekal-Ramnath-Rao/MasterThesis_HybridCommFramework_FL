@@ -4,6 +4,12 @@ Implements three quantization strategies:
 1. Quantization-Aware Training (QAT) - Simulates quantization during training
 2. Post-Training Quantization (PTQ) - Quantizes trained model weights
 3. Model Parameter Quantization - Direct weight/gradient quantization
+
+Supported bit widths: 4, 8, 16, 32
+- 4-bit: Uses nibble packing (2 values per byte) for 2x size reduction vs 8-bit
+- 8-bit: Standard uint8 quantization
+- 16-bit: uint16 quantization for higher precision
+- 32-bit: int32 quantization for maximum precision
 """
 
 import numpy as np
@@ -13,6 +19,14 @@ import pickle
 import json
 import os
 from enum import Enum
+
+try:
+    from pruning_client import ModelPruning, PruningConfig
+    PRUNING_MODULE_AVAILABLE = True
+except Exception:
+    ModelPruning = None
+    PruningConfig = None
+    PRUNING_MODULE_AVAILABLE = False
 
 
 class QuantizationStrategy(Enum):
@@ -64,6 +78,8 @@ class Quantization:
         self.config = config or QuantizationConfig()
         self.qat_model = None  # For QAT strategy
         self.quantization_params = {}  # Store quantization parameters
+        self.pruner = None
+        self.pruning_step = 0
         
         print(f"\n{'='*70}")
         print(f"Quantization Module Initialized")
@@ -73,6 +89,42 @@ class Quantization:
         print(f"Symmetric: {self.config.symmetric}")
         print(f"Per-channel: {self.config.per_channel}")
         print(f"{'='*70}\n")
+
+        use_pruning = os.getenv("USE_PRUNING", "false").lower() in ("true", "1", "yes", "y")
+        if use_pruning and PRUNING_MODULE_AVAILABLE:
+            self.pruner = ModelPruning(PruningConfig())
+            print("Quantization module: pruning enabled (prune -> quantize pipeline)")
+        elif use_pruning and not PRUNING_MODULE_AVAILABLE:
+            print("Quantization module: pruning requested but pruning module unavailable")
+
+    def _maybe_prune_before_quantization(self, data: Any, data_type: str) -> Any:
+        """Apply optional pruning before quantization to support global prune->quantize flow."""
+        if self.pruner is None or data_type not in ("weights", "gradients"):
+            return data
+
+        weights = None
+        if isinstance(data, tf.keras.Model):
+            weights = data.get_weights()
+        elif isinstance(data, list):
+            weights = data
+
+        if weights is None:
+            return data
+
+        pruned_weights = self.pruner.prune_weights(weights, step=self.pruning_step)
+        self.pruning_step += 1
+
+        try:
+            pruning_stats = self.pruner.get_pruning_statistics(pruned_weights)
+            print(
+                f"Pruning before quantization - "
+                f"Sparsity: {pruning_stats['overall_sparsity']:.2%}, "
+                f"Compression: {pruning_stats['compression_ratio']:.2f}x"
+            )
+        except Exception:
+            pass
+
+        return pruned_weights
     
     # ==================== Strategy 1: Quantization-Aware Training (QAT) ====================
     
@@ -308,14 +360,21 @@ class Quantization:
             zero_point = int(qmin - min_val / scale) if scale > 0 else 0
             zero_point = np.clip(zero_point, qmin, qmax)
         
-        return {
+        params = {
             "scale": scale,
             "zero_point": zero_point,
             "qmin": qmin,
             "qmax": qmax,
             "original_dtype": str(array.dtype),
-            "original_shape": array.shape
+            "original_shape": array.shape,
+            "bits": self.config.bits
         }
+        
+        # Store original element count for 4-bit unpacking
+        if self.config.bits == 4:
+            params["original_numel"] = array.size
+        
+        return params
     
     def _calculate_per_channel_params(self, array: np.ndarray) -> Dict:
         """Calculate per-channel quantization parameters"""
@@ -343,15 +402,22 @@ class Quantization:
             scales.append(scale)
             zero_points.append(zero_point)
         
-        return {
+        params = {
             "scales": scales,
             "zero_points": zero_points,
             "qmin": qmin,
             "qmax": qmax,
             "per_channel": True,
             "original_dtype": str(array.dtype),
-            "original_shape": array.shape
+            "original_shape": array.shape,
+            "bits": self.config.bits
         }
+        
+        # Store original element count for 4-bit unpacking
+        if self.config.bits == 4:
+            params["original_numel"] = array.size
+        
+        return params
     
     def _quantize_array(self, array: np.ndarray, params: Dict) -> np.ndarray:
         """Quantize array using parameters"""
@@ -368,7 +434,11 @@ class Quantization:
         quantized = np.clip(quantized, qmin, qmax)
         
         # Use appropriate dtype based on bits
-        if self.config.bits <= 8:
+        if self.config.bits == 4:
+            # 4-bit quantization: pack two values per byte for actual size reduction
+            quantized = quantized.astype(np.uint8)
+            return self._pack_4bit(quantized)
+        elif self.config.bits <= 8:
             dtype = np.uint8
         elif self.config.bits <= 16:
             dtype = np.uint16
@@ -376,6 +446,35 @@ class Quantization:
             dtype = np.int32
         
         return quantized.astype(dtype)
+    
+    def _pack_4bit(self, array: np.ndarray) -> np.ndarray:
+        """Pack 4-bit values into bytes (two values per byte)"""
+        flat = array.flatten()
+        original_size = flat.shape[0]
+        
+        # Pad to even length if needed
+        if original_size % 2 != 0:
+            flat = np.concatenate([flat, np.array([0], dtype=np.uint8)])
+        
+        # Pack two 4-bit values per byte: high nibble | low nibble
+        packed = (flat[0::2] << 4) | (flat[1::2] & 0x0F)
+        return packed.astype(np.uint8)
+    
+    def _unpack_4bit(self, packed: np.ndarray, original_size: int) -> np.ndarray:
+        """Unpack 4-bit values from bytes"""
+        flat = packed.flatten()
+        
+        # Extract high and low nibbles
+        high = (flat >> 4) & 0x0F
+        low = flat & 0x0F
+        
+        # Interleave back to original order
+        unpacked = np.empty(len(flat) * 2, dtype=np.uint8)
+        unpacked[0::2] = high
+        unpacked[1::2] = low
+        
+        # Trim to original size
+        return unpacked[:original_size]
     
     def _quantize_per_channel(self, array: np.ndarray, params: Dict) -> np.ndarray:
         """Quantize array with per-channel parameters"""
@@ -390,7 +489,11 @@ class Quantization:
             q_channel = np.round(channel_data / scales[i]) + zero_points[i]
             quantized[i] = np.clip(q_channel, qmin, qmax)
         
-        if self.config.bits <= 8:
+        if self.config.bits == 4:
+            # 4-bit quantization: pack two values per byte
+            quantized = quantized.astype(np.uint8)
+            return self._pack_4bit(quantized)
+        elif self.config.bits <= 8:
             dtype = np.uint8
         elif self.config.bits <= 16:
             dtype = np.uint16
@@ -406,6 +509,18 @@ class Quantization:
         
         scale = params["scale"]
         zero_point = params["zero_point"]
+        original_shape = params.get("original_shape")
+        bits = params.get("bits", self.config.bits)
+        
+        # Handle 4-bit unpacking
+        if bits == 4:
+            original_numel = params.get("original_numel", np.prod(original_shape) if original_shape else quantized.size * 2)
+            unpacked = self._unpack_4bit(quantized, original_numel)
+            # Dequantize: x = (q - zero_point) * scale
+            dequantized = (unpacked.astype(np.float32) - zero_point) * scale
+            if original_shape is not None:
+                dequantized = dequantized.reshape(original_shape)
+            return dequantized.astype(np.float32)
         
         # Dequantize: x = (q - zero_point) * scale
         dequantized = (quantized.astype(np.float32) - zero_point) * scale
@@ -414,10 +529,24 @@ class Quantization:
     
     def _dequantize_per_channel(self, quantized: np.ndarray, params: Dict) -> np.ndarray:
         """Dequantize array with per-channel parameters"""
-        dequantized = np.zeros(params["original_shape"], dtype=np.float32)
+        original_shape = params["original_shape"]
         scales = params["scales"]
         zero_points = params["zero_points"]
+        bits = params.get("bits", self.config.bits)
         
+        # Handle 4-bit unpacking
+        if bits == 4:
+            original_numel = params.get("original_numel", np.prod(original_shape))
+            unpacked = self._unpack_4bit(quantized, original_numel)
+            unpacked = unpacked.reshape(original_shape)
+            
+            dequantized = np.zeros(original_shape, dtype=np.float32)
+            for i in range(unpacked.shape[0]):
+                q_channel = unpacked[i]
+                dequantized[i] = (q_channel.astype(np.float32) - zero_points[i]) * scales[i]
+            return dequantized
+        
+        dequantized = np.zeros(original_shape, dtype=np.float32)
         for i in range(quantized.shape[0]):
             q_channel = quantized[i]
             dequantized[i] = (q_channel.astype(np.float32) - zero_points[i]) * scales[i]
@@ -441,12 +570,14 @@ class Quantization:
         Returns:
             Dictionary with compressed data and metadata
         """
+        input_data = self._maybe_prune_before_quantization(data, data_type)
+
         if self.config.strategy == QuantizationStrategy.QAT.value:
-            return self._compress_qat(data, data_type)
+            return self._compress_qat(input_data, data_type)
         elif self.config.strategy == QuantizationStrategy.PTQ.value:
-            return self._compress_ptq(data, data_type)
+            return self._compress_ptq(input_data, data_type)
         else:  # Parameter quantization
-            return self._compress_param(data, data_type)
+            return self._compress_param(input_data, data_type)
     
     def _compress_qat(self, data: Any, data_type: str) -> Dict:
         """Compress using QAT strategy"""
@@ -556,6 +687,29 @@ class Quantization:
         weights = self.dequantize_weights(q_weights, params)
         
         return weights
+
+    def as_training_weights(self, compressed_data: Dict) -> List[np.ndarray]:
+        """
+        Return weights suitable for local training WITHOUT dequantizing.
+
+        This intentionally does NOT apply quantization_params (no scale/zero-point restoration).
+        It only casts the quantized tensors to float32 so TensorFlow can load them into a model.
+        """
+        if not isinstance(compressed_data, dict):
+            raise ValueError(f"compressed_data must be a dict, got {type(compressed_data)}")
+
+        if compressed_data.get("data_type") == "tflite_model":
+            raise ValueError("tflite_model cannot be used as training weights in this pipeline")
+
+        q_weights = compressed_data.get("compressed_data")
+        if q_weights is None:
+            raise ValueError("compressed_data missing 'compressed_data'")
+
+        if not isinstance(q_weights, list):
+            # In this codebase, weight quantization uses list[np.ndarray]. Keep this strict.
+            raise ValueError(f"Expected quantized weights as list, got {type(q_weights)}")
+
+        return [np.asarray(w, dtype=np.float32) for w in q_weights]
     
     # ==================== Utility Methods ====================
     

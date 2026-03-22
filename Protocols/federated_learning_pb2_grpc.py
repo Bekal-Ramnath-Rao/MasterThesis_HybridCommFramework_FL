@@ -65,6 +65,11 @@ class FederatedLearningStub(object):
                 request_serializer=federated__learning__pb2.StatusRequest.SerializeToString,
                 response_deserializer=federated__learning__pb2.TrainingStatus.FromString,
                 _registered_method=True)
+        self.SendProtocolSelection = channel.unary_unary(
+                '/federated_learning.FederatedLearning/SendProtocolSelection',
+                request_serializer=federated__learning__pb2.ProtocolSelection.SerializeToString,
+                response_deserializer=federated__learning__pb2.ProtocolSelectionResponse.FromString,
+                _registered_method=True)
 
 
 class FederatedLearningServicer(object):
@@ -113,6 +118,13 @@ class FederatedLearningServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def SendProtocolSelection(self, request, context):
+        """Client responds to server protocol query for next global model downlink
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_FederatedLearningServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -145,6 +157,11 @@ def add_FederatedLearningServicer_to_server(servicer, server):
                     servicer.CheckTrainingStatus,
                     request_deserializer=federated__learning__pb2.StatusRequest.FromString,
                     response_serializer=federated__learning__pb2.TrainingStatus.SerializeToString,
+            ),
+            'SendProtocolSelection': grpc.unary_unary_rpc_method_handler(
+                    servicer.SendProtocolSelection,
+                    request_deserializer=federated__learning__pb2.ProtocolSelection.FromString,
+                    response_serializer=federated__learning__pb2.ProtocolSelectionResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -310,6 +327,33 @@ class FederatedLearning(object):
             '/federated_learning.FederatedLearning/CheckTrainingStatus',
             federated__learning__pb2.StatusRequest.SerializeToString,
             federated__learning__pb2.TrainingStatus.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SendProtocolSelection(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/federated_learning.FederatedLearning/SendProtocolSelection',
+            federated__learning__pb2.ProtocolSelection.SerializeToString,
+            federated__learning__pb2.ProtocolSelectionResponse.FromString,
             options,
             channel_credentials,
             insecure,

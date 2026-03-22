@@ -1,0 +1,700 @@
+# Docker Compose - Temperature Regulation FL with network_mode: host (high-performance, no bridge latency)
+# Use this to avoid Docker bridge and reduce DDS/HTTP3 latency deviations.
+# All services share the host network: use unique ports per process to avoid conflicts.
+# Port assignment:
+#   MQTT: broker 1883, 9001
+#   AMQP: broker 5672, 15672
+#   gRPC: server 50051
+#   QUIC: server 4433
+#   HTTP/3: server 4434
+#   DDS Discovery: 7400 (participant 0), server 7650 (1), client1 7900 (2), client2 8150 (3)
+# Connect to servers/brokers via 127.0.0.1 (localhost) when using host network.
+
+services:
+  # ============================================================================
+  # MQTT Broker (host network: binds 1883, 9001 on host)
+  # ============================================================================
+  mqtt-broker-temp:
+    image: eclipse-mosquitto:latest
+    network_mode: host
+    volumes:
+      - ../mqtt-config/mosquitto.conf:/mosquitto/config/mosquitto.conf
+    container_name: mqtt-broker-temp
+    # Ensure Mosquitto listens on 0.0.0.0 in mosquitto.conf when using host mode
+
+  # ============================================================================
+  # MQTT Protocol Services
+  # ============================================================================
+  fl-server-mqtt-temp:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    network_mode: host
+    environment:
+      - PROTOCOL=MQTT
+      - USE_CASE=temperature
+      - MQTT_BROKER=127.0.0.1
+      - MQTT_PORT=1883
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - CUDA_VISIBLE_DEVICES=
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../Server/Temperature_Regulation/packet_logger.db:/app/Server/Temperature_Regulation/packet_logger.db
+    depends_on:
+      - mqtt-broker-temp
+    container_name: fl-server-mqtt-temp
+    command: python -u Server/Temperature_Regulation/FL_Server_MQTT.py
+
+  fl-client-mqtt-temp-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=MQTT
+      - USE_CASE=temperature
+      - MQTT_BROKER=127.0.0.1
+      - MQTT_PORT=1883
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - mqtt-broker-temp
+      - fl-server-mqtt-temp
+    container_name: fl-client-mqtt-temp-1
+    command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/packet_logger.db:/app/Client/Temperature_Regulation/packet_logger.db
+
+  fl-client-mqtt-temp-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=MQTT
+      - USE_CASE=temperature
+      - MQTT_BROKER=127.0.0.1
+      - MQTT_PORT=1883
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - mqtt-broker-temp
+      - fl-server-mqtt-temp
+    container_name: fl-client-mqtt-temp-2
+    command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/packet_logger.db:/app/Client/Temperature_Regulation/packet_logger.db
+
+  # ============================================================================
+  # AMQP Broker (host network: binds 5672, 15672 on host)
+  # ============================================================================
+  rabbitmq-temp:
+    image: rabbitmq:3.12-management
+    network_mode: host
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    container_name: rabbitmq-temp
+
+  # ============================================================================
+  # AMQP Protocol Services
+  # ============================================================================
+  fl-server-amqp-temp:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    network_mode: host
+    environment:
+      - PROTOCOL=AMQP
+      - USE_CASE=temperature
+      - AMQP_HOST=127.0.0.1
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - CUDA_VISIBLE_DEVICES=
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - rabbitmq-temp
+    container_name: fl-server-amqp-temp
+    command: python -u Server/Temperature_Regulation/FL_Server_AMQP.py
+
+  fl-client-amqp-temp-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=AMQP
+      - USE_CASE=temperature
+      - AMQP_HOST=127.0.0.1
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - rabbitmq-temp
+      - fl-server-amqp-temp
+    container_name: fl-client-amqp-temp-1
+    command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-amqp-temp-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=AMQP
+      - USE_CASE=temperature
+      - AMQP_HOST=127.0.0.1
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - rabbitmq-temp
+      - fl-server-amqp-temp
+    container_name: fl-client-amqp-temp-2
+    command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  # ============================================================================
+  # gRPC Protocol Services (server binds 50051 on host)
+  # ============================================================================
+  fl-server-grpc-temp:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    network_mode: host
+    environment:
+      - PROTOCOL=gRPC
+      - USE_CASE=temperature
+      - GRPC_HOST=0.0.0.0
+      - GRPC_PORT=50051
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - CUDA_VISIBLE_DEVICES=
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    container_name: fl-server-grpc-temp
+    command: python -u Server/Temperature_Regulation/FL_Server_gRPC.py
+
+  fl-client-grpc-temp-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=gRPC
+      - USE_CASE=temperature
+      - GRPC_HOST=127.0.0.1
+      - GRPC_PORT=50051
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-grpc-temp
+    container_name: fl-client-grpc-temp-1
+    command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-grpc-temp-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=gRPC
+      - USE_CASE=temperature
+      - GRPC_HOST=127.0.0.1
+      - GRPC_PORT=50051
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-grpc-temp
+    container_name: fl-client-grpc-temp-2
+    command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  # ============================================================================
+  # QUIC Protocol Services (server binds 4433/UDP on host)
+  # ============================================================================
+  fl-server-quic-temp:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    network_mode: host
+    environment:
+      - PROTOCOL=QUIC
+      - USE_CASE=temperature
+      - QUIC_HOST=0.0.0.0
+      - QUIC_PORT=4433
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - QUIC_RECV_BUFFER=${QUIC_RECV_BUFFER:-2097152}
+      - QUIC_SEND_BUFFER=${QUIC_SEND_BUFFER:-2097152}
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../certs:/app/certs:ro
+    container_name: fl-server-quic-temp
+    command: python -u Server/Temperature_Regulation/FL_Server_QUIC.py
+
+  fl-client-quic-temp-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=QUIC
+      - USE_CASE=temperature
+      - QUIC_HOST=127.0.0.1
+      - QUIC_PORT=4433
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-quic-temp
+    container_name: fl-client-quic-temp-1
+    command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-quic-temp-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=QUIC
+      - USE_CASE=temperature
+      - QUIC_HOST=127.0.0.1
+      - QUIC_PORT=4433
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-quic-temp
+    container_name: fl-client-quic-temp-2
+    command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  # ============================================================================
+  # HTTP/3 Protocol Services (server binds 4434 on host)
+  # ============================================================================
+  fl-server-http3-temp:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    network_mode: host
+    environment:
+      - PROTOCOL=HTTP3
+      - USE_CASE=temperature
+      - HTTP3_HOST=0.0.0.0
+      - HTTP3_PORT=4434
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - CUDA_VISIBLE_DEVICES=
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+      - QUIC_RECV_BUFFER=${QUIC_RECV_BUFFER:-2097152}
+      - QUIC_SEND_BUFFER=${QUIC_SEND_BUFFER:-2097152}
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../certs:/app/certs:ro
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+    container_name: fl-server-http3-temp
+    command: python -u Server/Temperature_Regulation/FL_Server_HTTP3.py
+
+  fl-client-http3-temp-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=HTTP3
+      - USE_CASE=temperature
+      - HTTP3_HOST=127.0.0.1
+      - HTTP3_PORT=4434
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-http3-temp
+    container_name: fl-client-http3-temp-1
+    command: python -u Client/Temperature_Regulation/FL_Client_HTTP3.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-http3-temp-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=HTTP3
+      - USE_CASE=temperature
+      - HTTP3_HOST=127.0.0.1
+      - HTTP3_PORT=4434
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-http3-temp
+    container_name: fl-client-http3-temp-2
+    command: python -u Client/Temperature_Regulation/FL_Client_HTTP3.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  # ============================================================================
+  # DDS Discovery Server (unicast peer on 127.0.0.1:7400)
+  # ============================================================================
+  dds-discovery-temp:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    network_mode: host
+    environment:
+      - DDS_DOMAIN_ID=0
+      - CYCLONEDDS_URI=file:///app/config/cyclonedds-discovery-server.xml
+    volumes:
+      - ../config:/app/config:ro
+    container_name: dds-discovery-temp
+    command: python -u scripts/dds_discovery_server.py
+    # Start before DDS server and clients
+
+  # ============================================================================
+  # DDS Protocol Services (Discovery Server at 127.0.0.1:7400; server 7650, client1 7900, client2 8150)
+  # ============================================================================
+  fl-server-dds-temp:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    network_mode: host
+    environment:
+      - PROTOCOL=DDS
+      - USE_CASE=temperature
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - CUDA_VISIBLE_DEVICES=
+      - LOCAL_EPOCHS=20
+      - DDS_DOMAIN_ID=0
+      - CYCLONEDDS_URI=file:///app/config/cyclonedds-emotion-server.xml
+      - ROS_DISCOVERY_SERVER=127.0.0.1:7400
+      - DDS_USE_PRIMITIVE_CONFIG=1
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../config:/app/config:ro
+      - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
+    depends_on:
+      - dds-discovery-temp
+    container_name: fl-server-dds-temp
+    command: bash -c "sleep 5 && python -u Server/Temperature_Regulation/FL_Server_DDS.py"
+
+  fl-client-dds-temp-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    environment:
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=DDS
+      - USE_CASE=temperature
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - DDS_DOMAIN_ID=0
+      - CYCLONEDDS_URI=file:///app/config/cyclonedds-emotion-client1.xml
+      - ROS_DISCOVERY_SERVER=127.0.0.1:7400
+      - DDS_USE_PRIMITIVE_CONFIG=1
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    depends_on:
+      - dds-discovery-temp
+      - fl-server-dds-temp
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../config:/app/config:ro
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+    container_name: fl-client-dds-temp-1
+    command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+
+  fl-client-dds-temp-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    environment:
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=DDS
+      - USE_CASE=temperature
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - DDS_DOMAIN_ID=0
+      - CYCLONEDDS_URI=file:///app/config/cyclonedds-emotion-client2.xml
+      - ROS_DISCOVERY_SERVER=127.0.0.1:7400
+      - DDS_USE_PRIMITIVE_CONFIG=1
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    depends_on:
+      - dds-discovery-temp
+      - fl-server-dds-temp
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../config:/app/config:ro
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+    container_name: fl-client-dds-temp-2
+    command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']

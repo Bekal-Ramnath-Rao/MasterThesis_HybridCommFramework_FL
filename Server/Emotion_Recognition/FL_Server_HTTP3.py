@@ -1,14 +1,37 @@
+import os
+import sys
+# Server uses CPU only (aggregation is numpy-only); saves GPU memory for clients
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
 import numpy as np
 import json
 import pickle
 import base64
 import time
-import os
 import asyncio
-import sys
+import socket
 from typing import Dict, Optional
 import matplotlib.pyplot as plt
 from pathlib import Path
+
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+try:
+    from experiment_results_path import get_experiment_results_dir
+except ModuleNotFoundError:
+    def get_experiment_results_dir(use_case: str, protocol: str, scenario: str = None) -> Path:
+        if scenario is None:
+            scenario = os.getenv("NETWORK_SCENARIO", "default").strip() or "default"
+        root = Path("/app") if os.path.exists("/app") else Path(_project_root)
+        path = root / "experiment_results" / use_case / protocol / scenario
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -28,18 +51,26 @@ from aioquic.quic.events import QuicEvent, StreamReset, StreamDataReceived
 from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import DataReceived, HeadersReceived, H3Event
 
-# Server Configuration
-HTTP3_HOST = os.getenv("HTTP3_HOST", "fl-server-http3-emotion")
+# Server Configuration (use 0.0.0.0 for host network mode; 127.0.0.1 for local only)
+HTTP3_HOST = os.getenv("HTTP3_HOST", "0.0.0.0")
 HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
+INITIAL_MODEL_BROADCAST_ATTEMPTS = max(1, int(os.getenv("HTTP3_INITIAL_MODEL_BROADCAST_ATTEMPTS", "1")))
+INITIAL_MODEL_BROADCAST_INTERVAL_SEC = float(os.getenv("HTTP3_INITIAL_MODEL_BROADCAST_INTERVAL_SEC", "1.0"))
 # Dynamic client configuration
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Convergence Settings
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+HTTP3_MAX_STREAM_DATA_BYTES = 16 * 1024
+HTTP3_DATA_CHUNK_BYTES = 12 * 1024
+
+
+QUIC_SOCKET_BUFFER_BYTES = 7_500_000  # 7.5MB for SO_RCVBUF/SO_SNDBUF (poor network)
 
 
 class FederatedLearningServerProtocol(QuicConnectionProtocol):
@@ -49,31 +80,21 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
         self._http = None  # H3Connection instance
         self._stream_buffers = {}  # Buffer for incomplete messages
         self._stream_content_lengths = {}  # Track expected content length per stream
+
+    def connection_made(self, transport):
+        super().connection_made(transport)
+        sock = transport.get_extra_info("socket")
+        if sock:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, QUIC_SOCKET_BUFFER_BYTES)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, QUIC_SOCKET_BUFFER_BYTES)
+            except OSError as e:
+                print(f"[HTTP/3] Could not set socket buffers: {e}")
     
     def quic_event_received(self, event: QuicEvent):
         """Handle QUIC events and convert to HTTP/3 events"""
         try:
             event_type = type(event).__name__
-            
-            # Log all QUIC events for debugging (especially stream events)
-            if event_type in ['ConnectionIdIssued', 'ConnectionTerminated', 'StreamReset', 'StreamDataReceived', 'DatagramFrameReceived', 'StreamCreated', 'ConnectionEstablished', 'ProtocolNegotiated']:
-                print(f"[HTTP/3] QUIC event: {event_type}")
-                if hasattr(event, 'stream_id'):
-                    print(f"  Stream ID: {event.stream_id}")
-                if hasattr(event, 'data') and event.data:
-                    print(f"  Data size: {len(event.data)} bytes")
-                if event_type == 'ConnectionTerminated':
-                    if hasattr(event, 'error_code'):
-                        print(f"  Error code: {event.error_code}")
-                    if hasattr(event, 'reason_phrase'):
-                        print(f"  Reason: {event.reason_phrase}")
-                if event_type == 'ProtocolNegotiated':
-                    if hasattr(event, ' alpn_protocol'):
-                        print(f"  ALPN Protocol: {event.alpn_protocol}")
-            
-            # Also log StreamDataReceived events (these contain the actual HTTP/3 request data)
-            if event_type == 'StreamDataReceived':
-                print(f"[HTTP/3] Received stream data: stream_id={event.stream_id}, size={len(event.data)} bytes, end_stream={event.end_stream}")
             
             # Initialize H3 connection on first event (but only if ALPN is negotiated)
             # For HTTP/3, we should wait for ProtocolNegotiated event, but H3Connection can be initialized earlier
@@ -81,7 +102,6 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                 # Check if ALPN is negotiated (H3_ALPN should be in the negotiated protocol)
                 try:
                     # Initialize H3 connection - it will handle ALPN validation internally
-                    print(f"[HTTP/3] Initializing H3Connection for new client")
                     self._http = H3Connection(self._quic)
                 except Exception as init_error:
                     print(f"[HTTP/3] Error initializing H3Connection: {init_error}")
@@ -94,12 +114,8 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                 try:
                     h3_events = self._http.handle_event(event)
                     if h3_events:
-                        print(f"[HTTP/3] Generated {len(h3_events)} H3 event(s) from QUIC event {event_type}")
                         for h3_event in h3_events:
                             self._handle_h3_event(h3_event)
-                    elif event_type not in ['ConnectionIdIssued', 'ConnectionTerminated', 'ConnectionEstablished']:
-                        # Log if we're not generating H3 events from important QUIC events
-                        print(f"[HTTP/3] No H3 events generated from {event_type}")
                 except Exception as h3_error:
                     print(f"[HTTP/3] Error converting QUIC event to H3: {h3_error}")
                     import traceback
@@ -111,18 +127,11 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
     
     def _handle_h3_event(self, event: H3Event):
         """Handle HTTP/3 events"""
-        event_type = type(event).__name__
-        stream_id = getattr(event, 'stream_id', 'N/A')
-        print(f"[HTTP/3] H3 event: {event_type}, stream_id: {stream_id}, server: {self.server is not None}")
-        
         if isinstance(event, HeadersReceived):
             try:
                 stream_id = event.stream_id
                 headers = dict(event.headers)
                 method = headers.get(b":method", b"").decode()
-                path = headers.get(b":path", b"").decode()
-                
-                print(f"[HTTP/3] Received {method} request on stream {stream_id}, path: {path}")
                 
                 # Initialize buffer for this stream
                 if stream_id not in self._stream_buffers:
@@ -132,7 +141,6 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                 if method == "POST":
                     content_length = int(headers.get(b"content-length", b"0"))
                     self._stream_content_lengths[stream_id] = content_length
-                    print(f"[HTTP/3] Expecting {content_length} bytes on stream {stream_id}")
             except Exception as e:
                 print(f"[HTTP/3] Error handling headers: {e}")
                 import traceback
@@ -160,9 +168,7 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                     try:
                         data_str = self._stream_buffers[stream_id].decode('utf-8')
                         message = json.loads(data_str)
-                        msg_type = message.get('type', 'unknown')
                         client_id = message.get('client_id', 'unknown')
-                        print(f"[HTTP/3] Decoded complete message type '{msg_type}' from client {client_id} on stream {stream_id}")
                         
                         # Send HTTP/3 response
                         response_body = json.dumps({"status": "ok"}).encode('utf-8')
@@ -177,7 +183,6 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                         
                         # Handle message asynchronously
                         if self.server:
-                            print(f"[HTTP/3] Processing message type '{msg_type}' from client {client_id}")
                             asyncio.create_task(self.server.handle_message(message, self))
                         else:
                             print(f"[HTTP/3] ERROR: Server reference is None!")
@@ -229,13 +234,17 @@ class FederatedLearningServer:
         self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
+        self.transport_update_chunks = {}  # {(protocol, client_id, round): {'chunks': {}, ...}}
         self.global_weights = None
         
         # Metrics storage for classification
         self.ACCURACY = []
         self.LOSS = []
         self.ROUNDS = []
-        
+        self.ROUND_TIMES = []
+        self.BATTERY_CONSUMPTION = []
+        self.round_start_time = None
+
         # Convergence tracking
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
@@ -266,7 +275,7 @@ class FederatedLearningServer:
         
         # Training configuration
         self.training_config = {
-            "batch_size": 32,
+            "batch_size": int(os.getenv("BATCH_SIZE", "16")),
             "local_epochs": 20
         }
     
@@ -330,7 +339,6 @@ class FederatedLearningServer:
         protocol = self.registered_clients[client_id]
         # Ensure HTTP connection is initialized
         if protocol._http is None:
-            print(f"[HTTP/3] Initializing H3Connection for client {client_id}")
             protocol._http = H3Connection(protocol._quic)
         
         # Get next available stream ID (bidirectional for server push)
@@ -352,12 +360,14 @@ class FederatedLearningServer:
         
         try:
             protocol._http.send_headers(stream_id=stream_id, headers=headers)
-            protocol._http.send_data(stream_id=stream_id, data=payload, end_stream=True)
+            if len(payload) <= HTTP3_MAX_STREAM_DATA_BYTES:
+                protocol._http.send_data(stream_id=stream_id, data=payload, end_stream=True)
+            else:
+                for offset in range(0, len(payload), HTTP3_DATA_CHUNK_BYTES):
+                    chunk = payload[offset:offset + HTTP3_DATA_CHUNK_BYTES]
+                    is_last = (offset + HTTP3_DATA_CHUNK_BYTES) >= len(payload)
+                    protocol._http.send_data(stream_id=stream_id, data=chunk, end_stream=is_last)
             protocol.transmit()
-            
-            msg_type = message.get('type')
-            msg_size_mb = len(payload) / (1024 * 1024)
-            print(f"[HTTP/3] Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(payload)} bytes = {msg_size_mb:.2f} MB)")
         except Exception as e:
             print(f"[ERROR] Failed to send message to client {client_id}: {e}")
             import traceback
@@ -378,6 +388,64 @@ class FederatedLearningServer:
         msg_type = message.get('type')
         for client_id in self.registered_clients.keys():
             await self.send_message(client_id, message)
+
+    def _handle_transport_update_chunk(self, data, protocol):
+        """Reassemble chunked updates received over HTTP/3 text transport."""
+        client_id = data['client_id']
+        round_num = data['round']
+        total_chunks = int(data.get('total_chunks', 1) or 1)
+        chunk_index = int(data.get('chunk_index', 0) or 0)
+        payload_chunk = data.get('payload_chunk', '')
+        payload_key = data.get('payload_key', 'compressed_data')
+        key = (protocol, client_id, round_num)
+
+        if key not in self.transport_update_chunks:
+            self.transport_update_chunks[key] = {
+                'chunks': {},
+                'total_chunks': total_chunks,
+                'payload_key': payload_key,
+                'num_samples': data.get('num_samples', 0),
+                'metrics': data.get('metrics', {}),
+                'diagnostic_send_start_ts': data.get('diagnostic_send_start_ts'),
+            }
+
+        buf = self.transport_update_chunks[key]
+        buf['chunks'][chunk_index] = payload_chunk
+
+        # Chunk 0 carries authoritative metadata; it may arrive after other chunks.
+        if chunk_index == 0:
+            buf['num_samples'] = data.get('num_samples', buf.get('num_samples', 0))
+            buf['metrics'] = data.get('metrics', buf.get('metrics', {}))
+            if data.get('diagnostic_send_start_ts') is not None:
+                buf['diagnostic_send_start_ts'] = data.get('diagnostic_send_start_ts')
+
+        received = len(buf['chunks'])
+        if received % 20 == 0 or received == total_chunks:
+            print(f"[{protocol.upper()}] Received {received}/{total_chunks} update chunks from client {client_id}")
+
+        if received < total_chunks:
+            return None
+
+        try:
+            payload = ''.join(buf['chunks'][i] for i in range(total_chunks))
+        except KeyError as e:
+            print(f"[{protocol.upper()}] Missing chunk {e} for client {client_id}, round {round_num}")
+            return None
+
+        reconstructed = {
+            'type': 'model_update',
+            'client_id': client_id,
+            'round': round_num,
+            'num_samples': buf['num_samples'],
+            'metrics': buf['metrics'],
+            payload_key: payload,
+        }
+        if buf.get('diagnostic_send_start_ts') is not None:
+            reconstructed['diagnostic_send_start_ts'] = buf['diagnostic_send_start_ts']
+
+        del self.transport_update_chunks[key]
+        print(f"[{protocol.upper()}] Reassembled chunked update from client {client_id} for round {round_num}")
+        return reconstructed
     
     async def handle_message(self, message, protocol):
         """Handle incoming messages from clients"""
@@ -387,8 +455,12 @@ class FederatedLearningServer:
             
             if msg_type == 'register':
                 await self.handle_client_registration(message, protocol)
-            elif msg_type == 'model_update':
+            elif msg_type in ('model_update', 'update'):
                 await self.handle_client_update(message)
+            elif msg_type in ('update_chunk', 'model_update_chunk'):
+                reconstructed = self._handle_transport_update_chunk(message, 'http3')
+                if reconstructed is not None:
+                    await self.handle_client_update(reconstructed)
             elif msg_type == 'metrics':
                 await self.handle_client_metrics(message)
         except Exception as e:
@@ -403,7 +475,8 @@ class FederatedLearningServer:
         self.registered_clients[client_id] = protocol  # Store protocol reference
         self.active_clients.add(client_id)
         print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
-        print(f"[DEBUG] Registered clients: {list(self.registered_clients.keys())}")
+        # Keep a simple summary of registered clients
+        print(f"Registered clients: {list(self.registered_clients.keys())}")
         
         # Update total client count if more clients join
         if len(self.registered_clients) > self.num_clients:
@@ -428,6 +501,10 @@ class FederatedLearningServer:
     
     async def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore client-local convergence removal/disconnect.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         if client_id in self.active_clients:
             self.active_clients.discard(client_id)
             self.registered_clients.pop(client_id, None)
@@ -446,24 +523,32 @@ class FederatedLearningServer:
                 # If remaining active clients already sent metrics, do not stall.
                 await self.aggregate_metrics()
                 await self.continue_training()
+            elif len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
+                # If remaining active clients already sent updates, aggregate and continue.
+                await self.aggregate_models()
     
     async def handle_client_update(self, message):
         """Handle model update from client"""
+        recv_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
         client_id = message['client_id']
         round_num = message['round']
         if client_id not in self.active_clients:
             return
-        if float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+        if STOP_ON_CLIENT_CONVERGENCE and float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             await self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
             # Decompress or deserialize client weights
             if 'compressed_data' in message and self.quantization_handler is not None:
-                start_t = time.time()
                 compressed_data = pickle.loads(base64.b64decode(message['compressed_data']))
-                weights = self.quantization_handler.decompress_client_update(message['client_id'], compressed_data)
-                dt = time.time() - start_t
-                print(f"Server: Received and decompressed update from client {message['client_id']} in {dt:.2f}s")
+                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                self.client_updates[client_id] = {
+                    'compressed_data': compressed_data,
+                    'num_samples': message['num_samples'],
+                    'metrics': message['metrics']
+                }
+                print(f"Server: Received quantized update from client {message['client_id']} (kept quantized)")
+                weights = None
             else:
                 encoded = message.get('weights')
                 if encoded is None:
@@ -479,11 +564,18 @@ class FederatedLearningServer:
                     return
                 dt = time.time() - start_t
             
-            self.client_updates[client_id] = {
-                'weights': weights,
-                'num_samples': message['num_samples'],
-                'metrics': message['metrics']
-            }
+            if recv_start_cpu is not None:
+                O_recv = time.perf_counter() - recv_start_cpu
+                recv_end_ts = time.time()
+                send_start_ts = message.get("diagnostic_send_start_ts", recv_end_ts)
+                print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={send_start_ts:.9f}")
+            
+            if 'compressed_data' not in message or self.quantization_handler is None:
+                self.client_updates[client_id] = {
+                    'weights': weights,
+                    'num_samples': message['num_samples'],
+                    'metrics': message['metrics']
+                }
             
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{len(self.active_clients)})")
@@ -497,13 +589,16 @@ class FederatedLearningServer:
         round_num = message['round']
         if client_id not in self.active_clients:
             return
-        if float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+        if STOP_ON_CLIENT_CONVERGENCE and float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             await self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
+            m = message.get('metrics', {})
             self.client_metrics[client_id] = {
                 'num_samples': message['num_samples'],
-                'metrics': message['metrics']
+                'metrics': message['metrics'],
+                'battery_soc': float(m.get('battery_soc', 1.0)),
+                'round_time_sec': float(m.get('round_time_sec', 0.0)),
             }
             
             print(f"Received metrics from client {client_id} "
@@ -521,6 +616,7 @@ class FederatedLearningServer:
         })
         
         self.current_round = 1
+        self.round_start_time = time.time()
         
         print(f"\n{'='*70}")
         print(f"Distributing Initial Global Model")
@@ -563,16 +659,17 @@ class FederatedLearningServer:
             weights_data = self.serialize_weights(self.global_weights)
             weights_key = 'weights'
         
-        print("Publishing initial model to clients (sending multiple times for reliability)...")
-        for i in range(3):
+        print(f"Publishing initial model to clients ({INITIAL_MODEL_BROADCAST_ATTEMPTS} pass(es))...")
+        for i in range(INITIAL_MODEL_BROADCAST_ATTEMPTS):
             await self.broadcast_message({
                 'type': 'global_model',
                 'round': 0,
                 weights_key: weights_data,
                 'model_config': model_config
             })
-            print(f"  Attempt {i+1}/3: Initial model broadcast complete")
-            await asyncio.sleep(2.0)
+            print(f"  Attempt {i+1}/{INITIAL_MODEL_BROADCAST_ATTEMPTS}: Initial model broadcast complete")
+            if i < INITIAL_MODEL_BROADCAST_ATTEMPTS - 1:
+                await asyncio.sleep(INITIAL_MODEL_BROADCAST_INTERVAL_SEC)
         
         print("Initial global model (architecture + weights) sent to all clients")
         print("Waiting for clients to initialize their models (TensorFlow + CNN building)...")
@@ -592,9 +689,49 @@ class FederatedLearningServer:
     async def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
+
+        if not self.client_updates:
+            print("No client updates available to aggregate; waiting for next round signal.")
+            return
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            weights_data = base64.b64encode(pickle.dumps(self.global_compressed)).decode('utf-8')
+            await self.broadcast_message({
+                'type': 'global_model',
+                'round': self.current_round,
+                'quantized_data': weights_data,
+                'model_config': self.model_config_json
+            })
+
+            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients")
+
+            await asyncio.sleep(1)
+            await self.broadcast_message({'type': 'start_evaluation', 'round': self.current_round})
+            return
         
         total_samples = sum(update['num_samples'] 
                           for update in self.client_updates.values())
+
+        if total_samples <= 0:
+            print("Warning: total_samples is 0 during model aggregation; falling back to equal-weight averaging.")
+            total_samples = len(self.client_updates)
+            sample_weights = {cid: 1.0 / total_samples for cid in self.client_updates.keys()}
+        else:
+            sample_weights = {
+                cid: (update['num_samples'] / total_samples)
+                for cid, update in self.client_updates.items()
+            }
         
         aggregated_weights = []
         first_client_weights = list(self.client_updates.values())[0]['weights']
@@ -603,7 +740,7 @@ class FederatedLearningServer:
             layer_weights = np.zeros_like(first_client_weights[layer_idx])
             
             for client_id, update in self.client_updates.items():
-                weight = update['num_samples'] / total_samples
+                weight = sample_weights[client_id]
                 layer_weights += weight * update['weights'][layer_idx]
             
             aggregated_weights.append(layer_weights)
@@ -639,15 +776,30 @@ class FederatedLearningServer:
     async def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
         print(f"\nAggregating metrics from {len(self.client_metrics)} clients...")
-        
+        if not self.client_metrics:
+            print("No client metrics available to aggregate; waiting for next round signal.")
+            return
+        if getattr(self, 'round_start_time', None) is not None:
+            self.ROUND_TIMES.append(time.time() - self.round_start_time)
+        socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
+        self.BATTERY_CONSUMPTION.append(1.0 - (sum(socs) / len(socs) if socs else 1.0))
         total_samples = sum(metric['num_samples'] 
                           for metric in self.client_metrics.values())
-        
-        aggregated_accuracy = sum(metric['metrics']['accuracy'] * metric['num_samples']
+
+        if total_samples <= 0:
+            print("Warning: total_samples is 0 during metrics aggregation; using simple mean over clients.")
+            aggregated_accuracy = float(np.mean([
+                metric['metrics']['accuracy'] for metric in self.client_metrics.values()
+            ]))
+            aggregated_loss = float(np.mean([
+                metric['metrics']['loss'] for metric in self.client_metrics.values()
+            ]))
+        else:
+            aggregated_accuracy = sum(metric['metrics']['accuracy'] * metric['num_samples']
+                                     for metric in self.client_metrics.values()) / total_samples
+            
+            aggregated_loss = sum(metric['metrics']['loss'] * metric['num_samples']
                                  for metric in self.client_metrics.values()) / total_samples
-        
-        aggregated_loss = sum(metric['metrics']['loss'] * metric['num_samples']
-                             for metric in self.client_metrics.values()) / total_samples
         
         self.ACCURACY.append(aggregated_accuracy)
         self.LOSS.append(aggregated_loss)
@@ -678,6 +830,7 @@ class FederatedLearningServer:
         
         if self.current_round < self.num_rounds:
             self.current_round += 1
+            self.round_start_time = time.time()
             
             print(f"\n{'='*70}")
             print(f"Starting Round {self.current_round}/{self.num_rounds}")
@@ -728,50 +881,50 @@ class FederatedLearningServer:
             return False
     
     def plot_results(self):
-        """Plot training metrics"""
-        plt.figure(figsize=(12, 5))
-        
-        plt.subplot(1, 2, 1)
-        plt.plot(self.ROUNDS, self.LOSS, marker='o', linewidth=2, markersize=8, color='red')
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Loss', fontsize=12)
-        plt.title('Loss over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        plt.subplot(1, 2, 2)
-        plt.plot(self.ROUNDS, self.ACCURACY, marker='s', linewidth=2, markersize=8, color='green')
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Accuracy', fontsize=12)
-        plt.title('Accuracy over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
-        plt.savefig(results_dir / 'http3_training_metrics.png', dpi=300, bbox_inches='tight')
+        """Plot battery, round/convergence time, and loss/accuracy."""
+        results_dir = get_experiment_results_dir("emotion", "http3")
+        rounds = self.ROUNDS
+        n = len(rounds)
+        conv_time = self.convergence_time if self.convergence_time is not None else (time.time() - self.start_time if self.start_time else 0)
+        bc = (getattr(self, 'BATTERY_CONSUMPTION', []) + [0.0] * max(0, n - len(getattr(self, 'BATTERY_CONSUMPTION', []))))[:n] or [0.0] * n
+        rt = (getattr(self, 'ROUND_TIMES', []) + [0.0] * max(0, n - len(getattr(self, 'ROUND_TIMES', []))))[:n] or [0.0] * n
+        fig1, ax1 = plt.subplots(figsize=(7, 4))
+        if bc: ax1.plot(rounds, [c * 100 for c in bc], marker='o', linewidth=2, markersize=6, color='#2e86ab')
+        ax1.set_xlabel('Round'); ax1.set_ylabel('Battery consumption (%)'); ax1.set_title('HTTP/3: Battery consumption till end of FL'); ax1.grid(True, alpha=0.3)
+        fig1.tight_layout(); fig1.savefig(results_dir / 'http3_battery_consumption.png', dpi=300, bbox_inches='tight'); plt.close(fig1)
+        fig2, ax2 = plt.subplots(figsize=(7, 4))
+        if rt: ax2.bar(rounds, rt, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        ax2.axhline(y=conv_time, color='#f18f01', linestyle='--', linewidth=2, label=f'Convergence: {conv_time:.1f} s')
+        ax2.set_xlabel('Round'); ax2.set_ylabel('Time (s)'); ax2.set_title('HTTP/3: Time per round and convergence'); ax2.legend(); ax2.grid(True, alpha=0.3)
+        fig2.tight_layout(); fig2.savefig(results_dir / 'http3_round_and_convergence_time.png', dpi=300, bbox_inches='tight'); plt.close(fig2)
+        fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(12, 5))
+        ax3a.plot(rounds, self.LOSS, marker='o', linewidth=2, markersize=8, color='red'); ax3a.set_xlabel('Round'); ax3a.set_ylabel('Loss'); ax3a.set_title('HTTP/3: Loss over Rounds'); ax3a.grid(True, alpha=0.3)
+        ax3b.plot(rounds, self.ACCURACY, marker='s', linewidth=2, markersize=8, color='green'); ax3b.set_xlabel('Round'); ax3b.set_ylabel('Accuracy'); ax3b.set_title('HTTP/3: Accuracy over Rounds'); ax3b.grid(True, alpha=0.3)
+        fig3.tight_layout(); fig3.savefig(results_dir / 'http3_training_metrics.png', dpi=300, bbox_inches='tight'); plt.close(fig3)
         print(f"Results plot saved to {results_dir / 'http3_training_metrics.png'}")
-        print("\nDisplaying plot... Close the plot window to exit.")
-        plt.show()
-        
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1": plt.close('all')
+        else: plt.show(block=False)
         print("\nPlot closed. Server shutting down...")
         import sys
         sys.exit(0)
     
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("emotion", "http3")
         
         results = {
             "rounds": self.ROUNDS,
             "accuracy": self.ACCURACY,
             "loss": self.LOSS,
+            "round_times_seconds": getattr(self, 'ROUND_TIMES', []),
+            "battery_consumption": getattr(self, 'BATTERY_CONSUMPTION', []),
             "convergence_time_seconds": self.convergence_time,
             "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
             "total_rounds": len(self.ROUNDS),
             "num_clients": self.num_clients,
-            "converged": self.converged
+            "converged": self.converged,
+            "final_accuracy": self.ACCURACY[-1] if self.ACCURACY else None,
+            "final_loss": self.LOSS[-1] if self.LOSS else None,
         }
         
         results_file = results_dir / 'http3_training_results.json'
@@ -817,17 +970,20 @@ async def main():
     
     server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
-    # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/QUIC/DDS for unbiased comparison
+    # QUIC config: idle timeout 0/none = no limit (diagnostic pipeline); else env or 60s
+    _idle = os.getenv("IDLE_TIMEOUT", "0" if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else "60").strip().lower()
+    idle_sec = float(_idle) if _idle not in ("0", "none", "inf", "infinity") else 86400.0 * 7  # 7 days = effectively no limit
+    # Realistic max payload: HTTP/3 16 KB per stream
+    HTTP3_MAX_STREAM_DATA = 16 * 1024  # 16 KB
     configuration = QuicConfiguration(
         is_client=False,
         alpn_protocols=H3_ALPN,
-        # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
-        max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
-        max_data=256 * 1024 * 1024,  # 256 MB total connection
-        # FAIR CONFIG: Timeout 600s for very_poor network scenarios
-        idle_timeout=600.0,  # 10 minutes
-        max_datagram_frame_size=65536,  # 64 KB frames
-        initial_rtt=0.15,  # Account for network latency
+        congestion_control_algorithm="cubic",
+        idle_timeout=idle_sec,
+        max_data=HTTP3_MAX_STREAM_DATA * 2,  # 32 KB total
+        max_stream_data=HTTP3_MAX_STREAM_DATA,  # 16 KB per stream
+        max_datagram_frame_size=65536,
+        initial_rtt=0.15,
     )
     
     # Check if certificates exist in the certs directory

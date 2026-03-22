@@ -18,6 +18,16 @@ from aioquic.quic.events import QuicEvent, StreamDataReceived
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 # Add Compression_Technique to path for optional quantization support
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
@@ -37,6 +47,7 @@ QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "16"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # EEG Settings
 SEED = 42
@@ -75,13 +86,9 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
         super().__init__(*args, **kwargs)
         self.server = None
         self._stream_buffers = {}
-        print(f"[DEBUG] New server protocol instance created: {id(self)}")
 
     def quic_event_received(self, event: QuicEvent):
-        print(f"[DEBUG] quic_event_received called on protocol {id(self)}, event type: {type(event).__name__}")
         if isinstance(event, StreamDataReceived):
-            print(f"[DEBUG] Server received data on stream {event.stream_id}, size={len(event.data)} bytes, end_stream={event.end_stream}")
-            
             if event.stream_id not in self._stream_buffers:
                 self._stream_buffers[event.stream_id] = b''
 
@@ -101,7 +108,7 @@ class FederatedLearningServerProtocol(QuicConnectionProtocol):
                         if self.server:
                             asyncio.create_task(self.server.handle_message(message, self))
                         else:
-                            print(f"[DEBUG] Server not set in protocol, cannot handle message")
+                                print("Server not set in protocol, cannot handle message")
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
                         print(f"Error decoding message: {e}")
                         print(f"Message data length: {len(message_data)}")
@@ -368,7 +375,6 @@ class FederatedLearningServer:
         """Handle incoming messages from clients"""
         try:
             msg_type = message.get('type')
-            print(f"[DEBUG] Server received message type: {msg_type}")
 
             if msg_type == 'register':
                 await self.handle_client_registration(message, protocol)
@@ -384,7 +390,6 @@ class FederatedLearningServer:
     async def handle_client_registration(self, message, protocol):
         """Handle client registration"""
         client_id = message['client_id']
-        print(f"[DEBUG] Received registration from client {client_id}")
         self.registered_clients[client_id] = protocol
         self.active_clients.add(client_id)
         print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
@@ -392,7 +397,6 @@ class FederatedLearningServer:
         # Update total client count if more clients join
         if len(self.registered_clients) > self.num_clients:
             self.update_client_count(len(self.registered_clients))
-        print(f"[DEBUG] Registered clients: {sorted(self.registered_clients.keys())}")
 
         if self.training_started:
             self.active_clients.add(client_id)
@@ -410,6 +414,10 @@ class FederatedLearningServer:
 
     async def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore client-local convergence removal/disconnect.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         if client_id in self.active_clients:
             self.active_clients.discard(client_id)
             self.registered_clients.pop(client_id, None)
@@ -432,24 +440,25 @@ class FederatedLearningServer:
         m = message.get('metrics', {})
         if client_id not in self.active_clients:
             return
-        if float(m.get('client_converged', 0.0)) >= 1.0:
+        if STOP_ON_CLIENT_CONVERGENCE and float(m.get('client_converged', 0.0)) >= 1.0:
             await self.mark_client_converged(client_id)
             return
-
-        print(f"[DEBUG] Server received model_update - client_id={client_id}, round_num={round_num}, current_round={self.current_round}")
 
         if round_num == self.current_round:
             # Decompress or deserialize client weights
             if 'compressed_data' in message and self.quantization_handler is not None:
-                weights = self.quantization_handler.decompress_client_update(message['client_id'], message['compressed_data'])
-                print(f"Server: Received and decompressed update from client {message['client_id']}")
+                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                self.client_updates[client_id] = {
+                    'compressed_data': message['compressed_data'],
+                    'num_samples': message['num_samples']
+                }
+                print(f"Server: Received quantized update from client {message['client_id']} (kept quantized)")
             else:
                 weights = self.deserialize_weights(message['weights'])
-            
-            self.client_updates[client_id] = {
-                'weights': weights,
-                'num_samples': message['num_samples']
-            }
+                self.client_updates[client_id] = {
+                    'weights': weights,
+                    'num_samples': message['num_samples']
+                }
 
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{len(self.active_clients)})")
@@ -457,7 +466,7 @@ class FederatedLearningServer:
             if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
                 await self.aggregate_models()
         else:
-            print(f"[DEBUG] Ignoring update from client {client_id} - round mismatch (got {round_num}, expected {self.current_round})")
+            print(f"Ignoring update from client {client_id} - round mismatch (got {round_num}, expected {self.current_round})")
 
     async def handle_client_metrics(self, message):
         """Handle evaluation metrics from client (not used for server evaluation)"""
@@ -476,8 +485,6 @@ class FederatedLearningServer:
         print(f"\n{'=' * 70}")
         print(f"Distributing Initial Global Model")
         print(f"{'=' * 70}\n")
-
-        print(f"[DEBUG] Sending initial model - round=0, has_config=True")
         
         # Prepare global model (compress if quantization enabled)
         if self.quantization_handler is not None:
@@ -521,6 +528,42 @@ class FederatedLearningServer:
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
 
         total_samples = sum(update['num_samples'] for update in self.client_updates.values())
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            # Keep float-cast view for evaluation
+            try:
+                self.global_weights = [np.asarray(w, dtype=np.float32) for w in aggregated_compressed.get('compressed_data', [])]
+            except Exception:
+                pass
+
+            await self.evaluate_global_model()
+
+            await self.broadcast_message({
+                'type': 'global_model',
+                'round': self.current_round,
+                'quantized_data': self.global_compressed,
+                'model_config': {
+                    "architecture": "CNN+BiLSTM+MHA",
+                    "input_shape": [256, 20],
+                    "num_classes": NUM_CLASSES
+                }
+            })
+
+            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients")
+            await self.continue_training()
+            return
 
         aggregated_weights = []
         first_client_weights = list(self.client_updates.values())[0]['weights']
@@ -645,9 +688,8 @@ class FederatedLearningServer:
             "num_rounds": self.num_rounds
         }
 
-        results_dir = os.path.join(os.path.dirname(__file__), "results")
-        os.makedirs(results_dir, exist_ok=True)
-        results_file = os.path.join(results_dir, "quic_training_results.json")
+        results_dir = get_experiment_results_dir("mental_state", "quic")
+        results_file = results_dir / "quic_training_results.json"
 
         with open(results_file, "w") as f:
             json.dump(results, f, indent=2)

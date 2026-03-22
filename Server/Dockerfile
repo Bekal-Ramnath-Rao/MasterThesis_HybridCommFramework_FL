@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
     iproute2 \
     cmake \
     git \
+    tcpdump \
     && rm -rf /var/lib/apt/lists/*
 
 # Install CycloneDDS C library from source
@@ -42,8 +43,10 @@ RUN cd Protocols && \
     python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. federated_learning.proto && \
     cd ..
 
-# Copy the Server directory
+# Copy the Server directory and scripts (DDS discovery server)
 COPY scripts/utilities/packet_logger.py ./
+COPY scripts/utilities/experiment_results_path.py ./
+COPY scripts/dds_discovery_server.py ./scripts/
 COPY Server/ ./Server/
 
 # Copy Client/Compression_Technique for quantization support (needed by Server)

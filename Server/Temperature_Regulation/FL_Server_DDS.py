@@ -44,7 +44,18 @@ DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
+
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
 
 # Chunking configuration for large messages
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for better DDS performance in poor networks
@@ -258,8 +269,9 @@ class FederatedLearningServer:
                 model_config_json=model_config if chunk_id == 0 else ""  # Only send config with first chunk
             )
             self.writers['global_model_chunk'].write(chunk)
-            print(f"  Sent chunk {chunk_id + 1}/{total_chunks} ({len(chunk_data)} bytes)")
-            time.sleep(0.05)  # Small delay between chunks
+            # Aligned with unified: Reliable QoS handles delivery, no artificial delay needed
+            if (chunk_id + 1) % 20 == 0:
+                print(f"  Sent {chunk_id + 1}/{total_chunks} chunks")
     
     def setup_dds(self):
         """Initialize DDS participant, topics, readers, and writers"""
@@ -385,22 +397,12 @@ class FederatedLearningServer:
         if not hasattr(self, '_reg_check_count'):
             self._reg_check_count = 0
         self._reg_check_count += 1
-
-        if self._reg_check_count % 20 == 1:
-            print(f"[DEBUG] check_registrations called (count={self._reg_check_count}), samples received: {len(samples)}")
-
-        # Debug: log how many samples received
-        if len(samples) > 0:
-            print(f"[DEBUG] *** RECEIVED {len(samples)} REGISTRATION SAMPLES ***")
         
         for sample in samples:
             # Some DDS implementations may emit InvalidSample entries; guard against those
             if not sample or not hasattr(sample, 'client_id'):
-                # Debug: show what we're skipping
-                print(f"[DEBUG] Skipping invalid registration sample: {type(sample).__name__}")
                 continue
             client_id = sample.client_id
-            print(f"[DEBUG] Processing registration from client {client_id}")
             if client_id not in self.registered_clients:
                 self.registered_clients.add(client_id)
                 self.active_clients.add(client_id)
@@ -421,6 +423,10 @@ class FederatedLearningServer:
     
     def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore client-local convergence removal/disconnect.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         if client_id in self.active_clients:
             self.active_clients.discard(client_id)
             self.client_updates.pop(client_id, None)
@@ -561,25 +567,38 @@ class FederatedLearningServer:
                         if self.quantization_handler is not None:
                             try:
                                 compressed_data = pickle.loads(bytes(reassembled_data))
-                                weights = self.quantization_handler.decompress_client_update(client_id, compressed_data)
-                                print(f"Server: Received and decompressed update from client {client_id}")
+                                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                                metadata = self.model_update_metadata[client_id]
+                                self.client_updates[client_id] = {
+                                    'compressed_data': compressed_data,
+                                    'num_samples': metadata['num_samples'],
+                                    'metrics': {
+                                        'loss': metadata['loss'],
+                                        'mse': metadata['mse'],
+                                        'mae': metadata['mae'],
+                                        'mape': metadata['mape']
+                                    }
+                                }
+                                print(f"Server: Received quantized update from client {client_id} (kept quantized)")
+                                weights = None
                             except Exception as e:
                                 print(f"Server: Failed to decompress from client {client_id}, falling back: {e}")
                                 weights = self.deserialize_weights(reassembled_data)
                         else:
                             weights = self.deserialize_weights(reassembled_data)
                         
-                        metadata = self.model_update_metadata[client_id]
-                        self.client_updates[client_id] = {
-                            'weights': weights,
-                            'num_samples': metadata['num_samples'],
-                            'metrics': {
-                                'loss': metadata['loss'],
-                                'mse': metadata['mse'],
-                                'mae': metadata['mae'],
-                                'mape': metadata['mape']
+                        if self.quantization_handler is None:
+                            metadata = self.model_update_metadata[client_id]
+                            self.client_updates[client_id] = {
+                                'weights': weights,
+                                'num_samples': metadata['num_samples'],
+                                'metrics': {
+                                    'loss': metadata['loss'],
+                                    'mse': metadata['mse'],
+                                    'mae': metadata['mae'],
+                                    'mape': metadata['mape']
+                                }
                             }
-                        }
                         
                         # Clear chunk buffers for this client
                         del self.model_update_chunks[client_id]
@@ -630,6 +649,48 @@ class FederatedLearningServer:
         # Safety check: ensure we have at least one client update
         if len(self.client_updates) == 0:
             print("ERROR: aggregate_models called with 0 client updates. Skipping aggregation.")
+            return
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            print(f"Aggregated (kept-quantized) global model from round {self.current_round}")
+            print(f"Sending (kept-quantized) global model to clients...\n")
+
+            serialized_weights = list(pickle.dumps(self.global_compressed))
+
+            model_config = {
+                "architecture": "LSTM",
+                "layers": [
+                    {"type": "LSTM", "units": 50, "activation": "relu", "input_shape": [1, 4]},
+                    {"type": "Dense", "units": 1}
+                ],
+                "compile_config": {"loss": "mse", "optimizer": "adam", "metrics": ["mae"]}
+            }
+            self.send_global_model_chunked(self.current_round, serialized_weights, json.dumps(model_config))
+
+            time.sleep(1)
+            command = TrainingCommand(
+                round=self.current_round,
+                start_training=False,
+                start_evaluation=True,
+                training_complete=False
+            )
+            for retry in range(3):
+                self.writers['command'].write(command)
+                if retry < 2:
+                    time.sleep(0.5)
+
+            self.evaluation_phase = True
             return
         
         # Calculate total samples
@@ -710,7 +771,7 @@ class FederatedLearningServer:
                 client_id = sample.client_id
                 if client_id not in self.active_clients:
                     continue
-                if getattr(sample, 'client_converged', 0.0) >= 1.0:
+                if STOP_ON_CLIENT_CONVERGENCE and getattr(sample, 'client_converged', 0.0) >= 1.0:
                     self.mark_client_converged(client_id)
                     if len(self.active_clients) == 0:
                         return
@@ -798,7 +859,7 @@ class FederatedLearningServer:
             self.save_results()
             return
         
-        if self.current_round >= MIN_ROUNDS and self.check_convergence():
+        if STOP_ON_CLIENT_CONVERGENCE and self.current_round >= MIN_ROUNDS and self.check_convergence():
             self.convergence_time = time.time() - self.start_time if self.start_time else 0
             print("\n" + "="*70)
             print("CONVERGENCE ACHIEVED!")
@@ -930,18 +991,19 @@ class FederatedLearningServer:
         plt.tight_layout()
         
         # Save plot
-        results_dir = Path(__file__).parent.parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "dds")
         plt.savefig(results_dir / 'dds_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Training metrics plot saved to {results_dir / 'dds_training_metrics.png'}")
-        plt.show()
-        
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            plt.close()
+        else:
+            plt.show()
+
         print("\nPlot closed. Training complete.")
     
     def save_results(self):
         """Save training results to CSV"""
-        results_dir = Path(__file__).parent.parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "dds")
         
         results_df = pd.DataFrame({
             'Round': self.ROUNDS,
@@ -966,7 +1028,7 @@ class FederatedLearningServer:
         
         results_df = pd.concat([results_df, summary_df], ignore_index=True)
         
-        results_file = results_dir / f'dds_{NETWORK_SCENARIO}_training_results.csv'
+        results_file = results_dir / 'dds_training_results.csv'
         results_df.to_csv(results_file, index=False)
         print(f"Training results saved to {results_file}")
     

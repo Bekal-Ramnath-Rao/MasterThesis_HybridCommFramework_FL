@@ -1,0 +1,161 @@
+# Unified Temperature Regulation FL with network_mode: host (high-performance)
+
+services:
+  mqtt-broker-unified:
+    image: eclipse-mosquitto:latest
+    network_mode: host
+    volumes:
+      - ../mqtt-config/mosquitto.conf:/mosquitto/config/mosquitto.conf
+    container_name: mqtt-broker-unified
+    command: mosquitto -c /mosquitto/config/mosquitto.conf
+
+  amqp-broker-unified:
+    image: rabbitmq:3.12-management
+    network_mode: host
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    container_name: amqp-broker-unified
+
+  fl-server-unified-temperature:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    network_mode: host
+    container_name: fl-server-unified-temperature
+    environment:
+      - NODE_TYPE=server
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - MQTT_BROKER=127.0.0.1
+      - AMQP_BROKER=127.0.0.1
+      - AMQP_HOST=127.0.0.1
+      - GRPC_HOST=0.0.0.0
+      - GRPC_PORT=50051
+      - QUIC_HOST=0.0.0.0
+      - QUIC_PORT=4433
+      - HTTP3_HOST=0.0.0.0
+      - HTTP3_PORT=4434
+      - CONVERGENCE_THRESHOLD=0.001
+      - CONVERGENCE_PATIENCE=2
+      - MIN_ROUNDS=3
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+    volumes:
+      - ../Server/Temperature_Regulation:/app/Server/Temperature_Regulation
+      - ../experiment_results:/app/results
+      - ../shared_data:/shared_data
+      - ../certs:/app/certs:ro
+    depends_on:
+      - mqtt-broker-unified
+      - amqp-broker-unified
+    cap_add:
+      - NET_ADMIN
+    command: python3 Server/Temperature_Regulation/FL_Server_Unified.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+
+  fl-client-unified-temperature-1:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    container_name: fl-client-unified-temperature-1
+    environment:
+      - NODE_TYPE=client
+      - CLIENT_ID=1
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - USE_RL_SELECTION=true
+      - USE_COMMUNICATION_MODEL_REWARD=${USE_COMMUNICATION_MODEL_REWARD:-true}
+      - DEFAULT_PROTOCOL=mqtt
+      - MQTT_BROKER=127.0.0.1
+      - AMQP_BROKER=127.0.0.1
+      - AMQP_HOST=127.0.0.1
+      - GRPC_SERVER=127.0.0.1
+      - GRPC_HOST=127.0.0.1
+      - GRPC_PORT=50051
+      - QUIC_HOST=127.0.0.1
+      - QUIC_PORT=4433
+      - HTTP3_HOST=127.0.0.1
+      - HTTP3_PORT=4434
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+    volumes:
+      - ../Client/Temperature_Regulation:/app/Client/Temperature_Regulation
+      - ../shared_data:/shared_data
+      - ../experiment_results:/app/results
+      - ../certs:/app/certs:ro
+    depends_on:
+      - fl-server-unified-temperature
+      - mqtt-broker-unified
+      - amqp-broker-unified
+    cap_add:
+      - NET_ADMIN
+    command: python3 Client/Temperature_Regulation/FL_Client_Unified.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+
+  fl-client-unified-temperature-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    container_name: fl-client-unified-temperature-2
+    environment:
+      - NODE_TYPE=client
+      - CLIENT_ID=2
+      - NUM_CLIENTS=2
+      - NUM_ROUNDS=1000
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - USE_RL_SELECTION=true
+      - USE_COMMUNICATION_MODEL_REWARD=${USE_COMMUNICATION_MODEL_REWARD:-true}
+      - DEFAULT_PROTOCOL=mqtt
+      - MQTT_BROKER=127.0.0.1
+      - AMQP_BROKER=127.0.0.1
+      - AMQP_HOST=127.0.0.1
+      - GRPC_SERVER=127.0.0.1
+      - GRPC_HOST=127.0.0.1
+      - GRPC_PORT=50051
+      - QUIC_HOST=127.0.0.1
+      - QUIC_PORT=4433
+      - HTTP3_HOST=127.0.0.1
+      - HTTP3_PORT=4434
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+    volumes:
+      - ../Client/Temperature_Regulation:/app/Client/Temperature_Regulation
+      - ../shared_data:/shared_data
+      - ../experiment_results:/app/results
+      - ../certs:/app/certs:ro
+    depends_on:
+      - fl-server-unified-temperature
+      - mqtt-broker-unified
+      - amqp-broker-unified
+    cap_add:
+      - NET_ADMIN
+    command: python3 Client/Temperature_Regulation/FL_Client_Unified.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]

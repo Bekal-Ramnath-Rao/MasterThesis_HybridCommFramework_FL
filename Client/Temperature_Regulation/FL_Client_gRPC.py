@@ -5,6 +5,13 @@ import os
 import sys
 import logging
 import threading
+_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+if _xla_flags:
+    sanitized_flags = [f for f in _xla_flags.split() if f != "--xla_gpu_enable_command_buffer="]
+    if sanitized_flags:
+        os.environ["XLA_FLAGS"] = " ".join(sanitized_flags)
+    else:
+        os.environ.pop("XLA_FLAGS", None)
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
@@ -39,6 +46,13 @@ if compression_path not in sys.path:
     sys.path.insert(0, compression_path)
 
 from quantization_client import Quantization, QuantizationConfig
+try:
+    from pruning_client import ModelPruning, PruningConfig
+    PRUNING_AVAILABLE = True
+except Exception:
+    ModelPruning = None
+    PruningConfig = None
+    PRUNING_AVAILABLE = False
 
 # Make TensorFlow logs less verbose
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -59,6 +73,7 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 
 class FederatedLearningClient:
@@ -76,6 +91,19 @@ class FederatedLearningClient:
         else:
             self.quantizer = None
             print(f"Client {self.client_id}: Quantization disabled")
+
+        # Initialize pruning (default: disabled unless explicitly enabled)
+        up_env = os.getenv("USE_PRUNING", "false")
+        use_pruning = up_env.lower() in ("true", "1", "yes", "y")
+        if use_pruning and PRUNING_AVAILABLE and ModelPruning is not None:
+            self.pruner = ModelPruning(PruningConfig())
+            print(f"Client {self.client_id}: Pruning enabled")
+        else:
+            self.pruner = None
+            if use_pruning and not PRUNING_AVAILABLE:
+                print(f"Client {self.client_id}: Pruning requested but pruning module not available")
+            else:
+                print(f"Client {self.client_id}: Pruning disabled")
         self.x_train = None
         self.y_train = None
         self.x_test = None
@@ -241,11 +269,13 @@ class FederatedLearningClient:
                         try:
                             candidate = pickle.loads(global_model.weights)
                             if isinstance(candidate, dict) and 'quantization_params' in candidate:
-                                # Received compressed dict
-                                if self.quantizer is not None:
-                                    weights = self.quantizer.decompress(candidate)
+                                # Quantized payload (may already include pruning applied on server)
+                                weights = self.quantizer.as_training_weights(candidate) if self.quantizer is not None else []
+                            elif isinstance(candidate, dict) and 'pruned_data' in candidate:
+                                # Pruned-compressed payload (bytes) for pruning-only mode
+                                if self.pruner is not None and candidate['pruned_data']:
+                                    weights = self.pruner.decompress_pruned_weights(candidate['pruned_data'])
                                 else:
-                                    # If client has no quantizer, try to deserialize raw weights from server
                                     weights = []
                             else:
                                 weights = candidate
@@ -260,8 +290,10 @@ class FederatedLearningClient:
                         try:
                             candidate = pickle.loads(global_model.weights)
                             if isinstance(candidate, dict) and 'quantization_params' in candidate:
-                                if self.quantizer is not None:
-                                    weights = self.quantizer.decompress(candidate)
+                                weights = self.quantizer.as_training_weights(candidate) if self.quantizer is not None else []
+                            elif isinstance(candidate, dict) and 'pruned_data' in candidate:
+                                if self.pruner is not None and candidate['pruned_data']:
+                                    weights = self.pruner.decompress_pruned_weights(candidate['pruned_data'])
                                 else:
                                     weights = []
                             else:
@@ -400,10 +432,21 @@ class FederatedLearningClient:
         
         # Get model weights
         weights = self.model.get_weights()
-        # If quantization enabled, send the compressed data dict pickled
+
+        # Flow: Training -> Pruning -> Quantization -> Send
+        if self.pruner is not None:
+            weights = self.pruner.prune_weights(weights, step=self.current_round)
+
+        # Serialize payload for gRPC:
+        # - if quantization enabled -> send pickled quantized dict (may include pruning applied above)
+        # - else if pruning enabled -> send pickled {"pruned_data": <bytes>} sparse payload
+        # - else -> send pickled raw weights list
         if self.quantizer is not None:
             compressed_data = self.quantizer.compress(weights, data_type="weights")
             serialized_weights = pickle.dumps(compressed_data)
+        elif self.pruner is not None:
+            pruned_bytes, _ = self.pruner.compress_pruned_weights(weights)
+            serialized_weights = pickle.dumps({"pruned_data": pruned_bytes})
         else:
             serialized_weights = pickle.dumps(weights)
         
@@ -484,6 +527,10 @@ class FederatedLearningClient:
 
     def _notify_convergence_and_disconnect(self):
         """Notify server and stop this client."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore local convergence notification/disconnect.
+            print(f"Client {self.client_id} ignoring local convergence (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         try:
             self.stub.SendModelUpdate(
                 federated_learning_pb2.ModelUpdate(

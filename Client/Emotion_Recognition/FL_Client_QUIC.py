@@ -14,6 +14,13 @@ from aioquic.asyncio.protocol import QuicConnectionProtocol
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+if _xla_flags:
+    sanitized_flags = [f for f in _xla_flags.split() if f != "--xla_gpu_enable_command_buffer="]
+    if sanitized_flags:
+        os.environ["XLA_FLAGS"] = " ".join(sanitized_flags)
+    else:
+        os.environ.pop("XLA_FLAGS", None)
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
 # Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
 # This ensures different clients use different GPUs in multi-GPU setups
@@ -60,7 +67,7 @@ if gpus:
             try:
                 tf.config.set_logical_device_configuration(
                     gpu,
-                    [tf.config.LogicalDeviceConfiguration(memory_limit=7000)]  # 7GB per GPU
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=int(os.environ.get("TF_GPU_MEMORY_LIMIT_MB", "4000")))]
                 )
             except RuntimeError:
                 pass  # GPU already configured
@@ -84,6 +91,11 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
+
+# Controls whether this client should signal/exit on local convergence.
+# When false, clients keep training until the server indicates completion.
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Model initialization timeout (seconds) - longer for poor network conditions
 # Default: 300s (5 minutes) for very poor network conditions with large models
@@ -106,9 +118,6 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             # Append new data to buffer
             self._stream_buffers[event.stream_id] += event.data
             buffer_size = len(self._stream_buffers[event.stream_id])
-            # Reduced logging - only show progress for large messages (every 100KB)
-            if buffer_size % (100 * 1024) < len(event.data):
-                print(f"[DEBUG] Client stream {event.stream_id}: ~{buffer_size // 1024}KB received")
             
             # Send flow control updates to allow more data (critical for poor networks)
             self.transmit()
@@ -120,8 +129,6 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
                     try:
                         data = message_data.decode('utf-8')
                         message = json.loads(data)
-                        msg_type = message.get('type', 'unknown')
-                        print(f"[DEBUG] Client decoded message from stream {event.stream_id}: type={msg_type}, size={len(message_data)} bytes")
                         if self.client:
                             asyncio.create_task(self.client.handle_message(message))
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -129,12 +136,9 @@ class FederatedLearningClientProtocol(QuicConnectionProtocol):
             
             # If stream ended and buffer has remaining data, try to process it
             if event.end_stream and self._stream_buffers[event.stream_id]:
-                print(f"[DEBUG] Client stream {event.stream_id} ended with {len(self._stream_buffers[event.stream_id])} bytes remaining")
                 try:
                     data = self._stream_buffers[event.stream_id].decode('utf-8')
                     message = json.loads(data)
-                    msg_type = message.get('type', 'unknown')
-                    print(f"[DEBUG] Client decoded end-of-stream message: type={msg_type}")
                     if self.client:
                         asyncio.create_task(self.client.handle_message(message))
                     self._stream_buffers[event.stream_id] = b''
@@ -160,7 +164,7 @@ class FederatedLearningClient:
         self.train_generator = train_generator
         self.validation_generator = validation_generator
         self.current_round = 0
-        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        self.training_config = {"batch_size": 16, "local_epochs": 20}
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.has_converged = False
@@ -185,6 +189,27 @@ class FederatedLearningClient:
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
+
+    def _apply_generator_batch_size(self, batch_size):
+        """Sync DirectoryIterator batch size with training config."""
+        try:
+            batch_size = int(batch_size)
+        except (TypeError, ValueError):
+            return
+        if batch_size <= 0:
+            return
+
+        changed = False
+        for gen_name in ("train_generator", "validation_generator"):
+            generator = getattr(self, gen_name, None)
+            if generator is None:
+                continue
+            current = getattr(generator, "batch_size", None)
+            if current != batch_size:
+                setattr(generator, "batch_size", batch_size)
+                changed = True
+        if changed:
+            print(f"Client {self.client_id} synchronized generator batch_size to {batch_size}")
     
     def build_model_from_config(self, model_config):
         """Build model from server-provided configuration"""
@@ -273,7 +298,13 @@ class FederatedLearningClient:
     
     async def handle_training_config(self, message):
         """Update training configuration"""
-        self.training_config = message['config']
+        if isinstance(message.get('config'), dict):
+            self.training_config.update(message['config'])
+        try:
+            self.training_config["batch_size"] = int(self.training_config.get("batch_size", DEFAULT_DATA_BATCH_SIZE))
+        except (TypeError, ValueError):
+            self.training_config["batch_size"] = DEFAULT_DATA_BATCH_SIZE
+        self._apply_generator_batch_size(self.training_config["batch_size"])
         print(f"Client {self.client_id} updated config: {self.training_config}")
     
     async def handle_global_model(self, message):
@@ -285,11 +316,11 @@ class FederatedLearningClient:
         if 'quantized_data' in message and self.quantizer is not None:
             # Deserialize base64+pickle encoded quantized data
             compressed_data = pickle.loads(base64.b64decode(message['quantized_data']))
-            weights = self.quantizer.decompress(compressed_data)
-            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            weights = self.quantizer.as_training_weights(compressed_data)
+            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
         elif 'compressed_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['compressed_data'])
-            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            weights = self.quantizer.as_training_weights(message['compressed_data'])
+            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
         elif 'weights' in message:
             encoded_weights = message['weights']
             weights = self.deserialize_weights(encoded_weights)
@@ -417,6 +448,7 @@ class FederatedLearningClient:
     async def train_local_model(self):
         """Train model on local data and send updates to server"""
         batch_size = self.training_config['batch_size']
+        self._apply_generator_batch_size(batch_size)
         epochs = self.training_config['local_epochs']
         # Limit steps per epoch for faster training (configurable via env)
         try:
@@ -463,15 +495,24 @@ class FederatedLearningClient:
             weights_data = self.serialize_weights(updated_weights)
             weights_key = 'weights'
         
-        # Send model update to server
-        await self.send_message({
+        msg = {
             'type': 'model_update',
             'client_id': self.client_id,
             'round': self.current_round,
             weights_key: weights_data,
             'num_samples': num_samples,
             'metrics': metrics
-        })
+        }
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            send_start_ts = time.time()
+            send_start_cpu = time.perf_counter()
+            msg['diagnostic_send_start_ts'] = send_start_ts
+        payload = json.dumps(msg)
+        # Send model update to server
+        await self.send_message(msg)
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            O_send = time.perf_counter() - send_start_cpu
+            print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={len(payload)} send_start_ts={send_start_ts:.9f}")
     
     async def evaluate_model(self):
         """Evaluate model on validation data and send metrics to server"""
@@ -492,7 +533,8 @@ class FederatedLearningClient:
             'accuracy': float(accuracy)
         }
         if self.has_converged:
-            metrics_dict['client_converged'] = 1.0
+            # Avoid sending client_converged=1.0 when fixed-round mode is enabled.
+            metrics_dict['client_converged'] = 1.0 if STOP_ON_CLIENT_CONVERGENCE else 0.0
         
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
         
@@ -503,7 +545,7 @@ class FederatedLearningClient:
             'num_samples': self.validation_generator.n,
             'metrics': metrics_dict
         })
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             await asyncio.sleep(0.5)
             self.running = False
@@ -568,7 +610,7 @@ async def main():
     train_generator = train_datagen.flow_from_directory(
         os.path.join(client_data_dir, 'train'),
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode='grayscale',
         class_mode='categorical',
         shuffle=True
@@ -577,7 +619,7 @@ async def main():
     validation_generator = val_datagen.flow_from_directory(
         os.path.join(client_data_dir, 'validation'),
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode='grayscale',
         class_mode='categorical',
         shuffle=False
@@ -591,19 +633,17 @@ async def main():
     # Create client
     client = FederatedLearningClient(CLIENT_ID, NUM_CLIENTS, train_generator, validation_generator)
     
-    # Configure QUIC with large stream data limits for model weights
-    # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/DDS for unbiased comparison
+    # QUIC config: cubic congestion, 60s idle; 128 MB flow control (aligned with server for fair FL comparison)
+    QUIC_MAX_DATA_BYTES = 128 * 1024 * 1024  # 128 MB
     configuration = QuicConfiguration(
         is_client=True,
         alpn_protocols=["fl"],
-        # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
-        max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
-        max_data=256 * 1024 * 1024,  # 256 MB total connection
-        # FAIR CONFIG: Timeout 600s for very_poor network scenarios
-        idle_timeout=600.0,  # 10 minutes
-        max_datagram_frame_size=65536,  # 64 KB frames
-        # Poor network adjustments
-        initial_rtt=0.15,  # 150ms (account for 100ms latency + jitter)
+        congestion_control_algorithm="cubic",
+        idle_timeout=60.0,
+        max_data=QUIC_MAX_DATA_BYTES,
+        max_stream_data=QUIC_MAX_DATA_BYTES,
+        max_datagram_frame_size=65536,
+        initial_rtt=0.15,
     )
     
     # Load CA certificate for verification (optional - set verify_mode to False for testing)

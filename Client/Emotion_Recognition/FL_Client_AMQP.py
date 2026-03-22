@@ -6,7 +6,7 @@ import json
 import pickle
 import base64
 import time
-import random
+import threading
 import pika
 
 # Detect Docker environment and set project root accordingly
@@ -25,8 +25,21 @@ if _utilities_path not in sys.path:
 
 from packet_logger import log_received_packet, log_sent_packet, init_db
 
+# Battery model (shared with gRPC/MQTT/Unified)
+_client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _client_dir not in sys.path:
+    sys.path.insert(0, _client_dir)
+from battery_model import BatteryModel
+
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+if _xla_flags:
+    sanitized_flags = [f for f in _xla_flags.split() if f != "--xla_gpu_enable_command_buffer="]
+    if sanitized_flags:
+        os.environ["XLA_FLAGS"] = " ".join(sanitized_flags)
+    else:
+        os.environ.pop("XLA_FLAGS", None)
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
 # Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
 # This ensures different clients use different GPUs in multi-GPU setups
@@ -67,13 +80,13 @@ if gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
         print("GPU memory growth enabled")
         
-        # Set GPU memory limit to avoid OOM (RTX 3080 has 10GB, reserve 7GB per process)
-        # This prevents one process from consuming all GPU memory
+        # Limit GPU memory per process so multiple clients fit (e.g. 2 clients on one GPU)
+        memory_limit_mb = int(os.environ.get("TF_GPU_MEMORY_LIMIT_MB", "4000"))
         for gpu in gpus:
             try:
                 tf.config.set_logical_device_configuration(
                     gpu,
-                    [tf.config.LogicalDeviceConfiguration(memory_limit=7000)]  # 7GB per GPU
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=memory_limit_mb)]
                 )
             except RuntimeError:
                 pass  # GPU already configured
@@ -88,6 +101,13 @@ if compression_path not in sys.path:
     sys.path.insert(0, compression_path)
 
 from quantization_client import Quantization, QuantizationConfig
+try:
+    from pruning_client import ModelPruning, PruningConfig
+    PRUNING_AVAILABLE = True
+except Exception:
+    ModelPruning = None
+    PruningConfig = None
+    PRUNING_AVAILABLE = False
 
 # AMQP Configuration
 AMQP_HOST = os.getenv("AMQP_HOST", "localhost")
@@ -99,6 +119,21 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
+AMQP_MAX_FRAME_BYTES = 128 * 1024
+AMQP_CHUNK_PAYLOAD_BYTES = 96 * 1024
+
+# Controls whether this client should signal/exit on local convergence.
+# When false, clients keep training until the server indicates completion.
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
+
+# AMQP delivery mode: 2=persistent (default), 1=non-persistent (for diagnostics/experiments)
+try:
+    AMQP_DELIVERY_MODE = int(os.getenv("AMQP_DELIVERY_MODE", "2"))
+except (TypeError, ValueError):
+    AMQP_DELIVERY_MODE = 2
+if AMQP_DELIVERY_MODE not in (1, 2):
+    AMQP_DELIVERY_MODE = 2
 
 # AMQP Exchanges and Queues
 EXCHANGE_BROADCAST = "fl_broadcast"
@@ -111,7 +146,7 @@ class FederatedLearningClient:
         self.num_clients = num_clients
         self.current_round = 0
         # Default batch size adjusted for separate GPUs
-        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        self.training_config = {"batch_size": 16, "local_epochs": 20}
         # Deduplication tracking
         self.last_global_round = -1
         self.last_training_round = -1
@@ -127,6 +162,8 @@ class FederatedLearningClient:
         
         # Model will be initialized from server config
         self.model = None
+        self._training_lock = threading.Lock()
+        self._training_thread = None
         
         # Initialize quantization compression (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
@@ -137,14 +174,31 @@ class FederatedLearningClient:
         else:
             self.quantizer = None
             print(f"Client {self.client_id}: Quantization disabled")
+
+        # Initialize pruning (default: disabled unless explicitly enabled)
+        up_env = os.getenv("USE_PRUNING", "false")
+        use_pruning = up_env.lower() in ("true", "1", "yes", "y")
+        if use_pruning and PRUNING_AVAILABLE and ModelPruning is not None:
+            self.pruner = ModelPruning(PruningConfig())
+            print(f"Client {self.client_id}: Pruning enabled")
+        else:
+            self.pruner = None
+            if use_pruning and not PRUNING_AVAILABLE:
+                print(f"Client {self.client_id}: Pruning requested but pruning module not available")
+            else:
+                print(f"Client {self.client_id}: Pruning disabled")
         
         # Initialize packet logging database
         init_db()
+        
+        # Battery/energy model for consumption tracking (server uses for battery plot)
+        self.battery_model = BatteryModel(protocol="amqp")
         
         # AMQP connection
         self.connection = None
         self.channel = None
         self.consuming = False
+        self._global_model_chunk_buffers = {}
         
         print(f"Client {self.client_id} initialized with:")
         print(f"  Training samples: {self.train_generator.n}")
@@ -162,6 +216,56 @@ class FederatedLearningClient:
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
+
+    def _apply_generator_batch_size(self, batch_size):
+        """Sync DirectoryIterator batch size with training config."""
+        try:
+            batch_size = int(batch_size)
+        except (TypeError, ValueError):
+            return
+        if batch_size <= 0:
+            return
+
+        changed = False
+        for gen_name in ("train_generator", "validation_generator"):
+            generator = getattr(self, gen_name, None)
+            if generator is None:
+                continue
+            current = getattr(generator, "batch_size", None)
+            if current != batch_size:
+                setattr(generator, "batch_size", batch_size)
+                changed = True
+        if changed:
+            print(f"Client {self.client_id} synchronized generator batch_size to {batch_size}")
+
+    def _launch_training_for_round(self, round_num):
+        """Start local training in a background thread to keep AMQP consumer responsive."""
+        with self._training_lock:
+            if self._training_thread is not None and self._training_thread.is_alive():
+                print(f"Client {self.client_id} training already in progress; ignoring start for round {round_num}")
+                return
+            if self.last_training_round == round_num:
+                print(f"Client {self.client_id} ignoring duplicate start training for round {round_num}")
+                return
+
+            self.current_round = round_num
+            self.last_training_round = round_num
+            print(f"\nClient {self.client_id} starting training for round {round_num}...")
+
+            self._training_thread = threading.Thread(
+                target=self._train_local_model_safe,
+                args=(round_num,),
+                daemon=True,
+            )
+            self._training_thread.start()
+
+    def _train_local_model_safe(self, round_num):
+        try:
+            self.train_local_model()
+        except Exception as e:
+            print(f"Client {self.client_id} training thread error on round {round_num}: {e}")
+            import traceback
+            traceback.print_exc()
     
     def build_model_from_config(self, model_config):
         """Build model from server-provided configuration"""
@@ -200,6 +304,17 @@ class FederatedLearningClient:
         )
         
         return model
+
+    def _build_amqp_parameters(self):
+        credentials = pika.PlainCredentials(AMQP_USER, AMQP_PASSWORD)
+        return pika.ConnectionParameters(
+            host=AMQP_HOST,
+            port=AMQP_PORT,
+            credentials=credentials,
+            heartbeat=600,
+            blocked_connection_timeout=600,
+            frame_max=AMQP_MAX_FRAME_BYTES,
+        )
     
     
     def connect(self):
@@ -210,15 +325,7 @@ class FederatedLearningClient:
         for attempt in range(max_retries):
             try:
                 print(f"Attempting to connect to RabbitMQ at {AMQP_HOST}:{AMQP_PORT}...")
-                credentials = pika.PlainCredentials(AMQP_USER, AMQP_PASSWORD)
-                # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
-                parameters = pika.ConnectionParameters(
-                    host=AMQP_HOST,
-                    port=AMQP_PORT,
-                    credentials=credentials,
-                    heartbeat=600,  # 10 minutes for very_poor network
-                    blocked_connection_timeout=600  # Aligned with heartbeat
-                )
+                parameters = self._build_amqp_parameters()
                 self.connection = pika.BlockingConnection(parameters)
                 self.channel = self.connection.channel()
                 
@@ -240,8 +347,10 @@ class FederatedLearningClient:
                 
                 print(f"Client {self.client_id} connected to RabbitMQ broker")
                 
-                # Send registration message
-                self.send_registration()
+                # Send registration a few times so server receives it even if it wasn't ready on first send
+                for _ in range(3):
+                    self.send_registration()
+                    time.sleep(2)
                 
                 return True
                 
@@ -271,22 +380,20 @@ class FederatedLearningClient:
                         self.connection.close()
                     except:
                         pass
-                
-                credentials = pika.PlainCredentials(AMQP_USER, AMQP_PASSWORD)
-                # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
-                parameters = pika.ConnectionParameters(
-                    host=AMQP_HOST,
-                    port=AMQP_PORT,
-                    credentials=credentials,
-                    heartbeat=600,  # 10 minutes for very_poor network
-                    blocked_connection_timeout=600  # Aligned with heartbeat
-                )
+
+                parameters = self._build_amqp_parameters()
                 self.connection = pika.BlockingConnection(parameters)
                 self.channel = self.connection.channel()
                 
                 # Redeclare exchanges
                 self.channel.exchange_declare(exchange=EXCHANGE_BROADCAST, exchange_type='fanout', durable=True)
                 self.channel.exchange_declare(exchange=EXCHANGE_CLIENT_UPDATES, exchange_type='direct', durable=True)
+                
+                # Re-setup consumer so start_consuming() can be called again on this channel
+                queue_broadcast = f"fl.client.{self.client_id}.broadcast"
+                self.channel.queue_declare(queue=queue_broadcast, durable=False, exclusive=True, auto_delete=True)
+                self.channel.queue_bind(exchange=EXCHANGE_BROADCAST, queue=queue_broadcast)
+                self.channel.basic_consume(queue=queue_broadcast, on_message_callback=self.on_broadcast_message, auto_ack=True)
                 
                 print(f"Client {self.client_id} reconnected successfully")
                 return True
@@ -299,13 +406,17 @@ class FederatedLearningClient:
         return False
     
     def publish_with_retry(self, exchange, routing_key, body, properties=None, max_retries=3):
-        """Publish message with automatic retry and reconnection"""
+        """Publish using a dedicated connection to avoid cross-thread use of consumer channel."""
         for attempt in range(max_retries):
+            publish_connection = None
             try:
                 if properties is None:
-                    properties = pika.BasicProperties(delivery_mode=2)
-                    
-                self.channel.basic_publish(
+                    properties = pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
+
+                publish_connection = pika.BlockingConnection(self._build_amqp_parameters())
+                publish_channel = publish_connection.channel()
+                publish_channel.exchange_declare(exchange=exchange, exchange_type='direct', durable=True)
+                publish_channel.basic_publish(
                     exchange=exchange,
                     routing_key=routing_key,
                     body=body,
@@ -327,15 +438,17 @@ class FederatedLearningClient:
                     pika.exceptions.AMQPConnectionError) as e:
                 print(f"Client {self.client_id} publish failed (attempt {attempt + 1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
-                    if self.reconnect():
-                        print(f"Client {self.client_id} retrying publish...")
-                        time.sleep(0.5)
-                    else:
-                        print(f"Client {self.client_id} reconnection failed")
-                        return False
+                    print(f"Client {self.client_id} retrying publish...")
+                    time.sleep(0.5)
                 else:
                     print(f"Client {self.client_id} failed to publish after {max_retries} attempts")
                     return False
+            finally:
+                if publish_connection and not publish_connection.is_closed:
+                    try:
+                        publish_connection.close()
+                    except Exception:
+                        pass
         
         return False
     
@@ -346,7 +459,7 @@ class FederatedLearningClient:
             exchange=EXCHANGE_CLIENT_UPDATES,
             routing_key='client.register',
             body=json.dumps(registration),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         ):
             log_sent_packet(
                 packet_size=len(json.dumps(registration)),
@@ -358,6 +471,148 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} registration sent")
         else:
             print(f"Client {self.client_id} ERROR: Failed to send registration")
+
+    def _assemble_global_model_chunk(self, data):
+        """Buffer and reassemble chunked global model broadcast messages."""
+        try:
+            chunk_index = int(data.get("chunk_index", 0))
+            total_chunks = int(data.get("total_chunks", 1))
+            round_num = int(data["round"])
+            payload_key = data["payload_key"]
+            payload_chunk = data.get("payload_chunk", "")
+        except Exception as e:
+            print(f"Client {self.client_id} invalid global-model chunk metadata: {e}")
+            return None
+
+        if total_chunks <= 1:
+            assembled = dict(data)
+            assembled[payload_key] = payload_chunk
+            assembled["message_type"] = "global_model"
+            assembled["type"] = "global_model"
+            assembled.pop("payload_chunk", None)
+            assembled.pop("payload_key", None)
+            return assembled
+
+        chunk_key = (round_num, payload_key)
+        entry = self._global_model_chunk_buffers.setdefault(
+            chunk_key,
+            {"chunks": {}, "total_chunks": total_chunks, "base": None, "updated_at": time.time()}
+        )
+
+        if entry["base"] is None:
+            entry["base"] = {
+                "message_type": "global_model",
+                "type": "global_model",
+                "round": round_num,
+                "model_config": data.get("model_config")
+            }
+        if data.get("model_config") and not entry["base"].get("model_config"):
+            entry["base"]["model_config"] = data.get("model_config")
+
+        if chunk_index not in entry["chunks"]:
+            entry["chunks"][chunk_index] = payload_chunk
+        entry["updated_at"] = time.time()
+
+        if len(entry["chunks"]) < total_chunks:
+            return None
+
+        assembled_payload = "".join(entry["chunks"].get(i, "") for i in range(total_chunks))
+        assembled = dict(entry["base"])
+        assembled[payload_key] = assembled_payload
+        self._global_model_chunk_buffers.pop(chunk_key, None)
+        print(
+            f"Client {self.client_id} reassembled global model for round {round_num} "
+            f"from {total_chunks} chunks"
+        )
+        return assembled
+
+    def _chunk_model_update_messages(self, update_message):
+        payload_key = "compressed_data" if "compressed_data" in update_message else "weights"
+        payload_text = update_message[payload_key]
+        if not isinstance(payload_text, str):
+            raise TypeError(f"Expected string payload for {payload_key}, got {type(payload_text).__name__}")
+
+        chunks = [
+            payload_text[i:i + AMQP_CHUNK_PAYLOAD_BYTES]
+            for i in range(0, len(payload_text), AMQP_CHUNK_PAYLOAD_BYTES)
+        ] or [payload_text]
+
+        chunk_messages = []
+        total_chunks = len(chunks)
+        for chunk_index, chunk_data in enumerate(chunks):
+            chunk_msg = {
+                "message_type": "model_update_chunk",
+                "type": "update_chunk",
+                "protocol": "amqp",
+                "client_id": update_message["client_id"],
+                "round": update_message["round"],
+                "payload_key": payload_key,
+                "payload_chunk": chunk_data,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "num_samples": update_message["num_samples"] if chunk_index == 0 else 0,
+                "metrics": update_message["metrics"] if chunk_index == 0 else {},
+            }
+            if chunk_index == 0 and "diagnostic_send_start_ts" in update_message:
+                chunk_msg["diagnostic_send_start_ts"] = update_message["diagnostic_send_start_ts"]
+            chunk_messages.append(chunk_msg)
+        return chunk_messages
+
+    def _publish_update_with_chunking(self, update_message):
+        payload = json.dumps(update_message)
+        payload_size = len(payload.encode("utf-8"))
+
+        if payload_size <= AMQP_MAX_FRAME_BYTES:
+            ok = self.publish_with_retry(
+                exchange=EXCHANGE_CLIENT_UPDATES,
+                routing_key='client.update',
+                body=payload,
+                properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
+            )
+            if not ok:
+                raise RuntimeError("AMQP publish failed for single model update")
+            log_sent_packet(
+                packet_size=len(payload),
+                peer=EXCHANGE_CLIENT_UPDATES,
+                protocol="AMQP",
+                round=self.current_round,
+                extra_info="Model update"
+            )
+            return payload_size
+
+        chunk_messages = self._chunk_model_update_messages(update_message)
+        print(
+            f"Client {self.client_id} chunking AMQP model update: {payload_size} bytes total, "
+            f"{len(chunk_messages)} chunks"
+        )
+        sent_bytes = 0
+        for chunk in chunk_messages:
+            chunk_payload = json.dumps(chunk)
+            chunk_size = len(chunk_payload.encode("utf-8"))
+            if chunk_size > AMQP_MAX_FRAME_BYTES:
+                raise ValueError(
+                    f"AMQP chunk exceeds 128KB limit: {chunk_size} bytes "
+                    f"(chunk {chunk['chunk_index'] + 1}/{chunk['total_chunks']})"
+                )
+            ok = self.publish_with_retry(
+                exchange=EXCHANGE_CLIENT_UPDATES,
+                routing_key='client.update',
+                body=chunk_payload,
+                properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
+            )
+            if not ok:
+                raise RuntimeError(
+                    f"AMQP publish failed for chunk {chunk['chunk_index'] + 1}/{chunk['total_chunks']}"
+                )
+            sent_bytes += chunk_size
+            log_sent_packet(
+                packet_size=chunk_size,
+                peer=EXCHANGE_CLIENT_UPDATES,
+                protocol="AMQP",
+                round=self.current_round,
+                extra_info=f"Model update chunk {chunk['chunk_index'] + 1}/{chunk['total_chunks']}"
+            )
+        return sent_bytes
     
     def on_broadcast_message(self, ch, method, properties, body):
         """Unified handler for all broadcast messages - routes based on message_type"""
@@ -370,9 +625,9 @@ class FederatedLearningClient:
         )
         try:
             data = json.loads(body.decode())
-            message_type = data.get('message_type')
+            message_type = data.get('message_type') or data.get('type')
             
-            if message_type == 'global_model':
+            if message_type in ('global_model', 'global_model_chunk'):
                 self.on_global_model(ch, method, properties, body)
             elif message_type == 'training_config':
                 self.on_training_config(ch, method, properties, body)
@@ -401,12 +656,19 @@ class FederatedLearningClient:
         try:
             data = json.loads(body.decode())
             
-            # Check message type
-            if data.get('message_type') != 'global_model':
+            message_type = data.get('message_type') or data.get('type')
+            if message_type == 'global_model_chunk':
+                assembled = self._assemble_global_model_chunk(data)
+                if assembled is None:
+                    return
+                data = assembled
+            elif message_type != 'global_model':
                 return
             
             round_num = data['round']
-            # Check if weights are quantized
+            # Decompress/deserialize weights.
+            # If both pruning and quantization are enabled, server should send quantized_data that already reflects pruning,
+            # so we must dequantize first when available.
             if 'quantized_data' in data and self.quantizer is not None:
                 compressed_data = data['quantized_data']
                 # If server sent serialized base64 string, decode and unpickle
@@ -415,9 +677,21 @@ class FederatedLearningClient:
                         compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
                     except Exception as e:
                         print(f"Client {self.client_id} error decoding quantized_data: {e}")
-                weights = self.quantizer.decompress(compressed_data)
+                # Keep quantized end-to-end: do NOT dequantize/decompress.
+                weights = self.quantizer.as_training_weights(compressed_data)
                 if round_num > 0:
-                    print(f"Client {self.client_id}: Received and decompressed quantized global model")
+                    print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
+            elif 'pruned_data' in data and PRUNING_AVAILABLE and ModelPruning is not None:
+                try:
+                    compressed_bytes = base64.b64decode(data['pruned_data'].encode('utf-8'))
+                    pruning_codec = self.pruner or ModelPruning(PruningConfig())
+                    weights = pruning_codec.decompress_pruned_weights(compressed_bytes)
+                    if round_num > 0:
+                        print(f"Client {self.client_id}: Received and decompressed pruned global model")
+                except Exception as e:
+                    print(f"Client {self.client_id} error decoding pruned_data: {e}")
+                    encoded_weights = data['weights']
+                    weights = self.deserialize_weights(encoded_weights)
             else:
                 encoded_weights = data['weights']
                 weights = self.deserialize_weights(encoded_weights)
@@ -471,8 +745,7 @@ class FederatedLearningClient:
                 if self.pending_start_training_round == 1:
                     print(f"Client {self.client_id} processing deferred start_training for round 1")
                     self.pending_start_training_round = None
-                    self.current_round = 1
-                    self.train_local_model()
+                    self._launch_training_for_round(1)
             else:
                 # Updated model after aggregation
                 self.model.set_weights(weights)
@@ -493,6 +766,11 @@ class FederatedLearningClient:
                 return
             
             self.training_config = data['config']
+            try:
+                self.training_config["batch_size"] = int(self.training_config.get("batch_size", DEFAULT_DATA_BATCH_SIZE))
+            except (TypeError, ValueError):
+                self.training_config["batch_size"] = DEFAULT_DATA_BATCH_SIZE
+            self._apply_generator_batch_size(self.training_config["batch_size"])
             print(f"Client {self.client_id} updated config: {self.training_config}")
         except Exception as e:
             print(f"Client {self.client_id} error handling config: {e}")
@@ -507,6 +785,10 @@ class FederatedLearningClient:
                 return
             
             round_num = data['round']
+
+            if self.last_training_round == round_num:
+                print(f"Client {self.client_id} ignoring duplicate start training for round {round_num}")
+                return
             
             # Check if we're ready for this round (should have received global model first)
             if self.current_round == 0 and round_num == 1:
@@ -515,16 +797,13 @@ class FederatedLearningClient:
                     self.pending_start_training_round = round_num
                     return
                 # First training round with initial global model
-                self.current_round = round_num
-                print(f"\nClient {self.client_id} starting training for round {round_num} with initial global model...")
-                self.train_local_model()
+                self._launch_training_for_round(round_num)
             elif round_num == self.current_round:
                 if self.model is None:
                     print(f"Client {self.client_id} received start_training for round {round_num} but model not initialized; ignoring signal.")
                     return
                 # Subsequent rounds
-                print(f"\nClient {self.client_id} starting training for round {round_num}...")
-                self.train_local_model()
+                self._launch_training_for_round(round_num)
             else:
                 print(f"Client {self.client_id} round mismatch - received signal for round {round_num}, currently at {self.current_round}")
         except Exception as e:
@@ -557,6 +836,7 @@ class FederatedLearningClient:
     def train_local_model(self):
         """Train model on local data with GPU optimization and send updates to server"""
         batch_size = self.training_config['batch_size']
+        self._apply_generator_batch_size(batch_size)
         epochs = self.training_config['local_epochs']
         # Limit steps per epoch for faster training (configurable via env)
         try:
@@ -566,6 +846,7 @@ class FederatedLearningClient:
             steps_per_epoch = 100
             val_steps = 25
         
+        training_start = time.time()
         # Use GPU device context for training
         with tf.device('/GPU:0'):
             # Train the model with GPU acceleration
@@ -581,6 +862,17 @@ class FederatedLearningClient:
         # Get updated weights
         updated_weights = self.model.get_weights()
         num_samples = self.train_generator.n
+
+        # Apply pruning before quantization/transmission when enabled
+        if self.pruner is not None:
+            updated_weights = self.pruner.prune_weights(updated_weights, step=self.current_round)
+            if self.current_round == 0 or (self.current_round % 5 == 0):
+                stats = self.pruner.get_pruning_statistics(updated_weights)
+                print(
+                    f"Client {self.client_id}: Pruned weights - "
+                    f"Sparsity: {stats['overall_sparsity']:.2%}, "
+                    f"Compression: {stats['compression_ratio']:.2f}x"
+                )
         
         # Prepare training metrics
         metrics = {
@@ -590,7 +882,9 @@ class FederatedLearningClient:
             "val_accuracy": float(history.history["val_accuracy"][-1])
         }
         
-        # Compress weights if quantization is enabled
+        # Compress weights for transmission:
+        # - if quantization enabled -> quantize pruned weights
+        # - else if pruning enabled -> sparse-compress pruned weights
         if self.quantizer is not None:
             compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
             stats = self.quantizer.get_compression_stats(updated_weights, compressed_data)
@@ -607,6 +901,26 @@ class FederatedLearningClient:
                 "num_samples": num_samples,
                 "metrics": metrics
             }
+        elif self.pruner is not None:
+            try:
+                pruned_bytes, _ = self.pruner.compress_pruned_weights(updated_weights)
+                pruned_b64 = base64.b64encode(pruned_bytes).decode("utf-8")
+                update_message = {
+                    "client_id": self.client_id,
+                    "round": self.current_round,
+                    "pruned_data": pruned_b64,
+                    "num_samples": num_samples,
+                    "metrics": metrics
+                }
+            except Exception as e:
+                print(f"Client {self.client_id} error compressing pruned weights: {e}")
+                update_message = {
+                    "client_id": self.client_id,
+                    "round": self.current_round,
+                    "weights": self.serialize_weights(updated_weights),
+                    "num_samples": num_samples,
+                    "metrics": metrics
+                }
         else:
             # Send model update without compression
             update_message = {
@@ -617,28 +931,27 @@ class FederatedLearningClient:
             "metrics": metrics
         }
         
-        # Introduce random delay before sending model update
-        delay = random.uniform(0.5, 3.0)  # Random delay between 0.5 and 3.0 seconds
-        print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
-        time.sleep(delay)
-        
-        # Publish with retry logic
-        if self.publish_with_retry(
-            exchange=EXCHANGE_CLIENT_UPDATES,
-            routing_key='client.update',
-            body=json.dumps(update_message),
-            properties=pika.BasicProperties(delivery_mode=2)
-        ):
-            log_sent_packet(
-                packet_size=len(json.dumps(update_message)),
-                peer=EXCHANGE_CLIENT_UPDATES,
-                protocol="AMQP",
-                round=self.current_round,
-                extra_info="Model update"
-            )
+        training_time = time.time() - training_start
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            send_start_ts = time.time()
+            send_start_cpu = time.perf_counter()
+            update_message["diagnostic_send_start_ts"] = send_start_ts
+
+        # FAIR FIX: Removed random pre-send delay so AMQP matches other protocols and
+        # diagnostic pipeline measurements are not biased by artificial sleep.
+
+        comm_start = time.time()
+        try:
+            bytes_sent = self._publish_update_with_chunking(update_message)
+            communication_time = time.time() - comm_start
+            self.battery_model.update(bytes_sent, 0, training_time, communication_time)
+            if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+                send_end_cpu = time.perf_counter()
+                O_send = send_end_cpu - send_start_cpu
+                print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={bytes_sent} send_start_ts={send_start_ts:.9f}")
             print(f"Client {self.client_id} sent model update for round {self.current_round}")
-        else:
-            print(f"Client {self.client_id} ERROR: Failed to send model update for round {self.current_round}")
+        except Exception as e:
+            print(f"Client {self.client_id} ERROR: Failed to send model update for round {self.current_round}: {e}")
             return
         print(f"Training metrics - Loss: {metrics['loss']:.4f}, Accuracy: {metrics['accuracy']:.4f}")
     
@@ -670,10 +983,12 @@ class FederatedLearningClient:
         
         metrics_dict = {
             "loss": float(loss),
-            "accuracy": float(accuracy)
+            "accuracy": float(accuracy),
+            "battery_soc": float(self.battery_model.battery_soc),
         }
         if self.has_converged:
-            metrics_dict["client_converged"] = 1.0
+            # Avoid sending client_converged=1.0 when fixed-round mode is enabled.
+            metrics_dict["client_converged"] = 1.0 if STOP_ON_CLIENT_CONVERGENCE else 0.0
         
         metrics_message = {
             "client_id": self.client_id,
@@ -686,7 +1001,7 @@ class FederatedLearningClient:
             exchange=EXCHANGE_CLIENT_UPDATES,
             routing_key='client.metrics',
             body=json.dumps(metrics_message),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         ):
             print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
             log_sent_packet(
@@ -696,7 +1011,7 @@ class FederatedLearningClient:
                 round=self.current_round,
                 extra_info="Evaluation metrics"
             )
-            if self.has_converged:
+            if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
                 print(f"Client {self.client_id} notifying server of convergence and disconnecting")
                 time.sleep(2)
                 self.stop()
@@ -704,21 +1019,44 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} ERROR: Failed to send evaluation metrics")
     
     def start(self):
-        """Start consuming messages"""
+        """Start consuming messages. Restarts consuming after connection loss if reconnect() was used from a callback."""
         print(f"\nClient {self.client_id} waiting for messages...")
         self.consuming = True
-        try:
-            self.channel.start_consuming()
-        except KeyboardInterrupt:
-            print(f"\nClient {self.client_id} stopping...")
-            self.stop()
+        while self.consuming:
+            try:
+                self.channel.start_consuming()
+            except KeyboardInterrupt:
+                print(f"\nClient {self.client_id} stopping...")
+                self.stop()
+                break
+            except (pika.exceptions.ConnectionWrongStateError, pika.exceptions.AMQPConnectionError, ConnectionResetError) as e:
+                if not self.consuming:
+                    break
+                # Connection was lost (e.g. during publish); may have reconnected from callback
+                if self.connection and not self.connection.is_closed:
+                    # Reconnected from callback; consumer already set up on new channel
+                    continue
+                if self.reconnect():
+                    continue
+                raise
+            except Exception as e:
+                if not self.consuming:
+                    break
+                raise
     
     def stop(self):
         """Stop consuming and close connection"""
-        if self.consuming:
-            self.channel.stop_consuming()
-        if self.connection and not self.connection.is_closed:
-            self.connection.close()
+        self.consuming = False
+        try:
+            if self.channel and self.connection and not self.connection.is_closed:
+                self.channel.stop_consuming()
+        except Exception:
+            pass
+        try:
+            if self.connection and not self.connection.is_closed:
+                self.connection.close()
+        except Exception:
+            pass
         print(f"Client {self.client_id} disconnected")
 
 
@@ -744,7 +1082,7 @@ def load_data(client_id):
     train_generator = train_data_gen.flow_from_directory(
         train_path,
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode="grayscale",
         class_mode='categorical',
         shuffle=True
@@ -753,7 +1091,7 @@ def load_data(client_id):
     validation_generator = validation_data_gen.flow_from_directory(
         validation_path,
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode="grayscale",
         class_mode='categorical',
         shuffle=False

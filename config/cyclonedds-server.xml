@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- CycloneDDS MACVLAN server: static peers (IPs match docker-compose-emotion.macvlan.yml DDS static addresses) -->
+<CycloneDDS>
+  <Domain id="0">
+    <General>
+      <Interfaces>
+        <NetworkInterface name="eth0" multicast="false" autodetermine="false"/>
+      </Interfaces>
+    </General>
+    <Discovery>
+      <Peers>
+        <Peer address="192.168.254.11:7410"/>
+        <Peer address="192.168.254.12:7410"/>
+      </Peers>
+      <ParticipantIndex>0</ParticipantIndex>
+    </Discovery>
+  </Domain>
+</CycloneDDS>

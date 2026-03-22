@@ -7,9 +7,14 @@ import numpy as np
 import sys
 import os
 
-# Add paths
-client_compression_path = os.path.join(os.path.dirname(__file__), 'Client', 'Compression_Technique')
-server_compression_path = os.path.join(os.path.dirname(__file__), 'Server', 'Compression_Technique')
+# Add paths (works for both native checkout and Docker /app mount)
+project_root = '/app' if os.path.exists('/app') else os.path.abspath(
+    os.path.join(os.path.dirname(__file__), '..', '..')
+)
+client_compression_path = os.path.join(project_root, 'Client', 'Compression_Technique')
+server_compression_path = os.path.join(project_root, 'Server', 'Compression_Technique')
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 sys.path.insert(0, client_compression_path)
 sys.path.insert(0, server_compression_path)
 
@@ -49,8 +54,8 @@ def test_parameter_quantization():
     print(f"\nOriginal weights size: {original_size:.2f} MB")
     print(f"Number of layers: {len(weights)}")
     
-    # Test different bit depths
-    for bits in [8, 16, 32]:
+    # Test different bit depths (including 4-bit with nibble packing)
+    for bits in [4, 8, 16, 32]:
         print(f"\n--- Testing {bits}-bit quantization ---")
         
         config = QuantizationConfig(

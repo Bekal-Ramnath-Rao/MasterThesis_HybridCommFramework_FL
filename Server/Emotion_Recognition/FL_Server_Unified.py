@@ -7,11 +7,24 @@ using whichever protocol they selected via RL.
 """
 
 import os
+import socket
 import sys
 
 # Configure GPU before importing TensorFlow
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+_gpu_id = os.environ.get('GPU_DEVICE_ID', os.environ.get('CUDA_VISIBLE_DEVICES', '0'))
+os.environ['CUDA_VISIBLE_DEVICES'] = _gpu_id
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+# Ensure pip-installed CUDA 12 ptxas is on PATH (system ptxas may be too old)
+_nvcc_bin = os.path.join(sys.prefix, 'lib', 'python' + '.'.join(map(str, sys.version_info[:2])),
+                        'site-packages', 'nvidia', 'cuda_nvcc', 'bin')
+if os.path.isdir(_nvcc_bin) and _nvcc_bin not in os.environ.get('PATH', ''):
+    os.environ['PATH'] = _nvcc_bin + ':' + os.environ.get('PATH', '')
+
+# Remove stale CUDA 10.x paths from LD_LIBRARY_PATH to avoid library conflicts
+_ld_path = os.environ.get('LD_LIBRARY_PATH', '')
+_ld_path = ':'.join(p for p in _ld_path.split(':') if p and 'cuda-10' not in p)
+os.environ['LD_LIBRARY_PATH'] = _ld_path
 
 import numpy as np
 import pandas as pd
@@ -25,6 +38,9 @@ import fcntl
 from typing import List, Dict, Sequence, TYPE_CHECKING
 from pathlib import Path
 from concurrent import futures
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 import tensorflow as tf
 
@@ -118,6 +134,7 @@ if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 
 from packet_logger import init_db, log_sent_packet, log_received_packet
+from experiment_results_path import get_experiment_results_dir
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -136,6 +153,7 @@ except ImportError:
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
@@ -152,8 +170,17 @@ QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 HTTP3_HOST = os.getenv("HTTP3_HOST", '0.0.0.0')
 HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
-# FAIR CONFIG: 64 KB chunks for better DDS performance in poor networks
-CHUNK_SIZE = 64 * 1024  # 64KB chunks
+
+# Protocol max payload sizes (unified spec)
+MQTT_MAX_PAYLOAD_BYTES = 128 * 1024   # 128 KB
+AMQP_MAX_FRAME_BYTES = 128 * 1024     # 128 KB
+GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(4 * 1024 * 1024)))  # 4 MB
+HTTP3_MAX_STREAM_DATA = 16 * 1024     # HTTP/3: 16 KB per stream
+CHUNK_SIZE = 64 * 1024                # DDS: 64 KB per chunk
+# QUIC flow control (separate from HTTP/3; 128 MB for QUIC stream)
+QUIC_HTTP3_MAX_DATA_BYTES = 128 * 1024 * 1024  # 128 MB for QUIC
+PROTOCOL_NEGOTIATION_TIMEOUT_SEC = float(os.getenv("PROTOCOL_NEGOTIATION_TIMEOUT_SEC", "3.0"))
+PROTOCOL_NEGOTIATION_POLL_SEC = float(os.getenv("PROTOCOL_NEGOTIATION_POLL_SEC", "0.1"))
 
 # DDS Data Structures (must be defined at module level for Python 3.8)
 if DDS_AVAILABLE:
@@ -187,9 +214,7 @@ if DDS_AVAILABLE:
         weights: sequence[int]  # CycloneDDS sequence type for sequence<octet> in IDL
         num_samples: int
         loss: float
-        mse: float
-        mae: float
-        mape: float
+        accuracy: float
     
     @dataclass
     class ModelUpdateChunk(IdlStruct):
@@ -200,9 +225,7 @@ if DDS_AVAILABLE:
         payload: sequence[int]
         num_samples: int
         loss: float
-        mse: float
-        mae: float
-        mape: float
+        accuracy: float
     
     @dataclass
     class EvaluationMetrics(IdlStruct):
@@ -211,9 +234,8 @@ if DDS_AVAILABLE:
         num_samples: int
         loss: float
         accuracy: float
-        mse: float
-        mae: float
-        mape: float
+        client_converged: float = 0.0
+        battery_soc: float = 1.0
 
 
 class UnifiedFederatedLearningServer:
@@ -227,7 +249,11 @@ class UnifiedFederatedLearningServer:
         self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
-        self.registered_clients = {}  # Maps client_id -> protocol_used
+        self.registered_clients = {}  # Maps client_id -> control-plane registration protocol
+        self.client_delivery_protocols = {}  # Maps client_id -> preferred protocol for next global model downlink
+        self.client_uplink_protocols = {}  # Maps client_id -> last protocol used for local model upload
+        self.client_metric_protocols = {}  # Maps client_id -> last protocol used for metrics
+        self.client_protocol_queries = {}  # Maps client_id -> {'round_id', 'global_model_id'} when negotiation query is pending
         self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
@@ -242,7 +268,10 @@ class UnifiedFederatedLearningServer:
         self.ACCURACY = []
         self.LOSS = []
         self.ROUNDS = []
-        
+        self.ROUND_TIMES = []
+        self.BATTERY_CONSUMPTION = []
+        self.round_start_time = None
+
         # Convergence tracking
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
@@ -252,7 +281,8 @@ class UnifiedFederatedLearningServer:
         
         # DDS chunk reassembly buffers (FAIR CONFIG: matching standalone)
         self.model_update_chunks = {}  # {client_id: {chunk_id: payload}}
-        self.model_update_metadata = {}  # {client_id: {total_chunks, num_samples, loss, mse, mae, mape}}
+        self.model_update_metadata = {}  # {client_id: {total_chunks, num_samples, loss, accuracy}}
+        self.transport_update_chunks = {}  # {(protocol, client_id, round): {'chunks': {}, ...}}
         
         # Lock for thread-safe operations (reentrant for nested handlers)
         self.lock = threading.RLock()
@@ -412,8 +442,7 @@ class UnifiedFederatedLearningServer:
                 protocol=mqtt.MQTTv311, 
                 clean_session=True
             )
-            # FAIR CONFIG: Set max packet size to 128MB (aligned with AMQP default)
-            self.mqtt_client._max_packet_size = 128 * 1024 * 1024  # 128 MB
+            self.mqtt_client._max_packet_size = MQTT_MAX_PAYLOAD_BYTES  # 128 KB
             self.mqtt_client.on_connect = self.on_mqtt_connect
             self.mqtt_client.on_message = self.on_mqtt_message
             # FAIR CONFIG: keepalive 600s for very_poor network
@@ -464,7 +493,8 @@ class UnifiedFederatedLearningServer:
                             connection_attempts=5,
                             retry_delay=1,
                             heartbeat=600,  # 10 minutes for very_poor network
-                            blocked_connection_timeout=600  # Aligned with heartbeat
+                            blocked_connection_timeout=600,  # Aligned with heartbeat
+                            frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
                         )
                         conn = pika.BlockingConnection(parameters)
                         ch = conn.channel()
@@ -501,7 +531,12 @@ class UnifiedFederatedLearningServer:
                     print(f"[AMQP] Error setting up queues for client {client_id}: {e}")
             elif "/update" in msg.topic:
                 data = json.loads(msg.payload.decode())
-                self.handle_client_update(data, 'mqtt')
+                if data.get('type') == 'update_chunk':
+                    reconstructed = self._handle_transport_update_chunk(data, 'mqtt')
+                    if reconstructed is not None:
+                        self.handle_client_update(reconstructed, 'mqtt')
+                else:
+                    self.handle_client_update(data, 'mqtt')
             elif "/metrics" in msg.topic:
                 data = json.loads(msg.payload.decode())
                 self.handle_client_metrics(data, 'mqtt')
@@ -544,7 +579,8 @@ class UnifiedFederatedLearningServer:
                 heartbeat=600,  # 10 minutes for very_poor network
                 blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=5,
-                retry_delay=2
+                retry_delay=2,
+                frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
             )
             
             # Connection 1: Consumer (owned by consumer thread)
@@ -564,6 +600,18 @@ class UnifiedFederatedLearningServer:
             
             # Queue for client registrations
             self.amqp_channel.queue_declare(queue='fl_client_register', durable=True)
+            self.amqp_channel.queue_declare(queue='fl_client_update', durable=True)
+            self.amqp_channel.queue_declare(queue='fl_client_metrics', durable=True)
+            self.amqp_channel.queue_bind(
+                exchange='fl_client_updates',
+                queue='fl_client_update',
+                routing_key='client.update'
+            )
+            self.amqp_channel.queue_bind(
+                exchange='fl_client_updates',
+                queue='fl_client_metrics',
+                routing_key='client.metrics'
+            )
             
             # Set up registration consumer
             self.amqp_channel.basic_consume(
@@ -635,6 +683,38 @@ class UnifiedFederatedLearningServer:
     # Note: AMQP update and metrics callbacks are now defined inline in on_amqp_register
     # to handle separate connections per client
     
+    def _process_amqp_update_body(self, body):
+        """Handle one AMQP update body using standalone routing keys."""
+        log_received_packet(
+            packet_size=len(body),
+            peer="amqp_client",
+            protocol="AMQP",
+            round=self.current_round,
+            extra_info="model_update"
+        )
+        data = json.loads(body.decode())
+        if data.get('type') == 'update_chunk':
+            reconstructed = self._handle_transport_update_chunk(data, 'amqp')
+            if reconstructed is not None:
+                self.handle_client_update(reconstructed, 'amqp')
+                print(f"[AMQP] Received reassembled update from client {reconstructed.get('client_id')}")
+        else:
+            self.handle_client_update(data, 'amqp')
+            print(f"[AMQP] Received update from client {data.get('client_id')}")
+    
+    def _process_amqp_metrics_body(self, body):
+        """Handle one AMQP metrics body using standalone routing keys."""
+        log_received_packet(
+            packet_size=len(body),
+            peer="amqp_client",
+            protocol="AMQP",
+            round=self.current_round,
+            extra_info="metrics"
+        )
+        data = json.loads(body.decode())
+        self.handle_client_metrics(data, 'amqp')
+        print(f"[AMQP] Received metrics from client {data.get('client_id')}")
+    
     async def handle_quic_message(self, message, protocol):
         """Handle incoming QUIC messages asynchronously"""
         try:
@@ -653,7 +733,7 @@ class UnifiedFederatedLearningServer:
             if msg_type == 'register':
                 await loop.run_in_executor(None, self.handle_client_registration, client_id, 'quic')
                 print(f"[QUIC] Received registration from client {client_id}")
-            elif msg_type == 'update':
+            elif msg_type in ('update', 'model_update'):
                 await loop.run_in_executor(None, self.handle_client_update, message, 'quic')
                 print(f"[QUIC] Received update from client {client_id}")
             elif msg_type == 'metrics':
@@ -715,7 +795,8 @@ class UnifiedFederatedLearningServer:
                         port=AMQP_PORT,
                         credentials=credentials,
                         heartbeat=600,  # 10 minutes for very_poor network
-                        blocked_connection_timeout=600  # Aligned with heartbeat
+                        blocked_connection_timeout=600,  # Aligned with heartbeat
+                        frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
                     )
                     print("Before sending message type:", message_type)
                     self.amqp_send_connection = pika.BlockingConnection(parameters)
@@ -762,9 +843,9 @@ class UnifiedFederatedLearningServer:
             self.grpc_server = grpc.server(
                 futures.ThreadPoolExecutor(max_workers=10),
                 options=[
-                    # FAIR CONFIG: Message size limits 128MB (aligned with AMQP default)
-                    ('grpc.max_send_message_length', 128 * 1024 * 1024),
-                    ('grpc.max_receive_message_length', 128 * 1024 * 1024),
+                    # Realistic max payload: gRPC 4 MB
+                    ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
+                    ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
                     # FAIR CONFIG: Keepalive settings 600s for very_poor network
                     ('grpc.keepalive_time_ms', 600000),  # 10 minutes
                     ('grpc.keepalive_timeout_ms', 60000),  # 1 minute timeout
@@ -824,16 +905,15 @@ class UnifiedFederatedLearningServer:
     async def _run_quic_server(self):
         """Async QUIC server"""
         try:
-            # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/DDS for unbiased comparison
+            # QUIC config: cubic congestion, 60s idle; flow control 128 MB (aligned with MQTT/gRPC for fair comparison)
             configuration = QuicConfiguration(
                 is_client=False,
                 alpn_protocols=["fl"],
-                # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
-                max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
-                max_data=256 * 1024 * 1024,  # 256 MB total connection
-                # FAIR CONFIG: Timeout 600s for very_poor network scenarios
-                idle_timeout=600.0,  # 10 minutes
-                max_datagram_frame_size=65536,  # 64 KB frames
+                congestion_control_algorithm="cubic",
+                idle_timeout=60.0,
+                max_data=QUIC_HTTP3_MAX_DATA_BYTES,
+                max_stream_data=QUIC_HTTP3_MAX_DATA_BYTES,
+                max_datagram_frame_size=65536,
             )
             
             # Generate self-signed certificate for QUIC
@@ -884,9 +964,11 @@ class UnifiedFederatedLearningServer:
                 critical=False
             ).sign(private_key, hashes.SHA256())
             
-            # Save to temp files
-            cert_path = "/tmp/quic_cert.pem"
-            key_path = "/tmp/quic_key.pem"
+            # Save to project-local cert dir to avoid /tmp permission issues
+            cert_dir = os.path.join(project_root, ".certs")
+            os.makedirs(cert_dir, exist_ok=True)
+            cert_path = os.path.join(cert_dir, "quic_cert.pem")
+            key_path = os.path.join(cert_dir, "quic_key.pem")
             
             with open(cert_path, "wb") as f:
                 f.write(cert.public_bytes(serialization.Encoding.PEM))
@@ -904,7 +986,7 @@ class UnifiedFederatedLearningServer:
             print(f"[QUIC]   - Host: {QUIC_HOST}:{QUIC_PORT}")
             print(f"[QUIC]   - Certificate: {cert_path}")
             print(f"[QUIC]   - ALPN: fl")
-            print(f"[QUIC]   - Max stream data: 50 MB")
+            print(f"[QUIC]   - Max stream data: {QUIC_HTTP3_MAX_DATA_BYTES // (1024*1024)} MB")
             print(f"[QUIC]   - Idle timeout: 3600s")
             
             # Create protocol factory that sets server reference
@@ -967,16 +1049,15 @@ class UnifiedFederatedLearningServer:
     async def _run_http3_server(self):
         """Async HTTP/3 server"""
         try:
-            # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/QUIC/DDS for unbiased comparison
+            # Realistic max payload: HTTP/3 16 KB per stream
             configuration = QuicConfiguration(
                 is_client=False,
                 alpn_protocols=H3_ALPN,
-                # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
-                max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
-                max_data=256 * 1024 * 1024,  # 256 MB total connection
-                # FAIR CONFIG: Timeout 600s for very_poor network scenarios
-                idle_timeout=600.0,  # 10 minutes
-                max_datagram_frame_size=65536,  # 64 KB frames
+                congestion_control_algorithm="cubic",
+                idle_timeout=60.0,
+                max_data=HTTP3_MAX_STREAM_DATA * 4,  # 64 KB total
+                max_stream_data=HTTP3_MAX_STREAM_DATA,  # 16 KB per stream
+                max_datagram_frame_size=65536,
             )
             
             # Generate self-signed certificate for HTTP/3 (reuse QUIC cert generation logic)
@@ -1027,9 +1108,11 @@ class UnifiedFederatedLearningServer:
                 critical=False
             ).sign(private_key, hashes.SHA256())
             
-            # Save to temp files
-            cert_path = "/tmp/http3_cert.pem"
-            key_path = "/tmp/http3_key.pem"
+            # Save to project-local cert dir to avoid /tmp permission issues
+            cert_dir = os.path.join(project_root, ".certs")
+            os.makedirs(cert_dir, exist_ok=True)
+            cert_path = os.path.join(cert_dir, "http3_cert.pem")
+            key_path = os.path.join(cert_dir, "http3_key.pem")
             
             with open(cert_path, "wb") as f:
                 f.write(cert.public_bytes(serialization.Encoding.PEM))
@@ -1047,14 +1130,13 @@ class UnifiedFederatedLearningServer:
             print(f"[HTTP/3]   - Host: {HTTP3_HOST}:{HTTP3_PORT}")
             print(f"[HTTP/3]   - Certificate: {cert_path}")
             print(f"[HTTP/3]   - ALPN: {H3_ALPN}")
-            print(f"[HTTP/3]   - Max stream data: 128 MB")
+            print(f"[HTTP/3]   - Max stream data: {HTTP3_MAX_STREAM_DATA // 1024} KB")
             print(f"[HTTP/3]   - Idle timeout: 600s")
             
             # Create protocol factory that sets server reference
             def create_protocol(*args, **kwargs):
                 protocol = HTTP3ServerProtocol(*args, **kwargs)
                 protocol.server = self
-                print(f"[HTTP/3] Server created protocol instance for new connection")
                 return protocol
             
             print(f"[HTTP/3] Server starting serve() on {HTTP3_HOST}:{HTTP3_PORT}")
@@ -1064,8 +1146,6 @@ class UnifiedFederatedLearningServer:
                 configuration=configuration,
                 create_protocol=create_protocol,
             )
-            print(f"[HTTP/3] ✓ Server serve() completed, now running indefinitely")
-            print(f"[HTTP/3] Server is ready to accept connections")
             # Keep server running indefinitely
             await asyncio.Future()  # Run forever
         except Exception as e:
@@ -1082,7 +1162,6 @@ class UnifiedFederatedLearningServer:
             # Store HTTP/3 protocol reference for ANY message (not just registration)
             if client_id and client_id != 'unknown':
                 self.http3_clients[client_id] = protocol
-                print(f"[HTTP/3] Stored protocol reference for client {client_id}")
             
             # Use asyncio.to_thread to call synchronous methods from async context
             # This ensures thread-safe execution of methods with locks
@@ -1090,13 +1169,14 @@ class UnifiedFederatedLearningServer:
             
             if msg_type == 'register':
                 await loop.run_in_executor(None, self.handle_client_registration, client_id, 'http3')
-                print(f"[HTTP/3] Received registration from client {client_id}")
-            elif msg_type == 'update':
+            elif msg_type in ('update', 'model_update'):
                 await loop.run_in_executor(None, self.handle_client_update, message, 'http3')
-                print(f"[HTTP/3] Received update from client {client_id}")
+            elif msg_type == 'update_chunk':
+                reconstructed = await loop.run_in_executor(None, self._handle_transport_update_chunk, message, 'http3')
+                if reconstructed is not None:
+                    await loop.run_in_executor(None, self.handle_client_update, reconstructed, 'http3')
             elif msg_type == 'metrics':
                 await loop.run_in_executor(None, self.handle_client_metrics, message, 'http3')
-                print(f"[HTTP/3] Received metrics from client {client_id}")
         except Exception as e:
             print(f"[HTTP/3] Error handling message: {e}")
             import traceback
@@ -1134,7 +1214,6 @@ class UnifiedFederatedLearningServer:
             protocol.transmit()
             
             msg_type = message.get('type')
-            print(f"[HTTP/3] Sent {msg_type} to client {client_id} on stream {stream_id} ({len(payload)} bytes)")
             
             log_sent_packet(
                 packet_size=len(payload),
@@ -1164,7 +1243,8 @@ class UnifiedFederatedLearningServer:
                 heartbeat=600,  # 10 minutes for very_poor network
                 blocked_connection_timeout=600,  # Aligned with heartbeat
                 connection_attempts=5,
-                retry_delay=2
+                retry_delay=2,
+                frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
             )
             self.amqp_consumer_connection = pika.BlockingConnection(parameters)
             self.amqp_consumer_channel = self.amqp_consumer_connection.channel()
@@ -1192,6 +1272,46 @@ class UnifiedFederatedLearningServer:
                     # Poll ALL client queues (1 to num_clients), not just registered ones
                     # This ensures we receive messages even before/during registration
                     found_messages = False
+                    try:
+                        method, properties, body = self.amqp_consumer_channel.basic_get(
+                            queue='fl_client_update',
+                            auto_ack=False
+                        )
+                        if body is not None:
+                            found_messages = True
+                            consecutive_empty_checks = 0
+                            try:
+                                self._process_amqp_update_body(body)
+                                self.amqp_consumer_channel.basic_ack(delivery_tag=method.delivery_tag)
+                            except Exception as e:
+                                print(f"[AMQP] Error processing shared update: {e}")
+                                try:
+                                    self.amqp_consumer_channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    
+                    try:
+                        method, properties, body = self.amqp_consumer_channel.basic_get(
+                            queue='fl_client_metrics',
+                            auto_ack=False
+                        )
+                        if body is not None:
+                            found_messages = True
+                            consecutive_empty_checks = 0
+                            try:
+                                self._process_amqp_metrics_body(body)
+                                self.amqp_consumer_channel.basic_ack(delivery_tag=method.delivery_tag)
+                            except Exception as e:
+                                print(f"[AMQP] Error processing shared metrics: {e}")
+                                try:
+                                    self.amqp_consumer_channel.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    
                     for client_id in range(1, self.num_clients + 1):
                         update_queue = f'client_{client_id}_updates'
                         
@@ -1235,8 +1355,14 @@ class UnifiedFederatedLearningServer:
                                         extra_info="model_update"
                                     )
                                     data = json.loads(body.decode())
-                                    self.handle_client_update(data, 'amqp')
-                                    print(f"[AMQP] Received update from client {client_id}")
+                                    if data.get('type') == 'update_chunk':
+                                        reconstructed = self._handle_transport_update_chunk(data, 'amqp')
+                                        if reconstructed is not None:
+                                            self.handle_client_update(reconstructed, 'amqp')
+                                            print(f"[AMQP] Received reassembled update from client {client_id}")
+                                    else:
+                                        self.handle_client_update(data, 'amqp')
+                                        print(f"[AMQP] Received update from client {client_id}")
                                     # Acknowledge the message
                                     self.amqp_consumer_channel.basic_ack(delivery_tag=method.delivery_tag)
                                 except Exception as e:
@@ -1388,22 +1514,14 @@ class UnifiedFederatedLearningServer:
                                         'total_chunks': total_chunks,
                                         'num_samples': sample.num_samples,
                                         'loss': sample.loss,
-                                        'mse': sample.mse,
-                                        'mae': sample.mae,
-                                        'mape': sample.mape
+                                        'accuracy': sample.accuracy,
                                     }
                                 
                                 # Store chunk
                                 self.model_update_chunks[client_id][chunk_id] = sample.payload
                                 
-                                # Progress update every 20 chunks to reduce console spam
-                                if (chunk_id + 1) % 20 == 0 or (chunk_id + 1) == total_chunks:
-                                    print(f"Received {chunk_id + 1}/{total_chunks} chunks from client {client_id}")
-                                
                                 # Check if all chunks received for this client
                                 if len(self.model_update_chunks[client_id]) == total_chunks:
-                                    print(f"All chunks received from client {client_id}, reassembling...")
-                                    
                                     # Reassemble chunks in order
                                     reassembled_data = []
                                     for i in range(total_chunks):
@@ -1415,20 +1533,27 @@ class UnifiedFederatedLearningServer:
                                     
                                     # Only process if we have all chunks
                                     if len(reassembled_data) > 0:
-                                        # Deserialize client weights
-                                        weights = pickle.loads(bytes(reassembled_data))
-                                        
+                                        # Deserialize: may be weights (list) or quantized compressed_data (dict)
+                                        unpacked = pickle.loads(bytes(reassembled_data))
                                         metadata = self.model_update_metadata[client_id]
-                                        data = {
-                                            'client_id': client_id,
-                                            'round': sample.round,
-                                            'weights': weights,
-                                            'num_samples': metadata['num_samples'],
-                                            'loss': metadata['loss'],
-                                            'mse': metadata['mse'],
-                                            'mae': metadata['mae'],
-                                            'mape': metadata['mape']
-                                        }
+                                        if isinstance(unpacked, dict) and ('quantization_params' in unpacked or 'compressed_data' in unpacked):
+                                            data = {
+                                                'client_id': client_id,
+                                                'round': sample.round,
+                                                'compressed_data': unpacked,
+                                                'num_samples': metadata['num_samples'],
+                                                'loss': metadata['loss'],
+                                                'accuracy': metadata['accuracy'],
+                                            }
+                                        else:
+                                            data = {
+                                                'client_id': client_id,
+                                                'round': sample.round,
+                                                'weights': unpacked,
+                                                'num_samples': metadata['num_samples'],
+                                                'loss': metadata['loss'],
+                                                'accuracy': metadata['accuracy'],
+                                            }
                                         
                                         log_received_packet(
                                             packet_size=len(reassembled_data),
@@ -1464,9 +1589,10 @@ class UnifiedFederatedLearningServer:
                                         'weights': weights,
                                         'num_samples': sample.num_samples,
                                         'loss': sample.loss,
-                                        'mse': sample.mse,
-                                        'mae': sample.mae,
-                                        'mape': sample.mape
+                                        'metrics': {
+                                            'loss': sample.loss,
+                                            'accuracy': sample.accuracy,
+                                        }
                                     }
                                     
                                     print(f"[DDS] Processing update from client {sample.client_id}, round {sample.round}")
@@ -1500,9 +1626,13 @@ class UnifiedFederatedLearningServer:
                                         'num_samples': sample.num_samples,
                                         'loss': sample.loss,
                                         'accuracy': sample.accuracy,
-                                        'mse': sample.mse,
-                                        'mae': sample.mae,
-                                        'mape': sample.mape
+                                        'battery_soc': sample.battery_soc,
+                                        'metrics': {
+                                            'loss': sample.loss,
+                                            'accuracy': sample.accuracy,
+                                            'client_converged': sample.client_converged,
+                                            'battery_soc': sample.battery_soc,
+                                        }
                                     }
                                     
                                     print(f"[DDS] Processing metrics from client {sample.client_id}, round {sample.round}")
@@ -1584,6 +1714,9 @@ class UnifiedFederatedLearningServer:
             is_late_join = self.training_started
             
             self.registered_clients[client_id] = protocol
+            # Keep control-plane/bootstrap robust: default downlink preference is gRPC
+            # until the client explicitly negotiates a different protocol.
+            self.client_delivery_protocols.setdefault(client_id, 'grpc')
             self.active_clients.add(client_id)
             
             if is_late_join:
@@ -1609,6 +1742,9 @@ class UnifiedFederatedLearningServer:
     def mark_client_converged(self, client_id):
         """Remove converged client from active training set."""
         with self.lock:
+            if not STOP_ON_CLIENT_CONVERGENCE:
+                # Fixed-round mode: ignore client-local convergence removal/disconnect.
+                return
             if client_id in self.active_clients:
                 self.active_clients.remove(client_id)
                 self.client_updates.pop(client_id, None)
@@ -1635,12 +1771,16 @@ class UnifiedFederatedLearningServer:
     
     def handle_client_update(self, data, protocol):
         """Handle client model update (thread-safe)"""
-        print(f"[DEBUG] handle_client_update ENTRY - protocol={protocol}, client_id={data.get('client_id')}, round={data.get('round')}, current_round={self.current_round}")
         with self.lock:
             client_id = data['client_id']
             round_num = data['round']
-            
-            print(f"[DEBUG] handle_client_update LOCKED - checking round: {round_num} vs {self.current_round}")
+            client_metrics = data.get('metrics') or {}
+            if not client_metrics:
+                client_metrics = {
+                    'loss': float(data.get('loss', 0.0)),
+                    'accuracy': float(data.get('accuracy', 0.0)),
+                    'client_converged': float(data.get('client_converged', 0.0)),
+                }
             
             # Check if this update is for the current round
             # Allow updates only for current round (not past or future)
@@ -1653,16 +1793,14 @@ class UnifiedFederatedLearningServer:
                       f"(round {round_num} > current {self.current_round})")
                 return
             
-            # Update the protocol this client is using (RL agent may change protocol per round)
-            self.registered_clients[client_id] = protocol
+            # Track client uplink protocol separately from negotiated downlink preference.
+            self.client_uplink_protocols[client_id] = protocol
 
             if client_id not in self.active_clients:
                 print(f"[{protocol.upper()}] Ignoring update from inactive client {client_id}")
                 return
-
-            client_metrics = data.get('metrics') or {}
             try:
-                converged_flag = float(client_metrics.get('client_converged', 0.0)) >= 1.0
+                converged_flag = STOP_ON_CLIENT_CONVERGENCE and float(client_metrics.get('client_converged', 0.0)) >= 1.0
             except Exception:
                 converged_flag = False
             if converged_flag:
@@ -1678,16 +1816,25 @@ class UnifiedFederatedLearningServer:
                         compressed_update = pickle.loads(base64.b64decode(compressed_update.encode('utf-8')))
                     except Exception as e:
                         print(f"[Server] Error decoding compressed_data: {e}")
-                weights = self.quantization_handler.decompress_client_update(client_id, compressed_update)
+                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                self.client_updates[client_id] = {
+                    'compressed_data': compressed_update,
+                    'num_samples': data['num_samples'],
+                    'metrics': client_metrics,
+                    'protocol': protocol
+                }
+                weights = None
             else:
                 weights = self.deserialize_weights(data['weights'])
             
             # Store update (metrics are handled separately via handle_client_metrics)
-            self.client_updates[client_id] = {
-                'weights': weights,
-                'num_samples': data['num_samples'],
-                'protocol': protocol
-            }
+            if 'compressed_data' not in data or self.quantization_handler is None:
+                self.client_updates[client_id] = {
+                    'weights': weights,
+                    'num_samples': data['num_samples'],
+                    'metrics': client_metrics,
+                    'protocol': protocol
+                }
             
             print(f"[{protocol.upper()}] Received update from client {client_id} "
                   f"({len(self.client_updates)}/{self.num_clients})")
@@ -1695,12 +1842,66 @@ class UnifiedFederatedLearningServer:
             # Wait for all active clients only
             if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
                 self.aggregate_models()
+
+    def _handle_transport_update_chunk(self, data, protocol):
+        """Reassemble chunked updates received over text-based transports."""
+        client_id = data['client_id']
+        round_num = data['round']
+        total_chunks = int(data.get('total_chunks', 1) or 1)
+        chunk_index = int(data.get('chunk_index', 0) or 0)
+        payload_chunk = data.get('payload_chunk', '')
+        payload_key = data.get('payload_key', 'compressed_data')
+        key = (protocol, client_id, round_num)
+
+        if key not in self.transport_update_chunks:
+            self.transport_update_chunks[key] = {
+                'chunks': {},
+                'total_chunks': total_chunks,
+                'payload_key': payload_key,
+                'num_samples': data.get('num_samples', 0),
+                'metrics': data.get('metrics', {}),
+                'protocol': data.get('protocol', protocol),
+            }
+
+        buf = self.transport_update_chunks[key]
+        buf['chunks'][chunk_index] = payload_chunk
+
+        received = len(buf['chunks'])
+        if received % 20 == 0 or received == total_chunks:
+            print(f"[{protocol.upper()}] Received {received}/{total_chunks} update chunks from client {client_id}")
+
+        if received < total_chunks:
+            return None
+
+        try:
+            payload = ''.join(buf['chunks'][i] for i in range(total_chunks))
+        except KeyError as e:
+            print(f"[{protocol.upper()}] Missing chunk {e} for client {client_id}, round {round_num}")
+            return None
+
+        reconstructed = {
+            'client_id': client_id,
+            'round': round_num,
+            'num_samples': buf['num_samples'],
+            'metrics': buf['metrics'],
+            'protocol': buf['protocol'],
+            payload_key: payload,
+        }
+        del self.transport_update_chunks[key]
+        print(f"[{protocol.upper()}] Reassembled chunked update from client {client_id} for round {round_num}")
+        return reconstructed
     
     def handle_client_metrics(self, data, protocol):
         """Handle client evaluation metrics (thread-safe)"""
         with self.lock:
             client_id = data['client_id']
             round_num = data['round']
+            metrics_payload = data.get('metrics') or {}
+            loss_value = float(data.get('loss', metrics_payload.get('loss', 0.0)))
+            accuracy_value = float(data.get('accuracy', metrics_payload.get('accuracy', 0.0)))
+            battery_soc = float(data.get('battery_soc', metrics_payload.get('battery_soc', 1.0)))
+            round_time_sec = float(data.get('round_time_sec', metrics_payload.get('round_time_sec', 0.0)))
+            client_converged = float(data.get('client_converged', metrics_payload.get('client_converged', 0.0)))
             
             print(f"[{protocol.upper()}] handle_client_metrics ENTRY: client_id={client_id}, round={round_num}, current_round={self.current_round}")
             print(f"[{protocol.upper()}] Current client_metrics keys: {list(self.client_metrics.keys())}")
@@ -1723,19 +1924,31 @@ class UnifiedFederatedLearningServer:
                       f"(round {round_num} > current {self.current_round})")
                 return
             
-            # Update the protocol this client is using (RL agent may change protocol per round)
-            self.registered_clients[client_id] = protocol
+            self.client_metric_protocols[client_id] = protocol
 
             if client_id not in self.active_clients:
                 print(f"[{protocol.upper()}] Ignoring metrics from inactive client {client_id}")
                 return
             
+            if STOP_ON_CLIENT_CONVERGENCE and client_converged >= 1.0:
+                print(f"[{protocol.upper()}] Received convergence metrics from client {client_id}")
+                self.mark_client_converged(client_id)
+                return
+            
             self.client_metrics[client_id] = {
                 'round': round_num,
                 'num_samples': data['num_samples'],
-                'loss': data['loss'],
-                'accuracy': data['accuracy'],
-                'protocol': protocol
+                'loss': loss_value,
+                'accuracy': accuracy_value,
+                'protocol': protocol,
+                'battery_soc': battery_soc,
+                'round_time_sec': round_time_sec,
+                'metrics': metrics_payload or {
+                    'loss': loss_value,
+                    'accuracy': accuracy_value,
+                    'battery_soc': battery_soc,
+                    'round_time_sec': round_time_sec,
+                },
             }
             
             print(f"[{protocol.upper()}] Received metrics from client {client_id} "
@@ -1757,68 +1970,26 @@ class UnifiedFederatedLearningServer:
             weights_data = self.serialize_weights(self.global_weights)
             weights_key = 'weights'
         
-        for client_id, protocol in self.registered_clients.items():
+        for client_id in self.registered_clients.keys():
             if client_id not in self.active_clients:
                 continue
             try:
-                if protocol == 'mqtt':
-                    message = {
-                        'round': 0,
-                        weights_key: weights_data,
-                        'model_config': self.model_config
-                    }
-                    self.send_via_mqtt(client_id, "fl/global_model", message)
-                    print(f"[MQTT] Sent initial model to client {client_id}")
-                    
-                elif protocol == 'amqp':
-                    message = {
-                        'round': 0,
-                        weights_key: weights_data,
-                        'model_config': self.model_config
-                    }
-                    self.send_via_amqp(client_id, 'global_model', message)
-                    print(f"[AMQP] Sent initial model to client {client_id}")
-                    
-                elif protocol == 'quic':
-                    # Send via QUIC stream
-                    message = {
-                        'type': 'global_model',
-                        'round': 0,
-                        weights_key: weights_data,
-                        'model_config': self.model_config
-                    }
-                    self.send_quic_message(client_id, message)
-                    print(f"[QUIC] Sent initial model to client {client_id}")
-                    
-                elif protocol == 'http3':
-                    # Send via HTTP/3 stream
-                    message = {
-                        'type': 'global_model',
-                        'round': 0,
-                        weights_key: weights_data,
-                        'model_config': self.model_config
-                    }
-                    self.send_http3_message(client_id, message)
-                    print(f"[HTTP/3] Sent initial model to client {client_id}")
-                    
-                elif protocol == 'grpc':
-                    # Mark initial model as ready for gRPC client to pull
-                    self.grpc_model_ready[client_id] = 0
-                    print(f"[gRPC] Initial model ready for client {client_id} to pull")
-                    
-                elif protocol == 'dds':
-                    print(f"[DDS] Client {client_id} will receive initial model via pub/sub")
-                    
+                # Unified mode always exposes the initial model through gRPC so the
+                # client can bootstrap even when the selected data plane cannot carry
+                # the full model payload.
+                self.grpc_model_ready[client_id] = 0
+                print(f"[gRPC] Initial model ready for client {client_id} to pull")
             except Exception as e:
-                print(f"[{protocol.upper()}] Error sending initial model to client {client_id}: {e}")
+                print(f"[gRPC] Error preparing initial model for client {client_id}: {e}")
                 import traceback
                 traceback.print_exc()
         
         # Start first round
         time.sleep(2)
         self.current_round = 1
+        self.round_start_time = time.time()
         self.signal_start_training()
-    
+
     def signal_start_training(self):
         """Signal all clients to start training for current round"""
         # Unified RL requirement: use gRPC control signaling only.
@@ -1846,37 +2017,114 @@ class UnifiedFederatedLearningServer:
                 print(f"[gRPC] start_evaluation flagged for client {client_id} (round {self.current_round})")
             except Exception as e:
                 pass
+
+    def _get_delivery_protocol(self, client_id):
+        """Resolve negotiated downlink protocol for a specific client."""
+        return self.client_delivery_protocols.get(
+            client_id,
+            'grpc'
+        )
+
+    def _normalize_protocol_name(self, protocol_name):
+        """Normalize and validate protocol names used for downlink negotiation."""
+        if protocol_name is None:
+            return None
+        normalized = str(protocol_name).strip().lower()
+        allowed = {'mqtt', 'amqp', 'grpc', 'quic', 'http3', 'dds'}
+        return normalized if normalized in allowed else None
+
+    def prepare_downlink_protocol_negotiation(self, target_client_ids, round_id, global_model_id):
+        """Queue per-client protocol queries and wait briefly for gRPC selections."""
+        target_clients = [cid for cid in target_client_ids if cid in self.active_clients]
+        if not target_clients:
+            return
+
+        print(
+            f"[gRPC] Negotiating downlink protocol for global model {global_model_id} "
+            f"(round {round_id}, clients={len(target_clients)})"
+        )
+
+        for client_id in target_clients:
+            self.client_protocol_queries[client_id] = {
+                'round_id': int(round_id),
+                'global_model_id': int(global_model_id),
+            }
+
+        deadline = time.time() + max(PROTOCOL_NEGOTIATION_TIMEOUT_SEC, 0.0)
+        while time.time() < deadline:
+            pending = [cid for cid in target_clients if cid in self.client_protocol_queries]
+            if not pending:
+                break
+            time.sleep(max(PROTOCOL_NEGOTIATION_POLL_SEC, 0.01))
+
+        pending_after_wait = [cid for cid in target_clients if cid in self.client_protocol_queries]
+        for client_id in pending_after_wait:
+            # Fallback remains robust gRPC when no fresh selection arrives.
+            self.client_delivery_protocols[client_id] = 'grpc'
+            self.client_protocol_queries.pop(client_id, None)
+
+        if pending_after_wait:
+            print(
+                f"[gRPC] Protocol negotiation timeout for clients {pending_after_wait}; "
+                f"falling back to gRPC downlink"
+            )
+        else:
+            print("[gRPC] Protocol negotiation complete for all target clients")
+
+    def _payload_fits_protocol(self, protocol, message):
+        """Check whether a JSON message fits the transport's payload budget."""
+        if protocol == 'mqtt':
+            return len(json.dumps(message).encode('utf-8')) <= MQTT_MAX_PAYLOAD_BYTES
+        if protocol == 'amqp':
+            return len(json.dumps(message).encode('utf-8')) <= AMQP_MAX_FRAME_BYTES
+        if protocol == 'http3':
+            return len(json.dumps(message).encode('utf-8')) <= HTTP3_MAX_STREAM_DATA
+        return True
     
     def broadcast_global_model(self):
         """Broadcast updated global model to all clients via their registered protocols"""
         # Prepare message with weights
         if self.quantization_handler is not None:
-            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            # Keep quantized end-to-end: if we already aggregated in quantized space, broadcast it as-is.
+            compressed_data = getattr(self, "global_compressed", None)
+            if not (isinstance(compressed_data, dict) and 'compressed_data' in compressed_data):
+                compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
             weights_data = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             weights_key = 'quantized_data'
         else:
             weights_data = self.serialize_weights(self.global_weights)
             weights_key = 'weights'
         
-        for client_id, protocol in self.registered_clients.items():
+        for client_id in self.registered_clients.keys():
             if client_id not in self.active_clients:
                 continue
             try:
+                # Keep the gRPC pull path current for every client as a reliable fallback.
+                self.grpc_model_ready[client_id] = self.current_round
+                print(f"[gRPC] Global model ready for client {client_id} to pull (round {self.current_round})")
+
+                protocol = self._get_delivery_protocol(client_id)
                 if protocol == 'mqtt':
                     message = {
                         'round': self.current_round,
                         weights_key: weights_data
                     }
-                    self.send_via_mqtt(client_id, "fl/global_model", message)
-                    print(f"[MQTT] Sent global model to client {client_id}")
+                    if self._payload_fits_protocol('mqtt', message):
+                        self.send_via_mqtt(client_id, "fl/global_model", message)
+                        print(f"[MQTT] Sent global model to client {client_id}")
+                    else:
+                        print(f"[MQTT] Global model for client {client_id} exceeds payload limit; client will pull via gRPC")
                     
                 elif protocol == 'amqp':
                     message = {
                         'round': self.current_round,
                         weights_key: weights_data
                     }
-                    self.send_via_amqp(client_id, 'global_model', message)
-                    print(f"[AMQP] Sent global model to client {client_id}")
+                    if self._payload_fits_protocol('amqp', message):
+                        self.send_via_amqp(client_id, 'global_model', message)
+                        print(f"[AMQP] Sent global model to client {client_id}")
+                    else:
+                        print(f"[AMQP] Global model for client {client_id} exceeds payload limit; client will pull via gRPC")
                     
                 elif protocol == 'quic':
                     # Send via QUIC stream (like single-protocol server does)
@@ -1895,13 +2143,14 @@ class UnifiedFederatedLearningServer:
                         'round': self.current_round,
                         weights_key: weights_data
                     }
-                    self.send_http3_message(client_id, message)
-                    print(f"[HTTP/3] Sent global model to client {client_id}")
+                    if self._payload_fits_protocol('http3', message):
+                        self.send_http3_message(client_id, message)
+                        print(f"[HTTP/3] Sent global model to client {client_id}")
+                    else:
+                        print(f"[HTTP/3] Global model for client {client_id} exceeds payload limit; client will pull via gRPC")
                     
                 elif protocol == 'grpc':
-                    # gRPC uses pull model - mark model as ready for this client
-                    self.grpc_model_ready[client_id] = self.current_round
-                    print(f"[gRPC] Global model ready for client {client_id} to pull (round {self.current_round})")
+                    continue
                     
                 elif protocol == 'dds':
                     # FAIR CONFIG: DDS uses pub/sub with chunking (matching standalone)
@@ -1941,6 +2190,36 @@ class UnifiedFederatedLearningServer:
         
         # FedAvg: weighted average by number of samples
         total_samples = sum(update['num_samples'] for update in self.client_updates.values())
+        
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+            # Keep a float-cast view for any server-side code paths that still reference global_weights
+            try:
+                self.global_weights = [np.asarray(w, dtype=np.float32) for w in aggregated_compressed.get('compressed_data', [])]
+            except Exception:
+                pass
+
+            self.client_updates.clear()
+            self.prepare_downlink_protocol_negotiation(
+                target_client_ids=list(self.active_clients),
+                round_id=self.current_round,
+                global_model_id=self.current_round,
+            )
+            self.broadcast_global_model()
+            time.sleep(1)
+            self.signal_start_evaluation()
+            return
+
         aggregated_weights = []
         
         for i in range(len(self.global_weights)):
@@ -1960,6 +2239,14 @@ class UnifiedFederatedLearningServer:
         
         # Clear updates
         self.client_updates.clear()
+
+        # Query each active client for its preferred downlink protocol before sending
+        # the next global model snapshot for this round.
+        self.prepare_downlink_protocol_negotiation(
+            target_client_ids=list(self.active_clients),
+            round_id=self.current_round,
+            global_model_id=self.current_round,
+        )
         
         # Broadcast new global model
         self.broadcast_global_model()
@@ -1972,7 +2259,11 @@ class UnifiedFederatedLearningServer:
         """Aggregate client evaluation metrics"""
         if not self.client_metrics:
             return
-        
+        if self.round_start_time is not None:
+            self.ROUND_TIMES.append(time.time() - self.round_start_time)
+        socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
+        avg_soc = sum(socs) / len(socs) if socs else 1.0
+        self.BATTERY_CONSUMPTION.append(1.0 - avg_soc)
         # Check if we still have active clients before aggregating
         if len(self.active_clients) == 0:
             print("[Server] No active clients remaining. Stopping training.")
@@ -1998,7 +2289,7 @@ class UnifiedFederatedLearningServer:
         
         # Clear metrics
         self.client_metrics.clear()
-        
+        self.round_start_time = time.time()
         # Continue to next round ONLY if we still have active clients
         self.current_round += 1
         
@@ -2036,21 +2327,22 @@ class UnifiedFederatedLearningServer:
     
     def save_results(self):
         """Save experiment results"""
-        results_dir = Path("/app/results" if IN_DOCKER else "./results")
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("emotion", "unified")
         
         results = {
             'rounds': self.ROUNDS,
             'accuracy': self.ACCURACY,
             'loss': self.LOSS,
+            'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
+            'battery_consumption': getattr(self, 'BATTERY_CONSUMPTION', []),
             'converged': self.converged,
             'total_time': time.time() - self.start_time,
             'convergence_time': self.convergence_time,
             'num_clients': self.num_clients,
-            'protocols_used': dict(self.registered_clients),
+            'protocols_used': dict(self.client_delivery_protocols or self.registered_clients),
             'protocol_distribution': {
-                protocol: sum(1 for p in self.registered_clients.values() if p == protocol)
-                for protocol in set(self.registered_clients.values())
+                protocol: sum(1 for p in (self.client_delivery_protocols or self.registered_clients).values() if p == protocol)
+                for protocol in set((self.client_delivery_protocols or self.registered_clients).values())
             }
         }
         
@@ -2061,7 +2353,61 @@ class UnifiedFederatedLearningServer:
             json.dump(results, f, indent=2)
         
         print(f"\n✅ Results saved to {results_file}")
-    
+        self.plot_results()
+
+    def plot_results(self):
+        """Plot battery consumption, round/convergence time, and loss/accuracy."""
+        results_dir = get_experiment_results_dir("emotion", "unified")
+        rounds = self.ROUNDS
+        n = len(rounds)
+        if n == 0:
+            return
+        conv_time = self.convergence_time if self.convergence_time is not None else (time.time() - self.start_time if self.start_time else 0)
+        # 1) Battery consumption
+        fig1, ax1 = plt.subplots(figsize=(7, 4))
+        bc = (self.BATTERY_CONSUMPTION + [0.0] * max(0, n - len(self.BATTERY_CONSUMPTION)))[:n] if self.BATTERY_CONSUMPTION else [0.0] * n
+        if bc:
+            ax1.plot(rounds, [c * 100 for c in bc], marker='o', linewidth=2, markersize=6, color='#2e86ab')
+        ax1.set_xlabel('Round', fontsize=12)
+        ax1.set_ylabel('Battery consumption (%)', fontsize=12)
+        ax1.set_title('Unified: Battery consumption till end of FL training', fontsize=14)
+        ax1.grid(True, alpha=0.3)
+        fig1.tight_layout()
+        fig1.savefig(results_dir / 'unified_battery_consumption.png', dpi=300, bbox_inches='tight')
+        plt.close(fig1)
+        print(f"Battery plot saved to {results_dir / 'unified_battery_consumption.png'}")
+        # 2) Time per round and convergence time
+        fig2, ax2 = plt.subplots(figsize=(7, 4))
+        rt = (self.ROUND_TIMES + [0.0] * max(0, n - len(self.ROUND_TIMES)))[:n] if self.ROUND_TIMES else [0.0] * n
+        if rt:
+            ax2.bar(rounds, rt, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        ax2.axhline(y=conv_time, color='#f18f01', linestyle='--', linewidth=2, label=f'Total convergence time: {conv_time:.1f} s')
+        ax2.set_xlabel('Round', fontsize=12)
+        ax2.set_ylabel('Time (s)', fontsize=12)
+        ax2.set_title('Unified: Time per round and total convergence time', fontsize=14)
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        fig2.tight_layout()
+        fig2.savefig(results_dir / 'unified_round_and_convergence_time.png', dpi=300, bbox_inches='tight')
+        plt.close(fig2)
+        print(f"Time plot saved to {results_dir / 'unified_round_and_convergence_time.png'}")
+        # 3) Loss and Accuracy
+        fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(12, 5))
+        ax3a.plot(rounds, self.LOSS, marker='o', linewidth=2, markersize=8, color='red')
+        ax3a.set_xlabel('Round', fontsize=12)
+        ax3a.set_ylabel('Loss', fontsize=12)
+        ax3a.set_title('Unified: Loss over FL Rounds', fontsize=14)
+        ax3a.grid(True, alpha=0.3)
+        ax3b.plot(rounds, [a * 100 for a in self.ACCURACY], marker='s', linewidth=2, markersize=8, color='green')
+        ax3b.set_xlabel('Round', fontsize=12)
+        ax3b.set_ylabel('Accuracy (%)', fontsize=12)
+        ax3b.set_title('Unified: Accuracy over FL Rounds', fontsize=14)
+        ax3b.grid(True, alpha=0.3)
+        fig3.tight_layout()
+        fig3.savefig(results_dir / 'unified_training_metrics.png', dpi=300, bbox_inches='tight')
+        plt.close(fig3)
+        print(f"Results plot saved to {results_dir / 'unified_training_metrics.png'}")
+
     def run(self):
         """Run unified server (all protocols)"""
         print("[Server] Starting all protocol handlers...\n")
@@ -2110,11 +2456,14 @@ class UnifiedFederatedLearningServer:
 # =========================================================================
 
 if GRPC_AVAILABLE:
+    GRPC_CHUNK_SIZE = GRPC_MAX_MESSAGE_BYTES - 4096  # leave room for proto framing
+
     class FLServicer(federated_learning_pb2_grpc.FederatedLearningServicer):
-        """gRPC service implementation"""
+        """gRPC service implementation (chunked transfer when payload > 4 MB)."""
         
         def __init__(self, server):
             self.server = server
+            self._update_chunks = {}  # (client_id, round) -> {'chunks': {index: bytes}, 'num_samples': int, 'metrics': dict}
         
         def RegisterClient(self, request, context):
             """Handle client registration"""
@@ -2140,112 +2489,179 @@ if GRPC_AVAILABLE:
                 )
         
         def GetGlobalModel(self, request, context):
-            """Send global model to client"""
+            """Send global model to client (chunked when > 4 MB)."""
             try:
                 client_id = request.client_id
                 ready_round = self.server.grpc_model_ready.get(client_id)
+                chunk_index = getattr(request, 'chunk_index', 0) or 0
 
-                # If this client is marked ready for initial model, always serve round 0
-                # with model_config so first-time model initialization cannot be skipped.
-                if ready_round == 0 and request.round == 0:
-                    weights_bytes = pickle.dumps(self.server.global_weights)
-                    model_config_json = json.dumps(self.server.model_config)
-                    response = federated_learning_pb2.GlobalModel(
-                        round=0,
-                        weights=weights_bytes,
-                        available=True,
-                        model_config=model_config_json
+                # Resolve what to serve: serialized_weights, model_config_json, round_to_serve
+                if self.server.global_weights is None:
+                    return federated_learning_pb2.GlobalModel(
+                        round=0, weights=b"", available=False, model_config="",
+                        chunk_index=0, total_chunks=1
                     )
-                # Serve a specifically marked ready round for gRPC pull clients.
-                elif ready_round is not None and request.round == 0:
-                    weights_bytes = pickle.dumps(self.server.global_weights)
-                    response = federated_learning_pb2.GlobalModel(
-                        round=ready_round,
-                        weights=weights_bytes,
-                        available=True,
-                        model_config=""
-                    )
-                # Backward-compatible fallback: allow polling latest/current.
-                elif request.round == 0 or request.round == self.server.current_round or request.round == self.server.current_round - 1:
-                    weights_bytes = pickle.dumps(self.server.global_weights)
-                    response = federated_learning_pb2.GlobalModel(
-                        round=self.server.current_round,
-                        weights=weights_bytes,
-                        available=True,
-                        model_config=""
-                    )
+                if self.server.quantization_handler is not None:
+                    compressed_data = self.server.quantization_handler.compress_global_model(self.server.global_weights)
+                    serialized_weights = pickle.dumps(compressed_data)
                 else:
-                    # Client requesting old/future round - not available
-                    response = federated_learning_pb2.GlobalModel(
-                        round=request.round,
-                        weights=b"",
-                        available=False,
-                        model_config=""
+                    serialized_weights = pickle.dumps(self.server.global_weights)
+                total_size = len(serialized_weights)
+                model_config_json = json.dumps(self.server.model_config)
+
+                if ready_round == 0 and request.round == 0:
+                    round_to_serve = 0
+                elif ready_round is not None and request.round == 0:
+                    round_to_serve = ready_round
+                elif request.round == 0 or request.round == self.server.current_round or request.round == self.server.current_round - 1:
+                    round_to_serve = self.server.current_round
+                    if request.round != 0 and round_to_serve != 0:
+                        model_config_json = ""
+                else:
+                    return federated_learning_pb2.GlobalModel(
+                        round=request.round, weights=b"", available=False, model_config="",
+                        chunk_index=0, total_chunks=1
                     )
-                
+
+                # Single message if within chunk size
+                if total_size <= GRPC_CHUNK_SIZE:
+                    log_sent_packet(
+                        packet_size=total_size, peer=f"client_{client_id}", protocol="gRPC",
+                        round=round_to_serve, extra_info="global_model"
+                    )
+                    return federated_learning_pb2.GlobalModel(
+                        round=round_to_serve,
+                        weights=serialized_weights,
+                        available=True,
+                        model_config=model_config_json,
+                        chunk_index=0,
+                        total_chunks=1
+                    )
+
+                # Chunked transfer
+                chunks = [serialized_weights[i:i + GRPC_CHUNK_SIZE] for i in range(0, total_size, GRPC_CHUNK_SIZE)]
+                total_chunks = len(chunks)
+                if chunk_index < 0 or chunk_index >= total_chunks:
+                    return federated_learning_pb2.GlobalModel(
+                        round=round_to_serve, weights=b"", available=False, model_config="",
+                        chunk_index=chunk_index, total_chunks=total_chunks
+                    )
+                chunk_data = chunks[chunk_index]
+                cfg = model_config_json if chunk_index == 0 else ""
+                if chunk_index == 0:
+                    print(f"[gRPC] Client {client_id}: Sending global model (round {round_to_serve}, {total_size/1024:.2f} KB in {total_chunks} chunks)")
                 log_sent_packet(
-                    packet_size=response.ByteSize(),
-                    peer=f"client_{request.client_id}",
-                    protocol="gRPC",
-                    round=request.round,
-                    extra_info="global_model"
+                    packet_size=len(chunk_data), peer=f"client_{client_id}", protocol="gRPC",
+                    round=round_to_serve, extra_info="global_model_chunk"
                 )
-                
-                return response
+                return federated_learning_pb2.GlobalModel(
+                    round=round_to_serve,
+                    weights=chunk_data,
+                    available=True,
+                    model_config=cfg,
+                    chunk_index=chunk_index,
+                    total_chunks=total_chunks
+                )
             except Exception as e:
                 print(f"[gRPC] Error in GetGlobalModel: {e}")
                 return federated_learning_pb2.GlobalModel(
-                    round=request.round,
-                    weights=b"",
-                    available=False,
-                    model_config=""
+                    round=getattr(request, 'round', 0),
+                    weights=b"", available=False, model_config="",
+                    chunk_index=0, total_chunks=1
                 )
         
         def SendModelUpdate(self, request, context):
-            """Receive model update from client"""
+            """Receive model update from client (chunked when > 4 MB)."""
             try:
-                print(f"[gRPC] SendModelUpdate called - client_id={request.client_id}, round={request.round}, current_round={self.server.current_round}")
-                
+                client_id = request.client_id
+                round_num = request.round
+                metrics = dict(request.metrics)
+                total_chunks = getattr(request, 'total_chunks', 1) or 1
+                chunk_index = getattr(request, 'chunk_index', 0) or 0
+
                 log_received_packet(
                     packet_size=request.ByteSize(),
-                    peer=f"client_{request.client_id}",
+                    peer=f"client_{client_id}",
                     protocol="gRPC",
-                    round=request.round,
-                    extra_info="model_update"
+                    round=round_num,
+                    extra_info="model_update" if total_chunks == 1 else "model_update_chunk"
                 )
-                
-                # Decode the weights - they come as bytes or string
-                if isinstance(request.weights, bytes):
-                    weights_str = request.weights.decode('utf-8')
+
+                # Convergence: accept even if chunked stream incomplete
+                converged_flag = STOP_ON_CLIENT_CONVERGENCE and float(metrics.get('client_converged', 0.0)) >= 1.0
+                if converged_flag and round_num <= self.server.current_round and client_id in self.server.active_clients:
+                    self.server.mark_client_converged(client_id)
+                    return federated_learning_pb2.UpdateResponse(success=True, message=f"Client {client_id} convergence acknowledged")
+                if round_num != self.server.current_round:
+                    return federated_learning_pb2.UpdateResponse(success=False, message=f"Round mismatch: expected {self.server.current_round}, got {round_num}")
+
+                # Chunked: accumulate until complete
+                if total_chunks > 1:
+                    key = (client_id, round_num)
+                    if key not in self._update_chunks:
+                        self._update_chunks[key] = {'chunks': {}, 'num_samples': 0, 'metrics': {}}
+                    buf = self._update_chunks[key]
+                    buf['chunks'][chunk_index] = request.weights if request.weights else b''
+                    if chunk_index == 0:
+                        buf['num_samples'] = request.num_samples
+                        buf['metrics'] = metrics
+                    if len(buf['chunks']) < total_chunks:
+                        return federated_learning_pb2.UpdateResponse(
+                            success=True,
+                            message=f"Chunk {chunk_index + 1}/{total_chunks} received for round {round_num}"
+                        )
+                    serialized_weights = b''.join(buf['chunks'][i] for i in range(total_chunks))
+                    num_samples = buf['num_samples']
+                    metrics = buf['metrics']
+                    del self._update_chunks[key]
                 else:
-                    weights_str = request.weights
-                
-                metrics = dict(request.metrics)
-                
-                data = {
-                    'client_id': request.client_id,
-                    'round': request.round,
-                    'weights': weights_str,  # Already base64-encoded from client
-                    'num_samples': request.num_samples,
-                    'metrics': metrics
-                }
-                
-                print(f"[gRPC] Calling handle_client_update for client {request.client_id}, round {request.round}")
+                    serialized_weights = request.weights
+                    num_samples = request.num_samples
+
+                # Build data for handle_client_update (chunked reassembly is raw bytes; single message may be JSON)
+                if isinstance(serialized_weights, bytes):
+                    try:
+                        payload_str = serialized_weights.decode('utf-8')
+                    except UnicodeDecodeError:
+                        payload_str = base64.b64encode(serialized_weights).decode('utf-8')
+                        data = {'client_id': client_id, 'round': round_num, 'weights': payload_str, 'num_samples': num_samples, 'metrics': metrics}
+                        self.server.handle_client_update(data, 'grpc')
+                        return federated_learning_pb2.UpdateResponse(success=True, message="Update received")
+                else:
+                    payload_str = serialized_weights
+                try:
+                    parsed = json.loads(payload_str)
+                    if isinstance(parsed, dict) and ('compressed_data' in parsed or 'weights' in parsed):
+                        data = {
+                            'client_id': parsed.get('client_id', client_id),
+                            'round': round_num,
+                            'num_samples': parsed.get('num_samples', num_samples),
+                            'metrics': parsed.get('metrics', metrics)
+                        }
+                        if 'compressed_data' in parsed:
+                            data['compressed_data'] = parsed['compressed_data']
+                        else:
+                            data['weights'] = parsed['weights']
+                    else:
+                        data = None
+                except (json.JSONDecodeError, TypeError):
+                    data = None
+                if data is None:
+                    data = {
+                        'client_id': client_id,
+                        'round': round_num,
+                        'weights': payload_str,
+                        'num_samples': num_samples,
+                        'metrics': metrics
+                    }
+
                 self.server.handle_client_update(data, 'grpc')
-                print(f"[gRPC] handle_client_update completed for client {request.client_id}")
-                
-                return federated_learning_pb2.UpdateResponse(
-                    success=True,
-                    message="Update received"
-                )
+                return federated_learning_pb2.UpdateResponse(success=True, message="Update received")
             except Exception as e:
                 print(f"[gRPC] Error in SendModelUpdate: {e}")
                 import traceback
                 traceback.print_exc()
-                return federated_learning_pb2.UpdateResponse(
-                    success=False,
-                    message=str(e)
-                )
+                return federated_learning_pb2.UpdateResponse(success=False, message=str(e))
         
         def SendMetrics(self, request, context):
             """Receive evaluation metrics from client"""
@@ -2263,7 +2679,9 @@ if GRPC_AVAILABLE:
                     'round': request.round,
                     'num_samples': request.num_samples,
                     'loss': request.loss,
-                    'accuracy': request.accuracy
+                    'accuracy': request.accuracy,
+                    'battery_soc': getattr(request, 'battery_soc', 1.0),
+                    'round_time_sec': getattr(request, 'round_time_sec', 0.0),
                 }
                 
                 self.server.handle_client_metrics(data, 'grpc')
@@ -2284,21 +2702,35 @@ if GRPC_AVAILABLE:
             try:
                 client_id = request.client_id
                 
-                # Check if client should train
+                # Check if client should train or evaluate
                 should_train = self.server.grpc_should_train.get(client_id, False)
                 should_evaluate = self.server.grpc_should_evaluate.get(client_id, False)
                 
-                # Clear flags after reading (one-time signals)
-                if should_train:
-                    self.server.grpc_should_train[client_id] = False
-                if should_evaluate:
-                    self.server.grpc_should_evaluate[client_id] = False
+                # Don't clear flags immediately - let them persist for multiple polls
+                # This prevents race conditions where signals are lost if client has guards
+                # Flags will be cleared when next round's signals are set
+                pending_query = self.server.client_protocol_queries.get(client_id)
+                has_protocol_query = pending_query is not None
+                protocol_query = None
+                if has_protocol_query:
+                    protocol_query = federated_learning_pb2.ProtocolQuery(
+                        client_id=client_id,
+                        round_id=int(pending_query.get('round_id', self.server.current_round)),
+                        global_model_id=int(pending_query.get('global_model_id', self.server.current_round)),
+                    )
                 
+                status_kwargs = {
+                    'should_train': should_train,
+                    'should_evaluate': should_evaluate,
+                    'current_round': self.server.current_round,
+                    'is_complete': self.server.converged,
+                    'has_protocol_query': has_protocol_query,
+                }
+                if protocol_query is not None:
+                    status_kwargs['protocol_query'] = protocol_query
+
                 return federated_learning_pb2.TrainingStatus(
-                    should_train=should_train,
-                    should_evaluate=should_evaluate,
-                    current_round=self.server.current_round,
-                    is_complete=self.server.converged
+                    **status_kwargs
                 )
             except Exception as e:
                 print(f"[gRPC] Error in CheckTrainingStatus: {e}")
@@ -2306,7 +2738,56 @@ if GRPC_AVAILABLE:
                     should_train=False,
                     should_evaluate=False,
                     current_round=0,
-                    is_complete=True
+                    is_complete=True,
+                    has_protocol_query=False,
+                )
+
+        def SendProtocolSelection(self, request, context):
+            """Receive client's negotiated downlink protocol preference over gRPC control plane."""
+            try:
+                client_id = request.client_id
+                selected_protocol = self.server._normalize_protocol_name(request.downlink_protocol_requested)
+                if selected_protocol is None:
+                    return federated_learning_pb2.ProtocolSelectionResponse(
+                        success=False,
+                        message=f"Unsupported downlink protocol: {request.downlink_protocol_requested}",
+                    )
+
+                pending_query = self.server.client_protocol_queries.get(client_id)
+                if pending_query is None:
+                    # Accept as best-effort preference refresh even if query already timed out/cleared.
+                    self.server.client_delivery_protocols[client_id] = selected_protocol
+                    return federated_learning_pb2.ProtocolSelectionResponse(
+                        success=True,
+                        message="Selection accepted (no pending query)",
+                    )
+
+                expected_round = int(pending_query.get('round_id', self.server.current_round))
+                expected_model_id = int(pending_query.get('global_model_id', self.server.current_round))
+                if request.round_id != expected_round or request.global_model_id != expected_model_id:
+                    return federated_learning_pb2.ProtocolSelectionResponse(
+                        success=False,
+                        message=(
+                            f"Selection mismatch: expected round={expected_round}, "
+                            f"global_model_id={expected_model_id}"
+                        ),
+                    )
+
+                self.server.client_delivery_protocols[client_id] = selected_protocol
+                self.server.client_protocol_queries.pop(client_id, None)
+                print(
+                    f"[gRPC] Client {client_id} selected downlink protocol '{selected_protocol}' "
+                    f"for round {request.round_id}, global model {request.global_model_id}"
+                )
+                return federated_learning_pb2.ProtocolSelectionResponse(
+                    success=True,
+                    message="Protocol selection recorded",
+                )
+            except Exception as e:
+                print(f"[gRPC] Error in SendProtocolSelection: {e}")
+                return federated_learning_pb2.ProtocolSelectionResponse(
+                    success=False,
+                    message=str(e),
                 )
 
 
@@ -2323,7 +2804,7 @@ if HTTP3_AVAILABLE:
             self.server = None  # Set by factory function
             self._http = None  # H3Connection instance
             self._stream_buffers = {}  # Buffer data per stream ID (instance-specific)
-            print(f"[HTTP/3] Protocol instance created")
+            self._stream_content_lengths = {}
         
         def quic_event_received(self, event):
             """Handle QUIC events and convert to HTTP/3 events"""
@@ -2342,9 +2823,6 @@ if HTTP3_AVAILABLE:
                     stream_id = event.stream_id
                     headers = dict(event.headers)
                     method = headers.get(b":method", b"").decode()
-                    path = headers.get(b":path", b"").decode()
-                    
-                    print(f"[HTTP/3] Received {method} request on stream {stream_id}, path: {path}")
                     
                     # Initialize buffer for this stream
                     if stream_id not in self._stream_buffers:
@@ -2353,7 +2831,7 @@ if HTTP3_AVAILABLE:
                     # Handle POST requests (client sending data)
                     if method == "POST":
                         content_length = int(headers.get(b"content-length", b"0"))
-                        print(f"[HTTP/3] Expecting {content_length} bytes on stream {stream_id}")
+                        self._stream_content_lengths[stream_id] = content_length
                     
                 except Exception as e:
                     print(f"[HTTP/3] Error handling headers: {e}")
@@ -2369,19 +2847,19 @@ if HTTP3_AVAILABLE:
                     
                     # Append new data to buffer
                     self._stream_buffers[stream_id] += event.data
-                    print(f"[HTTP/3] Stream {stream_id}: received {len(event.data)} bytes, buffer now {len(self._stream_buffers[stream_id])} bytes")
                     
                     # Send flow control updates to allow more data
                     self.transmit()
                     
-                    # If stream ended, process complete message
-                    if event.end_stream:
+                    expected_length = self._stream_content_lengths.get(stream_id, 0)
+                    received_length = len(self._stream_buffers[stream_id])
+                    
+                    if expected_length > 0 and received_length >= expected_length:
                         try:
                             data_str = self._stream_buffers[stream_id].decode('utf-8')
                             message = json.loads(data_str)
-                            msg_type = message.get('type', 'unknown')
                             client_id = message.get('client_id', 'unknown')
-                            print(f"[HTTP/3] Decoded complete message type '{msg_type}' from stream {stream_id}")
+                            msg_type = message.get('type', 'unknown')
                             
                             log_received_packet(
                                 packet_size=len(data_str),
@@ -2392,11 +2870,12 @@ if HTTP3_AVAILABLE:
                             )
                             
                             # Send HTTP/3 response
+                            response_body = json.dumps({"status": "ok"}).encode('utf-8')
                             response_headers = [
                                 (b":status", b"200"),
                                 (b"content-type", b"application/json"),
+                                (b"content-length", str(len(response_body)).encode()),
                             ]
-                            response_body = json.dumps({"status": "ok"}).encode('utf-8')
                             self._http.send_headers(stream_id=stream_id, headers=response_headers)
                             self._http.send_data(stream_id=stream_id, data=response_body, end_stream=True)
                             self.transmit()
@@ -2407,6 +2886,7 @@ if HTTP3_AVAILABLE:
                             
                             # Clear buffer
                             self._stream_buffers[stream_id] = b''
+                            self._stream_content_lengths.pop(stream_id, None)
                         except (json.JSONDecodeError, UnicodeDecodeError) as e:
                             print(f"[HTTP/3] Error decoding message: {e}")
                             # Send error response
@@ -2416,12 +2896,14 @@ if HTTP3_AVAILABLE:
                                     (b"content-type", b"text/plain"),
                                 ]
                                 error_body = f"Error: {str(e)}".encode('utf-8')
+                                error_headers.append((b"content-length", str(len(error_body)).encode()))
                                 self._http.send_headers(stream_id=stream_id, headers=error_headers)
                                 self._http.send_data(stream_id=stream_id, data=error_body, end_stream=True)
                                 self.transmit()
                             except:
                                 pass
                             self._stream_buffers[stream_id] = b''
+                            self._stream_content_lengths.pop(stream_id, None)
                 except Exception as e:
                     print(f"[HTTP/3] Error handling data: {e}")
                     import traceback
@@ -2433,6 +2915,7 @@ if HTTP3_AVAILABLE:
                 if stream_id in self._stream_buffers:
                     del self._stream_buffers[stream_id]
                     print(f"[HTTP/3] Stream {stream_id} reset, cleared buffer")
+                self._stream_content_lengths.pop(stream_id, None)
 
 # =========================================================================
 # QUIC Protocol Handler
@@ -2444,6 +2927,8 @@ if QUIC_AVAILABLE:
         data_str = message_data.decode('utf-8')
         return json.loads(data_str)
 
+    QUIC_SOCKET_BUFFER_BYTES = 7_500_000  # 7.5MB for SO_RCVBUF/SO_SNDBUF (poor network)
+
     class QUICServerProtocol(QuicConnectionProtocol):
         """QUIC protocol handler (supports multiple clients)"""
         
@@ -2452,6 +2937,17 @@ if QUIC_AVAILABLE:
             self.server = None  # Set by factory function
             self._stream_buffers = {}  # Buffer data per stream ID (instance-specific)
             print(f"[QUIC] Protocol instance created")
+
+        def connection_made(self, transport):
+            super().connection_made(transport)
+            sock = transport.get_extra_info("socket")
+            if sock:
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, QUIC_SOCKET_BUFFER_BYTES)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, QUIC_SOCKET_BUFFER_BYTES)
+                    print(f"[QUIC] UDP socket buffers set to {QUIC_SOCKET_BUFFER_BYTES // 1_000_000}MB")
+                except OSError as e:
+                    print(f"[QUIC] Could not set socket buffers: {e}")
         
         async def _process_parsed_message(self, message_data: bytes, stream_id: int):
             """Parse message in executor (non-blocking) and dispatch. Prevents event loop
@@ -2514,7 +3010,8 @@ if QUIC_AVAILABLE:
 def main():
     """Main function"""
     # Prevent duplicate unified server instance in the same container/host.
-    lock_path = "/tmp/unified_emotion_server.lock"
+    # Use user-writable path (home or cwd) to avoid PermissionError on /tmp.
+    lock_path = os.path.join(os.path.expanduser("~"), ".unified_emotion_server.lock")
     lock_file = open(lock_path, "w")
     try:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

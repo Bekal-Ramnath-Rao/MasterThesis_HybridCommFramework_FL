@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- CycloneDDS Emotion FL Client 2 - ParticipantIndex 3 => port 7416, peers 7410 (discovery), 7412 (server) -->
+<CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+    <Domain id="any">
+        <General>
+            <AllowMulticast>false</AllowMulticast>
+        </General>
+        <Discovery>
+            <ParticipantIndex>3</ParticipantIndex>
+            <Peers>
+                <Peer address="127.0.0.1:7410"/>
+                <Peer address="127.0.0.1:7412"/>
+            </Peers>
+        </Discovery>
+        <Internal>
+            <HeartbeatInterval>500ms</HeartbeatInterval>
+        </Internal>
+        <Tracing>
+            <Verbosity>warning</Verbosity>
+            <OutputFile>stderr</OutputFile>
+        </Tracing>
+    </Domain>
+</CycloneDDS>

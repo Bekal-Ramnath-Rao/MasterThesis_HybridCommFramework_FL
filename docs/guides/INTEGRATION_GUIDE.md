@@ -228,7 +228,7 @@ $env:USE_QUANTIZATION="true"           # or "false"
 $env:QUANTIZATION_STRATEGY="parameter_quantization"  # or "qat", "ptq"
 
 # Precision
-$env:QUANTIZATION_BITS="8"             # or "16", "32"
+$env:QUANTIZATION_BITS="8"             # or "4", "16", "32" (4-bit uses nibble packing for 2x compression)
 
 # Mode
 $env:QUANTIZATION_SYMMETRIC="true"     # or "false"
@@ -255,11 +255,11 @@ $env:QUANTIZATION_BITS="16"
 $env:QUANTIZATION_PER_CHANNEL="true"
 ```
 
-#### 3. Maximum Compression
+#### 3. Maximum Compression (4-bit)
 ```powershell
 $env:USE_QUANTIZATION="true"
 $env:QUANTIZATION_STRATEGY="parameter_quantization"
-$env:QUANTIZATION_BITS="8"
+$env:QUANTIZATION_BITS="4"
 ```
 
 #### 4. Quick Testing

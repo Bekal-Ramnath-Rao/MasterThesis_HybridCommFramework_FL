@@ -16,10 +16,30 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QPushButton, QComboBox, QCheckBox, QSpinBox, QSlider,
     QGroupBox, QTextEdit, QProgressBar, QGridLayout,
-    QMessageBox, QLineEdit, QFrame
+    QMessageBox, QLineEdit, QFrame, QRadioButton, QButtonGroup,
+    QScrollArea, QTabWidget
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QPalette, QColor
+
+NETWORK_SCENARIO_PRESETS = {
+    "none": {"latency": 0, "bandwidth": 100, "jitter": 0, "packet_loss": 0.0},
+    "excellent": {"latency": 5, "bandwidth": 100, "jitter": 0, "packet_loss": 0.0},
+    "good": {"latency": 20, "bandwidth": 50, "jitter": 0, "packet_loss": 0.1},
+    "moderate": {"latency": 50, "bandwidth": 20, "jitter": 0, "packet_loss": 0.5},
+    "poor": {"latency": 100, "bandwidth": 5, "jitter": 0, "packet_loss": 1.0},
+    "very_poor": {"latency": 200, "bandwidth": 1, "jitter": 0, "packet_loss": 3.0},
+    "satellite": {"latency": 600, "bandwidth": 10, "jitter": 50, "packet_loss": 2.0},
+    "congested_light": {"latency": 30, "bandwidth": 30, "jitter": 5, "packet_loss": 0.5},
+    "congested_moderate": {"latency": 75, "bandwidth": 15, "jitter": 15, "packet_loss": 1.5},
+    "congested_heavy": {"latency": 150, "bandwidth": 5, "jitter": 30, "packet_loss": 3.0},
+}
+
+CONGESTION_PRESETS = {
+    "light": {"latency": 10, "jitter": 5, "packet_loss": 0.2, "bandwidth_factor": 0.85},
+    "moderate": {"latency": 25, "jitter": 10, "packet_loss": 0.5, "bandwidth_factor": 0.70},
+    "heavy": {"latency": 50, "jitter": 20, "packet_loss": 1.0, "bandwidth_factor": 0.50},
+}
 
 
 class ClientMonitor(QThread):
@@ -87,17 +107,9 @@ class DistributedClientGUI(QMainWindow):
         header = self.create_header()
         main_layout.addWidget(header)
         
-        # Connection Configuration
-        connection_group = self.create_connection_config()
-        main_layout.addWidget(connection_group)
-        
-        # Client Configuration
-        client_config_group = self.create_client_config()
-        main_layout.addWidget(client_config_group)
-        
-        # Network Scenario Selection
-        network_group = self.create_network_config()
-        main_layout.addWidget(network_group)
+        # Configuration tabs
+        self.config_tabs = self.create_config_tabs()
+        main_layout.addWidget(self.config_tabs)
         
         # Control Buttons
         control_layout = self.create_control_buttons()
@@ -139,6 +151,42 @@ class DistributedClientGUI(QMainWindow):
         layout.addWidget(subtitle)
         
         return header
+
+    def create_config_tabs(self):
+        """Create tabbed configuration panels"""
+        tabs = QTabWidget()
+        tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #dfe6e9;
+                background: white;
+                border-radius: 8px;
+            }
+            QTabBar::tab {
+                background: #ecf0f1;
+                padding: 8px 14px;
+                margin-right: 4px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+            }
+            QTabBar::tab:selected {
+                background: white;
+                font-weight: bold;
+            }
+        """)
+        tabs.addTab(self.create_connection_config(), "Connection")
+        tabs.addTab(self.wrap_in_scroll(self.create_client_config()), "Client")
+        tabs.addTab(self.wrap_in_scroll(self.create_network_config()), "Network")
+        tabs.addTab(self.wrap_in_scroll(self.create_advanced_config()), "Advanced")
+        return tabs
+
+    def wrap_in_scroll(self, widget):
+        """Wrap a widget in a scroll area for large forms"""
+        scroll = QScrollArea()
+        scroll.setWidget(widget)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        return scroll
     
     def create_connection_config(self):
         """Create connection configuration section"""
@@ -170,7 +218,7 @@ class DistributedClientGUI(QMainWindow):
         
         # Port Configuration (Read-only info)
         info_label = QLabel(
-            "Standard Ports: MQTT(1883) | AMQP(5672) | gRPC(50051) | QUIC(4433) | DDS(Domain 0)"
+            "Remote ports: MQTT(31883) | AMQP(35672) | gRPC(50051) | QUIC(4433) | HTTP/3(4434) | DDS(Domain 0)"
         )
         info_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
         layout.addWidget(info_label, 1, 0, 1, 3)
@@ -180,64 +228,139 @@ class DistributedClientGUI(QMainWindow):
     
     def create_client_config(self):
         """Create client configuration section"""
+        container = QWidget()
+        outer_layout = QVBoxLayout(container)
+        outer_layout.setSpacing(12)
+
         group = QGroupBox("⚙️ Client Configuration")
         group.setStyleSheet(self.get_group_style())
         layout = QGridLayout()
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(10)
         
-        # Client ID
+        # Client ID / total expected clients
         layout.addWidget(QLabel("Client ID:"), 0, 0)
         self.client_id = QSpinBox()
         self.client_id.setRange(1, 100)
         self.client_id.setValue(3)
         self.client_id.setStyleSheet("padding: 8px; font-size: 12px;")
         layout.addWidget(self.client_id, 0, 1)
+
+        layout.addWidget(QLabel("Total Expected Clients:"), 0, 2)
+        self.total_clients = QSpinBox()
+        self.total_clients.setRange(1, 100)
+        self.total_clients.setValue(2)
+        self.total_clients.setStyleSheet("padding: 8px; font-size: 12px;")
+        self.total_clients.setToolTip("Match the total number of clients expected by the main experiment, including remote clients.")
+        layout.addWidget(self.total_clients, 0, 3)
         
         # Use Case
         layout.addWidget(QLabel("Use Case:"), 1, 0)
         self.use_case = QComboBox()
-        self.use_case.addItems(["emotion", "mentalstate", "temperature"])
+        self.use_case.addItem("emotion", "emotion")
+        self.use_case.addItem("mentalstate", "mentalstate")
+        self.use_case.addItem("temperature", "temperature")
         self.use_case.setStyleSheet("padding: 8px; font-size: 12px;")
         layout.addWidget(self.use_case, 1, 1)
         
         # Protocol Selection Mode
-        layout.addWidget(QLabel("Protocol Mode:"), 2, 0)
+        layout.addWidget(QLabel("Protocol Mode:"), 1, 2)
         self.protocol_mode = QComboBox()
-        self.protocol_mode.addItem("RL-Unified (Auto Select)", "rl_unified")
+        self.protocol_mode.addItem("RL-Unified (Dynamic Selection)", "rl_unified")
         self.protocol_mode.addItem("MQTT", "mqtt")
         self.protocol_mode.addItem("AMQP", "amqp")
         self.protocol_mode.addItem("gRPC", "grpc")
         self.protocol_mode.addItem("QUIC", "quic")
+        self.protocol_mode.addItem("HTTP/3", "http3")
         self.protocol_mode.addItem("DDS", "dds")
         self.protocol_mode.setStyleSheet("padding: 8px; font-size: 12px;")
-        layout.addWidget(self.protocol_mode, 2, 1)
+        layout.addWidget(self.protocol_mode, 1, 3)
+        
+        # DDS implementation selector (only meaningful when DDS protocol is selected)
+        self.dds_impl_label = QLabel("DDS Implementation:")
+        self.dds_impl = QComboBox()
+        self.dds_impl.addItem("CycloneDDS", "cyclonedds")
+        self.dds_impl.addItem("Fast DDS", "fastdds")
+        self.dds_impl.setStyleSheet("padding: 8px; font-size: 12px;")
+        layout.addWidget(self.dds_impl_label, 2, 0)
+        layout.addWidget(self.dds_impl, 2, 1)
+
+        # RL-unified mode selector
+        layout.addWidget(QLabel("RL-Unified Mode:"), 2, 2)
+        rl_mode_layout = QHBoxLayout()
+        self.rl_mode_group = QButtonGroup(self)
+        self.rl_mode_training = QRadioButton("Training")
+        self.rl_mode_inference = QRadioButton("Inference")
+        self.rl_mode_inference.setChecked(True)
+        self.rl_mode_group.addButton(self.rl_mode_training)
+        self.rl_mode_group.addButton(self.rl_mode_inference)
+        rl_mode_layout.addWidget(self.rl_mode_training)
+        rl_mode_layout.addWidget(self.rl_mode_inference)
+        rl_mode_layout.addStretch()
+        layout.addLayout(rl_mode_layout, 2, 3)
         
         # GPU Support
         self.gpu_enabled = QCheckBox("Enable GPU (if available)")
         self.gpu_enabled.setStyleSheet("padding: 5px; font-size: 12px;")
         layout.addWidget(self.gpu_enabled, 3, 0, 1, 2)
         
-        # Q-Learning Convergence Training (only for RL-Unified)
-        self.ql_convergence_enabled = QCheckBox("Train until Q-value converges (RL-Unified only)")
+        # Q-learning mode note (mirrors experiment GUI behavior)
+        self.ql_convergence_enabled = QCheckBox("End RL training when Q-learning values converge")
         self.ql_convergence_enabled.setStyleSheet("padding: 5px; font-size: 12px;")
-        self.ql_convergence_enabled.setToolTip("When enabled, training continues until Q-learning values converge instead of accuracy-based convergence")
-        layout.addWidget(self.ql_convergence_enabled, 4, 0, 1, 2)
+        self.ql_convergence_enabled.setToolTip("Automatically enabled in RL training mode, disabled in inference mode.")
+        layout.addWidget(self.ql_convergence_enabled, 3, 2, 1, 2)
+
+        self.communication_model_reward_enabled = QCheckBox("Include communication model in RL rewards")
+        self.communication_model_reward_enabled.setChecked(True)
+        self.communication_model_reward_enabled.setStyleSheet("padding: 5px; font-size: 12px;")
+        self.communication_model_reward_enabled.setToolTip(
+            "When enabled, RL rewards include the communication-model T_calc penalty. "
+            "Disable this to train or run RL without reward influence from the communication model."
+        )
+        layout.addWidget(self.communication_model_reward_enabled, 4, 0, 1, 4)
         
-        # Update checkbox state when protocol mode changes
+        # Termination mode + round cap (must match experiment GUI for fixed-rounds runs)
+        layout.addWidget(QLabel("Termination mode:"), 5, 0)
+        self.termination_mode_combo = QComboBox()
+        self.termination_mode_combo.addItem("End on client convergence (may stop early)", "client_convergence")
+        self.termination_mode_combo.addItem("End on fixed rounds (run selected rounds)", "fixed_rounds")
+        self.termination_mode_combo.setCurrentIndex(0)  # Preserve existing behavior
+        self.termination_mode_combo.setStyleSheet("padding: 5px; font-size: 12px;")
+        layout.addWidget(self.termination_mode_combo, 5, 1, 1, 3)
+        
+        layout.addWidget(QLabel("NUM_ROUNDS:"), 6, 0)
+        self.rounds_spinbox = QSpinBox()
+        self.rounds_spinbox.setRange(1, 1000)
+        self.rounds_spinbox.setValue(10)
+        self.rounds_spinbox.setStyleSheet("padding: 5px; font-size: 12px;")
+        self.rounds_spinbox.setToolTip("Round cap to keep in sync with the main experiment GUI.")
+        layout.addWidget(self.rounds_spinbox, 6, 1)
+        
+        # Update state when protocol mode changes
         self.protocol_mode.currentIndexChanged.connect(self.update_ql_convergence_visibility)
+        self.protocol_mode.currentIndexChanged.connect(self.update_dds_impl_visibility)
+        self.rl_mode_training.toggled.connect(self.update_ql_convergence_visibility)
+        self.rl_mode_inference.toggled.connect(self.update_ql_convergence_visibility)
         self.update_ql_convergence_visibility()
+        self.update_dds_impl_visibility()
         
         group.setLayout(layout)
-        return group
+        outer_layout.addWidget(group)
+        outer_layout.addStretch()
+        return container
     
     def create_network_config(self):
         """Create network scenario configuration"""
-        group = QGroupBox("🌐 Network Conditions (Applied to This Client)")
-        group.setStyleSheet(self.get_group_style())
-        layout = QVBoxLayout()
+        container = QWidget()
+        outer_layout = QVBoxLayout(container)
+        outer_layout.setSpacing(12)
+
+        scenario_group = QGroupBox("🌐 Network Conditions (Applied to This Client)")
+        scenario_group.setStyleSheet(self.get_group_style())
+        scenario_layout = QVBoxLayout()
         
-        # Preset scenarios
-        scenario_layout = QHBoxLayout()
-        scenario_layout.addWidget(QLabel("Preset Scenario:"))
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("Preset Scenario:"))
         self.network_scenario = QComboBox()
         self.network_scenario.addItem("None (No Simulation)", "none")
         self.network_scenario.addItem("Excellent", "excellent")
@@ -250,12 +373,11 @@ class DistributedClientGUI(QMainWindow):
         self.network_scenario.addItem("Moderate Congestion", "congested_moderate")
         self.network_scenario.addItem("Heavy Congestion", "congested_heavy")
         self.network_scenario.setStyleSheet("padding: 8px; font-size: 12px;")
-        self.network_scenario.currentIndexChanged.connect(self.update_network_preview)
-        scenario_layout.addWidget(self.network_scenario)
-        scenario_layout.addStretch()
-        layout.addLayout(scenario_layout)
-        
-        # Network preview
+        self.network_scenario.currentIndexChanged.connect(self.apply_selected_network_preset)
+        preset_row.addWidget(self.network_scenario)
+        preset_row.addStretch()
+        scenario_layout.addLayout(preset_row)
+
         self.network_preview = QLabel("No network simulation")
         self.network_preview.setStyleSheet("""
             background-color: #f8f9fa;
@@ -265,10 +387,211 @@ class DistributedClientGUI(QMainWindow):
             font-size: 11px;
             color: #495057;
         """)
-        layout.addWidget(self.network_preview)
-        
-        group.setLayout(layout)
-        return group
+        self.network_preview.setWordWrap(True)
+        scenario_layout.addWidget(self.network_preview)
+        scenario_group.setLayout(scenario_layout)
+        outer_layout.addWidget(scenario_group)
+
+        dynamic_group = QGroupBox("🎛️ Dynamic Network Control")
+        dynamic_group.setStyleSheet(self.get_group_style())
+        dynamic_layout = QGridLayout()
+
+        dynamic_layout.addWidget(QLabel("Latency (ms):"), 0, 0)
+        self.latency_slider = QSlider(Qt.Horizontal)
+        self.latency_slider.setRange(0, 1000)
+        self.latency_slider.setValue(0)
+        self.latency_slider.setTickPosition(QSlider.TicksBelow)
+        self.latency_slider.setTickInterval(100)
+        self.latency_label = QLabel("0 ms")
+        self.latency_label.setStyleSheet("font-weight: bold; min-width: 80px;")
+        self.latency_slider.valueChanged.connect(lambda v: self.latency_label.setText(f"{v} ms"))
+        self.latency_slider.valueChanged.connect(self.update_network_preview)
+        dynamic_layout.addWidget(self.latency_slider, 0, 1)
+        dynamic_layout.addWidget(self.latency_label, 0, 2)
+
+        dynamic_layout.addWidget(QLabel("Bandwidth (Mbps):"), 1, 0)
+        self.bandwidth_slider = QSlider(Qt.Horizontal)
+        self.bandwidth_slider.setRange(1, 1000)
+        self.bandwidth_slider.setValue(100)
+        self.bandwidth_slider.setTickPosition(QSlider.TicksBelow)
+        self.bandwidth_slider.setTickInterval(100)
+        self.bandwidth_label = QLabel("100 Mbps")
+        self.bandwidth_label.setStyleSheet("font-weight: bold; min-width: 80px;")
+        self.bandwidth_slider.valueChanged.connect(lambda v: self.bandwidth_label.setText(f"{v} Mbps"))
+        self.bandwidth_slider.valueChanged.connect(self.update_network_preview)
+        dynamic_layout.addWidget(self.bandwidth_slider, 1, 1)
+        dynamic_layout.addWidget(self.bandwidth_label, 1, 2)
+
+        dynamic_layout.addWidget(QLabel("Jitter (ms):"), 2, 0)
+        self.jitter_slider = QSlider(Qt.Horizontal)
+        self.jitter_slider.setRange(0, 100)
+        self.jitter_slider.setValue(0)
+        self.jitter_slider.setTickPosition(QSlider.TicksBelow)
+        self.jitter_slider.setTickInterval(10)
+        self.jitter_label = QLabel("0 ms")
+        self.jitter_label.setStyleSheet("font-weight: bold; min-width: 80px;")
+        self.jitter_slider.valueChanged.connect(lambda v: self.jitter_label.setText(f"{v} ms"))
+        self.jitter_slider.valueChanged.connect(self.update_network_preview)
+        dynamic_layout.addWidget(self.jitter_slider, 2, 1)
+        dynamic_layout.addWidget(self.jitter_label, 2, 2)
+
+        dynamic_layout.addWidget(QLabel("Packet Loss (%):"), 3, 0)
+        self.packet_loss_slider = QSlider(Qt.Horizontal)
+        self.packet_loss_slider.setRange(0, 100)
+        self.packet_loss_slider.setValue(0)
+        self.packet_loss_slider.setTickPosition(QSlider.TicksBelow)
+        self.packet_loss_slider.setTickInterval(10)
+        self.packet_loss_label = QLabel("0.0 %")
+        self.packet_loss_label.setStyleSheet("font-weight: bold; min-width: 80px;")
+        self.packet_loss_slider.valueChanged.connect(lambda v: self.packet_loss_label.setText(f"{v / 10.0:.1f} %"))
+        self.packet_loss_slider.valueChanged.connect(self.update_network_preview)
+        dynamic_layout.addWidget(self.packet_loss_slider, 3, 1)
+        dynamic_layout.addWidget(self.packet_loss_label, 3, 2)
+
+        dynamic_group.setLayout(dynamic_layout)
+        outer_layout.addWidget(dynamic_group)
+
+        congestion_group = QGroupBox("🚦 Traffic Congestion")
+        congestion_group.setStyleSheet(self.get_group_style())
+        congestion_layout = QHBoxLayout()
+        self.enable_congestion = QCheckBox("Enable Traffic Generator-Based Congestion")
+        self.enable_congestion.setStyleSheet("font-size: 13px; padding: 5px;")
+        self.enable_congestion.toggled.connect(self.update_network_preview)
+        congestion_layout.addWidget(self.enable_congestion)
+        congestion_layout.addWidget(QLabel("Congestion Level:"))
+        self.congestion_level = QComboBox()
+        self.congestion_level.addItems(["Light", "Moderate", "Heavy"])
+        self.congestion_level.setCurrentText("Moderate")
+        self.congestion_level.setStyleSheet("padding: 5px;")
+        self.congestion_level.currentIndexChanged.connect(self.update_network_preview)
+        congestion_layout.addWidget(self.congestion_level)
+        congestion_layout.addStretch()
+        congestion_group.setLayout(congestion_layout)
+        outer_layout.addWidget(congestion_group)
+
+        outer_layout.addStretch()
+        self.apply_selected_network_preset()
+        return container
+
+    def create_advanced_config(self):
+        """Create advanced runtime options to match experiment GUI"""
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setSpacing(12)
+
+        quant_group = QGroupBox("🔢 Model Quantization")
+        quant_group.setStyleSheet(self.get_group_style())
+        quant_layout = QVBoxLayout()
+        self.quantization_enabled = QCheckBox("Enable Quantization")
+        self.quantization_enabled.setStyleSheet("font-size: 13px; padding: 5px;")
+        self.quantization_enabled.toggled.connect(self.toggle_quantization_options)
+        quant_layout.addWidget(self.quantization_enabled)
+
+        quant_options = QWidget()
+        quant_options_layout = QGridLayout()
+        quant_options_layout.addWidget(QLabel("Quantization Bits:"), 0, 0)
+        self.quant_bits = QComboBox()
+        self.quant_bits.addItems(["4", "8", "16", "32"])
+        self.quant_bits.setCurrentText("8")
+        self.quant_bits.setStyleSheet("padding: 5px;")
+        quant_options_layout.addWidget(self.quant_bits, 0, 1)
+        quant_options_layout.addWidget(QLabel("Strategy:"), 0, 2)
+        self.quant_strategy = QComboBox()
+        self.quant_strategy.addItems(["full_quantization", "parameter_quantization", "activation_quantization"])
+        self.quant_strategy.setStyleSheet("padding: 5px;")
+        quant_options_layout.addWidget(self.quant_strategy, 0, 3)
+        self.quant_symmetric = QCheckBox("Use Symmetric Quantization")
+        self.quant_symmetric.setStyleSheet("padding: 5px;")
+        quant_options_layout.addWidget(self.quant_symmetric, 1, 0, 1, 2)
+        self.quant_per_channel = QCheckBox("Per-Channel Quantization")
+        self.quant_per_channel.setStyleSheet("padding: 5px;")
+        quant_options_layout.addWidget(self.quant_per_channel, 1, 2, 1, 2)
+        quant_options.setLayout(quant_options_layout)
+        quant_options.setEnabled(False)
+        self.quant_options_widget = quant_options
+        quant_layout.addWidget(quant_options)
+        quant_group.setLayout(quant_layout)
+        layout.addWidget(quant_group)
+
+        compression_group = QGroupBox("📦 Model Compression")
+        compression_group.setStyleSheet(self.get_group_style())
+        compression_layout = QVBoxLayout()
+        self.compression_enabled = QCheckBox("Enable Compression")
+        self.compression_enabled.setStyleSheet("font-size: 13px; padding: 5px;")
+        self.compression_enabled.toggled.connect(self.toggle_compression_options)
+        compression_layout.addWidget(self.compression_enabled)
+
+        comp_options = QWidget()
+        comp_options_layout = QHBoxLayout()
+        comp_options_layout.addWidget(QLabel("Algorithm:"))
+        self.compression_algo = QComboBox()
+        self.compression_algo.addItems(["gzip", "lz4", "zstd", "snappy"])
+        self.compression_algo.setCurrentText("gzip")
+        self.compression_algo.setStyleSheet("padding: 5px;")
+        comp_options_layout.addWidget(self.compression_algo)
+        comp_options_layout.addWidget(QLabel("Level:"))
+        self.compression_level = QSpinBox()
+        self.compression_level.setRange(1, 9)
+        self.compression_level.setValue(6)
+        self.compression_level.setStyleSheet("padding: 5px;")
+        comp_options_layout.addWidget(self.compression_level)
+        comp_options_layout.addStretch()
+        comp_options.setLayout(comp_options_layout)
+        comp_options.setEnabled(False)
+        self.comp_options_widget = comp_options
+        compression_layout.addWidget(comp_options)
+        compression_group.setLayout(compression_layout)
+        layout.addWidget(compression_group)
+
+        pruning_group = QGroupBox("✂️ Model Pruning")
+        pruning_group.setStyleSheet(self.get_group_style())
+        pruning_layout = QVBoxLayout()
+        self.pruning_enabled = QCheckBox("Enable Pruning")
+        self.pruning_enabled.setStyleSheet("font-size: 13px; padding: 5px;")
+        self.pruning_enabled.toggled.connect(self.toggle_pruning_options)
+        pruning_layout.addWidget(self.pruning_enabled)
+
+        pruning_options = QWidget()
+        pruning_options_layout = QHBoxLayout()
+        pruning_options_layout.addWidget(QLabel("Pruning Ratio:"))
+        self.pruning_ratio = QSlider(Qt.Horizontal)
+        self.pruning_ratio.setRange(0, 90)
+        self.pruning_ratio.setValue(50)
+        self.pruning_ratio.setTickPosition(QSlider.TicksBelow)
+        self.pruning_ratio.setTickInterval(10)
+        self.pruning_ratio_label = QLabel("50%")
+        self.pruning_ratio_label.setStyleSheet("font-weight: bold; min-width: 50px;")
+        self.pruning_ratio.valueChanged.connect(lambda v: self.pruning_ratio_label.setText(f"{v}%"))
+        pruning_options_layout.addWidget(self.pruning_ratio)
+        pruning_options_layout.addWidget(self.pruning_ratio_label)
+        pruning_options.setLayout(pruning_options_layout)
+        pruning_options.setEnabled(False)
+        self.pruning_options_widget = pruning_options
+        pruning_layout.addWidget(pruning_options)
+        pruning_group.setLayout(pruning_layout)
+        layout.addWidget(pruning_group)
+
+        other_group = QGroupBox("⚙️ Other Options")
+        other_group.setStyleSheet(self.get_group_style())
+        other_layout = QGridLayout()
+        self.save_checkpoints = QCheckBox("Save Model Checkpoints")
+        self.save_checkpoints.setChecked(True)
+        self.save_checkpoints.setStyleSheet("padding: 5px;")
+        other_layout.addWidget(self.save_checkpoints, 0, 0)
+        self.verbose_logging = QCheckBox("Verbose Logging")
+        self.verbose_logging.setStyleSheet("padding: 5px;")
+        other_layout.addWidget(self.verbose_logging, 0, 1)
+        self.enable_tensorboard = QCheckBox("Enable TensorBoard")
+        self.enable_tensorboard.setStyleSheet("padding: 5px;")
+        other_layout.addWidget(self.enable_tensorboard, 1, 0)
+        self.profile_performance = QCheckBox("Profile Performance")
+        self.profile_performance.setStyleSheet("padding: 5px;")
+        other_layout.addWidget(self.profile_performance, 1, 1)
+        other_group.setLayout(other_layout)
+        layout.addWidget(other_group)
+
+        layout.addStretch()
+        return container
     
     def create_control_buttons(self):
         """Create control buttons"""
@@ -369,9 +692,34 @@ class DistributedClientGUI(QMainWindow):
     def update_ql_convergence_visibility(self):
         """Update Q-learning convergence checkbox visibility based on protocol mode"""
         is_rl_unified = (self.protocol_mode.currentData() == "rl_unified")
-        self.ql_convergence_enabled.setEnabled(is_rl_unified)
-        if not is_rl_unified:
-            self.ql_convergence_enabled.setChecked(False)
+        training_selected = is_rl_unified and self.rl_mode_training.isChecked()
+        self.rl_mode_training.setEnabled(is_rl_unified)
+        self.rl_mode_inference.setEnabled(is_rl_unified)
+        self.ql_convergence_enabled.setChecked(training_selected)
+        self.ql_convergence_enabled.setEnabled(False)
+        self.communication_model_reward_enabled.setEnabled(is_rl_unified)
+    
+    def update_dds_impl_visibility(self):
+        """Enable DDS implementation selector only when DDS protocol is selected"""
+        is_dds = (self.protocol_mode.currentData() == "dds")
+        self.dds_impl_label.setEnabled(is_dds)
+        self.dds_impl.setEnabled(is_dds)
+
+    def is_rl_training_mode(self):
+        """Return True when RL-unified is configured in training mode"""
+        return self.protocol_mode.currentData() == "rl_unified" and self.rl_mode_training.isChecked()
+
+    def toggle_quantization_options(self, enabled):
+        """Toggle quantization options"""
+        self.quant_options_widget.setEnabled(enabled)
+
+    def toggle_compression_options(self, enabled):
+        """Toggle compression options"""
+        self.comp_options_widget.setEnabled(enabled)
+
+    def toggle_pruning_options(self, enabled):
+        """Toggle pruning options"""
+        self.pruning_options_widget.setEnabled(enabled)
     
     def create_log_section(self):
         """Create log and status section"""
@@ -449,22 +797,51 @@ class DistributedClientGUI(QMainWindow):
     
     def update_network_preview(self):
         """Update network scenario preview"""
-        scenarios = {
-            "none": "No network simulation applied",
-            "excellent": "Latency: 5ms | Bandwidth: 100Mbps | Loss: 0%",
-            "good": "Latency: 20ms | Bandwidth: 50Mbps | Loss: 0.1%",
-            "moderate": "Latency: 50ms | Bandwidth: 20Mbps | Loss: 0.5%",
-            "poor": "Latency: 100ms | Bandwidth: 5Mbps | Loss: 1%",
-            "very_poor": "Latency: 200ms | Bandwidth: 1Mbps | Loss: 3%",
-            "satellite": "Latency: 600ms | Bandwidth: 10Mbps | Jitter: 50ms | Loss: 2%",
-            "congested_light": "Latency: 30ms | Bandwidth: 30Mbps | Jitter: 5ms | Loss: 0.5%",
-            "congested_moderate": "Latency: 75ms | Bandwidth: 15Mbps | Jitter: 15ms | Loss: 1.5%",
-            "congested_heavy": "Latency: 150ms | Bandwidth: 5Mbps | Jitter: 30ms | Loss: 3%"
+        profile = self.get_effective_network_profile()
+        scenario_name = self.network_scenario.currentText()
+        preview = (
+            f"📊 {scenario_name}\n"
+            f"Latency: {profile['latency']} ms | "
+            f"Bandwidth: {profile['bandwidth']} Mbps | "
+            f"Jitter: {profile['jitter']} ms | "
+            f"Loss: {profile['packet_loss']:.1f}%"
+        )
+        if self.enable_congestion.isChecked():
+            preview += f"\nCongestion: {self.congestion_level.currentText()}"
+        self.network_preview.setText(preview)
+
+    def apply_selected_network_preset(self):
+        """Apply the selected preset values to the manual network controls"""
+        preset = NETWORK_SCENARIO_PRESETS.get(self.network_scenario.currentData(), NETWORK_SCENARIO_PRESETS["none"])
+        for slider in (self.latency_slider, self.bandwidth_slider, self.jitter_slider, self.packet_loss_slider):
+            slider.blockSignals(True)
+        self.latency_slider.setValue(int(preset["latency"]))
+        self.bandwidth_slider.setValue(int(preset["bandwidth"]))
+        self.jitter_slider.setValue(int(preset["jitter"]))
+        self.packet_loss_slider.setValue(int(round(preset["packet_loss"] * 10)))
+        for slider in (self.latency_slider, self.bandwidth_slider, self.jitter_slider, self.packet_loss_slider):
+            slider.blockSignals(False)
+        self.latency_label.setText(f"{self.latency_slider.value()} ms")
+        self.bandwidth_label.setText(f"{self.bandwidth_slider.value()} Mbps")
+        self.jitter_label.setText(f"{self.jitter_slider.value()} ms")
+        self.packet_loss_label.setText(f"{self.packet_loss_slider.value() / 10.0:.1f} %")
+        self.update_network_preview()
+
+    def get_effective_network_profile(self):
+        """Build the final tc/netem profile from UI controls"""
+        profile = {
+            "latency": self.latency_slider.value(),
+            "bandwidth": self.bandwidth_slider.value(),
+            "jitter": self.jitter_slider.value(),
+            "packet_loss": self.packet_loss_slider.value() / 10.0,
         }
-        
-        scenario = self.network_scenario.currentData()
-        preview_text = scenarios.get(scenario, "Unknown scenario")
-        self.network_preview.setText(f"📊 {preview_text}")
+        if self.enable_congestion.isChecked():
+            congestion = CONGESTION_PRESETS[self.congestion_level.currentText().lower()]
+            profile["latency"] += congestion["latency"]
+            profile["jitter"] += congestion["jitter"]
+            profile["packet_loss"] += congestion["packet_loss"]
+            profile["bandwidth"] = max(1, int(profile["bandwidth"] * congestion["bandwidth_factor"]))
+        return profile
     
     def test_connection(self):
         """Test connection to server"""
@@ -515,7 +892,8 @@ class DistributedClientGUI(QMainWindow):
         """Start the distributed client container"""
         server_ip = self.server_ip.text().strip()
         client_id = self.client_id.value()
-        use_case = self.use_case.currentText()
+        total_clients = self.total_clients.value()
+        use_case = self.use_case.currentData() or self.use_case.currentText()
         protocol = self.protocol_mode.currentData()
         network_scenario = self.network_scenario.currentData()
         
@@ -523,7 +901,7 @@ class DistributedClientGUI(QMainWindow):
         if not server_ip:
             QMessageBox.warning(self, "Error", "Please enter server IP address!")
             return
-        
+
         # Determine if using unified or single protocol
         is_unified = (protocol == "rl_unified")
         
@@ -533,12 +911,21 @@ class DistributedClientGUI(QMainWindow):
             "Start Client",
             f"Ready to start client with:\n\n"
             f"Client ID: {client_id}\n"
+            f"Total Clients: {total_clients}\n"
             f"Server: {server_ip}\n"
             f"Use Case: {use_case}\n"
             f"Protocol: {protocol}\n"
+            f"RL Mode: {'Training' if self.is_rl_training_mode() else 'Inference'}\n"
+            f"DDS Implementation: {self.dds_impl.currentText() if protocol == 'dds' else 'N/A'}\n"
             f"Network: {network_scenario}\n"
+            f"Rounds: {self.rounds_spinbox.value()}\n"
+            f"Termination: {self.termination_mode_combo.currentText()}\n"
             f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
-            f"Q-Learning Convergence: {'Enabled' if (is_unified and self.ql_convergence_enabled.isChecked()) else 'Disabled'}\n\n"
+            f"Q-Learning Convergence: {'Enabled' if self.is_rl_training_mode() else 'Disabled'}\n"
+            f"Communication Model Reward: {'Enabled' if is_unified and self.communication_model_reward_enabled.isChecked() else 'Disabled'}\n"
+            f"Quantization: {'Enabled' if self.quantization_enabled.isChecked() else 'Disabled'}\n"
+            f"Compression: {'Enabled' if self.compression_enabled.isChecked() else 'Disabled'}\n"
+            f"Pruning: {'Enabled' if self.pruning_enabled.isChecked() else 'Disabled'}\n\n"
             f"Continue?",
             QMessageBox.Yes | QMessageBox.No
         )
@@ -606,37 +993,81 @@ class DistributedClientGUI(QMainWindow):
             "--network", "host",  # Use host network to access server
             "--cap-add", "NET_ADMIN",  # For network simulation
             "-e", f"CLIENT_ID={client_id}",
+            "-e", f"NUM_CLIENTS={total_clients}",
+            "-e", f"NUM_ROUNDS={self.rounds_spinbox.value()}",
             "-e", f"NODE_TYPE=client",
             "-e", f"MQTT_BROKER={server_ip}",
             "-e", "MQTT_PORT=31883",  # External port for MQTT broker
+            "-e", f"AMQP_HOST={server_ip}",
             "-e", f"AMQP_BROKER={server_ip}",
             "-e", "AMQP_PORT=35672",  # External port for RabbitMQ broker
             "-e", "AMQP_USER=guest",
             "-e", "AMQP_PASSWORD=guest",
+            "-e", f"GRPC_HOST={server_ip}",
             "-e", f"GRPC_SERVER={server_ip}",
             "-e", "GRPC_PORT=50051",
             "-e", f"QUIC_HOST={server_ip}",
             "-e", "QUIC_PORT=4433",
+            "-e", f"HTTP3_HOST={server_ip}",
+            "-e", "HTTP3_PORT=4434",
             "-e", "DDS_DOMAIN_ID=0"
         ]
+        
+        termination_mode = self.termination_mode_combo.currentData() or self.termination_mode_combo.currentText()
+        stop_on_client_convergence = "false" if termination_mode == "fixed_rounds" else "true"
+        cmd.extend(["-e", f"STOP_ON_CLIENT_CONVERGENCE={stop_on_client_convergence}"])
+        
+        # DDS implementation vendor selection (passed as environment variable)
+        if protocol == "dds":
+            dds_impl_value = self.dds_impl.currentData() or self.dds_impl.currentText()
+            cmd.extend(["-e", f"DDS_IMPL={dds_impl_value}"])
         
         # Add unified-specific env vars
         if is_unified:
             cmd.extend([
                 "-e", "USE_RL_SELECTION=true",
-                "-e", "ENABLE_METRICS=true"
+                "-e", "ENABLE_METRICS=true",
+                "-e", f"USE_COMMUNICATION_MODEL_REWARD={'true' if self.communication_model_reward_enabled.isChecked() else 'false'}",
             ])
-            # Add Q-learning convergence option if enabled
-            if self.ql_convergence_enabled.isChecked():
+            if self.is_rl_training_mode():
                 cmd.extend([
                     "-e", "USE_QL_CONVERGENCE=true",
                     "-e", "Q_CONVERGENCE_THRESHOLD=0.01",
                     "-e", "Q_CONVERGENCE_PATIENCE=5"
                 ])
+            else:
+                cmd.extend(["-e", "USE_QL_CONVERGENCE=false"])
         else:
             cmd.extend([
                 "-e", f"PROTOCOL={protocol.upper()}"
             ])
+
+        if self.quantization_enabled.isChecked():
+            cmd.extend([
+                "-e", "USE_QUANTIZATION=true",
+                "-e", f"QUANTIZATION_BITS={self.quant_bits.currentText()}",
+                "-e", f"QUANTIZATION_STRATEGY={self.quant_strategy.currentText()}",
+                "-e", f"QUANTIZATION_SYMMETRIC={'true' if self.quant_symmetric.isChecked() else 'false'}",
+                "-e", f"QUANTIZATION_PER_CHANNEL={'true' if self.quant_per_channel.isChecked() else 'false'}",
+            ])
+        if self.pruning_enabled.isChecked():
+            cmd.extend([
+                "-e", "USE_PRUNING=true",
+                "-e", f"PRUNING_SPARSITY={self.pruning_ratio.value() / 100.0:.2f}",
+            ])
+        if self.compression_enabled.isChecked():
+            cmd.extend([
+                "-e", "ENABLE_COMPRESSION=true",
+                "-e", f"COMPRESSION_ALGORITHM={self.compression_algo.currentText()}",
+                "-e", f"COMPRESSION_LEVEL={self.compression_level.value()}",
+            ])
+
+        cmd.extend([
+            "-e", f"SAVE_CHECKPOINTS={'true' if self.save_checkpoints.isChecked() else 'false'}",
+            "-e", f"VERBOSE_LOGGING={'true' if self.verbose_logging.isChecked() else 'false'}",
+            "-e", f"ENABLE_TENSORBOARD={'true' if self.enable_tensorboard.isChecked() else 'false'}",
+            "-e", f"PROFILE_PERFORMANCE={'true' if self.profile_performance.isChecked() else 'false'}",
+        ])
         
         # GPU support
         if self.gpu_enabled.isChecked():
@@ -680,36 +1111,29 @@ class DistributedClientGUI(QMainWindow):
     
     def apply_network_conditions(self, container_name, scenario):
         """Apply network conditions to client container"""
-        conditions = {
-            "excellent": {"latency": "5ms", "bandwidth": "100mbit", "loss": "0"},
-            "good": {"latency": "20ms", "bandwidth": "50mbit", "loss": "0.1"},
-            "moderate": {"latency": "50ms", "bandwidth": "20mbit", "loss": "0.5"},
-            "poor": {"latency": "100ms", "bandwidth": "5mbit", "loss": "1"},
-            "very_poor": {"latency": "200ms", "bandwidth": "1mbit", "loss": "3"},
-            "satellite": {"latency": "600ms", "bandwidth": "10mbit", "jitter": "50ms", "loss": "2"},
-            "congested_light": {"latency": "30ms", "bandwidth": "30mbit", "jitter": "5ms", "loss": "0.5"},
-            "congested_moderate": {"latency": "75ms", "bandwidth": "15mbit", "jitter": "15ms", "loss": "1.5"},
-            "congested_heavy": {"latency": "150ms", "bandwidth": "5mbit", "jitter": "30ms", "loss": "3"}
-        }
-        
-        if scenario not in conditions:
+        if scenario == "none" and not self.enable_congestion.isChecked():
             return
-        
-        cond = conditions[scenario]
+
+        cond = self.get_effective_network_profile()
         self.log_text.append(f"\n🌐 Applying network conditions: {scenario}\n")
+        self.log_text.append(
+            f"Resolved profile -> latency={cond['latency']}ms, bandwidth={cond['bandwidth']}mbit, "
+            f"jitter={cond['jitter']}ms, loss={cond['packet_loss']:.1f}%\n"
+        )
         
         try:
             # Build tc commands to apply inside container
             setup_cmds = [
+                "tc qdisc del dev eth0 root || true",
                 "tc qdisc add dev eth0 root handle 1: htb default 12",
-                f"tc class add dev eth0 parent 1: classid 1:12 htb rate {cond['bandwidth']}",
+                f"tc class add dev eth0 parent 1: classid 1:12 htb rate {cond['bandwidth']}mbit",
             ]
             
-            netem_params = [f"delay {cond['latency']}"]
-            if 'jitter' in cond:
-                netem_params.append(cond['jitter'])
-            if 'loss' in cond and float(cond['loss']) > 0:
-                netem_params.append(f"loss {cond['loss']}%")
+            netem_params = [f"delay {cond['latency']}ms"]
+            if cond["jitter"] > 0:
+                netem_params.append(f"{cond['jitter']}ms")
+            if cond["packet_loss"] > 0:
+                netem_params.append(f"loss {cond['packet_loss']:.1f}%")
             
             setup_cmds.append(f"tc qdisc add dev eth0 parent 1:12 handle 10: netem {' '.join(netem_params)}")
             
@@ -784,19 +1208,13 @@ class DistributedClientGUI(QMainWindow):
     
     def rebuild_client_image(self):
         """Rebuild the client Docker image for current configuration"""
-        use_case = self.use_case.currentText()
+        use_case = self.use_case.currentData() or self.use_case.currentText()
         protocol = self.protocol_mode.currentData()
         
         # Determine if using unified or single protocol
         is_unified = (protocol == "rl_unified")
         
-        # Map use case display name to file name
-        use_case_map = {
-            "Emotion Recognition": "emotion",
-            "Mental State Recognition": "mentalstate",
-            "Temperature Regulation": "temperature"
-        }
-        use_case_file = use_case_map.get(use_case, use_case.lower().replace(" ", ""))
+        use_case_file = str(use_case).lower().replace(" ", "")
         
         # Map to docker-compose file and service pattern
         if is_unified:

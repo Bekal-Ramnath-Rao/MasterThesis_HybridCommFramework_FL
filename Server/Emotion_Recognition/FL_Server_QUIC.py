@@ -1,14 +1,28 @@
+import os
+import sys
+# Server uses CPU only (aggregation is numpy-only); saves GPU memory for clients
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
 import numpy as np
 import json
 import pickle
 import base64
 import time
-import os
 import asyncio
-import sys
+import socket
 from typing import Dict, Optional
 import matplotlib.pyplot as plt
 from pathlib import Path
+
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -26,13 +40,14 @@ from aioquic.asyncio import QuicConnectionProtocol, serve
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import QuicEvent, StreamDataReceived
 
-# Server Configuration
-QUIC_HOST = os.getenv("QUIC_HOST", "fl-server-quic-emotion")
+# Server Configuration (use 0.0.0.0 for host network mode; 127.0.0.1 for local only)
+QUIC_HOST = os.getenv("QUIC_HOST", "0.0.0.0")
 QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 # Dynamic client configuration
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Convergence Settings
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -40,12 +55,26 @@ CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
 
+QUIC_SOCKET_BUFFER_BYTES = 7_500_000  # 7.5MB for SO_RCVBUF/SO_SNDBUF (poor network)
+
+
 class FederatedLearningServerProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.server = None
         self._stream_buffers = {}  # Buffer for incomplete messages
-    
+
+    def connection_made(self, transport):
+        super().connection_made(transport)
+        sock = transport.get_extra_info("socket")
+        if sock:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, QUIC_SOCKET_BUFFER_BYTES)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, QUIC_SOCKET_BUFFER_BYTES)
+                print(f"[QUIC] UDP socket buffers set to {QUIC_SOCKET_BUFFER_BYTES // 1_000_000}MB")
+            except OSError as e:
+                print(f"[QUIC] Could not set socket buffers: {e}")
+
     def quic_event_received(self, event: QuicEvent):
         #print(f"[DEBUG] quic_event_received called, event type: {type(event).__name__}")
         if isinstance(event, StreamDataReceived):
@@ -110,7 +139,10 @@ class FederatedLearningServer:
         self.ACCURACY = []
         self.LOSS = []
         self.ROUNDS = []
-        
+        self.ROUND_TIMES = []
+        self.BATTERY_CONSUMPTION = []
+        self.round_start_time = None
+
         # Convergence tracking
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
@@ -142,10 +174,11 @@ class FederatedLearningServer:
         
         # Training configuration
         # Training configuration sent to clients
-        # Reduced batch size to 16 to prevent GPU OOM on RTX 3080 (10GB)
+        # Batch size 16 to reduce client GPU memory; server runs on CPU
+        # Batch size 16 to reduce client GPU memory; server runs on CPU
         self.training_config = {
-            "batch_size": 32,
-            "local_epochs": 20  # Reduced from 20 for faster experiments
+            "batch_size": int(os.getenv("BATCH_SIZE", "16")),
+            "local_epochs": 20
         }
     
     def initialize_global_model(self):
@@ -288,6 +321,10 @@ class FederatedLearningServer:
     
     async def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore client-local convergence removal/disconnect.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         if client_id in self.active_clients:
             self.active_clients.discard(client_id)
             self.registered_clients.pop(client_id, None)
@@ -306,25 +343,33 @@ class FederatedLearningServer:
                 # If remaining active clients already sent metrics, do not stall.
                 await self.aggregate_metrics()
                 await self.continue_training()
+            elif len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
+                # If remaining active clients already sent updates, aggregate and continue.
+                await self.aggregate_models()
     
     async def handle_client_update(self, message):
         """Handle model update from client"""
+        recv_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
         client_id = message['client_id']
         round_num = message['round']
         if client_id not in self.active_clients:
             return
-        if float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+        if STOP_ON_CLIENT_CONVERGENCE and float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             await self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
             # Decompress or deserialize client weights
             if 'compressed_data' in message and self.quantization_handler is not None:
-                start_t = time.time()
                 # Deserialize base64+pickle encoded compressed data
                 compressed_data = pickle.loads(base64.b64decode(message['compressed_data']))
-                weights = self.quantization_handler.decompress_client_update(message['client_id'], compressed_data)
-                dt = time.time() - start_t
-                print(f"Server: Received and decompressed update from client {message['client_id']} in {dt:.2f}s")
+                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                self.client_updates[client_id] = {
+                    'compressed_data': compressed_data,
+                    'num_samples': message['num_samples'],
+                    'metrics': message['metrics']
+                }
+                print(f"Server: Received quantized update from client {message['client_id']} (kept quantized)")
+                weights = None
             else:
                 # Offload heavy deserialization to thread pool to avoid blocking event loop
                 encoded = message.get('weights')
@@ -342,11 +387,18 @@ class FederatedLearningServer:
                 dt = time.time() - start_t
                 #print(f"[DEBUG] Deserialized weights from client {client_id} in {dt:.2f}s")
             
-            self.client_updates[client_id] = {
-                'weights': weights,
-                'num_samples': message['num_samples'],
-                'metrics': message['metrics']
-            }
+            if recv_start_cpu is not None:
+                O_recv = time.perf_counter() - recv_start_cpu
+                recv_end_ts = time.time()
+                send_start_ts = message.get("diagnostic_send_start_ts", recv_end_ts)
+                print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={send_start_ts:.9f}")
+            
+            if 'compressed_data' not in message or self.quantization_handler is None:
+                self.client_updates[client_id] = {
+                    'weights': weights,
+                    'num_samples': message['num_samples'],
+                    'metrics': message['metrics']
+                }
             
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{len(self.active_clients)})")
@@ -362,13 +414,16 @@ class FederatedLearningServer:
         round_num = message['round']
         if client_id not in self.active_clients:
             return
-        if float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+        if STOP_ON_CLIENT_CONVERGENCE and float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             await self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
+            m = message.get('metrics', {})
             self.client_metrics[client_id] = {
                 'num_samples': message['num_samples'],
-                'metrics': message['metrics']
+                'metrics': message['metrics'],
+                'battery_soc': float(m.get('battery_soc', 1.0)),
+                'round_time_sec': float(m.get('round_time_sec', 0.0)),
             }
             
             print(f"Received metrics from client {client_id} "
@@ -386,6 +441,7 @@ class FederatedLearningServer:
         })
         
         self.current_round = 1
+        self.round_start_time = time.time()
         
         print(f"\n{'='*70}")
         print(f"Distributing Initial Global Model")
@@ -461,6 +517,33 @@ class FederatedLearningServer:
     async def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            weights_data = base64.b64encode(pickle.dumps(self.global_compressed)).decode('utf-8')
+            await self.broadcast_message({
+                'type': 'global_model',
+                'round': self.current_round,
+                'quantized_data': weights_data,
+                'model_config': self.model_config_json
+            })
+
+            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients")
+
+            await asyncio.sleep(1)
+            await self.broadcast_message({'type': 'start_evaluation', 'round': self.current_round})
+            return
         
         total_samples = sum(update['num_samples'] 
                           for update in self.client_updates.values())
@@ -509,7 +592,10 @@ class FederatedLearningServer:
     async def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
         print(f"\nAggregating metrics from {len(self.client_metrics)} clients...")
-        
+        if getattr(self, 'round_start_time', None) is not None:
+            self.ROUND_TIMES.append(time.time() - self.round_start_time)
+        socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
+        self.BATTERY_CONSUMPTION.append(1.0 - (sum(socs) / len(socs) if socs else 1.0))
         total_samples = sum(metric['num_samples'] 
                           for metric in self.client_metrics.values())
         
@@ -548,6 +634,7 @@ class FederatedLearningServer:
         
         if self.current_round < self.num_rounds:
             self.current_round += 1
+            self.round_start_time = time.time()
             
             print(f"\n{'='*70}")
             print(f"Starting Round {self.current_round}/{self.num_rounds}")
@@ -598,50 +685,50 @@ class FederatedLearningServer:
             return False
     
     def plot_results(self):
-        """Plot training metrics"""
-        plt.figure(figsize=(12, 5))
-        
-        plt.subplot(1, 2, 1)
-        plt.plot(self.ROUNDS, self.LOSS, marker='o', linewidth=2, markersize=8, color='red')
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Loss', fontsize=12)
-        plt.title('Loss over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        plt.subplot(1, 2, 2)
-        plt.plot(self.ROUNDS, self.ACCURACY, marker='s', linewidth=2, markersize=8, color='green')
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Accuracy', fontsize=12)
-        plt.title('Accuracy over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
-        plt.savefig(results_dir / 'quic_training_metrics.png', dpi=300, bbox_inches='tight')
+        """Plot battery, round/convergence time, and loss/accuracy."""
+        results_dir = get_experiment_results_dir("emotion", "quic")
+        rounds = self.ROUNDS
+        n = len(rounds)
+        conv_time = self.convergence_time if self.convergence_time is not None else (time.time() - self.start_time if self.start_time else 0)
+        bc = (getattr(self, 'BATTERY_CONSUMPTION', []) + [0.0] * max(0, n - len(getattr(self, 'BATTERY_CONSUMPTION', []))))[:n] or [0.0] * n
+        rt = (getattr(self, 'ROUND_TIMES', []) + [0.0] * max(0, n - len(getattr(self, 'ROUND_TIMES', []))))[:n] or [0.0] * n
+        fig1, ax1 = plt.subplots(figsize=(7, 4))
+        if bc: ax1.plot(rounds, [c * 100 for c in bc], marker='o', linewidth=2, markersize=6, color='#2e86ab')
+        ax1.set_xlabel('Round'); ax1.set_ylabel('Battery consumption (%)'); ax1.set_title('QUIC: Battery consumption till end of FL'); ax1.grid(True, alpha=0.3)
+        fig1.tight_layout(); fig1.savefig(results_dir / 'quic_battery_consumption.png', dpi=300, bbox_inches='tight'); plt.close(fig1)
+        fig2, ax2 = plt.subplots(figsize=(7, 4))
+        if rt: ax2.bar(rounds, rt, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        ax2.axhline(y=conv_time, color='#f18f01', linestyle='--', linewidth=2, label=f'Convergence: {conv_time:.1f} s')
+        ax2.set_xlabel('Round'); ax2.set_ylabel('Time (s)'); ax2.set_title('QUIC: Time per round and convergence'); ax2.legend(); ax2.grid(True, alpha=0.3)
+        fig2.tight_layout(); fig2.savefig(results_dir / 'quic_round_and_convergence_time.png', dpi=300, bbox_inches='tight'); plt.close(fig2)
+        fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(12, 5))
+        ax3a.plot(rounds, self.LOSS, marker='o', linewidth=2, markersize=8, color='red'); ax3a.set_xlabel('Round'); ax3a.set_ylabel('Loss'); ax3a.set_title('QUIC: Loss over Rounds'); ax3a.grid(True, alpha=0.3)
+        ax3b.plot(rounds, self.ACCURACY, marker='s', linewidth=2, markersize=8, color='green'); ax3b.set_xlabel('Round'); ax3b.set_ylabel('Accuracy'); ax3b.set_title('QUIC: Accuracy over Rounds'); ax3b.grid(True, alpha=0.3)
+        fig3.tight_layout(); fig3.savefig(results_dir / 'quic_training_metrics.png', dpi=300, bbox_inches='tight'); plt.close(fig3)
         print(f"Results plot saved to {results_dir / 'quic_training_metrics.png'}")
-        print("\nDisplaying plot... Close the plot window to exit.")
-        plt.show()
-        
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1": plt.close('all')
+        else: plt.show(block=False)
         print("\nPlot closed. Server shutting down...")
         import sys
         sys.exit(0)
     
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("emotion", "quic")
         
         results = {
             "rounds": self.ROUNDS,
             "accuracy": self.ACCURACY,
             "loss": self.LOSS,
+            "round_times_seconds": getattr(self, 'ROUND_TIMES', []),
+            "battery_consumption": getattr(self, 'BATTERY_CONSUMPTION', []),
             "convergence_time_seconds": self.convergence_time,
             "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
             "total_rounds": len(self.ROUNDS),
             "num_clients": self.num_clients,
-            "converged": self.converged
+            "converged": self.converged,
+            "final_accuracy": self.ACCURACY[-1] if self.ACCURACY else None,
+            "final_loss": self.LOSS[-1] if self.LOSS else None,
         }
         
         results_file = results_dir / 'quic_training_results.json'
@@ -661,21 +748,17 @@ async def main():
     
     server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
-    # Fair comparison settings aligned with MQTT/AMQP/gRPC/DDS
-    # FAIR CONFIG: Aligned with MQTT/AMQP/gRPC/DDS for unbiased comparison
+    # QUIC config: cubic congestion, 60s idle; 128 MB flow control (aligned with MQTT/gRPC for fair FL comparison)
+    QUIC_MAX_DATA_BYTES = 128 * 1024 * 1024  # 128 MB
     configuration = QuicConfiguration(
         is_client=False,
         alpn_protocols=["fl"],
-        
-        # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
-        max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
-        max_data=256 * 1024 * 1024,  # 256 MB total connection
-        
-        # FAIR CONFIG: Timeout 600s for very_poor network scenarios
-        idle_timeout=600.0,  # 10 minutes
-        max_datagram_frame_size=65536,  # 64 KB frames
-        # Poor network adjustments
-        initial_rtt=0.15,  # Account for network latency
+        congestion_control_algorithm="cubic",
+        idle_timeout=60.0,
+        max_data=QUIC_MAX_DATA_BYTES,
+        max_stream_data=QUIC_MAX_DATA_BYTES,
+        max_datagram_frame_size=65536,
+        initial_rtt=0.15,
     )
     
     # Check if certificates exist in the certs directory

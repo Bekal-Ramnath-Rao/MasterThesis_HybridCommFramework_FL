@@ -34,7 +34,18 @@ QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 NETWORK_SCENARIO = os.getenv("NETWORK_SCENARIO", "excellent")  # Network scenario for result filename
+
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
 
 # Convergence Settings
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -224,7 +235,11 @@ class FederatedLearningServer:
             print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     
     async def mark_client_converged(self, client_id):
-        """Remove converged client from active federation."""
+        """Handle convergence signal from a client."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore client-local convergence.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         if client_id in self.active_clients:
             self.active_clients.discard(client_id)
             self.registered_clients.pop(client_id, None)
@@ -246,22 +261,26 @@ class FederatedLearningServer:
         round_num = message['round']
         if client_id not in self.active_clients:
             return
-        if float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+        if STOP_ON_CLIENT_CONVERGENCE and float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             await self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
             # Decompress or deserialize client weights
             if 'compressed_data' in message and self.quantization_handler is not None:
-                weights = self.quantization_handler.decompress_client_update(message['client_id'], message['compressed_data'])
-                print(f"Server: Received and decompressed update from client {message['client_id']}")
+                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                self.client_updates[client_id] = {
+                    'compressed_data': message['compressed_data'],
+                    'num_samples': message['num_samples'],
+                    'metrics': message['metrics']
+                }
+                print(f"Server: Received quantized update from client {message['client_id']} (kept quantized)")
             else:
                 weights = self.deserialize_weights(message['weights'])
-            
-            self.client_updates[client_id] = {
-                'weights': weights,
-                'num_samples': message['num_samples'],
-                'metrics': message['metrics']
-            }
+                self.client_updates[client_id] = {
+                    'weights': weights,
+                    'num_samples': message['num_samples'],
+                    'metrics': message['metrics']
+                }
             
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{len(self.active_clients)})")
@@ -275,7 +294,7 @@ class FederatedLearningServer:
         round_num = message['round']
         if client_id not in self.active_clients:
             return
-        if float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+        if STOP_ON_CLIENT_CONVERGENCE and float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             await self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
@@ -346,6 +365,42 @@ class FederatedLearningServer:
     async def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            # Define model_config for late-joiners
+            model_config = {
+                "architecture": "LSTM",
+                "layers": [
+                    {"type": "LSTM", "units": 50, "activation": "relu", "input_shape": [1, 4]},
+                    {"type": "Dense", "units": 1}
+                ],
+                "compile_config": {"loss": "mse", "optimizer": "adam", "metrics": ["mae"]}
+            }
+
+            await self.broadcast_message({
+                'type': 'global_model',
+                'round': self.current_round,
+                'quantized_data': self.global_compressed,
+                'model_config': model_config
+            })
+
+            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients")
+
+            await asyncio.sleep(1)
+            await self.broadcast_message({'type': 'start_evaluation', 'round': self.current_round})
+            return
         
         total_samples = sum(update['num_samples'] 
                           for update in self.client_updates.values())
@@ -450,7 +505,7 @@ class FederatedLearningServer:
             self.plot_results()
             return
         
-        if self.current_round >= MIN_ROUNDS and self.check_convergence():
+        if STOP_ON_CLIENT_CONVERGENCE and self.current_round >= MIN_ROUNDS and self.check_convergence():
             self.convergence_time = time.time() - self.start_time if self.start_time else 0
             print("\n" + "="*70)
             print("CONVERGENCE ACHIEVED!")
@@ -548,21 +603,22 @@ class FederatedLearningServer:
         
         plt.tight_layout()
         
-        results_dir = Path(__file__).parent.parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "quic")
         plt.savefig(results_dir / 'quic_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'quic_training_metrics.png'}")
-        print("\nDisplaying plot... Close the plot window to exit.")
-        plt.show()
-        
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            plt.close()
+        else:
+            print("\nDisplaying plot... Close the plot window to exit.")
+            plt.show()
+
         print("\nPlot closed. Server shutting down...")
         import sys
         sys.exit(0)
     
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent.parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("temperature", "quic")
         
         results = {
             "rounds": self.ROUNDS,
@@ -576,7 +632,7 @@ class FederatedLearningServer:
             "num_clients": self.num_clients
         }
         
-        results_file = results_dir / f'quic_{NETWORK_SCENARIO}_training_results.json'
+        results_file = results_dir / 'quic_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
         

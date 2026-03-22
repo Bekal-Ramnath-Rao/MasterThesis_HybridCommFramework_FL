@@ -1,11 +1,14 @@
+import os
+import sys
+# Server uses CPU only (aggregation is numpy-only); saves GPU memory for clients
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+
 import numpy as np
 import json
 import pickle
 import base64
 import time
 import pika
-import os
-import sys
 from typing import List, Dict
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -25,6 +28,7 @@ if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 
 from packet_logger import log_sent_packet, log_received_packet, init_db
+from experiment_results_path import get_experiment_results_dir
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -44,10 +48,19 @@ AMQP_HOST = os.getenv("AMQP_HOST", "localhost")
 AMQP_PORT = int(os.getenv("AMQP_PORT", "5672"))
 AMQP_USER = os.getenv("AMQP_USER", "guest")
 AMQP_PASSWORD = os.getenv("AMQP_PASSWORD", "guest")
+
+# AMQP delivery mode: 2=persistent (default), 1=non-persistent (for diagnostics/experiments)
+try:
+    AMQP_DELIVERY_MODE = int(os.getenv("AMQP_DELIVERY_MODE", "2"))
+except (TypeError, ValueError):
+    AMQP_DELIVERY_MODE = 2
+if AMQP_DELIVERY_MODE not in (1, 2):
+    AMQP_DELIVERY_MODE = 2
 # Dynamic client configuration
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -60,6 +73,9 @@ EXCHANGE_CLIENT_UPDATES = "fl_client_updates"
 QUEUE_CLIENT_REGISTER = "fl.client.register"
 QUEUE_CLIENT_UPDATE = "fl.client.update"
 QUEUE_CLIENT_METRICS = "fl.client.metrics"
+
+AMQP_MAX_FRAME_BYTES = 128 * 1024
+AMQP_CHUNK_PAYLOAD_BYTES = 96 * 1024
 
 
 class FederatedLearningServer:
@@ -79,7 +95,10 @@ class FederatedLearningServer:
         self.ACCURACY = []
         self.LOSS = []
         self.ROUNDS = []
-        
+        self.ROUND_TIMES = []
+        self.BATTERY_CONSUMPTION = []
+        self.round_start_time = None
+
         # Convergence tracking
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
@@ -105,20 +124,22 @@ class FederatedLearningServer:
             else:
                 print("Server: Quantization disabled")
         
-        # Initialize global model
-        self.initialize_global_model()
+        # Global model is initialized after connect() so RabbitMQ queues exist before clients send
+        self.global_weights = None
+        self.model_config = None
         
         # Training configuration
         # Training configuration broadcast to AMQP clients
         self.training_config = {
-            "batch_size": 32,
-            "local_epochs": 20  # Reduced from 20 for faster experiments
+            "batch_size": int(os.getenv("BATCH_SIZE", "16")),
+            "local_epochs": 20
         }
         
         # AMQP connection
         self.connection = None
         self.channel = None
         self.consuming = False
+        self._model_update_chunk_buffers = {}
     
     def initialize_global_model(self):
         """Initialize the global CNN model for emotion recognition"""
@@ -192,6 +213,149 @@ class FederatedLearningServer:
         serialized = base64.b64decode(encoded_weights.encode('utf-8'))
         weights = pickle.loads(serialized)
         return weights
+
+    def _chunk_model_payload(self, model_message):
+        payload_key = "quantized_data" if "quantized_data" in model_message else "weights"
+        payload_text = model_message[payload_key]
+        if not isinstance(payload_text, str):
+            raise TypeError(f"Expected string payload for {payload_key}, got {type(payload_text).__name__}")
+
+        chunks = [
+            payload_text[i:i + AMQP_CHUNK_PAYLOAD_BYTES]
+            for i in range(0, len(payload_text), AMQP_CHUNK_PAYLOAD_BYTES)
+        ] or [payload_text]
+
+        total_chunks = len(chunks)
+        chunk_messages = []
+        for chunk_index, chunk_data in enumerate(chunks):
+            chunk_msg = {
+                "message_type": "global_model_chunk",
+                "type": "global_model_chunk",
+                "round": model_message["round"],
+                "payload_key": payload_key,
+                "payload_chunk": chunk_data,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+            }
+            if chunk_index == 0 and "model_config" in model_message:
+                chunk_msg["model_config"] = model_message["model_config"]
+            chunk_messages.append(chunk_msg)
+        return chunk_messages
+
+    def _publish_global_model_with_chunking(self, model_message, extra_info):
+        message_json = json.dumps(model_message)
+        message_size = len(message_json.encode("utf-8"))
+
+        if message_size <= AMQP_MAX_FRAME_BYTES:
+            self.channel.basic_publish(
+                exchange=EXCHANGE_BROADCAST,
+                routing_key='',
+                body=message_json,
+                properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
+            )
+            log_sent_packet(
+                packet_size=message_size,
+                peer=EXCHANGE_BROADCAST,
+                protocol="AMQP",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info=extra_info
+            )
+            return message_size
+
+        chunks = self._chunk_model_payload(model_message)
+        print(f"Chunking AMQP global model: {message_size} bytes total, {len(chunks)} chunks")
+        sent_bytes = 0
+        for chunk in chunks:
+            chunk_payload = json.dumps(chunk)
+            chunk_size = len(chunk_payload.encode("utf-8"))
+            if chunk_size > AMQP_MAX_FRAME_BYTES:
+                raise ValueError(
+                    f"AMQP global-model chunk exceeds 128KB: {chunk_size} bytes "
+                    f"(chunk {chunk['chunk_index'] + 1}/{chunk['total_chunks']})"
+                )
+            self.channel.basic_publish(
+                exchange=EXCHANGE_BROADCAST,
+                routing_key='',
+                body=chunk_payload,
+                properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
+            )
+            sent_bytes += chunk_size
+            log_sent_packet(
+                packet_size=chunk_size,
+                peer=EXCHANGE_BROADCAST,
+                protocol="AMQP",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info=f"{extra_info} chunk {chunk['chunk_index'] + 1}/{chunk['total_chunks']}"
+            )
+        return sent_bytes
+
+    def _assemble_model_update_chunk(self, data):
+        try:
+            client_id = int(data["client_id"])
+            round_num = int(data["round"])
+            payload_key = data["payload_key"]
+            chunk_index = int(data.get("chunk_index", 0))
+            total_chunks = int(data.get("total_chunks", 1))
+            payload_chunk = data.get("payload_chunk", "")
+        except Exception as e:
+            print(f"Server invalid AMQP update chunk metadata: {e}")
+            return None
+
+        if total_chunks <= 1:
+            assembled = {
+                "client_id": client_id,
+                "round": round_num,
+                payload_key: payload_chunk,
+                "num_samples": data.get("num_samples", 0),
+                "metrics": data.get("metrics", {}),
+            }
+            if "diagnostic_send_start_ts" in data:
+                assembled["diagnostic_send_start_ts"] = data.get("diagnostic_send_start_ts")
+            return assembled
+
+        chunk_key = (client_id, round_num, payload_key)
+        entry = self._model_update_chunk_buffers.setdefault(
+            chunk_key,
+            {
+                "chunks": {},
+                "total_chunks": total_chunks,
+                "num_samples": data.get("num_samples", 0),
+                "metrics": data.get("metrics", {}),
+                "diagnostic_send_start_ts": data.get("diagnostic_send_start_ts"),
+                "updated_at": time.time(),
+            }
+        )
+
+        if chunk_index == 0:
+            entry["num_samples"] = data.get("num_samples", entry["num_samples"])
+            entry["metrics"] = data.get("metrics", entry["metrics"])
+            if "diagnostic_send_start_ts" in data:
+                entry["diagnostic_send_start_ts"] = data.get("diagnostic_send_start_ts")
+
+        if chunk_index not in entry["chunks"]:
+            entry["chunks"][chunk_index] = payload_chunk
+        entry["updated_at"] = time.time()
+
+        if len(entry["chunks"]) < total_chunks:
+            return None
+
+        assembled_payload = "".join(entry["chunks"].get(i, "") for i in range(total_chunks))
+        assembled = {
+            "client_id": client_id,
+            "round": round_num,
+            payload_key: assembled_payload,
+            "num_samples": entry["num_samples"],
+            "metrics": entry["metrics"],
+        }
+        if entry.get("diagnostic_send_start_ts") is not None:
+            assembled["diagnostic_send_start_ts"] = entry["diagnostic_send_start_ts"]
+
+        self._model_update_chunk_buffers.pop(chunk_key, None)
+        print(
+            f"Reassembled AMQP model update from client {client_id} for round {round_num} "
+            f"from {total_chunks} chunks"
+        )
+        return assembled
     
     def connect(self):
         """Connect to RabbitMQ broker"""
@@ -208,7 +372,8 @@ class FederatedLearningServer:
                     port=AMQP_PORT,
                     credentials=credentials,
                     heartbeat=600,  # 10 minutes for very_poor network
-                    blocked_connection_timeout=600  # Aligned with heartbeat
+                    blocked_connection_timeout=600,  # Aligned with heartbeat
+                    frame_max=AMQP_MAX_FRAME_BYTES  # Realistic max payload: AMQP 128 KB
                 )
                 self.connection = pika.BlockingConnection(parameters)
                 self.channel = self.connection.channel()
@@ -288,6 +453,10 @@ class FederatedLearningServer:
     
     def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore client-local convergence removal/disconnect.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         if client_id in self.active_clients:
             self.active_clients.discard(client_id)
             self.client_updates.pop(client_id, None)
@@ -301,9 +470,18 @@ class FederatedLearningServer:
                 self.plot_results()
                 self.save_results()
                 self.stop()
+                return
+            # Re-check: remaining active clients may have already sent metrics/updates
+            if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
+                self.aggregate_metrics()
+                self.continue_training()
+                return
+            if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
+                self.aggregate_models()
     
     def on_client_update(self, ch, method, properties, body):
         """Handle model update from client"""
+        recv_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
         log_received_packet(
             packet_size=len(body),
             peer=EXCHANGE_CLIENT_UPDATES,
@@ -313,12 +491,17 @@ class FederatedLearningServer:
         )
         try:
             data = json.loads(body.decode())
+            msg_type = data.get("message_type") or data.get("type")
+            if msg_type in ("model_update_chunk", "update_chunk"):
+                data = self._assemble_model_update_chunk(data)
+                if data is None:
+                    return
             client_id = data['client_id']
             round_num = data['round']
             
             if client_id not in self.active_clients:
                 return
-            if float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+            if STOP_ON_CLIENT_CONVERGENCE and float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
                 self.mark_client_converged(client_id)
                 return
             if round_num == self.current_round:
@@ -331,19 +514,29 @@ class FederatedLearningServer:
                             compressed_update = pickle.loads(base64.b64decode(compressed_update.encode('utf-8')))
                         except Exception as e:
                             print(f"Server error decoding compressed_data from client {client_id}: {e}")
-                    weights = self.quantization_handler.decompress_client_update(
-                        client_id, 
-                        compressed_update
-                    )
-                    print(f"Received and decompressed update from client {client_id}")
+                    # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                    self.client_updates[client_id] = {
+                        'compressed_data': compressed_update,
+                        'num_samples': data['num_samples'],
+                        'metrics': data['metrics']
+                    }
+                    print(f"Received quantized update from client {client_id} (kept quantized)")
+                    weights = None
                 else:
                     weights = self.deserialize_weights(data['weights'])
                 
-                self.client_updates[client_id] = {
-                    'weights': weights,
-                    'num_samples': data['num_samples'],
-                    'metrics': data['metrics']
-                }
+                if recv_start_cpu is not None:
+                    O_recv = time.perf_counter() - recv_start_cpu
+                    recv_end_ts = time.time()
+                    send_start_ts = data.get("diagnostic_send_start_ts", recv_end_ts)
+                    print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={send_start_ts:.9f}")
+                
+                if 'compressed_data' not in data or self.quantization_handler is None:
+                    self.client_updates[client_id] = {
+                        'weights': weights,
+                        'num_samples': data['num_samples'],
+                        'metrics': data['metrics']
+                    }
                 
                 print(f"Received update from client {client_id} "
                       f"({len(self.client_updates)}/{len(self.active_clients)})")
@@ -369,13 +562,16 @@ class FederatedLearningServer:
             
             if client_id not in self.active_clients:
                 return
-            if float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+            if STOP_ON_CLIENT_CONVERGENCE and float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
                 self.mark_client_converged(client_id)
                 return
             if round_num == self.current_round:
+                m = data.get('metrics', {})
                 self.client_metrics[client_id] = {
                     'num_samples': data['num_samples'],
-                    'metrics': data['metrics']
+                    'metrics': data['metrics'],
+                    'battery_soc': float(m.get('battery_soc', 1.0)),
+                    'round_time_sec': float(m.get('round_time_sec', 0.0)),
                 }
                 
                 print(f"Received metrics from client {client_id} "
@@ -397,10 +593,11 @@ class FederatedLearningServer:
                 "message_type": "training_config",
                 "config": self.training_config
             }),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         )
         
         self.current_round = 1
+        self.round_start_time = time.time()
         
         print(f"\n{'='*70}")
         print(f"Distributing Initial Global Model")
@@ -453,21 +650,12 @@ class FederatedLearningServer:
         print(f"Model config: {len(initial_model_message.get('model_config', {}).get('layers', []))} layers")
         
         print("\nPublishing initial model to clients...")
-        self.channel.basic_publish(
-            exchange=EXCHANGE_BROADCAST,
-            routing_key='',
-            body=message_json,
-            properties=pika.BasicProperties(delivery_mode=2)
-        )
-        log_sent_packet(
-            packet_size=message_size,
-            peer=EXCHANGE_BROADCAST,
-            protocol="AMQP",
-            round=self.current_round if hasattr(self, 'current_round') else None,
+        sent_bytes = self._publish_global_model_with_chunking(
+            initial_model_message,
             extra_info="Initial global model distribution"
         )
         
-        print("Initial global model sent to all clients")
+        print(f"Initial global model sent to all clients ({sent_bytes} bytes transmitted)")
         
         # Wait for clients to receive and set the initial model
         print("Waiting for clients to receive and build the model...")
@@ -486,13 +674,83 @@ class FederatedLearningServer:
                 "message_type": "start_training",
                 "round": self.current_round
             }),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         )
         print("Start training signal sent successfully\n")
+    
+    def send_current_model_to_client(self, client_id):
+        """Send current global model to a single client (e.g. late joiner). Uses broadcast so the client receives it."""
+        if self.global_weights is None or self.model_config is None:
+            return
+        if self.quantization_handler is not None:
+            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
+            msg = {
+                "message_type": "global_model",
+                "round": self.current_round,
+                "quantized_data": serialized,
+                "model_config": self.model_config
+            }
+        else:
+            msg = {
+                "message_type": "global_model",
+                "round": self.current_round,
+                "weights": self.serialize_weights(self.global_weights),
+                "model_config": self.model_config
+            }
+        self._publish_global_model_with_chunking(
+            msg,
+            extra_info=f"Late-join model broadcast (for client {client_id})"
+        )
+        print(f"Current global model (round {self.current_round}) sent to client {client_id} (broadcast)")
     
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            serialized = base64.b64encode(pickle.dumps(self.global_compressed)).decode('utf-8')
+            global_model_message = {
+                "message_type": "global_model",
+                "round": self.current_round,
+                "quantized_data": serialized,
+                "model_config": self.model_config
+            }
+
+            self._publish_global_model_with_chunking(
+                global_model_message,
+                extra_info="Aggregated global model distribution (kept quantized)"
+            )
+
+            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients")
+
+            time.sleep(1)
+            self.channel.basic_publish(
+                exchange=EXCHANGE_BROADCAST,
+                routing_key='',
+                body=json.dumps({"message_type": "start_evaluation", "round": self.current_round}),
+                properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
+            )
+            log_sent_packet(
+                packet_size=len(json.dumps({"message_type": "start_evaluation", "round": self.current_round})),
+                peer=EXCHANGE_BROADCAST,
+                protocol="AMQP",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Start evaluation signal"
+            )
+            return
         
         # Calculate total samples
         total_samples = sum(update['num_samples'] 
@@ -535,18 +793,8 @@ class FederatedLearningServer:
                 "weights": self.serialize_weights(self.global_weights)
         }
         
-        self.channel.basic_publish(
-            exchange=EXCHANGE_BROADCAST,
-            routing_key='',
-            body=json.dumps(global_model_message),
-            properties=pika.BasicProperties(delivery_mode=2)
-        )
-        message_size = len(json.dumps(global_model_message).encode('utf-8'))
-        log_sent_packet(
-            packet_size=message_size,
-            peer=EXCHANGE_BROADCAST,
-            protocol="AMQP",
-            round=self.current_round if hasattr(self, 'current_round') else None,
+        message_size = self._publish_global_model_with_chunking(
+            global_model_message,
             extra_info="Aggregated global model distribution"
         )
         
@@ -561,7 +809,7 @@ class FederatedLearningServer:
                 "message_type": "start_evaluation",
                 "round": self.current_round
             }),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         )
         log_sent_packet(
             packet_size=len(json.dumps({
@@ -577,7 +825,10 @@ class FederatedLearningServer:
     def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
         print(f"\nAggregating metrics from {len(self.client_metrics)} clients...")
-        
+        if getattr(self, 'round_start_time', None) is not None:
+            self.ROUND_TIMES.append(time.time() - self.round_start_time)
+        socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
+        self.BATTERY_CONSUMPTION.append(1.0 - (sum(socs) / len(socs) if socs else 1.0))
         # Calculate total samples
         total_samples = sum(metric['num_samples'] 
                           for metric in self.client_metrics.values())
@@ -620,6 +871,7 @@ class FederatedLearningServer:
         # Check if more rounds needed
         if self.current_round < self.num_rounds:
             self.current_round += 1
+            self.round_start_time = time.time()
             
             print(f"\n{'='*70}")
             print(f"Starting Round {self.current_round}/{self.num_rounds}")
@@ -635,7 +887,7 @@ class FederatedLearningServer:
                     "message_type": "start_training",
                     "round": self.current_round
                 }),
-                properties=pika.BasicProperties(delivery_mode=2)
+                properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
             )
             log_sent_packet(
                 packet_size=len(json.dumps({
@@ -695,7 +947,7 @@ class FederatedLearningServer:
             body=json.dumps({
                 "message_type": "training_complete"
             }),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         )
         log_sent_packet(
             packet_size=len(json.dumps({
@@ -709,43 +961,48 @@ class FederatedLearningServer:
         print("Training complete signal sent to all clients")
     
     def plot_results(self):
-        """Plot training metrics"""
-        plt.figure(figsize=(12, 5))
-        
-        plt.subplot(1, 2, 1)
-        plt.plot(self.ROUNDS, self.LOSS, 'b-', marker='o')
-        plt.xlabel('Round')
-        plt.ylabel('Loss')
-        plt.title('Training Loss (Emotion Recognition)')
-        plt.grid(True)
-        
-        plt.subplot(1, 2, 2)
-        plt.plot(self.ROUNDS, self.ACCURACY, 'g-', marker='o')
-        plt.xlabel('Round')
-        plt.ylabel('Accuracy')
-        plt.title('Training Accuracy (Emotion Recognition)')
-        plt.grid(True)
-        
-        plt.tight_layout()
-        
-        # Save plot
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
-        plt.savefig(results_dir / 'amqp_training_metrics.png', dpi=300, bbox_inches='tight')
+        """Plot battery consumption, round/convergence time, and loss/accuracy."""
+        results_dir = get_experiment_results_dir("emotion", "amqp")
+        rounds = self.ROUNDS
+        n = len(rounds)
+        conv_time = self.convergence_time if self.convergence_time is not None else (time.time() - self.start_time if self.start_time else 0)
+        # 1) Battery
+        fig1, ax1 = plt.subplots(figsize=(7, 4))
+        bc = (self.BATTERY_CONSUMPTION + [0.0] * max(0, n - len(self.BATTERY_CONSUMPTION)))[:n] if getattr(self, 'BATTERY_CONSUMPTION', []) else [0.0] * n
+        if bc:
+            ax1.plot(rounds, [c * 100 for c in bc], marker='o', linewidth=2, markersize=6, color='#2e86ab')
+        ax1.set_xlabel('Round'); ax1.set_ylabel('Battery consumption (%)'); ax1.set_title('AMQP: Battery consumption till end of FL training'); ax1.grid(True, alpha=0.3)
+        fig1.tight_layout(); fig1.savefig(results_dir / 'amqp_battery_consumption.png', dpi=300, bbox_inches='tight'); plt.close(fig1)
+        # 2) Time per round and convergence
+        fig2, ax2 = plt.subplots(figsize=(7, 4))
+        rt = (self.ROUND_TIMES + [0.0] * max(0, n - len(self.ROUND_TIMES)))[:n] if getattr(self, 'ROUND_TIMES', []) else [0.0] * n
+        if rt:
+            ax2.bar(rounds, rt, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        ax2.axhline(y=conv_time, color='#f18f01', linestyle='--', linewidth=2, label=f'Total convergence: {conv_time:.1f} s')
+        ax2.set_xlabel('Round'); ax2.set_ylabel('Time (s)'); ax2.set_title('AMQP: Time per round and convergence time'); ax2.legend(); ax2.grid(True, alpha=0.3)
+        fig2.tight_layout(); fig2.savefig(results_dir / 'amqp_round_and_convergence_time.png', dpi=300, bbox_inches='tight'); plt.close(fig2)
+        # 3) Loss and Accuracy
+        fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(12, 5))
+        ax3a.plot(rounds, self.LOSS, 'b-', marker='o'); ax3a.set_xlabel('Round'); ax3a.set_ylabel('Loss'); ax3a.set_title('AMQP: Loss over Rounds'); ax3a.grid(True)
+        ax3b.plot(rounds, self.ACCURACY, 'g-', marker='o'); ax3b.set_xlabel('Round'); ax3b.set_ylabel('Accuracy'); ax3b.set_title('AMQP: Accuracy over Rounds'); ax3b.grid(True)
+        fig3.tight_layout()
+        fig3.savefig(results_dir / 'amqp_training_metrics.png', dpi=300, bbox_inches='tight')
+        plt.close(fig3)
         print(f"Training metrics plot saved to {results_dir / 'amqp_training_metrics.png'}")
-        plt.show()
-        
+        if not os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            plt.show(block=False)
         print("\nPlot closed. Training complete.")
     
     def save_results(self):
         """Save training results to JSON"""
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("emotion", "amqp")
         
         results = {
             'rounds': self.ROUNDS,
             'loss': self.LOSS,
             'accuracy': self.ACCURACY,
+            'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
+            'battery_consumption': getattr(self, 'BATTERY_CONSUMPTION', []),
             'summary': {
                 'total_rounds': len(self.ROUNDS),
                 'num_clients': self.num_clients,
@@ -795,7 +1052,9 @@ if __name__ == "__main__":
     server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
     try:
+        # Connect first so registration queue exists before clients send (avoids lost registrations)
         server.connect()
+        server.initialize_global_model()
         server.start()
     except KeyboardInterrupt:
         print("\nServer shutting down...")

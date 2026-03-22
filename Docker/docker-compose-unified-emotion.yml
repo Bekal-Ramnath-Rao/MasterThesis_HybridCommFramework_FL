@@ -6,9 +6,9 @@ services:
   mqtt-broker-unified:
     image: eclipse-mosquitto:latest
     container_name: mqtt-broker-unified
-    ports:
-      - "1883:1883"
-      - "9001:9001"
+    expose:
+      - "1883"
+      - "9001"
     volumes:
       - ./mqtt-config:/mosquitto/config
     networks:
@@ -18,9 +18,9 @@ services:
   amqp-broker-unified:
     image: rabbitmq:3-management
     container_name: amqp-broker-unified
-    ports:
-      - "5672:5672"
-      - "15672:15672"
+    expose:
+      - "5672"
+      - "15672"
     environment:
       - RABBITMQ_DEFAULT_USER=guest
       - RABBITMQ_DEFAULT_PASS=guest
@@ -40,6 +40,7 @@ services:
       - NODE_TYPE=server
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - MQTT_BROKER=mqtt-broker-unified
@@ -96,7 +97,9 @@ services:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - USE_RL_SELECTION=true
+      - USE_COMMUNICATION_MODEL_REWARD=${USE_COMMUNICATION_MODEL_REWARD:-true}
       - USE_QL_CONVERGENCE=${USE_QL_CONVERGENCE:-false}
       - Q_CONVERGENCE_THRESHOLD=${Q_CONVERGENCE_THRESHOLD:-0.01}
       - Q_CONVERGENCE_PATIENCE=${Q_CONVERGENCE_PATIENCE:-5}
@@ -145,7 +148,9 @@ services:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - USE_RL_SELECTION=true
+      - USE_COMMUNICATION_MODEL_REWARD=${USE_COMMUNICATION_MODEL_REWARD:-true}
       - USE_QL_CONVERGENCE=${USE_QL_CONVERGENCE:-false}
       - Q_CONVERGENCE_THRESHOLD=${Q_CONVERGENCE_THRESHOLD:-0.01}
       - Q_CONVERGENCE_PATIENCE=${Q_CONVERGENCE_PATIENCE:-5}

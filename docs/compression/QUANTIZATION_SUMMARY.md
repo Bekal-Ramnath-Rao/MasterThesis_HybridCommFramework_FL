@@ -11,7 +11,7 @@ A comprehensive quantization compression system for your Federated Learning fram
 - ✓ Quantization-Aware Training (QAT) support
 - ✓ Post-Training Quantization (PTQ) support  
 - ✓ Model Parameter Quantization (default)
-- ✓ 8-bit, 16-bit, 32-bit precision support
+- ✓ 4-bit, 8-bit, 16-bit, 32-bit precision support (4-bit uses nibble packing for 2x compression)
 - ✓ Symmetric and asymmetric quantization
 - ✓ Per-tensor and per-channel quantization
 - ✓ Compression and decompression methods

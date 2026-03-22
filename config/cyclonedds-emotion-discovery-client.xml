@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- CycloneDDS Emotion FL - Discovery Client config. Set DDS_PARTICIPANT_INDEX (1=server, 2=client1, 3=client2) via env. -->
+<CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+    <Domain id="any">
+        <General>
+            <AllowMulticast>false</AllowMulticast>
+        </General>
+        <Discovery>
+            <!-- ParticipantIndex set via env DDS_PARTICIPANT_INDEX: 1=server(7650), 2=client1(7900), 3=client2(8150) -->
+            <ParticipantIndex>auto</ParticipantIndex>
+            <Peers>
+                <Peer address="127.0.0.1:7400"/>
+            </Peers>
+        </Discovery>
+        <Internal>
+            <HeartbeatInterval>500ms</HeartbeatInterval>
+        </Internal>
+        <Tracing>
+            <Verbosity>warning</Verbosity>
+            <OutputFile>stderr</OutputFile>
+        </Tracing>
+    </Domain>
+</CycloneDDS>

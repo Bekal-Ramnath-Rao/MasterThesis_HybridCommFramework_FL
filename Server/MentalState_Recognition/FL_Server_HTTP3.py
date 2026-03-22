@@ -13,6 +13,16 @@ from collections import Counter
 import glob
 from pathlib import Path
 
+# Project root and utilities (for experiment_results path)
+if os.path.exists("/app"):
+    _project_root = "/app"
+else:
+    _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_utilities_path = os.path.join(_project_root, "scripts", "utilities")
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
@@ -155,6 +165,7 @@ HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Convergence Settings
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -364,8 +375,7 @@ class FederatedLearningServer:
     
     def initialize_global_model(self):
         """Initialize the global EEG model"""
-        print("
-Initializing global EEG model (CNN+BiLSTM+MHA)...")
+        print("\nInitializing global EEG model (CNN+BiLSTM+MHA)...")
         model = build_model()
         self.global_weights = model.get_weights()
         print(f"Model initialized with {len(self.global_weights)} weight layers")
@@ -473,6 +483,10 @@ Initializing global EEG model (CNN+BiLSTM+MHA)...")
     
     async def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore client-local convergence removal/disconnect.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         if client_id in self.active_clients:
             self.active_clients.discard(client_id)
             self.registered_clients.pop(client_id, None)
@@ -498,17 +512,21 @@ Initializing global EEG model (CNN+BiLSTM+MHA)...")
         round_num = message['round']
         if client_id not in self.active_clients:
             return
-        if float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+        if STOP_ON_CLIENT_CONVERGENCE and float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             await self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
             # Decompress or deserialize client weights
             if 'compressed_data' in message and self.quantization_handler is not None:
-                start_t = time.time()
                 compressed_data = pickle.loads(base64.b64decode(message['compressed_data']))
-                weights = self.quantization_handler.decompress_client_update(message['client_id'], compressed_data)
-                dt = time.time() - start_t
-                print(f"Server: Received and decompressed update from client {message['client_id']} in {dt:.2f}s")
+                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                self.client_updates[client_id] = {
+                    'compressed_data': compressed_data,
+                    'num_samples': message['num_samples'],
+                    'metrics': message['metrics']
+                }
+                print(f"Server: Received quantized update from client {message['client_id']} (kept quantized)")
+                weights = None
             else:
                 encoded = message.get('weights')
                 if encoded is None:
@@ -524,11 +542,12 @@ Initializing global EEG model (CNN+BiLSTM+MHA)...")
                     return
                 dt = time.time() - start_t
             
-            self.client_updates[client_id] = {
-                'weights': weights,
-                'num_samples': message['num_samples'],
-                'metrics': message['metrics']
-            }
+            if 'compressed_data' not in message or self.quantization_handler is None:
+                self.client_updates[client_id] = {
+                    'weights': weights,
+                    'num_samples': message['num_samples'],
+                    'metrics': message['metrics']
+                }
             
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{len(self.active_clients)})")
@@ -542,7 +561,7 @@ Initializing global EEG model (CNN+BiLSTM+MHA)...")
         round_num = message['round']
         if client_id not in self.active_clients:
             return
-        if float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
+        if STOP_ON_CLIENT_CONVERGENCE and float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             await self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
@@ -637,6 +656,33 @@ Initializing global EEG model (CNN+BiLSTM+MHA)...")
     async def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            weights_data = base64.b64encode(pickle.dumps(self.global_compressed)).decode('utf-8')
+            await self.broadcast_message({
+                'type': 'global_model',
+                'round': self.current_round,
+                'quantized_data': weights_data,
+                'model_config': self.model_config_json
+            })
+
+            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients")
+
+            await asyncio.sleep(1)
+            await self.broadcast_message({'type': 'start_evaluation', 'round': self.current_round})
+            return
         
         total_samples = sum(update['num_samples'] 
                           for update in self.client_updates.values())
@@ -792,21 +838,22 @@ Initializing global EEG model (CNN+BiLSTM+MHA)...")
         
         plt.tight_layout()
         
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("mental_state", "http3")
         plt.savefig(results_dir / 'http3_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'http3_training_metrics.png'}")
-        print("\nDisplaying plot... Close the plot window to exit.")
-        plt.show()
-        
+        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            plt.close()
+        else:
+            print("\nDisplaying plot... Close the plot window to exit.")
+            plt.show()
+
         print("\nPlot closed. Server shutting down...")
         import sys
         sys.exit(0)
     
     def save_results(self):
         """Save results to file"""
-        results_dir = Path(__file__).parent / 'results'
-        results_dir.mkdir(exist_ok=True)
+        results_dir = get_experiment_results_dir("mental_state", "http3")
         
         results = {
             "rounds": self.ROUNDS,
@@ -866,9 +913,9 @@ async def main():
     configuration = QuicConfiguration(
         is_client=False,
         alpn_protocols=H3_ALPN,
-        # FAIR CONFIG: Data limits 128MB per stream, 256MB total (aligned with AMQP)
-        max_stream_data=128 * 1024 * 1024,  # 128 MB per stream
-        max_data=256 * 1024 * 1024,  # 256 MB total connection
+        # Align HTTP/3 transport with the configured 16 KB stream payload cap
+        max_stream_data=16 * 1024,  # 16 KB per stream
+        max_data=32 * 1024,  # 32 KB total connection
         # FAIR CONFIG: Timeout 600s for very_poor network scenarios
         idle_timeout=600.0,  # 10 minutes
         max_datagram_frame_size=65536,  # 64 KB frames

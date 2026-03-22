@@ -21,6 +21,9 @@ service FederatedLearning {
     
     // Check if training should start for a round
     rpc CheckTrainingStatus(StatusRequest) returns (TrainingStatus);
+
+    // Client responds to server protocol query for next global model downlink
+    rpc SendProtocolSelection(ProtocolSelection) returns (ProtocolSelectionResponse);
 }
 
 // Messages
@@ -36,21 +39,26 @@ message RegistrationResponse {
 message ModelRequest {
     int32 client_id = 1;
     int32 round = 2;
+    int32 chunk_index = 3;  // For chunked transfer: 0-based index when payload exceeds max message size
 }
 
 message GlobalModel {
     int32 round = 1;
-    bytes weights = 2;  // Serialized model weights
+    bytes weights = 2;  // Serialized model weights (or one chunk when chunked)
     bool available = 3;
-    string model_config = 4;  // JSON string containing model architecture configuration
+    string model_config = 4;  // JSON string; only set on chunk 0 when chunked
+    int32 chunk_index = 5;   // 0-based chunk index
+    int32 total_chunks = 6;  // Total chunks (1 = single message, no chunking)
 }
 
 message ModelUpdate {
     int32 client_id = 1;
     int32 round = 2;
-    bytes weights = 3;  // Serialized model weights
+    bytes weights = 3;  // Serialized model weights (or one chunk when chunked)
     int32 num_samples = 4;
     map<string, double> metrics = 5;
+    int32 chunk_index = 6;   // 0-based chunk index (0 = only message or first chunk)
+    int32 total_chunks = 7;  // Total chunks (1 = single message, no chunking)
 }
 
 message UpdateResponse {
@@ -64,6 +72,9 @@ message Metrics {
     int32 num_samples = 3;
     double loss = 4;
     double accuracy = 5;
+    double battery_soc = 6;       // optional: state of charge [0,1] for battery plot
+    double round_time_sec = 7;    // optional: time for this round (training + comm)
+    double client_converged = 8;  // 1.0 = client has converged locally and will disconnect; server removes from active set
 }
 
 message MetricsResponse {
@@ -97,4 +108,24 @@ message TrainingStatus {
     int32 current_round = 2;
     bool should_evaluate = 3;
     bool is_complete = 4;
+    bool has_protocol_query = 5;
+    ProtocolQuery protocol_query = 6;
+}
+
+message ProtocolQuery {
+    int32 client_id = 1;
+    int32 round_id = 2;
+    int32 global_model_id = 3;
+}
+
+message ProtocolSelection {
+    int32 client_id = 1;
+    int32 round_id = 2;
+    int32 global_model_id = 3;
+    string downlink_protocol_requested = 4;
+}
+
+message ProtocolSelectionResponse {
+    bool success = 1;
+    string message = 2;
 }

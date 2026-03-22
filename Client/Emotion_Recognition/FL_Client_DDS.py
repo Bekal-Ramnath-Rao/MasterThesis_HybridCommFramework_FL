@@ -6,9 +6,17 @@ import json
 import pickle
 import time
 import random
+import threading
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+if _xla_flags:
+    sanitized_flags = [f for f in _xla_flags.split() if f != "--xla_gpu_enable_command_buffer="]
+    if sanitized_flags:
+        os.environ["XLA_FLAGS"] = " ".join(sanitized_flags)
+    else:
+        os.environ.pop("XLA_FLAGS", None)
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
 # Fallback strategy: GPU_DEVICE_ID -> (CLIENT_ID - 1) -> "0"
 # This ensures different clients use different GPUs in multi-GPU setups
@@ -55,7 +63,7 @@ if gpus:
             try:
                 tf.config.set_logical_device_configuration(
                     gpu,
-                    [tf.config.LogicalDeviceConfiguration(memory_limit=7000)]  # 7GB per GPU
+                    [tf.config.LogicalDeviceConfiguration(memory_limit=int(os.environ.get("TF_GPU_MEMORY_LIMIT_MB", "4000")))]
                 )
             except RuntimeError:
                 pass  # GPU already configured
@@ -69,6 +77,13 @@ cyclone_path = r"C:\Masters_Infotech\Semester_5\MT_SW_Addons\vcpkg\buildtrees\cy
 if cyclone_path not in os.environ.get('PATH', ''):
     os.environ['PATH'] = cyclone_path + os.pathsep + os.environ.get('PATH', '')
 
+# Set CycloneDDS config before any cyclonedds import (native lib may read at load time)
+if not os.environ.get("CYCLONEDDS_URI") and os.path.exists("/app/config"):
+    _cid = os.environ.get("CLIENT_ID", "1")
+    _path = f"/app/config/cyclonedds-emotion-client{_cid}.xml"
+    if os.path.exists(_path):
+        os.environ["CYCLONEDDS_URI"] = f"file://{_path}"
+
 from cyclonedds.domain import DomainParticipant
 
 # Add Compression_Technique to path
@@ -77,6 +92,12 @@ if compression_path not in sys.path:
     sys.path.insert(0, compression_path)
 
 from quantization_client import Quantization, QuantizationConfig
+
+# Battery model (shared with gRPC/MQTT/AMQP/HTTP3)
+_client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _client_dir not in sys.path:
+    sys.path.insert(0, _client_dir)
+from battery_model import BatteryModel
 
 from cyclonedds.topic import Topic
 from cyclonedds.sub import DataReader
@@ -88,6 +109,14 @@ from cyclonedds.core import Qos, Policy
 from dataclasses import dataclass
 from typing import List
 
+# DDS implementation vendor (CycloneDDS vs Fast DDS placeholder)
+DDS_IMPL = os.getenv("DDS_IMPL", "cyclonedds").strip().lower()
+print(f"DDS implementation (client {os.getenv('CLIENT_ID', '0')}): {DDS_IMPL}")
+if DDS_IMPL not in ("cyclonedds", "fastdds"):
+    print("Warning: Unknown DDS_IMPL; defaulting to CycloneDDS transport.")
+elif DDS_IMPL == "fastdds":
+    print("Note: Fast DDS integration is not yet implemented; using CycloneDDS stack for now.")
+
 # DDS Configuration
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
@@ -95,9 +124,14 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
+
+# Controls whether this client should signal/exit on local convergence.
+# When false, clients keep training until the server indicates completion.
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Chunking configuration for large messages
-CHUNK_SIZE = 64 * 1024  # 64KB chunks for better DDS performance in poor networks
+CHUNK_SIZE = 64 * 1024
 
 
 # DDS Data Types (matching IDL)
@@ -109,7 +143,7 @@ class ClientRegistration(IdlStruct):
 
 @dataclass
 class ClientReady(IdlStruct):
-    """Signal from client that it's ready to receive chunks"""
+    """Signal from client that it's ready to receive model"""
     client_id: int
     ready_for_chunks: bool
 
@@ -132,7 +166,8 @@ class TrainingCommand(IdlStruct):
 class GlobalModel(IdlStruct):
     round: int
     weights: sequence[int]
-    model_config_json: str = ""  # JSON string containing model configuration
+    model_config_json: str = ""
+    model_config_octets: sequence[int] = ()  # Primitive encoding; decode to get model_config_json
 
 
 @dataclass
@@ -141,7 +176,7 @@ class GlobalModelChunk(IdlStruct):
     chunk_id: int
     total_chunks: int
     payload: sequence[int]
-    model_config_json: str = ""  # JSON string containing model configuration
+    model_config_json: str = ""
 
 
 @dataclass
@@ -174,6 +209,7 @@ class EvaluationMetrics(IdlStruct):
     loss: float
     accuracy: float
     client_converged: float = 0.0
+    battery_soc: float = 1.0
 
 
 @dataclass
@@ -185,12 +221,22 @@ class ServerStatus(IdlStruct):
     registered_clients: int
 
 
+def _octets_to_config(octets: list) -> str:
+    """Decode primitive sequence[int] back to config JSON string (4 bytes per int)."""
+    if not octets:
+        return ""
+    b = b"".join(int(x).to_bytes(4, "little") for x in octets)
+    return b.rstrip(b"\x00").decode("utf-8", errors="replace")
+
+
 class FederatedLearningClient:
     def __init__(self, client_id, num_clients, train_generator=None, validation_generator=None):
         self.client_id = client_id
         self.num_clients = num_clients
         self.model = None
         
+        # Battery/energy model for consumption tracking (server uses for battery plot)
+        self.battery_model = BatteryModel(protocol="dds")
         # Initialize quantization compression (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
         use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
@@ -203,15 +249,17 @@ class FederatedLearningClient:
         self.train_generator = train_generator
         self.validation_generator = validation_generator
         self.current_round = 0
-        self.training_config = {"batch_size": 32, "local_epochs": 20}
+        self.last_training_round = -1
+        self.training_config = {"batch_size": 16, "local_epochs": 20}
         self.running = True
+        self._training_lock = threading.Lock()
+        self._training_thread = None
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.has_converged = False
-        
-        # Chunk reassembly buffers
-        self.global_model_chunks = {}  # {chunk_id: payload}
-        self.global_model_metadata = {}  # {round, total_chunks, model_config_json}
+        self.global_model_chunks = {}
+        self.global_model_metadata = {}
+        self._last_evaluated_round = -1
         
         # DDS entities
         self.participant = None
@@ -233,21 +281,84 @@ class FederatedLearningClient:
         """Deserialize model weights received from DDS"""
         # Convert list of ints back to bytes
         return pickle.loads(bytes(serialized_weights))
+
+    def _apply_generator_batch_size(self, batch_size):
+        """Sync DirectoryIterator batch size with training config."""
+        try:
+            batch_size = int(batch_size)
+        except (TypeError, ValueError):
+            return
+        if batch_size <= 0:
+            return
+
+        changed = False
+        for gen_name in ("train_generator", "validation_generator"):
+            generator = getattr(self, gen_name, None)
+            if generator is None:
+                continue
+            current = getattr(generator, "batch_size", None)
+            if current != batch_size:
+                setattr(generator, "batch_size", batch_size)
+                changed = True
+        if changed:
+            print(f"Client {self.client_id} synchronized generator batch_size to {batch_size}")
+
+    def _launch_training_for_round(self, round_num):
+        """Start local training in a background thread to keep DDS polling responsive."""
+        with self._training_lock:
+            if self._training_thread is not None and self._training_thread.is_alive():
+                print(f"Client {self.client_id} training already in progress; ignoring start for round {round_num}")
+                return
+            if self.last_training_round == round_num:
+                print(f"Client {self.client_id} ignoring duplicate start training for round {round_num}")
+                return
+
+            self.current_round = round_num
+            self.last_training_round = round_num
+            print(f"\nClient {self.client_id} starting training for round {round_num}...")
+
+            self._training_thread = threading.Thread(
+                target=self._train_local_model_safe,
+                args=(round_num,),
+                daemon=True,
+            )
+            self._training_thread.start()
+
+    def _train_local_model_safe(self, round_num):
+        try:
+            self.train_local_model()
+        except Exception as e:
+            print(f"Client {self.client_id} training thread error on round {round_num}: {e}")
+            import traceback
+            traceback.print_exc()
     
+    def send_model_update(self, round_num, serialized_weights, num_samples, loss, accuracy):
+        """Send model update in a single Reliable message."""
+        msg = ModelUpdate(
+            client_id=self.client_id,
+            round=round_num,
+            weights=serialized_weights,
+            num_samples=num_samples,
+            loss=loss,
+            accuracy=accuracy,
+        )
+        self.writers['model_update'].write(msg)
+        print(f"Client {self.client_id}: Sent model update for round {round_num} ({len(serialized_weights)} bytes)")
+
     def split_into_chunks(self, data):
-        """Split serialized data into chunks of CHUNK_SIZE"""
         chunks = []
         for i in range(0, len(data), CHUNK_SIZE):
             chunks.append(data[i:i + CHUNK_SIZE])
         return chunks
-    
+
     def send_model_update_chunked(self, round_num, serialized_weights, num_samples, loss, accuracy):
-        """Send model update as chunks"""
+        """Send model update as DDS chunks to keep payloads bounded."""
         chunks = self.split_into_chunks(serialized_weights)
         total_chunks = len(chunks)
-        
-        print(f"Client {self.client_id}: Sending model update in {total_chunks} chunks ({len(serialized_weights)} bytes total)")
-        
+        print(
+            f"Client {self.client_id}: Sending model update in {total_chunks} chunks "
+            f"({len(serialized_weights)} bytes total)"
+        )
         for chunk_id, chunk_data in enumerate(chunks):
             chunk = ModelUpdateChunk(
                 client_id=self.client_id,
@@ -257,46 +368,48 @@ class FederatedLearningClient:
                 payload=chunk_data,
                 num_samples=num_samples,
                 loss=loss,
-                accuracy=accuracy
+                accuracy=accuracy,
             )
             self.writers['model_update_chunk'].write(chunk)
-            
-            # CRITICAL: Pacing for BestEffort QoS to prevent UDP buffer overflow
-            time.sleep(0.01)  # 10ms between chunks
-            
-            if (chunk_id + 1) % 20 == 0:  # Progress update every 20 chunks
+            if (chunk_id + 1) % 20 == 0:
                 print(f"  Sent {chunk_id + 1}/{total_chunks} chunks")
-                time.sleep(0.1)  # Extra pause for buffer drain
     
     def setup_dds(self):
         """Initialize DDS participant, topics, readers, and writers"""
+        # Ensure CycloneDDS uses discovery server config (must be set before participant creation)
+        uri = os.environ.get("CYCLONEDDS_URI")
+        if not uri and os.path.exists("/app/config"):
+            cid = os.environ.get("CLIENT_ID", "1")
+            path = f"/app/config/cyclonedds-emotion-client{cid}.xml"
+            if os.path.exists(path):
+                uri = f"file://{path}"
+                os.environ["CYCLONEDDS_URI"] = uri
+        print(f"[DDS] CYCLONEDDS_URI={uri or os.environ.get('CYCLONEDDS_URI', '(not set)')}")
         print(f"Setting up DDS on domain {DDS_DOMAIN_ID}...")
         
         # Create domain participant
         self.participant = DomainParticipant(DDS_DOMAIN_ID)
         
-        # Reliable QoS for critical control messages (registration, config, commands)
-        # TransientLocal durability ensures messages survive discovery delays
+        # Reliable QoS for control/small messages
         reliable_qos = Qos(
             Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
             Policy.History.KeepLast(10),
             Policy.Durability.TransientLocal
         )
-
-        # Best effort QoS for large data transfers (model chunks)
-        # Increased history buffer to handle burst packet loss
-        best_effort_qos = Qos(
-            Policy.Reliability.BestEffort,
-            Policy.History.KeepLast(50),  # Buffer up to 50 chunks to handle burst losses
+        # Long blocking time + resource limits for large model updates (9MB; round 1 has no tc but discovery must be ready)
+        reliable_qos_large = Qos(
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),  # 10 min for degraded networks
+            Policy.History.KeepLast(10),
+            Policy.Durability.TransientLocal,
+            Policy.ResourceLimits(max_samples=10, max_instances=10, max_samples_per_instance=10),  # allow 9MB samples
         )
-        # Reliable chunk QoS for receiving full global model chunk set.
+        # Dedicated QoS for chunked model transfer (matches unified path)
         chunk_qos = Qos(
             Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
             Policy.History.KeepLast(2048),
-            Policy.Durability.TransientLocal
+            Policy.Durability.TransientLocal,
         )
-        
-        # Create topics
+        # Create topics (single-message + chunked for bounded payloads)
         topic_registration = Topic(self.participant, "ClientRegistration", ClientRegistration)
         topic_ready = Topic(self.participant, "ClientReady", ClientReady)
         topic_config = Topic(self.participant, "TrainingConfig", TrainingConfig)
@@ -319,30 +432,25 @@ class FederatedLearningClient:
         # self.writers['model_update'] = DataWriter(self.participant, topic_model_update, qos=reliable_qos)
         # self.writers['metrics'] = DataWriter(self.participant, topic_metrics, qos=reliable_qos)
         
-        # Create readers (for receiving from server)
-        # Use Reliable QoS for config and commands (critical control messages)
+        # Create readers (for receiving from server) — all Reliable
         self.readers['config'] = DataReader(self.participant, topic_config, qos=reliable_qos)
         self.readers['command'] = DataReader(self.participant, topic_command, qos=reliable_qos)
-        # Use BestEffort for chunked model data
-        self.readers['global_model'] = DataReader(self.participant, topic_global_model, qos=best_effort_qos)
+        self.readers['global_model'] = DataReader(self.participant, topic_global_model, qos=reliable_qos)
         self.readers['global_model_chunk'] = DataReader(self.participant, topic_global_model_chunk, qos=chunk_qos)
-        self.readers['status'] = DataReader(self.participant, topic_status, qos=best_effort_qos)
+        self.readers['status'] = DataReader(self.participant, topic_status, qos=reliable_qos)
         
-        # Create writers (for sending to server)
-        # Use Reliable QoS for registration and ready signals (critical to ensure server receives them)
+        # Create writers (for sending to server) — Reliable; model_update uses long timeout for large payload
         self.writers['registration'] = DataWriter(self.participant, topic_registration, qos=reliable_qos)
         self.writers['ready'] = DataWriter(self.participant, topic_ready, qos=reliable_qos)
-        # Use Reliable+deep-history for chunk stream to avoid server-side partial updates.
-        self.writers['model_update'] = DataWriter(self.participant, topic_model_update, qos=best_effort_qos)
+        self.writers['model_update'] = DataWriter(self.participant, topic_model_update, qos=reliable_qos_large)
         self.writers['model_update_chunk'] = DataWriter(self.participant, topic_model_update_chunk, qos=chunk_qos)
-        self.writers['metrics'] = DataWriter(self.participant, topic_metrics, qos=best_effort_qos)
+        self.writers['metrics'] = DataWriter(self.participant, topic_metrics, qos=reliable_qos)
 
-        print(f"Client {self.client_id} DDS setup complete (Reliable QoS for control, BestEffort for data)")
+        print(f"Client {self.client_id} DDS setup complete (Reliable QoS; model_update 10 min blocking for large uploads)")
         
-        # Wait for DDS endpoint discovery (critical for BestEffort QoS!)
-        # BestEffort chunks are lost if sent before DataReader/DataWriter are matched
+        # Wait for DDS endpoint discovery before sending
         print(f"Client {self.client_id} waiting for endpoint discovery...")
-        time.sleep(3.0)  # Increased for BestEffort chunk endpoints
+        time.sleep(2.0)
         
         # Register with server (send multiple times for reliability)
         registration = ClientRegistration(
@@ -356,17 +464,23 @@ class FederatedLearningClient:
             time.sleep(0.3)
         print(f"Client {self.client_id} registration sent")
         
-        # Signal that we're ready to receive chunks (AFTER registration)
-        time.sleep(2.0)  # Extra wait to ensure chunk endpoints are discovered
+        # Signal ready to receive model
+        time.sleep(2.0)
         ready_signal = ClientReady(
             client_id=self.client_id,
             ready_for_chunks=True
         )
-        print(f"Client {self.client_id} signaling ready for chunk reception...")
+        print(f"Client {self.client_id} signaling ready...")
         for i in range(3):
             self.writers['ready'].write(ready_signal)
             time.sleep(0.2)
-        print(f"Client {self.client_id} ready signal sent\n")
+        print(f"Client {self.client_id} ready signal sent")
+        # Allow time for model_update reader (server) to be discovered so round 1 send is delivered (no tc yet)
+        wait_s = int(os.environ.get("DDS_MODEL_UPDATE_DISCOVERY_WAIT", "12"))
+        if wait_s > 0:
+            print(f"Client {self.client_id} waiting {wait_s}s for model_update endpoint discovery...")
+            time.sleep(wait_s)
+        print()
     
     def run(self):
         """Main client loop"""
@@ -384,15 +498,8 @@ class FederatedLearningClient:
         
         print(f"Client {self.client_id} waiting for training to start...\n")
         
-        loop_count = 0
         try:
             while self.running:
-                loop_count += 1
-                
-                # Heartbeat every 5 seconds (50 iterations * 0.1s)
-                if loop_count % 50 == 0:
-                    print(f"[ClientLoop] Client {self.client_id} iteration {loop_count}, model={'received' if self.model else 'waiting'}, round={self.current_round}")
-                
                 # Check for global model updates
                 self.check_global_model()
                 
@@ -419,6 +526,7 @@ class FederatedLearningClient:
                         "batch_size": sample.batch_size,
                         "local_epochs": sample.local_epochs
                     }
+                    self._apply_generator_batch_size(self.training_config["batch_size"])
                     print(f"Client {self.client_id} received config: {self.training_config}")
                     return
             time.sleep(0.5)
@@ -444,14 +552,10 @@ class FederatedLearningClient:
                         if self.model is None:
                             print(f"Client {self.client_id} waiting for initial model before training...")
                             return
-                        self.current_round = sample.round
-                        print(f"\nClient {self.client_id} starting training for round {self.current_round} with initial global model...")
-                        self.train_local_model()
+                        self._launch_training_for_round(sample.round)
                     elif sample.round > self.current_round:
                         # Subsequent rounds
-                        self.current_round = sample.round
-                        print(f"\nClient {self.client_id} starting training for round {self.current_round}...")
-                        self.train_local_model()
+                        self._launch_training_for_round(sample.round)
 
         # Fallback: if we've received the initial global model but no command within a short window,
         # and server status indicates training has started, proactively begin round 1.
@@ -459,189 +563,148 @@ class FederatedLearningClient:
         for status in status_samples:
             if status and not self.current_round and status.training_started and not status.training_complete:
                 if self.model is not None:
-                    self.current_round = max(1, status.current_round)
-                    print(f"\n[Fallback] Client {self.client_id} starting training for round {self.current_round} based on server status...")
-                    self.train_local_model()
-                else:
-                    print(f"[Fallback] Client {self.client_id} awaiting model before starting training...")
+                    self._launch_training_for_round(max(1, status.current_round))
     
+    def _apply_global_model_payload(self, round_num, serialized_weights, config_json=""):
+        """Deserialize and apply global model payload (supports both single and chunked DDS paths)."""
+        try:
+            raw_weights = self.deserialize_weights(serialized_weights)
+        except Exception as e:
+            print(f"[ERROR] Client {self.client_id}: deserialize failed: {e}")
+            return
+        if isinstance(raw_weights, dict) and 'compressed_data' in raw_weights:
+            if self.quantizer is not None:
+                weights = self.quantizer.as_training_weights(raw_weights)
+                print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
+            else:
+                print(f"Client {self.client_id}: ERROR - quantized data but quantizer not initialized")
+                return
+        else:
+            weights = raw_weights
+
+        def build_model_from_config(model_config_json):
+            if not model_config_json:
+                return
+            model_config = json.loads(model_config_json)
+            self.model = Sequential()
+            self.model.add(Input(shape=tuple(model_config['input_shape'])))
+            for layer_config in model_config['layers']:
+                if layer_config['type'] == 'Conv2D':
+                    self.model.add(Conv2D(
+                        filters=layer_config['filters'],
+                        kernel_size=tuple(layer_config['kernel_size']),
+                        activation=layer_config.get('activation')
+                    ))
+                elif layer_config['type'] == 'MaxPooling2D':
+                    self.model.add(MaxPooling2D(pool_size=tuple(layer_config['pool_size'])))
+                elif layer_config['type'] == 'Dropout':
+                    self.model.add(Dropout(layer_config['rate']))
+                elif layer_config['type'] == 'Flatten':
+                    self.model.add(Flatten())
+                elif layer_config['type'] == 'Dense':
+                    self.model.add(Dense(
+                        units=layer_config['units'],
+                        activation=layer_config.get('activation')
+                    ))
+            self.model.compile(
+                loss='categorical_crossentropy',
+                optimizer=Adam(learning_rate=0.0001),
+                metrics=['accuracy']
+            )
+            print(f"Client {self.client_id} built CNN from server config")
+
+        if self.model is None:
+            print(f"Client {self.client_id} received initial global model (round {round_num})")
+            build_model_from_config(config_json)
+            if self.model is None:
+                self.model = Sequential()
+                self.model.add(Input(shape=(48, 48, 1)))
+                self.model.add(Conv2D(32, kernel_size=(3, 3), activation='relu'))
+                self.model.add(Conv2D(64, kernel_size=(3, 3), activation='relu'))
+                self.model.add(MaxPooling2D(pool_size=(2, 2)))
+                self.model.add(Dropout(0.25))
+                self.model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
+                self.model.add(MaxPooling2D(pool_size=(2, 2)))
+                self.model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
+                self.model.add(MaxPooling2D(pool_size=(2, 2)))
+                self.model.add(Dropout(0.25))
+                self.model.add(Flatten())
+                self.model.add(Dense(1024, activation='relu'))
+                self.model.add(Dropout(0.5))
+                self.model.add(Dense(7, activation='softmax'))
+                self.model.compile(
+                    loss='categorical_crossentropy',
+                    optimizer=Adam(learning_rate=0.0001),
+                    metrics=['accuracy']
+                )
+            self.model.set_weights(weights)
+            self.current_round = 0
+            print(f"Client {self.client_id} initialized model; waiting for start_training command for round 1...")
+            return
+        if round_num == self.current_round:
+            self.model.set_weights(weights)
+            print(f"Client {self.client_id} received global model for round {self.current_round}")
+            print(f"Client {self.client_id} starting evaluation for round {self.current_round}...")
+            self._last_evaluated_round = self.current_round
+            self.evaluate_model()
+
+    def _apply_global_model(self, sample):
+        """Process a single GlobalModel sample (legacy non-chunked path)."""
+        round_num = sample.round
+        config_json = ""
+        if getattr(sample, 'model_config_octets', None) and len(sample.model_config_octets) > 0:
+            config_json = _octets_to_config(sample.model_config_octets)
+        if not config_json and getattr(sample, 'model_config_json', None):
+            config_json = sample.model_config_json or ""
+        self._apply_global_model_payload(round_num, sample.weights, config_json)
+
     def check_global_model(self):
-        """Check for global model updates from server (chunked version)"""
-        # Check for chunked global model
+        """Check for global model updates from server (chunked + legacy single-message)."""
         chunk_samples = self.readers['global_model_chunk'].take()
-        
-        # DEBUG: Log if we're receiving anything
-        if len(chunk_samples) > 0:
-            print(f"[DEBUG] Client {self.client_id} received {len(chunk_samples)} chunk samples from DataReader")
-        
         for sample in chunk_samples:
             if not sample or not hasattr(sample, 'round'):
                 continue
-            
             round_num = sample.round
             chunk_id = sample.chunk_id
             total_chunks = sample.total_chunks
-            
-            # Initialize buffers if needed
             if not self.global_model_metadata:
                 self.global_model_metadata = {
                     'round': round_num,
                     'total_chunks': total_chunks,
                     'model_config_json': sample.model_config_json if hasattr(sample, 'model_config_json') else ''
                 }
-                print(f"Client {self.client_id}: Receiving global model in {total_chunks} chunks...")
-            
-            # Store chunk
+                print(f"Client {self.client_id}: Receiving global model in {total_chunks} DDS chunks...")
+
             self.global_model_chunks[chunk_id] = sample.payload
-            
-            # Progress logging - show every 20 chunks to reduce spam
-            chunks_received = len(self.global_model_chunks)
-            if chunks_received % 20 == 0 or chunks_received == total_chunks:
-                print(f"Client {self.client_id}: Received {chunks_received}/{total_chunks} chunks")
-            
-            # Check if all chunks received
-            if chunks_received == total_chunks:
-                print(f"Client {self.client_id}: All chunks received, reassembling...")
-                
-                try:
-                    # Reassemble chunks in order
-                    reassembled_data = []
-                    for i in range(total_chunks):
-                        if i in self.global_model_chunks:
-                            reassembled_data.extend(self.global_model_chunks[i])
-                        else:
-                            print(f"ERROR: Missing chunk {i}")
-                            break
-                    
-                    # Only process if we have all chunks
-                    print(f"[DEBUG] Client {self.client_id}: Reassembled {len(reassembled_data)} bytes")
-                    if len(reassembled_data) > 0:
-                        print(f"[DEBUG] Client {self.client_id}: Starting deserialization...")
-                        # Deserialize and potentially decompress weights
-                        raw_weights = self.deserialize_weights(reassembled_data)
-                        print(f"[DEBUG] Client {self.client_id}: Deserialization complete, type: {type(raw_weights)}")
-                    
-                    # Check if weights are compressed (quantized)
-                    if isinstance(raw_weights, dict) and 'compressed_data' in raw_weights:
-                        if self.quantizer is not None:
-                            weights = self.quantizer.decompress(raw_weights)
-                            print(f"Client {self.client_id}: Received and decompressed quantized global model")
-                        else:
-                            print(f"Client {self.client_id}: ERROR - Received quantized data but quantizer not initialized!")
-                            # Clear buffers and continue
-                            self.global_model_chunks.clear()
-                            self.global_model_metadata.clear()
-                            continue
+
+            if len(self.global_model_chunks) == total_chunks:
+                reassembled_data = []
+                missing_chunk = False
+                for index in range(total_chunks):
+                    if index in self.global_model_chunks:
+                        reassembled_data.extend(self.global_model_chunks[index])
                     else:
-                        weights = raw_weights
-                    
-                    # Check if model needs initialization (works for late-joiners too)
-                    print(f"[DEBUG] Client {self.client_id}: Model is None: {self.model is None}")
-                    if self.model is None:
-                        print(f"Client {self.client_id} received initial global model from server (round {round_num})")
-                        
-                        # Parse model config if available
-                        model_config_json = self.global_model_metadata.get('model_config_json', '')
-                        if model_config_json:
-                            model_config = json.loads(model_config_json)
-                            
-                            # Build CNN model from server's architecture definition
-                            self.model = Sequential()
-                            self.model.add(Input(shape=tuple(model_config['input_shape'])))
-                            
-                            for layer_config in model_config['layers']:
-                                if layer_config['type'] == 'Conv2D':
-                                    self.model.add(Conv2D(
-                                        filters=layer_config['filters'],
-                                        kernel_size=tuple(layer_config['kernel_size']),
-                                        activation=layer_config.get('activation')
-                                    ))
-                                elif layer_config['type'] == 'MaxPooling2D':
-                                    self.model.add(MaxPooling2D(pool_size=tuple(layer_config['pool_size'])))
-                                elif layer_config['type'] == 'Dropout':
-                                    self.model.add(Dropout(layer_config['rate']))
-                                elif layer_config['type'] == 'Flatten':
-                                    self.model.add(Flatten())
-                                elif layer_config['type'] == 'Dense':
-                                    self.model.add(Dense(
-                                        units=layer_config['units'],
-                                        activation=layer_config.get('activation')
-                                    ))
-                            
-                            # Compile model
-                            self.model.compile(
-                                loss='categorical_crossentropy',
-                                optimizer=Adam(learning_rate=0.0001),
-                                metrics=['accuracy']
-                            )
-                            
-                            print(f"Client {self.client_id} built CNN model from server configuration")
-                            print(f"  Input shape: {model_config['input_shape']}")
-                            print(f"  Output classes: {model_config['num_classes']}")
-                        else:
-                            # Fallback: hardcode architecture if server doesn't send config
-                            self.model = Sequential()
-                            self.model.add(Input(shape=(48, 48, 1)))
-                            self.model.add(Conv2D(32, kernel_size=(3, 3), activation='relu'))
-                            self.model.add(Conv2D(64, kernel_size=(3, 3), activation='relu'))
-                            self.model.add(MaxPooling2D(pool_size=(2, 2)))
-                            self.model.add(Dropout(0.25))
-                            
-                            self.model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
-                            self.model.add(MaxPooling2D(pool_size=(2, 2)))
-                            self.model.add(Conv2D(128, kernel_size=(3, 3), activation='relu'))
-                            self.model.add(MaxPooling2D(pool_size=(2, 2)))
-                            self.model.add(Dropout(0.25))
-                            
-                            self.model.add(Flatten())
-                            self.model.add(Dense(1024, activation='relu'))
-                            self.model.add(Dropout(0.5))
-                            self.model.add(Dense(7, activation='softmax'))
-                            
-                            self.model.compile(
-                                loss='categorical_crossentropy',
-                                optimizer=Adam(learning_rate=0.0001),
-                                metrics=['accuracy']
-                            )
-                            print(f"Client {self.client_id} using hardcoded CNN model architecture")
-                        
-                        # Set the initial weights from server
-                        self.model.set_weights(weights)
-                        print(f"Client {self.client_id} model initialized with server weights")
-                        self.current_round = 0
-                        # Start round 1 immediately after initial model is ready to avoid
-                        # missing one-shot start_training command timing.
-                        self.current_round = 1
-                        print(f"Client {self.client_id} starting training for round 1 with initial global model...")
-                        self.train_local_model()
-                        # Training call handles further loop progression.
-                        self.global_model_chunks.clear()
-                        self.global_model_metadata.clear()
-                        return
-                    elif round_num == self.current_round:
-                        # Updated model after aggregation
-                        self.model.set_weights(weights)
-                        print(f"Client {self.client_id} received global model for round {self.current_round}")
-                        
-                        # Evaluate immediately after receiving global model
-                        print(f"Client {self.client_id} starting evaluation for round {self.current_round}...")
-                        self.evaluate_model()
-                    
-                    # Clear chunk buffers
-                    self.global_model_chunks.clear()
-                    self.global_model_metadata.clear()
-                    
-                except Exception as e:
-                    print(f"[ERROR] Client {self.client_id}: Exception during model reassembly: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    # Clear buffers on error
-                    self.global_model_chunks.clear()
-                    self.global_model_metadata.clear()
+                        missing_chunk = True
+                        print(f"Client {self.client_id}: Missing global-model chunk {index}")
+                        break
+
+                if not missing_chunk and len(reassembled_data) > 0:
+                    config_json = self.global_model_metadata.get('model_config_json', '')
+                    self._apply_global_model_payload(round_num, reassembled_data, config_json)
+
+                self.global_model_chunks.clear()
+                self.global_model_metadata.clear()
+
+        samples = self.readers['global_model'].take()
+        for sample in samples:
+            if not sample or not hasattr(sample, 'round') or not hasattr(sample, 'weights'):
+                continue
+            self._apply_global_model(sample)
     
     def train_local_model(self):
         """Train model on local data and send updates to server"""
         batch_size = self.training_config['batch_size']
+        self._apply_generator_batch_size(batch_size)
         epochs = self.training_config['local_epochs']
         # Limit steps per epoch for faster training (configurable via env)
         try:
@@ -651,6 +714,7 @@ class FederatedLearningClient:
             steps_per_epoch = 100
             val_steps = 25
         
+        training_start = time.time()
         # Train the model
         history = self.model.fit(
             self.train_generator,
@@ -677,12 +741,15 @@ class FederatedLearningClient:
         else:
             serialized_weights = self.serialize_weights(weights)
         
-        # Introduce random delay before sending model update
-        delay = random.uniform(0.5, 3.0)  # Random delay between 0.5 and 3.0 seconds
-        print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
-        time.sleep(delay)
+        # FAIR FIX: no artificial pre-send delay; align behavior with unified and other protocols.
         
-        # Send model update to server using chunking
+        payload_bytes = len(serialized_weights)
+        training_time = time.time() - training_start
+        if payload_bytes > 1_000_000 and os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            print(f"Client {self.client_id} sending model update ({payload_bytes / 1e6:.2f} MB); may take 1–2 min on moderate network...")
+        send_start_ts = time.time()
+        send_start_cpu = time.perf_counter() if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1" else None
+        # Send model update to server (chunked DDS path)
         self.send_model_update_chunked(
             self.current_round,
             serialized_weights,
@@ -690,7 +757,11 @@ class FederatedLearningClient:
             float(final_loss),
             float(final_accuracy)
         )
-        
+        communication_time = time.time() - send_start_ts
+        self.battery_model.update(payload_bytes, 0, training_time, communication_time)
+        if send_start_cpu is not None:
+            O_send = time.perf_counter() - send_start_cpu
+            print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={payload_bytes} send_start_ts={send_start_ts:.9f}")
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
         print(f"Training metrics - Loss: {final_loss:.4f}, Accuracy: {final_accuracy:.4f}")
         
@@ -705,41 +776,14 @@ class FederatedLearningClient:
         """Actively wait for global model after training"""
         timeout = 30
         start_time = time.time()
+        self._last_evaluated_round = -1
         check_count = 0
         
         while time.time() - start_time < timeout:
-            samples = self.readers['global_model'].take()
             check_count += 1
-            
-            if check_count % 50 == 0:  # Log every 5 seconds
-                print(f"Client {self.client_id} still waiting... (checked {check_count} times)")
-            
-            for sample in samples:
-                if sample:
-                    print(f"Client {self.client_id} received sample for round {sample.round} (expecting {self.current_round})")
-                    if sample.round == self.current_round:
-                        # Update local model with global weights
-                        # Deserialize and potentially decompress weights
-                        raw_weights = self.deserialize_weights(sample.weights)
-                        
-                        # Check if weights are compressed (quantized)
-                        if isinstance(raw_weights, dict) and 'compressed_data' in raw_weights:
-                            if self.quantizer is not None:
-                                weights = self.quantizer.decompress(raw_weights)
-                                print(f"Client {self.client_id}: Received and decompressed quantized global model")
-                            else:
-                                print(f"Client {self.client_id}: ERROR - Received quantized data but quantizer not initialized!")
-                                return
-                        else:
-                            weights = raw_weights
-                        
-                        self.model.set_weights(weights)
-                        print(f"Client {self.client_id} received global model for round {self.current_round}")
-                        
-                        # Evaluate immediately
-                        print(f"Client {self.client_id} starting evaluation for round {self.current_round}...")
-                        self.evaluate_model()
-                        return
+            self.check_global_model()
+            if self._last_evaluated_round == self.current_round:
+                return
             time.sleep(0.1)
         
         print(f"Client {self.client_id} WARNING: Timeout waiting for global model round {self.current_round}")
@@ -764,16 +808,17 @@ class FederatedLearningClient:
         loss, accuracy = self.model.evaluate(self.validation_generator, verbose=0)
         
         self._update_local_convergence(float(loss))
-        client_converged = 1.0 if self.has_converged else 0.0
+        client_converged = 1.0 if (self.has_converged and STOP_ON_CLIENT_CONVERGENCE) else 0.0
         
-        # Send metrics to server
+        # Send metrics to server (include battery_soc for server battery consumption plot)
         metrics = EvaluationMetrics(
             client_id=self.client_id,
             round=self.current_round,
             num_samples=self.validation_generator.n,
             loss=float(loss),
             accuracy=float(accuracy),
-            client_converged=client_converged
+            client_converged=client_converged,
+            battery_soc=float(self.battery_model.battery_soc),
         )
         
         # Write with explicit return check
@@ -784,7 +829,7 @@ class FederatedLearningClient:
         
         print(f"Client {self.client_id} sent evaluation metrics for round {self.current_round}")
         print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}\n")
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             self.running = False
     
@@ -818,7 +863,7 @@ def load_data(client_id):
     train_generator = train_data_gen.flow_from_directory(
         train_path,
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode="grayscale",
         class_mode='categorical',
         shuffle=True
@@ -827,7 +872,7 @@ def load_data(client_id):
     validation_generator = validation_data_gen.flow_from_directory(
         validation_path,
         target_size=(48, 48),
-        batch_size=32,
+        batch_size=DEFAULT_DATA_BATCH_SIZE,
         color_mode="grayscale",
         class_mode='categorical',
         shuffle=False

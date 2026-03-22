@@ -1,0 +1,10 @@
+# Overlay: use external macvlan network for MentalState FL (replaces bridge).
+# Use with: docker compose -f docker-compose-mentalstate.gpu-isolated.yml -f fl-macvlan-overlay-mentalstate.yml ...
+# Or: docker compose -f docker-compose-mentalstate.yml -f fl-macvlan-overlay-mentalstate.yml ...
+networks:
+  mentalstate_network:
+    external: true
+    name: fl-macvlan
+  fl-mqtt-network:
+    external: true
+    name: fl-macvlan

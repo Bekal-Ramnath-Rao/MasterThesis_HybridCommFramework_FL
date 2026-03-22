@@ -11,6 +11,13 @@ import time
 import random
 import logging
 import numpy as np
+_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+if _xla_flags:
+    sanitized_flags = [f for f in _xla_flags.split() if f != "--xla_gpu_enable_command_buffer="]
+    if sanitized_flags:
+        os.environ["XLA_FLAGS"] = " ".join(sanitized_flags)
+    else:
+        os.environ.pop("XLA_FLAGS", None)
 import tensorflow as tf
 import grpc
 
@@ -80,6 +87,7 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Training Configuration
 AUTOTUNE = tf.data.AUTOTUNE
@@ -312,18 +320,16 @@ class FederatedLearningClient:
             try:
                 print(f"Attempting to connect to gRPC server at {GRPC_HOST}:{GRPC_PORT}...")
                 options = [
-                    ('grpc.max_send_message_length', 100 * 1024 * 1024),
-                    ('grpc.max_receive_message_length', 100 * 1024 * 1024),
+                    ('grpc.max_send_message_length', 4 * 1024 * 1024),
+                    ('grpc.max_receive_message_length', 4 * 1024 * 1024),
                 ]
                 self.channel = grpc.insecure_channel(f'{GRPC_HOST}:{GRPC_PORT}', options=options)
                 self.stub = federated_learning_pb2_grpc.FederatedLearningStub(self.channel)
                 
                 # Test connection by registering
-                print(f"[DEBUG] Client {self.client_id} sending registration request to server...")
                 response = self.stub.RegisterClient(
                     federated_learning_pb2.ClientRegistration(client_id=self.client_id)
                 )
-                print(f"[DEBUG] Client {self.client_id} received registration response: success={response.success}")
                 
                 if response.success:
                     print(f"Client {self.client_id} connected to gRPC server")
@@ -368,8 +374,6 @@ class FederatedLearningClient:
                     federated_learning_pb2.ModelRequest(client_id=self.client_id, round=0)
                 )
                 
-                print(f"[DEBUG] Initial model fetch - available={model_update.available}, has_weights={bool(model_update.weights)}, has_config={bool(model_update.model_config)}, round={model_update.round}")
-                
                 if model_update.available and model_update.weights and model_update.model_config:
                     self.receive_global_model(model_update)
                     initial_model_received = True
@@ -399,8 +403,6 @@ class FederatedLearningClient:
                     )
                 )
                 
-                print(f"[DEBUG] Client {self.client_id} - Status: should_train={status.should_train}, current_round={status.current_round}, local_round={self.current_round}, is_complete={status.is_complete}")
-                
                 if status.is_complete:
                     print(f"\n{'='*70}")
                     print(f"Client {self.client_id} - Training completed!")
@@ -411,23 +413,15 @@ class FederatedLearningClient:
                     time.sleep(1)
                     continue
                 
-                print(f"[DEBUG] Client {self.client_id} - should_train is True, checking if need to fetch new model...")
-                
                 # If server's round is ahead, fetch new global model first
                 if status.current_round > self.current_round:
-                    print(f"[DEBUG] Client {self.client_id} - Fetching global model for round {status.current_round}...")
                     model_update = self.stub.GetGlobalModel(
                         federated_learning_pb2.ModelRequest(client_id=self.client_id, round=self.current_round)
                     )
-                    
-                    print(f"[DEBUG] Client {self.client_id} - Received model update, round={model_update.round}, status.current_round={status.current_round}")
-                    
                     if model_update.round == status.current_round:
-                        print(f"[DEBUG] Client {self.client_id} - Model round matches, updating...")
                         self.receive_global_model(model_update)
                         self.current_round = status.current_round
                     else:
-                        print(f"[DEBUG] Client {self.client_id} - Model round mismatch!")
                         time.sleep(0.5)
                         continue
                 
@@ -462,16 +456,14 @@ class FederatedLearningClient:
     def receive_global_model(self, model_update):
         """Receive and set global model weights from server"""
         try:
-            print(f"[DEBUG] Client {self.client_id} receive_global_model - round={model_update.round}, has_config={bool(model_update.model_config)}, model exists={self.model is not None}")
-            
             # Decompress or deserialize weights (handle pickled compressed dicts)
             if model_update.weights:
                 if self.quantizer is not None:
                     try:
                         candidate = pickle.loads(model_update.weights)
                         if isinstance(candidate, dict) and 'quantization_params' in candidate:
-                            weights = self.quantizer.decompress(candidate)
-                            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+                            weights = self.quantizer.as_training_weights(candidate)
+                            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
                         else:
                             weights = candidate
                     except Exception:
@@ -600,6 +592,10 @@ class FederatedLearningClient:
 
     def _notify_convergence_and_disconnect(self):
         """Notify server and stop this client."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore local convergence notification/disconnect.
+            print(f"Client {self.client_id} ignoring local convergence (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         try:
             self.stub.SendModelUpdate(
                 federated_learning_pb2.ModelUpdate(
@@ -614,8 +610,9 @@ class FederatedLearningClient:
         except Exception as e:
             print(f"Client {self.client_id} failed to notify convergence: {e}")
         finally:
-            import sys
-            sys.exit(0)
+            if STOP_ON_CLIENT_CONVERGENCE:
+                import sys
+                sys.exit(0)
 
 
 if __name__ == "__main__":

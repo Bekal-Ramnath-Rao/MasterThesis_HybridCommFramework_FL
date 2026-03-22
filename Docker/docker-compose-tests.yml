@@ -1,0 +1,29 @@
+services:
+  rabbitmq-test:
+    image: rabbitmq:3-management
+    container_name: fl-rabbitmq-test
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  native-style-test-runner:
+    build:
+      context: ..
+      dockerfile: Server/Dockerfile
+    container_name: fl-native-style-test-runner
+    depends_on:
+      rabbitmq-test:
+        condition: service_healthy
+    working_dir: /app
+    volumes:
+      - ..:/app
+    environment:
+      - PYTHONPATH=/app
+      - AMQP_HOST=rabbitmq-test
+      - AMQP_PORT=5672
+    command: ["bash", "-lc", "chmod +x scripts/testing/run_native_style_tests.sh && scripts/testing/run_native_style_tests.sh"]

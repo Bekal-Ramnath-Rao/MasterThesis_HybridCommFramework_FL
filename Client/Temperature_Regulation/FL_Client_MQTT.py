@@ -4,6 +4,13 @@ import math
 import os
 import sys
 import logging
+_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+if _xla_flags:
+    sanitized_flags = [f for f in _xla_flags.split() if f != "--xla_gpu_enable_command_buffer="]
+    if sanitized_flags:
+        os.environ["XLA_FLAGS"] = " ".join(sanitized_flags)
+    else:
+        os.environ.pop("XLA_FLAGS", None)
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
@@ -39,6 +46,13 @@ if compression_path not in sys.path:
     sys.path.insert(0, compression_path)
 
 from quantization_client import Quantization, QuantizationConfig
+try:
+    from pruning_client import ModelPruning, PruningConfig
+    PRUNING_AVAILABLE = True
+except Exception:
+    ModelPruning = None
+    PruningConfig = None
+    PRUNING_AVAILABLE = False
 
 # Make TensorFlow logs less verbose
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -54,6 +68,7 @@ NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "5"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # MQTT Topics
 TOPIC_GLOBAL_MODEL = "fl/global_model"
@@ -80,6 +95,19 @@ class FederatedLearningClient:
         else:
             self.quantizer = None
             print(f"Client {self.client_id}: Quantization disabled")
+
+        # Initialize pruning compression (default: disabled unless explicitly enabled)
+        up_env = os.getenv("USE_PRUNING", "false")
+        use_pruning = up_env.lower() in ("true", "1", "yes", "y")
+        if use_pruning and PRUNING_AVAILABLE and ModelPruning is not None:
+            self.pruner = ModelPruning(PruningConfig())
+            print(f"Client {self.client_id}: Pruning enabled")
+        else:
+            self.pruner = None
+            if use_pruning and not PRUNING_AVAILABLE:
+                print(f"Client {self.client_id}: Pruning requested but pruning module not available")
+            else:
+                print(f"Client {self.client_id}: Pruning disabled")
         self.x_train = None
         self.y_train = None
         self.x_test = None
@@ -225,6 +253,18 @@ class FederatedLearningClient:
         """Receive and set global model weights and architecture from server"""
         data = json.loads(payload.decode())
         round_num = data['round']
+        # Check if weights are pruned-compressed
+        if 'pruned_data' in data and PRUNING_AVAILABLE and ModelPruning is not None:
+            try:
+                compressed_bytes = base64.b64decode(data['pruned_data'].encode('utf-8'))
+                pruning_codec = self.pruner or ModelPruning(PruningConfig())
+                weights = pruning_codec.decompress_pruned_weights(compressed_bytes)
+                if round_num > 0:
+                    print(f"Client {self.client_id}: Received and decompressed pruned global model")
+            except Exception as e:
+                print(f"Client {self.client_id} error decoding pruned_data: {e}")
+                encoded_weights = data['weights']
+                weights = self.deserialize_weights(encoded_weights)
         # Check if weights are quantized
         if 'quantized_data' in data and self.quantizer is not None:
             compressed_data = data['quantized_data']
@@ -234,12 +274,15 @@ class FederatedLearningClient:
                     compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
                 except Exception as e:
                     print(f"Client {self.client_id} error decoding quantized_data: {e}")
-            weights = self.quantizer.decompress(compressed_data)
+            # Keep quantized end-to-end: do NOT dequantize/decompress.
+            # Cast quantized tensors to float32 only so TF can load them.
+            weights = self.quantizer.as_training_weights(compressed_data)
             if round_num > 0:
-                print(f"Client {self.client_id}: Received and decompressed quantized global model")
+                print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
         else:
-            encoded_weights = data['weights']
-            weights = self.deserialize_weights(encoded_weights)
+            if 'pruned_data' not in data:
+                encoded_weights = data['weights']
+                weights = self.deserialize_weights(encoded_weights)
         
         # Initialize model if not yet created (works for any round)
         if self.model is None:
@@ -340,6 +383,17 @@ class FederatedLearningClient:
         # Get updated weights
         updated_weights = self.model.get_weights()
         num_samples = len(self.x_train)
+
+        # Apply pruning before quantization/transmission when enabled
+        if self.pruner is not None:
+            updated_weights = self.pruner.prune_weights(updated_weights, step=self.current_round)
+            if self.current_round == 0 or (self.current_round % 5 == 0):
+                pruning_stats = self.pruner.get_pruning_statistics(updated_weights)
+                print(
+                    f"Client {self.client_id}: Pruned weights - "
+                    f"Sparsity: {pruning_stats['overall_sparsity']:.2%}, "
+                    f"Compression: {pruning_stats['compression_ratio']:.2f}x"
+                )
         
         # Prepare training metrics
         metrics = {
@@ -353,7 +407,9 @@ class FederatedLearningClient:
             "val_mape": float(history.history["val_mape"][-1]),
         }
         
-        # Compress weights if quantization is enabled
+        # Compress weights for transmission:
+        # - if quantization enabled -> quantize pruned weights
+        # - else if pruning enabled -> sparse-compress pruned weights
         if self.quantizer is not None:
             compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
             stats = self.quantizer.get_compression_stats(updated_weights, compressed_data)
@@ -370,6 +426,26 @@ class FederatedLearningClient:
                 "num_samples": num_samples,
                 "metrics": metrics
             }
+        elif self.pruner is not None:
+            try:
+                pruned_bytes, _ = self.pruner.compress_pruned_weights(updated_weights)
+                pruned_b64 = base64.b64encode(pruned_bytes).decode("utf-8")
+                update_message = {
+                    "client_id": self.client_id,
+                    "round": self.current_round,
+                    "pruned_data": pruned_b64,
+                    "num_samples": num_samples,
+                    "metrics": metrics
+                }
+            except Exception as e:
+                print(f"Client {self.client_id} error compressing pruned weights: {e}")
+                update_message = {
+                    "client_id": self.client_id,
+                    "round": self.current_round,
+                    "weights": self.serialize_weights(updated_weights),
+                    "num_samples": num_samples,
+                    "metrics": metrics
+                }
         else:
             # Send model update without compression
             update_message = {
@@ -419,7 +495,7 @@ class FederatedLearningClient:
             "mae": float(mae),
             "mape": float(mape)
         }
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             metrics_dict["client_converged"] = 1.0
         
         metrics_message = {
@@ -432,7 +508,7 @@ class FederatedLearningClient:
         self.mqtt_client.publish(TOPIC_CLIENT_METRICS, json.dumps(metrics_message))
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, MSE: {mse:.4f}, "
               f"MAE: {mae:.4f}, MAPE: {mape:.4f}")
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             time.sleep(2)
             self.mqtt_client.disconnect()

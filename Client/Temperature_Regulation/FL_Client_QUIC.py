@@ -9,10 +9,25 @@ import random
 import asyncio
 import os
 import logging
+_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+if _xla_flags:
+    sanitized_flags = [f for f in _xla_flags.split() if f != "--xla_gpu_enable_command_buffer="]
+    if sanitized_flags:
+        os.environ["XLA_FLAGS"] = " ".join(sanitized_flags)
+    else:
+        os.environ.pop("XLA_FLAGS", None)
 from aioquic.asyncio import connect
 from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import QuicEvent, StreamDataReceived
 from aioquic.asyncio.protocol import QuicConnectionProtocol
+
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in os.sys.path:
+    os.sys.path.insert(0, compression_path)
+
+from quantization_client import Quantization, QuantizationConfig
+from pruning_client import ModelPruning, PruningConfig
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
@@ -46,6 +61,7 @@ NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "5"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 
 class FederatedLearningClientProtocol(QuicConnectionProtocol):
@@ -95,6 +111,15 @@ class FederatedLearningClient:
         else:
             self.quantizer = None
             print(f"Client {self.client_id}: Quantization disabled")
+
+        up_env = os.getenv("USE_PRUNING", "false")
+        use_pruning = up_env.lower() in ("true", "1", "yes", "y")
+        if use_pruning:
+            self.pruner = ModelPruning(PruningConfig())
+            print(f"Client {self.client_id}: Pruning enabled")
+        else:
+            self.pruner = None
+            print(f"Client {self.client_id}: Pruning disabled")
         self.x_train = None
         self.y_train = None
         self.x_test = None
@@ -202,13 +227,22 @@ class FederatedLearningClient:
         round_num = message['round']
         encoded_weights = message['weights']
         
-        # Decompress or deserialize weights
+        # Decompress/deserialize weights.
+        # Keep quantized end-to-end: do NOT dequantize/decompress.
         if 'quantized_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['quantized_data'])
-            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            weights = self.quantizer.as_training_weights(message['quantized_data'])
+            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
         elif 'compressed_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['compressed_data'])
-            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            weights = self.quantizer.as_training_weights(message['compressed_data'])
+            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
+        elif 'pruned_data' in message and self.pruner is not None:
+            try:
+                compressed_bytes = base64.b64decode(message['pruned_data'].encode('utf-8'))
+                weights = self.pruner.decompress_pruned_weights(compressed_bytes)
+                print(f"Client {self.client_id}: Received and decompressed pruned global model")
+            except Exception as e:
+                print(f"Client {self.client_id} error decoding pruned_data: {e}")
+                weights = self.deserialize_weights(encoded_weights)
         else:
             weights = self.deserialize_weights(encoded_weights)
         
@@ -317,6 +351,10 @@ class FederatedLearningClient:
         
         updated_weights = self.model.get_weights()
         num_samples = len(self.x_train)
+
+        # Flow: Training -> Pruning -> Quantization -> Send
+        if self.pruner is not None:
+            updated_weights = self.pruner.prune_weights(updated_weights, step=self.current_round)
         
         metrics = {
             "loss": float(history.history["loss"][-1]),
@@ -334,14 +372,40 @@ class FederatedLearningClient:
         print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
         await asyncio.sleep(delay)
         
-        update_message = {
-            "type": "model_update",
-            "client_id": self.client_id,
-            "round": self.current_round,
-            "weights": self.serialize_weights(updated_weights),
-            "num_samples": num_samples,
-            "metrics": metrics
-        }
+        # Compress weights for transmission:
+        # - if quantization enabled -> quantize pruned weights
+        # - else if pruning enabled -> sparse-compress pruned weights
+        if self.quantizer is not None:
+            compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
+            update_message = {
+                "type": "model_update",
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "compressed_data": serialized,
+                "num_samples": num_samples,
+                "metrics": metrics
+            }
+        elif self.pruner is not None:
+            pruned_bytes, _ = self.pruner.compress_pruned_weights(updated_weights)
+            pruned_b64 = base64.b64encode(pruned_bytes).decode("utf-8")
+            update_message = {
+                "type": "model_update",
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "pruned_data": pruned_b64,
+                "num_samples": num_samples,
+                "metrics": metrics
+            }
+        else:
+            update_message = {
+                "type": "model_update",
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "weights": self.serialize_weights(updated_weights),
+                "num_samples": num_samples,
+                "metrics": metrics
+            }
         
         await self.send_message(update_message)
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
@@ -383,7 +447,7 @@ class FederatedLearningClient:
             "mae": float(mae),
             "mape": float(mape)
         }
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             metrics_dict["client_converged"] = 1.0
         
         metrics_message = {
@@ -397,7 +461,7 @@ class FederatedLearningClient:
         await self.send_message(metrics_message)
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, MSE: {mse:.4f}, "
               f"MAE: {mae:.4f}, MAPE: {mape:.4f}")
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             await asyncio.sleep(2)
             import sys

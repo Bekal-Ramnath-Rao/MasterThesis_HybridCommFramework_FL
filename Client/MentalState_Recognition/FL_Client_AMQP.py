@@ -12,6 +12,13 @@ import time
 import random
 import logging
 import numpy as np
+_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+if _xla_flags:
+    sanitized_flags = [f for f in _xla_flags.split() if f != "--xla_gpu_enable_command_buffer="]
+    if sanitized_flags:
+        os.environ["XLA_FLAGS"] = " ".join(sanitized_flags)
+    else:
+        os.environ.pop("XLA_FLAGS", None)
 import tensorflow as tf
 import pika
 
@@ -75,6 +82,7 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # AMQP Exchanges and Queues
 EXCHANGE_BROADCAST = "fl_broadcast"
@@ -472,9 +480,9 @@ class FederatedLearningClient:
                         compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
                     except Exception as e:
                         print(f"Client {self.client_id} error decoding quantized_data: {e}")
-                weights = self.quantizer.decompress(compressed_data)
+                weights = self.quantizer.as_training_weights(compressed_data)
                 if round_num > 0:
-                    print(f"Client {self.client_id}: Received and decompressed quantized global model")
+                    print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
             else:
                 encoded_weights = data['weights']
                 weights = self.deserialize_weights(encoded_weights)
@@ -609,7 +617,7 @@ class FederatedLearningClient:
             "loss": final_loss,
             "accuracy": final_acc
         }
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             metrics["client_converged"] = 1.0
         num_samples = int(len(self.y_train))
         
@@ -654,7 +662,7 @@ class FederatedLearningClient:
         
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
         print(f"Training metrics - Loss: {final_loss:.4f}, Accuracy: {final_acc:.4f}")
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             time.sleep(2)
             self.stop()

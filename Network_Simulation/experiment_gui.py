@@ -7,22 +7,66 @@ A beautiful and comprehensive interface for running FL experiments
 import sys
 import os
 import json
+import shlex
+import signal
 import subprocess
 import threading
+import time
 from datetime import datetime
+from pathlib import Path
 
 # Add GUI directory to path for packet_logs_tab import
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'GUI'))
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LOCAL_PRIVILEGED_ENV_FILE = PROJECT_ROOT / "Network_Simulation" / ".privileged_ops.env"
+
+
+def shell_join(parts):
+    """Quote command parts so shell=True still works from any project path."""
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def load_local_runtime_env():
+    """Load optional local-only env overrides for privileged operations."""
+    overrides = {}
+    if not LOCAL_PRIVILEGED_ENV_FILE.is_file():
+        return overrides
+
+    try:
+        with LOCAL_PRIVILEGED_ENV_FILE.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+                    value = value[1:-1]
+                if key and value:
+                    overrides[key] = value
+    except OSError:
+        pass
+
+    return overrides
+
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QCheckBox, QSpinBox, QSlider,
     QGroupBox, QTextEdit, QProgressBar, QTabWidget, QGridLayout,
     QScrollArea, QMessageBox, QLineEdit, QRadioButton, QButtonGroup,
-    QFrame, QSplitter
+    QFrame, QSplitter, QDialog, QSizePolicy, QFileDialog
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QPalette, QColor, QIcon
+
+# Matplotlib with Qt5 backend for completion plot (must set before importing pyplot)
+import matplotlib
+matplotlib.use("Qt5Agg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
 
 class DashboardMonitor(QThread):
@@ -101,6 +145,46 @@ class LogMonitor(QThread):
             self.process.terminate()
 
 
+class NativeLogMonitor(QThread):
+    """Background thread for monitoring native (no-Docker) run log files"""
+    log_update = pyqtSignal(str, str)  # (log_type, message)
+
+    def __init__(self, log_file_path, log_type, parent=None):
+        super().__init__(parent)
+        self.log_file_path = log_file_path
+        self.log_type = log_type
+        self.running = True
+
+    def run(self):
+        import time
+        try:
+            path = self.log_file_path
+            if not path or not os.path.exists(path):
+                self.log_update.emit(self.log_type, f"(Waiting for log file: {path})\n")
+                while self.running and (not os.path.exists(path)):
+                    time.sleep(0.5)
+                if not self.running:
+                    return
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                # Read existing content first
+                for line in f:
+                    if not self.running:
+                        return
+                    self.log_update.emit(self.log_type, line)
+                # Tail new content
+                while self.running:
+                    line = f.readline()
+                    if line:
+                        self.log_update.emit(self.log_type, line)
+                    else:
+                        time.sleep(0.2)
+        except Exception as e:
+            self.log_update.emit(self.log_type, f"Log Error: {str(e)}\n")
+
+    def stop(self):
+        self.running = False
+
+
 class NetworkController(QThread):
     """Background thread for network control via fl_network_monitor"""
     control_update = pyqtSignal(str)
@@ -158,6 +242,58 @@ class ExperimentRunner(QThread):
         super().__init__(parent)
         self.command = command
         self.process = None
+
+    def _terminate_process_tree(self, grace_seconds=3.0):
+        """Terminate the full process tree for the running experiment command."""
+        if not self.process:
+            return
+        if self.process.poll() is not None:
+            return
+
+        terminated = False
+        pgid = None
+        try:
+            pgid = os.getpgid(self.process.pid)
+        except Exception:
+            pgid = None
+
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
+                terminated = True
+            else:
+                self.process.terminate()
+                terminated = True
+        except ProcessLookupError:
+            return
+        except Exception:
+            try:
+                self.process.terminate()
+                terminated = True
+            except Exception:
+                pass
+
+        if not terminated:
+            return
+
+        deadline = time.time() + max(0.1, float(grace_seconds))
+        while time.time() < deadline:
+            if self.process.poll() is not None:
+                return
+            time.sleep(0.1)
+
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                self.process.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            try:
+                self.process.kill()
+            except Exception:
+                pass
         
     def run(self):
         try:
@@ -167,6 +303,7 @@ class ExperimentRunner(QThread):
             # Set environment to disable Python buffering for real-time output
             env = os.environ.copy()
             env['PYTHONUNBUFFERED'] = '1'
+            env.update(load_local_runtime_env())
             
             self.process = subprocess.Popen(
                 self.command,
@@ -176,7 +313,8 @@ class ExperimentRunner(QThread):
                 text=True,
                 bufsize=1,  # Line buffered
                 env=env,    # Force unbuffered Python output
-                universal_newlines=True
+                universal_newlines=True,
+                start_new_session=True
             )
             
             # Stream output in real-time
@@ -203,7 +341,7 @@ class ExperimentRunner(QThread):
     
     def stop(self):
         if self.process:
-            self.process.terminate()
+            self._terminate_process_tree(grace_seconds=3.0)
             self.progress_update.emit("\n⚠️ Experiment stopped by user\n")
 
 
@@ -238,6 +376,7 @@ class DockerBuildThread(QThread):
 class FLExperimentGUI(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.project_root = str(PROJECT_ROOT)
         self.experiment_thread = None
         self.dashboard_thread = None
         self.network_controller = None
@@ -435,7 +574,26 @@ class FLExperimentGUI(QMainWindow):
         """)
         self.clear_button.clicked.connect(self.clear_all_output)
         
+        self.diagnostic_pipeline_button = QPushButton("📊 Run Diagnostic Pipeline")
+        self.diagnostic_pipeline_button.setStyleSheet("""
+            QPushButton {
+                background-color: #6f42c1;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 12px 24px;
+                border-radius: 8px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #5a32a3; }
+            QPushButton:pressed { background-color: #4c2d8a; }
+            QPushButton:disabled { background-color: #6c757d; }
+        """)
+        self.diagnostic_pipeline_button.setToolTip("Run empirical overhead, network extraction, and analytical model for selected protocol(s) and scenario(s). Supports multiple protocols × multiple network scenarios (MQTT, AMQP, gRPC, QUIC, HTTP/3, DDS).")
+        self.diagnostic_pipeline_button.clicked.connect(self.start_diagnostic_pipeline)
+        
         control_layout.addWidget(self.start_button)
+        control_layout.addWidget(self.diagnostic_pipeline_button)
         control_layout.addWidget(self.stop_button)
         control_layout.addWidget(self.apply_network_button)
         control_layout.addWidget(self.clear_button)
@@ -495,18 +653,86 @@ class FLExperimentGUI(QMainWindow):
         ])
         layout.addWidget(protocol_group)
         self.protocol_checkboxes = protocol_group.findChildren(QCheckBox)
+
+        # DDS implementation selector (CycloneDDS vs Fast DDS)
+        self.dds_impl_group = QGroupBox("🔧 DDS Implementation")
+        self.dds_impl_group.setStyleSheet(self.get_group_style())
+        dds_impl_layout = QHBoxLayout()
+        self.dds_impl_label = QLabel("DDS Library:")
+        self.dds_impl = QComboBox()
+        self.dds_impl.addItem("CycloneDDS", "cyclonedds")
+        self.dds_impl.addItem("Fast DDS", "fastdds")
+        self.dds_impl.setStyleSheet("padding: 5px; font-size: 12px;")
+        dds_impl_layout.addWidget(self.dds_impl_label)
+        dds_impl_layout.addWidget(self.dds_impl)
+        dds_impl_layout.addStretch()
+        self.dds_impl_group.setLayout(dds_impl_layout)
+        layout.addWidget(self.dds_impl_group)
+        # Update visibility based on whether DDS is selected
+        for cb in self.protocol_checkboxes:
+            cb.toggled.connect(self.update_dds_impl_visibility)
+        self.update_dds_impl_visibility()
         
-        # Q-learning convergence (unified use case only)
-        ql_conv_group = QGroupBox("🎓 Q-Learning End Condition (Unified Only)")
-        ql_conv_group.setStyleSheet(self.get_group_style())
-        ql_conv_layout = QHBoxLayout()
-        self.use_ql_convergence = QCheckBox("End training when Q-learning value converges (run multiple episodes)")
+        # RL-unified mode selector
+        self.rl_mode_group_box = QGroupBox("🤖 RL-Unified Mode")
+        self.rl_mode_group_box.setStyleSheet(self.get_group_style())
+        rl_mode_layout = QVBoxLayout()
+        rl_mode_row = QHBoxLayout()
+        self.rl_mode_buttons = QButtonGroup(self)
+        self.rl_mode_training = QRadioButton("Training")
+        self.rl_mode_training.setToolTip("Train/update the Q-table before deployment.")
+        self.rl_mode_inference = QRadioButton("Inference")
+        self.rl_mode_inference.setToolTip("Load the converged Q-table and choose the best protocol greedily.")
+        self.rl_mode_inference.setChecked(True)
+        self.rl_mode_buttons.addButton(self.rl_mode_training)
+        self.rl_mode_buttons.addButton(self.rl_mode_inference)
+        rl_mode_row.addWidget(QLabel("Mode:"))
+        rl_mode_row.addWidget(self.rl_mode_training)
+        rl_mode_row.addWidget(self.rl_mode_inference)
+        rl_mode_row.addStretch()
+        rl_mode_layout.addLayout(rl_mode_row)
+
+        ql_conv_row = QHBoxLayout()
+        self.use_ql_convergence = QCheckBox("End RL training when Q-learning values converge")
         self.use_ql_convergence.setStyleSheet("font-size: 12px; padding: 5px;")
-        self.use_ql_convergence.setToolTip("If unchecked: training ends on accuracy convergence (current behavior). If checked: training runs until Q-values stabilize.")
-        ql_conv_layout.addWidget(self.use_ql_convergence)
-        ql_conv_layout.addStretch()
-        ql_conv_group.setLayout(ql_conv_layout)
-        layout.addWidget(ql_conv_group)
+        self.use_ql_convergence.setToolTip(
+            "Training only. If unchecked, RL-unified training ends on model accuracy convergence. "
+            "If checked, it runs until Q-values stabilize."
+        )
+        ql_conv_row.addWidget(self.use_ql_convergence)
+        ql_conv_row.addStretch()
+        rl_mode_layout.addLayout(ql_conv_row)
+
+        comm_reward_row = QHBoxLayout()
+        self.use_communication_model_reward = QCheckBox("Include communication model in RL rewards")
+        self.use_communication_model_reward.setChecked(True)
+        self.use_communication_model_reward.setStyleSheet("font-size: 12px; padding: 5px;")
+        self.use_communication_model_reward.setToolTip(
+            "When enabled, RL rewards include the communication-model T_calc penalty. "
+            "Disable this to train or run RL without communication-model influence on reward."
+        )
+        comm_reward_row.addWidget(self.use_communication_model_reward)
+        comm_reward_row.addStretch()
+        rl_mode_layout.addLayout(comm_reward_row)
+
+        epsilon_reset_row = QHBoxLayout()
+        self.reset_epsilon_on_start = QCheckBox("Reset Epsilon to 1.0 (Fresh Training)")
+        self.reset_epsilon_on_start.setChecked(True)  # Default: reset (current behavior)
+        self.reset_epsilon_on_start.setStyleSheet("font-size: 12px; padding: 5px;")
+        self.reset_epsilon_on_start.setToolTip(
+            "Training only. When CHECKED: Epsilon resets to 1.0 for fresh exploration (recommended for new scenarios).\n"
+            "When UNCHECKED: Continue with previous epsilon value and accumulated learning (useful for resuming interrupted training)."
+        )
+        epsilon_reset_row.addWidget(self.reset_epsilon_on_start)
+        epsilon_reset_row.addStretch()
+        rl_mode_layout.addLayout(epsilon_reset_row)
+
+        self.rl_mode_group_box.setLayout(rl_mode_layout)
+        layout.addWidget(self.rl_mode_group_box)
+        for cb in self.protocol_checkboxes:
+            cb.toggled.connect(self.update_rl_mode_visibility)
+        self.rl_mode_training.toggled.connect(self.update_rl_mode_visibility)
+        self.update_rl_mode_visibility()
         
         # Network Scenarios
         scenario_group = self.create_checkbox_group("🌐 Network Scenarios", [
@@ -518,13 +744,15 @@ class FLExperimentGUI(QMainWindow):
             ("Satellite", "satellite", False),
             ("Light Congestion", "congested_light", False),
             ("Moderate Congestion", "congested_moderate", False),
-            ("Heavy Congestion", "congested_heavy", False)
+            ("Heavy Congestion", "congested_heavy", False),
+            # Dynamic: randomly alternates between Excellent / Moderate / Poor / Light Congestion
+            ("Dynamic (Random Excellent/Moderate/Poor/Light Congestion)", "dynamic", False),
         ])
         layout.addWidget(scenario_group)
         self.scenario_checkboxes = scenario_group.findChildren(QCheckBox)
         
-        # GPU Configuration
-        gpu_group = QGroupBox("🖥️ GPU Configuration")
+        # GPU Configuration + Execution Environment
+        gpu_group = QGroupBox("🖥️ GPU & Execution Configuration")
         gpu_group.setStyleSheet(self.get_group_style())
         gpu_layout = QHBoxLayout()
         
@@ -532,6 +760,34 @@ class FLExperimentGUI(QMainWindow):
         self.gpu_enabled.setChecked(True)
         self.gpu_enabled.setStyleSheet("font-size: 13px; padding: 5px;")
         gpu_layout.addWidget(self.gpu_enabled)
+        
+        # Execution environment: Docker containers (default) or native Python + namespaces
+        gpu_layout.addWidget(QLabel("Execution:"))
+        self.exec_mode_group = QButtonGroup(self)
+        self.exec_mode_docker = QRadioButton("Docker (containers)")
+        self.exec_mode_docker.setToolTip("Run FL server/clients in Docker containers using docker-compose (existing behavior).")
+        self.exec_mode_docker.setChecked(True)
+        self.exec_mode_native = QRadioButton("Native (Python + namespaces)")
+        self.exec_mode_native.setToolTip("Run FL server/clients as normal Python scripts on this machine using Linux network namespaces + tc/netem (no Docker). Currently optimized for gRPC.")
+        for r in (self.exec_mode_docker, self.exec_mode_native):
+            r.setStyleSheet("font-size: 12px; padding: 2px;")
+            self.exec_mode_group.addButton(r)
+            gpu_layout.addWidget(r)
+        
+        # Network mode: 3 options for Docker-based experiments and diagnostic pipeline
+        gpu_layout.addWidget(QLabel("Network mode:"))
+        self.network_mode_group = QButtonGroup(self)
+        self.network_mode_gpu = QRadioButton("1. GPU (Docker bridge)")
+        self.network_mode_gpu.setToolTip("Use docker-compose *.gpu-isolated.yml (or standard). Tc applied per container.")
+        self.network_mode_gpu.setChecked(True)
+        self.network_mode_host = QRadioButton("2. Host network (tc on host)")
+        self.network_mode_host.setToolTip("Use docker-compose *.host-network.yml (network_mode: host). Tc applied on host interface (e.g. eno2); affects all containers.")
+        self.network_mode_host_macvlan = QRadioButton("3. Host + macvlan (per-container tc)")
+        self.network_mode_host_macvlan.setToolTip("Use docker-compose *.macvlan.yml. Creates fl-macvlan network; tc applied inside each container. Set FL_MACVLAN_PARENT (e.g. eno2) for parent interface.")
+        for r in (self.network_mode_gpu, self.network_mode_host, self.network_mode_host_macvlan):
+            r.setStyleSheet("font-size: 12px; padding: 2px;")
+            self.network_mode_group.addButton(r)
+            gpu_layout.addWidget(r)
         
         gpu_layout.addWidget(QLabel("GPU Count:"))
         self.gpu_count = QSpinBox()
@@ -543,6 +799,16 @@ class FLExperimentGUI(QMainWindow):
         gpu_layout.addStretch()
         gpu_group.setLayout(gpu_layout)
         layout.addWidget(gpu_group)
+        self.gpu_network_info = QLabel(
+            "ℹ️ Docker modes: 1=GPU bridge (*.gpu-isolated.yml, per-container tc). "
+            "2=Host network (*.host-network.yml, tc on host). "
+            "3=Macvlan (*.macvlan.yml, per-container tc).\n"
+            "   Native mode: runs FL server/clients as local Python scripts in Linux namespaces with tc/netem "
+            "applied independently on server/client directions (currently tested with gRPC)."
+        )
+        self.gpu_network_info.setWordWrap(True)
+        self.gpu_network_info.setStyleSheet("color: #555; font-size: 11px; padding: 4px 0;")
+        layout.addWidget(self.gpu_network_info)
         
         # Training Configuration
         training_group = QGroupBox("🎓 Training Configuration")
@@ -556,6 +822,14 @@ class FLExperimentGUI(QMainWindow):
         self.rounds_spinbox.setStyleSheet("padding: 5px;")
         training_layout.addWidget(self.rounds_spinbox, 0, 1)
         
+        training_layout.addWidget(QLabel("Termination mode:"), 3, 0)
+        self.termination_mode_combo = QComboBox()
+        self.termination_mode_combo.addItem("End on client convergence (may stop early)", "client_convergence")
+        self.termination_mode_combo.addItem("End on fixed rounds (run selected rounds)", "fixed_rounds")
+        self.termination_mode_combo.setCurrentIndex(0)  # Preserve current default behavior
+        self.termination_mode_combo.setStyleSheet("padding: 5px;")
+        training_layout.addWidget(self.termination_mode_combo, 3, 1)
+        
         training_layout.addWidget(QLabel("Batch Size:"), 0, 2)
         self.batch_size = QSpinBox()
         self.batch_size.setRange(1, 512)
@@ -568,12 +842,26 @@ class FLExperimentGUI(QMainWindow):
         self.learning_rate.setStyleSheet("padding: 5px;")
         training_layout.addWidget(self.learning_rate, 1, 1)
         
-        training_layout.addWidget(QLabel("Min Clients:"), 1, 2)
+        training_layout.addWidget(QLabel("Min Clients (server):"), 1, 2)
         self.min_clients = QSpinBox()
         self.min_clients.setRange(1, 100)
         self.min_clients.setValue(2)
         self.min_clients.setStyleSheet("padding: 5px;")
+        self.min_clients.setToolTip("Minimum number of clients required by the FL server before training can start.")
         training_layout.addWidget(self.min_clients, 1, 3)
+
+        # Number of clients started from this GUI (Docker-based runs only; native uses Min Clients)
+        training_layout.addWidget(QLabel("Clients from this GUI:"), 2, 0)
+        self.gui_clients = QSpinBox()
+        self.gui_clients.setRange(1, 2)
+        self.gui_clients.setValue(2)
+        self.gui_clients.setStyleSheet("padding: 5px;")
+        self.gui_clients.setToolTip(
+            "Number of client containers to start on this machine when running Docker-based experiments.\n"
+            "The FL server will still wait for the configured minimum clients (e.g., 2). "
+            "You can start the remaining clients from other PCs using the Distributed Client GUI."
+        )
+        training_layout.addWidget(self.gui_clients, 2, 1)
         
         training_group.setLayout(training_layout)
         layout.addWidget(training_group)
@@ -755,7 +1043,7 @@ class FLExperimentGUI(QMainWindow):
         
         quant_options_layout.addWidget(QLabel("Quantization Bits:"), 0, 0)
         self.quant_bits = QComboBox()
-        self.quant_bits.addItems(["8", "16", "32"])
+        self.quant_bits.addItems(["4", "8", "16", "32"])
         self.quant_bits.setCurrentText("8")
         self.quant_bits.setStyleSheet("padding: 5px;")
         quant_options_layout.addWidget(self.quant_bits, 0, 1)
@@ -930,6 +1218,40 @@ class FLExperimentGUI(QMainWindow):
         self.build_btn_emotion.clicked.connect(self.build_docker_images_emotion)
         docker_layout.addWidget(self.build_btn_emotion)
 
+        # Host-network build buttons (all use cases – high-performance, no bridge)
+        host_label = QLabel("🌐 Host Network Build (recommended for experiments)")
+        host_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #16a085; margin-top: 8px;")
+        docker_layout.addWidget(host_label)
+        self.build_btn_temp_host = QPushButton("🐳 Build Docker Images (Temperature) [Host Network]")
+        self.build_btn_temp_host.setStyleSheet("font-size: 14px; padding: 8px; background-color: #16a085; color: white; border-radius: 6px;")
+        self.build_btn_temp_host.clicked.connect(self.build_docker_images_temperature_host)
+        docker_layout.addWidget(self.build_btn_temp_host)
+        self.build_btn_mental_host = QPushButton("🐳 Build Docker Images (Mental State) [Host Network]")
+        self.build_btn_mental_host.setStyleSheet("font-size: 14px; padding: 8px; background-color: #16a085; color: white; border-radius: 6px;")
+        self.build_btn_mental_host.clicked.connect(self.build_docker_images_mentalstate_host)
+        docker_layout.addWidget(self.build_btn_mental_host)
+        self.build_btn_emotion_host = QPushButton("🐳 Build Docker Images (Emotion) [Host Network]")
+        self.build_btn_emotion_host.setStyleSheet("font-size: 14px; padding: 8px; background-color: #16a085; color: white; border-radius: 6px;")
+        self.build_btn_emotion_host.clicked.connect(self.build_docker_images_emotion_host)
+        docker_layout.addWidget(self.build_btn_emotion_host)
+
+        # Macvlan build buttons (per-container tc, fl-macvlan network)
+        macvlan_label = QLabel("🔗 Macvlan Build (per-container tc, *.macvlan.yml)")
+        macvlan_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #8e44ad; margin-top: 8px;")
+        docker_layout.addWidget(macvlan_label)
+        self.build_btn_temp_macvlan = QPushButton("🐳 Build Docker Images (Temperature) [Macvlan]")
+        self.build_btn_temp_macvlan.setStyleSheet("font-size: 14px; padding: 8px; background-color: #8e44ad; color: white; border-radius: 6px;")
+        self.build_btn_temp_macvlan.clicked.connect(self.build_docker_images_temperature_macvlan)
+        docker_layout.addWidget(self.build_btn_temp_macvlan)
+        self.build_btn_mental_macvlan = QPushButton("🐳 Build Docker Images (Mental State) [Macvlan]")
+        self.build_btn_mental_macvlan.setStyleSheet("font-size: 14px; padding: 8px; background-color: #8e44ad; color: white; border-radius: 6px;")
+        self.build_btn_mental_macvlan.clicked.connect(self.build_docker_images_mentalstate_macvlan)
+        docker_layout.addWidget(self.build_btn_mental_macvlan)
+        self.build_btn_emotion_macvlan = QPushButton("🐳 Build Docker Images (Emotion) [Macvlan]")
+        self.build_btn_emotion_macvlan.setStyleSheet("font-size: 14px; padding: 8px; background-color: #8e44ad; color: white; border-radius: 6px;")
+        self.build_btn_emotion_macvlan.clicked.connect(self.build_docker_images_emotion_macvlan)
+        docker_layout.addWidget(self.build_btn_emotion_macvlan)
+
         # Add separator
         separator = QLabel("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         separator.setStyleSheet("color: #95a5a6; font-size: 10px; margin: 10px 0;")
@@ -954,6 +1276,23 @@ class FLExperimentGUI(QMainWindow):
         self.build_btn_unified_emotion.setStyleSheet("font-size: 15px; padding: 10px; background-color: #e74c3c; color: white; border-radius: 6px;")
         self.build_btn_unified_emotion.clicked.connect(self.build_docker_images_unified_emotion)
         docker_layout.addWidget(self.build_btn_unified_emotion)
+
+        # Unified host-network build buttons
+        unified_host_label = QLabel("🌐 Unified Host Network Build")
+        unified_host_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #c0392b; margin-top: 8px;")
+        docker_layout.addWidget(unified_host_label)
+        self.build_btn_unified_temp_host = QPushButton("🤖 Build Unified Images (Temperature) [Host Network]")
+        self.build_btn_unified_temp_host.setStyleSheet("font-size: 14px; padding: 8px; background-color: #c0392b; color: white; border-radius: 6px;")
+        self.build_btn_unified_temp_host.clicked.connect(self.build_docker_images_unified_temperature_host)
+        docker_layout.addWidget(self.build_btn_unified_temp_host)
+        self.build_btn_unified_mental_host = QPushButton("🤖 Build Unified Images (Mental State) [Host Network]")
+        self.build_btn_unified_mental_host.setStyleSheet("font-size: 14px; padding: 8px; background-color: #c0392b; color: white; border-radius: 6px;")
+        self.build_btn_unified_mental_host.clicked.connect(self.build_docker_images_unified_mentalstate_host)
+        docker_layout.addWidget(self.build_btn_unified_mental_host)
+        self.build_btn_unified_emotion_host = QPushButton("🤖 Build Unified Images (Emotion) [Host Network]")
+        self.build_btn_unified_emotion_host.setStyleSheet("font-size: 14px; padding: 8px; background-color: #c0392b; color: white; border-radius: 6px;")
+        self.build_btn_unified_emotion_host.clicked.connect(self.build_docker_images_unified_emotion_host)
+        docker_layout.addWidget(self.build_btn_unified_emotion_host)
 
         docker_group.setLayout(docker_layout)
         layout.addWidget(docker_group)
@@ -1250,7 +1589,7 @@ class FLExperimentGUI(QMainWindow):
         """Build Docker images for the emotion use case and show output"""
         use_cache = self.use_cache.isChecked()
         compose_file = "Docker/docker-compose-emotion.gpu-isolated.yml"
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         full_compose_path = f"{base_dir}/{compose_file}"
         cmd = ["docker", "compose", "-f", full_compose_path, "build"]
         if not use_cache:
@@ -1282,7 +1621,7 @@ class FLExperimentGUI(QMainWindow):
         """Build Docker images for the mental state use case and show output"""
         use_cache = self.use_cache.isChecked()
         compose_file = "Docker/docker-compose-mentalstate.gpu-isolated.yml"
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         full_compose_path = f"{base_dir}/{compose_file}"
         cmd = ["docker", "compose", "-f", full_compose_path, "build"]
         if not use_cache:
@@ -1312,7 +1651,7 @@ class FLExperimentGUI(QMainWindow):
         """Build Docker images for the temperature regulation use case and show output"""
         use_cache = self.use_cache.isChecked()
         compose_file = "Docker/docker-compose-temperature.gpu-isolated.yml"
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         full_compose_path = f"{base_dir}/{compose_file}"
         cmd = ["docker", "compose", "-f", full_compose_path, "build"]
         if not use_cache:
@@ -1342,7 +1681,7 @@ class FLExperimentGUI(QMainWindow):
         """Build Docker images for unified RL scenario - temperature use case"""
         use_cache = self.use_cache.isChecked()
         compose_file = "Docker/docker-compose-unified-temperature.yml"
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         full_compose_path = f"{base_dir}/{compose_file}"
         cmd = ["docker", "compose", "-f", full_compose_path, "build"]
         if not use_cache:
@@ -1370,7 +1709,7 @@ class FLExperimentGUI(QMainWindow):
         """Build Docker images for unified RL scenario - mentalstate use case"""
         use_cache = self.use_cache.isChecked()
         compose_file = "Docker/docker-compose-unified-mentalstate.yml"
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         full_compose_path = f"{base_dir}/{compose_file}"
         cmd = ["docker", "compose", "-f", full_compose_path, "build"]
         if not use_cache:
@@ -1398,7 +1737,7 @@ class FLExperimentGUI(QMainWindow):
         """Build Docker images for unified RL scenario - emotion use case"""
         use_cache = self.use_cache.isChecked()
         compose_file = "Docker/docker-compose-unified-emotion.yml"
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         full_compose_path = f"{base_dir}/{compose_file}"
         cmd = ["docker", "compose", "-f", full_compose_path, "build"]
         if not use_cache:
@@ -1421,6 +1760,124 @@ class FLExperimentGUI(QMainWindow):
                 self.docker_build_log_text.append(f"\n❌ Unified Docker build failed (Emotion), code {returncode}")
         self.docker_build_thread.build_finished.connect(on_build_finished)
         self.docker_build_thread.start()
+
+    def _build_compose(self, compose_file, btn_attr, msg_ok, msg_fail, label):
+        """Shared helper to run docker compose build and wire log/button state."""
+        use_cache = self.use_cache.isChecked()
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        full_compose_path = os.path.join(base_dir, compose_file)
+        cmd = ["docker", "compose", "-f", full_compose_path, "build"]
+        if not use_cache:
+            cmd.append("--no-cache")
+        self.statusBar().showMessage(f"🐳 Building Docker images ({label})...")
+        btn = getattr(self, btn_attr, None)
+        if btn:
+            btn.setEnabled(False)
+        self.docker_build_log_text.clear()
+        self.output_tabs.setCurrentWidget(self.docker_build_log_text)
+        self.docker_build_thread = DockerBuildThread(cmd, base_dir)
+        self.docker_build_thread.log_update.connect(self.docker_build_log_text.append)
+        def on_finish(success, returncode):
+            if btn:
+                btn.setEnabled(True)
+            if success and returncode == 0:
+                self.statusBar().showMessage(msg_ok)
+                self.docker_build_log_text.append(f"\n✅ {msg_ok}")
+            else:
+                self.statusBar().showMessage(msg_fail)
+                self.docker_build_log_text.append(f"\n❌ {msg_fail}, code {returncode}")
+        self.docker_build_thread.build_finished.connect(on_finish)
+        self.docker_build_thread.start()
+
+    def build_docker_images_emotion_host(self):
+        """Build Docker images for Emotion use case (host network)."""
+        self._build_compose(
+            "Docker/docker-compose-emotion.host-network.yml",
+            "build_btn_emotion_host",
+            "Docker images built successfully (Emotion) [Host Network]",
+            "Docker build failed (Emotion) [Host Network]",
+            "Emotion Host Network",
+        )
+
+    def build_docker_images_temperature_host(self):
+        """Build Docker images for Temperature use case (host network)."""
+        self._build_compose(
+            "Docker/docker-compose-temperature.host-network.yml",
+            "build_btn_temp_host",
+            "Docker images built successfully (Temperature) [Host Network]",
+            "Docker build failed (Temperature) [Host Network]",
+            "Temperature Host Network",
+        )
+
+    def build_docker_images_mentalstate_host(self):
+        """Build Docker images for Mental State use case (host network)."""
+        self._build_compose(
+            "Docker/docker-compose-mentalstate.host-network.yml",
+            "build_btn_mental_host",
+            "Docker images built successfully (Mental State) [Host Network]",
+            "Docker build failed (Mental State) [Host Network]",
+            "Mental State Host Network",
+        )
+
+    def build_docker_images_emotion_macvlan(self):
+        """Build Docker images for Emotion use case (macvlan)."""
+        self._build_compose(
+            "Docker/docker-compose-emotion.macvlan.yml",
+            "build_btn_emotion_macvlan",
+            "Docker images built successfully (Emotion) [Macvlan]",
+            "Docker build failed (Emotion) [Macvlan]",
+            "Emotion Macvlan",
+        )
+
+    def build_docker_images_temperature_macvlan(self):
+        """Build Docker images for Temperature use case (macvlan)."""
+        self._build_compose(
+            "Docker/docker-compose-temperature.macvlan.yml",
+            "build_btn_temp_macvlan",
+            "Docker images built successfully (Temperature) [Macvlan]",
+            "Docker build failed (Temperature) [Macvlan]",
+            "Temperature Macvlan",
+        )
+
+    def build_docker_images_mentalstate_macvlan(self):
+        """Build Docker images for Mental State use case (macvlan)."""
+        self._build_compose(
+            "Docker/docker-compose-mentalstate.macvlan.yml",
+            "build_btn_mental_macvlan",
+            "Docker images built successfully (Mental State) [Macvlan]",
+            "Docker build failed (Mental State) [Macvlan]",
+            "Mental State Macvlan",
+        )
+
+    def build_docker_images_unified_emotion_host(self):
+        """Build Unified Docker images for Emotion (host network)."""
+        self._build_compose(
+            "Docker/docker-compose-unified-emotion.host-network.yml",
+            "build_btn_unified_emotion_host",
+            "Unified Docker images built successfully (Emotion) [Host Network]",
+            "Unified Docker build failed (Emotion) [Host Network]",
+            "Unified Emotion Host Network",
+        )
+
+    def build_docker_images_unified_temperature_host(self):
+        """Build Unified Docker images for Temperature (host network)."""
+        self._build_compose(
+            "Docker/docker-compose-unified-temperature.host-network.yml",
+            "build_btn_unified_temp_host",
+            "Unified Docker images built successfully (Temperature) [Host Network]",
+            "Unified Docker build failed (Temperature) [Host Network]",
+            "Unified Temperature Host Network",
+        )
+
+    def build_docker_images_unified_mentalstate_host(self):
+        """Build Unified Docker images for Mental State (host network)."""
+        self._build_compose(
+            "Docker/docker-compose-unified-mentalstate.host-network.yml",
+            "build_btn_unified_mental_host",
+            "Unified Docker images built successfully (Mental State) [Host Network]",
+            "Unified Docker build failed (Mental State) [Host Network]",
+            "Unified Mental State Host Network",
+        )
 
     def create_monitoring_output_section(self):
         """Create comprehensive monitoring and output section (buttons are in create_control_buttons_row above)"""
@@ -1592,6 +2049,110 @@ class FLExperimentGUI(QMainWindow):
             self.output_tabs.addTab(ql_fallback, "🎓 Q-Learning")
             self.q_learning_logs_tab = None
 
+        # Tab: Diagnostic Pipeline Results (database-backed; filled when Run Diagnostic Pipeline completes)
+        from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
+        diag_tab = QWidget()
+        diag_layout = QVBoxLayout(diag_tab)
+        diag_layout.addWidget(QLabel("Diagnostic pipeline results (Empirical Overhead, Network Extraction, Analytical Model). Data is stored in a database; new runs update by (Protocol, Scenario)."))
+
+        # Controls for Diagnostic Results (e.g., Excel export)
+        diag_controls_layout = QHBoxLayout()
+        self.diagnostic_download_excel_btn = QPushButton("📥 Download to Excel")
+        self.diagnostic_download_excel_btn.setStyleSheet("padding: 6px 12px; font-weight: bold;")
+        self.diagnostic_download_excel_btn.setToolTip("Export diagnostic_results.db to an Excel sheet.")
+        self.diagnostic_download_excel_btn.clicked.connect(self.download_diagnostic_results_excel)
+        diag_controls_layout.addWidget(self.diagnostic_download_excel_btn)
+        diag_controls_layout.addStretch()
+        diag_layout.addLayout(diag_controls_layout)
+        self.diagnostic_results_table = QTableWidget()
+        self.diagnostic_results_table.setColumnCount(10)
+        self.diagnostic_results_table.setHorizontalHeaderLabels([
+            "Client", "Protocol", "Scenario", "O_app (s)", "O_broker", "Loss (p)", "T_actual (s)", "T_calc (s)", "Error %", "Alpha"
+        ])
+        self.diagnostic_results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.diagnostic_results_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.diagnostic_results_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #222831;
+                color: #eee;
+                gridline-color: #444;
+                font-size: 12px;
+            }
+            QTableWidget::item { padding: 6px; }
+            QHeaderView::section { background-color: #393e46; color: #00adb5; padding: 8px; }
+        """)
+        diag_layout.addWidget(self.diagnostic_results_table)
+        self.output_tabs.addTab(diag_tab, "📊 Diagnostic Results")
+        # Initialize diagnostic DB and load existing data (including current diagnostic_results_latest.json)
+        self._init_diagnostic_db()
+        self._seed_diagnostic_db_from_json_if_present()
+        self._load_diagnostic_results_table_from_db()
+
+        # Tab: Experimental Results (per-protocol FL run metrics)
+        exp_result_tab = QWidget()
+        exp_result_layout = QVBoxLayout(exp_result_tab)
+        exp_result_layout.addWidget(QLabel(
+            "FL experiment results per protocol: protocol name, clients, rounds, time per round, convergence time. "
+            "Data is loaded from experiment_results/ and experiment_results_baseline/; use Refresh after runs."
+        ))
+        exp_result_controls = QHBoxLayout()
+        self.experiment_results_refresh_btn = QPushButton("🔄 Refresh from experiment_results")
+        self.experiment_results_refresh_btn.setStyleSheet("padding: 6px 12px; font-weight: bold;")
+        self.experiment_results_refresh_btn.setToolTip("Scan experiment_results and experiment_results_baseline folders and reload the table.")
+        self.experiment_results_refresh_btn.clicked.connect(self._refresh_experiment_results_from_disk)
+        exp_result_controls.addWidget(self.experiment_results_refresh_btn)
+
+        # Combined plots controls (timestamp folder selector + action)
+        self.exp_folder_selector = QComboBox()
+        self.exp_folder_selector.setMinimumWidth(360)
+        self.exp_folder_selector.setToolTip("Select which experiment_results/<timestamp_folder>/ to combine plots from.")
+        exp_result_controls.addWidget(QLabel("Folder:"))
+        exp_result_controls.addWidget(self.exp_folder_selector)
+
+        self.combine_plots_single_figure = QCheckBox("Single combined figure")
+        self.combine_plots_single_figure.setChecked(True)
+        self.combine_plots_single_figure.setToolTip("If enabled, also generates combined_metrics_grid.png (all plots in one figure).")
+        exp_result_controls.addWidget(self.combine_plots_single_figure)
+
+        self.combine_plots_btn = QPushButton("🧩 Combine Plots")
+        self.combine_plots_btn.setStyleSheet("padding: 6px 12px; font-weight: bold;")
+        self.combine_plots_btn.setToolTip("Generate combined plots (battery/accuracy/loss/model size + bar charts for rounds and convergence time). Saves PNGs to the selected experiment folder.")
+        self.combine_plots_btn.clicked.connect(self.generate_combined_experiment_plots)
+        exp_result_controls.addWidget(self.combine_plots_btn)
+
+        self.experiment_results_download_excel_btn = QPushButton("📥 Download to Excel")
+        self.experiment_results_download_excel_btn.setStyleSheet("padding: 6px 12px; font-weight: bold;")
+        self.experiment_results_download_excel_btn.setToolTip("Export experimental results table to an Excel file.")
+        self.experiment_results_download_excel_btn.clicked.connect(self.download_experiment_results_excel)
+        exp_result_controls.addWidget(self.experiment_results_download_excel_btn)
+        exp_result_controls.addStretch()
+        exp_result_layout.addLayout(exp_result_controls)
+        self.experiment_results_table = QTableWidget()
+        self.experiment_results_table.setColumnCount(14)
+        self.experiment_results_table.setHorizontalHeaderLabels([
+            "Protocol", "Scenario", "Use Case", "Num Clients", "Num Rounds",
+            "Avg Time/Round (s)", "Min RTT (s)", "Max RTT (s)",
+            "Convergence Time (s)", "Convergence Time (min)",
+            "Final Accuracy %", "Final Loss", "Run Timestamp", "Source"
+        ])
+        self.experiment_results_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.experiment_results_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.experiment_results_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #222831;
+                color: #eee;
+                gridline-color: #444;
+                font-size: 12px;
+            }
+            QTableWidget::item { padding: 6px; }
+            QHeaderView::section { background-color: #393e46; color: #00adb5; padding: 8px; }
+        """)
+        exp_result_layout.addWidget(self.experiment_results_table)
+        self.output_tabs.addTab(exp_result_tab, "📈 Experimental Results")
+        self._init_experiment_results_db()
+        self._load_experiment_results_table_from_db()
+        self._refresh_experiment_folder_selector()
+
         # Add Docker Build Logs tab
         self.docker_build_log_text = QTextEdit()
         self.docker_build_log_text.setReadOnly(True)
@@ -1726,7 +2287,7 @@ class FLExperimentGUI(QMainWindow):
         return group
     
     def toggle_quantization_options(self, enabled):
-        """Toggle quantization options"""
+        """Toggle quantization options."""
         self.quant_options_widget.setEnabled(enabled)
     
     def toggle_compression_options(self, enabled):
@@ -1908,27 +2469,36 @@ class FLExperimentGUI(QMainWindow):
             self.client_selector.addItem("Error detecting clients", None)
     
     def switch_client_log(self):
-        """Switch to viewing logs of a different client"""
-        client_name = self.client_selector.currentData()
-        
-        if client_name is None:
+        """Switch to viewing logs of a different client (Docker container or native log file)"""
+        selection = self.client_selector.currentData()
+        if selection is None:
             return
-        
-        # Stop current client log monitor if running
+
+        # Stop any existing client log monitor
         if hasattr(self, 'client_log_monitor') and self.client_log_monitor.isRunning():
             self.client_log_monitor.stop()
             self.client_log_monitor.wait()
-        
-        # Clear current log display
+        for m in list(self.log_monitors):
+            if getattr(m, 'log_type', None) == "client":
+                m.stop()
+                m.wait(1000)
+                if m in self.log_monitors:
+                    self.log_monitors.remove(m)
+                break
+
         self.client_log_text.clear()
-        self.client_log_text.append(f"=== Logs for {client_name} ===\n")
-        
-        # Start new log monitor for selected client
-        self.client_log_monitor = LogMonitor(client_name, "client")
+        # Native run: selection is a file path
+        if isinstance(selection, str) and (selection.endswith(".log") or "native_logs" in selection):
+            self.client_log_text.append(f"=== Logs for {os.path.basename(selection)} ===\n")
+            self.client_log_monitor = NativeLogMonitor(selection, "client")
+        else:
+            self.client_log_text.append(f"=== Logs for {selection} ===\n")
+            self.client_log_monitor = LogMonitor(selection, "client")
         self.client_log_monitor.log_update.connect(
             lambda log_type, text: self.client_log_text.append(text)
         )
         self.client_log_monitor.start()
+        self.log_monitors.append(self.client_log_monitor)
 
     
     def get_selected_use_case(self):
@@ -1954,105 +2524,225 @@ class FLExperimentGUI(QMainWindow):
                 scenarios.append(checkbox.property("value"))
         return scenarios
     
+    def update_dds_impl_visibility(self):
+        """Enable DDS implementation selector only when DDS protocol is selected."""
+        if not hasattr(self, "dds_impl_group") or not hasattr(self, "protocol_checkboxes"):
+            return
+        has_dds = False
+        for checkbox in self.protocol_checkboxes:
+            value = checkbox.property("value")
+            if value == "dds" and checkbox.isChecked():
+                has_dds = True
+                break
+        self.dds_impl_group.setEnabled(has_dds)
+        self.dds_impl_label.setEnabled(has_dds)
+        self.dds_impl.setEnabled(has_dds)
+
+    def is_rl_unified_selected(self):
+        """Return True when the RL-unified protocol is selected."""
+        return "rl_unified" in self.get_selected_protocols()
+
+    def is_rl_training_mode(self):
+        """Return True when RL-unified is set to training mode."""
+        return self.is_rl_unified_selected() and getattr(self, "rl_mode_training", None) is not None and self.rl_mode_training.isChecked()
+
+    def update_rl_mode_visibility(self):
+        """Enable RL-unified mode controls only when RL-unified is selected."""
+        if not hasattr(self, "rl_mode_group_box"):
+            return
+        enabled = self.is_rl_unified_selected()
+        self.rl_mode_group_box.setEnabled(enabled)
+        if hasattr(self, "use_ql_convergence"):
+            training_selected = enabled and self.rl_mode_training.isChecked()
+            self.use_ql_convergence.setChecked(training_selected)
+            self.use_ql_convergence.setEnabled(False)
+        if hasattr(self, "use_communication_model_reward"):
+            self.use_communication_model_reward.setEnabled(enabled)
+
     def build_command(self):
         """Build the experiment command"""
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
-        script = f"{base_dir}/Network_Simulation/run_network_experiments.py"
+        base_dir = Path(self.project_root)
         
-        # Basic parameters
-        cmd_parts = ["python3", script]
+        # Decide which backend to use: Docker experiment runner or native (namespaces) runner
+        if self.exec_mode_native.isChecked():
+            # Native: run server + clients as Python scripts in Linux namespaces (no Docker).
+            script = base_dir / "Network_Simulation" / "run_native_experiments.py"
+            cmd_parts = ["python3", script]
+        else:
+            # Existing Docker-based experiment runner.
+            script = base_dir / "Network_Simulation" / "run_network_experiments.py"
+            cmd_parts = ["python3", script]
         
         # Use case
         use_case = self.get_selected_use_case()
         cmd_parts.extend(["--use-case", use_case])
         
+        # Termination mode (controls STOP_ON_CLIENT_CONVERGENCE in runners)
+        termination_mode = self.termination_mode_combo.currentData() or self.termination_mode_combo.currentText()
+        if termination_mode == "fixed_rounds":
+            cmd_parts.extend(["--termination-mode", "fixed_rounds"])
+        
         # GPU (always enabled for baseline)
         if self.gpu_enabled.isChecked():
             cmd_parts.append("--enable-gpu")
         
-        # Baseline mode flag
-        if self.baseline_mode.isChecked():
-            cmd_parts.append("--baseline")
-        
-        # Rounds
-        cmd_parts.extend(["--rounds", str(self.rounds_spinbox.value())])
-        
-        # Protocols
-        protocols = self.get_selected_protocols()
-        if protocols:
-            cmd_parts.extend(["--protocols"] + protocols)
-        
-        # For baseline mode, skip network scenarios (script handles it automatically)
-        if not self.baseline_mode.isChecked():
-            # Scenarios
+        # Native vs Docker specific options
+        if self.exec_mode_native.isChecked():
+            # Native runner: one or more protocols/scenarios, explicit client count.
+            protocols = self.get_selected_protocols()
+            if protocols:
+                cmd_parts.extend(["--protocols"] + protocols)
+            
             scenarios = self.get_selected_scenarios()
             if scenarios:
                 cmd_parts.extend(["--scenarios"] + scenarios)
             
-            # Network parameters (if custom values set)
-            if self.latency_slider.value() > 0:
-                cmd_parts.extend(["--latency", str(self.latency_slider.value())])
-            if self.bandwidth_slider.value() != 100:
-                cmd_parts.extend(["--bandwidth", str(self.bandwidth_slider.value())])
-            if self.jitter_slider.value() > 0:
-                cmd_parts.extend(["--jitter", str(self.jitter_slider.value())])
-            if self.packet_loss_slider.value() > 0:
-                cmd_parts.extend(["--packet-loss", str(self.packet_loss_slider.value())])
+            # Rounds and client count (native: all clients run on this machine)
+            cmd_parts.extend(["--rounds", str(self.rounds_spinbox.value())])
+            cmd_parts.extend(["--num-clients", str(self.min_clients.value())])
+            # Pruning (native mode)
+            if self.pruning_enabled.isChecked():
+                cmd_parts.append("--use-pruning")
+                sparsity = self.pruning_ratio.value() / 100.0
+                cmd_parts.extend(["--pruning-sparsity", f"{sparsity:.2f}"])
+            # Quantization (native mode)
+            if self.quantization_enabled.isChecked():
+                cmd_parts.append("--use-quantization")
+                cmd_parts.extend(["--quantization-bits", self.quant_bits.currentText()])
+                cmd_parts.extend(["--quantization-strategy", self.quant_strategy.currentText()])
+                if self.quant_symmetric.isChecked():
+                    cmd_parts.append("--quantization-symmetric")
+            if self.is_rl_training_mode():
+                cmd_parts.append("--use-ql-convergence")
+            if self.is_rl_unified_selected() and not self.use_communication_model_reward.isChecked():
+                cmd_parts.append("--disable-communication-model-reward")
+        else:
+            # Docker-based experiment runner options (existing behavior).
+            # Network mode: gpu | host | host_macvlan
+            mode = "host_macvlan" if self.network_mode_host_macvlan.isChecked() else ("host" if self.network_mode_host.isChecked() else "gpu")
+            cmd_parts.extend(["--network-mode", mode])
+            # Number of client containers started from this GUI on the central machine
+            cmd_parts.extend(["--local-clients", str(self.gui_clients.value())])
+        
+        # Baseline mode flag (Docker-only at the moment)
+        if not self.exec_mode_native.isChecked():
+            if self.baseline_mode.isChecked():
+                cmd_parts.append("--baseline")
+        
+        # Docker-specific experiment runner arguments
+        if not self.exec_mode_native.isChecked():
+            # Rounds
+            cmd_parts.extend(["--rounds", str(self.rounds_spinbox.value())])
             
-            # Congestion
-            if self.enable_congestion.isChecked():
-                cmd_parts.append("--enable-congestion")
-                cmd_parts.extend(["--congestion-level", self.congestion_level.currentText().lower()])
+            # Protocols
+            protocols = self.get_selected_protocols()
+            if protocols:
+                cmd_parts.extend(["--protocols"] + protocols)
+            
+            # For baseline mode, skip network scenarios (script handles it automatically)
+            if not self.baseline_mode.isChecked():
+                # Scenarios
+                scenarios = self.get_selected_scenarios()
+                if scenarios:
+                    cmd_parts.extend(["--scenarios"] + scenarios)
+                
+                # Network parameters (if custom values set)
+                if self.latency_slider.value() > 0:
+                    cmd_parts.extend(["--latency", str(self.latency_slider.value())])
+                if self.bandwidth_slider.value() != 100:
+                    cmd_parts.extend(["--bandwidth", str(self.bandwidth_slider.value())])
+                if self.jitter_slider.value() > 0:
+                    cmd_parts.extend(["--jitter", str(self.jitter_slider.value())])
+                if self.packet_loss_slider.value() > 0:
+                    cmd_parts.extend(["--packet-loss", str(self.packet_loss_slider.value())])
+                
+                # Congestion
+                if self.enable_congestion.isChecked():
+                    cmd_parts.append("--enable-congestion")
+                    cmd_parts.extend(["--congestion-level", self.congestion_level.currentText().lower()])
         
-        # Quantization
-        if self.quantization_enabled.isChecked():
-            cmd_parts.append("--use-quantization")
-            cmd_parts.extend(["--quantization-bits", self.quant_bits.currentText()])
-            cmd_parts.extend(["--quantization-strategy", self.quant_strategy.currentText()])
-            if self.quant_symmetric.isChecked():
-                cmd_parts.append("--quantization-symmetric")
-        
-        # Compression
-        if self.compression_enabled.isChecked():
-            cmd_parts.append("--enable-compression")
-            cmd_parts.extend(["--compression-algorithm", self.compression_algo.currentText()])
-            cmd_parts.extend(["--compression-level", str(self.compression_level.value())])
-        
-        # Q-learning convergence (only when rl_unified is selected)
-        if self.use_ql_convergence.isChecked() and "rl_unified" in self.get_selected_protocols():
-            cmd_parts.append("--use-ql-convergence")
-        
-        return " ".join(cmd_parts)
+        # Quantization / compression / RL-unified options currently apply to Docker-based path only.
+        if not self.exec_mode_native.isChecked():
+            # Quantization
+            if self.quantization_enabled.isChecked():
+                cmd_parts.append("--use-quantization")
+                cmd_parts.extend(["--quantization-bits", self.quant_bits.currentText()])
+                cmd_parts.extend(["--quantization-strategy", self.quant_strategy.currentText()])
+                if self.quant_symmetric.isChecked():
+                    cmd_parts.append("--quantization-symmetric")
+            
+            # Compression
+            if self.compression_enabled.isChecked():
+                cmd_parts.append("--enable-compression")
+                cmd_parts.extend(["--compression-algorithm", self.compression_algo.currentText()])
+                cmd_parts.extend(["--compression-level", str(self.compression_level.value())])
+            
+            # Pruning (Docker-based experiments)
+            if self.pruning_enabled.isChecked():
+                cmd_parts.append("--use-pruning")
+                sparsity = self.pruning_ratio.value() / 100.0
+                cmd_parts.extend(["--pruning-sparsity", f"{sparsity:.2f}"])
+            
+            # RL-unified training/inference mode
+            if self.is_rl_training_mode():
+                cmd_parts.append("--use-ql-convergence")
+            if self.is_rl_unified_selected() and not self.use_communication_model_reward.isChecked():
+                cmd_parts.append("--disable-communication-model-reward")
+
+        # Epsilon reset control (training only) - applies to BOTH Docker and native modes
+        if self.is_rl_unified_selected() and self.is_rl_training_mode():
+            if not self.reset_epsilon_on_start.isChecked():
+                cmd_parts.append("--no-reset-epsilon")
+
+        # DDS implementation flag (CycloneDDS vs Fast DDS) – applies when DDS protocol is selected
+        selected_protocols = self.get_selected_protocols()
+        if any(p.lower() == "dds" for p in selected_protocols):
+            impl = getattr(self, "dds_impl", None)
+            if impl is not None:
+                dds_impl_value = impl.currentData() or str(impl.currentText()).strip().lower().replace(" ", "")
+                if dds_impl_value:
+                    cmd_parts.extend(["--dds-impl", dds_impl_value])
+
+        return shell_join(cmd_parts)
     
     def start_experiment(self):
         """Start the experiment"""
-        # Validate baseline mode
-        if self.baseline_mode.isChecked():
-            if not self.gpu_enabled.isChecked():
-                QMessageBox.critical(
-                    self, 
-                    "Baseline Mode Error", 
-                    "GPU must be enabled for baseline mode!\n"
-                    "Baseline models require GPU for proper training."
-                )
-                return
-            
-            # Confirm baseline mode
-            reply = QMessageBox.question(
+        if self.experiment_thread is not None and self.experiment_thread.isRunning():
+            QMessageBox.warning(
                 self,
-                "Confirm Baseline Mode",
-                "🎯 BASELINE MODE ENABLED\n\n"
-                "This will create reference models with:\n"
-                "  • Excellent network conditions (no latency/packet loss)\n"
-                "  • GPU acceleration (forced)\n"
-                "  • Saved to experiment_results_baseline/\n\n"
-                "These will be used for comparison in future experiments.\n\n"
-                "Continue?",
-                QMessageBox.Yes | QMessageBox.No
+                "Experiment already running",
+                "An experiment or diagnostic pipeline is already running.\n\n"
+                "Please wait for it to complete or stop it before starting a new one.",
             )
-            
-            if reply == QMessageBox.No:
-                return
+            return
+        # Baseline mode only makes sense for Docker-based runs
+        if not self.exec_mode_native.isChecked():
+            if self.baseline_mode.isChecked():
+                if not self.gpu_enabled.isChecked():
+                    QMessageBox.critical(
+                        self, 
+                        "Baseline Mode Error", 
+                        "GPU must be enabled for baseline mode!\n"
+                        "Baseline models require GPU for proper training."
+                    )
+                    return
+                
+                # Confirm baseline mode
+                reply = QMessageBox.question(
+                    self,
+                    "Confirm Baseline Mode",
+                    "🎯 BASELINE MODE ENABLED\n\n"
+                    "This will create reference models with:\n"
+                    "  • Excellent network conditions (no latency/packet loss)\n"
+                    "  • GPU acceleration (forced)\n"
+                    "  • Saved to experiment_results_baseline/\n\n"
+                    "These will be used for comparison in future experiments.\n\n"
+                    "Continue?",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                
+                if reply == QMessageBox.No:
+                    return
         
         # Validate selections
         if not self.get_selected_protocols():
@@ -2063,13 +2753,36 @@ class FLExperimentGUI(QMainWindow):
         if not self.baseline_mode.isChecked() and not self.get_selected_scenarios():
             QMessageBox.warning(self, "Warning", "Please select at least one network scenario!")
             return
+
+        # Additional validation for native (no Docker) mode
+        if self.exec_mode_native.isChecked():
+            protocols = self.get_selected_protocols()
+            scenarios = self.get_selected_scenarios()
+            if not protocols:
+                QMessageBox.warning(self, "Native Mode", "Please select at least one protocol for native mode.")
+                return
+            if not scenarios:
+                QMessageBox.warning(self, "Native Mode", "Please select at least one network scenario for native mode.")
+                return
         
         # Build command
         command = self.build_command()
         
         # Confirm
-        mode_str = "BASELINE" if self.baseline_mode.isChecked() else "NETWORK EXPERIMENT"
-        scenarios_str = "N/A (Excellent Network)" if self.baseline_mode.isChecked() else ', '.join(self.get_selected_scenarios())
+        if self.exec_mode_native.isChecked():
+            mode_str = "NATIVE (no Docker, Python + namespaces)"
+            protocol_str = ', '.join(self.get_selected_protocols())
+            scenario_str = ', '.join(self.get_selected_scenarios())
+            network_str = "Linux namespaces + veth (tc/netem per direction)"
+        else:
+            mode_str = "BASELINE" if self.baseline_mode.isChecked() else "NETWORK EXPERIMENT"
+            protocol_str = ', '.join(self.get_selected_protocols())
+            scenario_str = "N/A (Excellent Network)" if self.baseline_mode.isChecked() else ', '.join(self.get_selected_scenarios())
+            network_str = (
+                "Host + macvlan" if self.network_mode_host_macvlan.isChecked()
+                else ("Host (tc on host)" if self.network_mode_host.isChecked() else "GPU (Docker bridge)")
+            )
+        rl_mode_str = "Training" if self.is_rl_training_mode() else ("Inference" if self.is_rl_unified_selected() else "N/A")
         
         reply = QMessageBox.question(
             self,
@@ -2077,10 +2790,14 @@ class FLExperimentGUI(QMainWindow):
             f"Ready to start {mode_str} with:\n\n"
             f"Mode: {mode_str}\n"
             f"Use Case: {self.get_selected_use_case()}\n"
-            f"Protocols: {', '.join(self.get_selected_protocols())}\n"
-            f"Scenarios: {', '.join(self.get_selected_scenarios())}\n"
+            f"Protocols: {protocol_str}\n"
+            f"RL Mode: {rl_mode_str}\n"
+            f"Communication Model Reward: {'Enabled' if self.is_rl_unified_selected() and self.use_communication_model_reward.isChecked() else 'Disabled'}\n"
+            f"Scenarios: {scenario_str}\n"
             f"Rounds: {self.rounds_spinbox.value()}\n"
-            f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n\n"
+            f"Termination: {self.termination_mode_combo.currentText()}\n"
+            f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
+            f"Network: {network_str}\n\n"
             f"Command:\n{command}\n\n"
             f"This may take a long time. Continue?",
             QMessageBox.Yes | QMessageBox.No
@@ -2089,6 +2806,103 @@ class FLExperimentGUI(QMainWindow):
         if reply == QMessageBox.No:
             return
         
+        self._run_command_common(command)
+    
+    def start_diagnostic_pipeline(self):
+        """Run diagnostic pipeline for selected protocol(s) and scenario(s). Supports multiple protocols × multiple network scenarios."""
+        if self.experiment_thread is not None and self.experiment_thread.isRunning():
+            QMessageBox.warning(
+                self,
+                "Experiment already running",
+                "An experiment or diagnostic pipeline is already running.\n\n"
+                "Please wait for it to complete or stop it before starting a new one.",
+            )
+            return
+        protocols = self.get_selected_protocols()
+        pipeline_protocols = ["mqtt", "amqp", "grpc", "quic", "http3", "dds"]
+        if not protocols:
+            QMessageBox.warning(
+                self,
+                "Diagnostic Pipeline",
+                "Please select at least one protocol for the diagnostic pipeline.\n\n"
+                "Supported: MQTT, AMQP, gRPC, QUIC, HTTP/3, DDS."
+            )
+            return
+        pipeline_selected = [p.lower() for p in protocols if p.lower() in pipeline_protocols]
+        unsupported = [p for p in protocols if p.lower() not in pipeline_protocols]
+        if unsupported:
+            QMessageBox.warning(
+                self,
+                "Diagnostic Pipeline",
+                f"Diagnostic pipeline supports only: MQTT, AMQP, gRPC, QUIC, HTTP/3, DDS.\n"
+                f"Unsupported selection(s) will be skipped: {', '.join(unsupported)}."
+            )
+        if not pipeline_selected:
+            return
+        scenarios = self.get_selected_scenarios()
+        if not scenarios:
+            QMessageBox.warning(
+                self,
+                "Diagnostic Pipeline",
+                "Please select at least one network scenario for the diagnostic pipeline.\n\n"
+                "Phase 1 uses a clean channel (no losses). Phases 2–4 use each selected scenario."
+            )
+            return
+        scenario_list = [s.lower() for s in scenarios]
+        use_case = self.get_selected_use_case()
+        base_dir = Path(self.project_root)
+        script = base_dir / "Network_Simulation" / "diagnostic_pipeline.py"
+        cmd_parts = ["python3", script, "--protocols", *pipeline_selected, "--scenarios", *scenario_list, "--use-case", use_case]
+        # DDS implementation selection applies when DDS is part of the diagnostic protocols
+        if any(p.lower() == "dds" for p in pipeline_selected) and hasattr(self, "dds_impl"):
+            dds_impl_value = self.dds_impl.currentData() or str(self.dds_impl.currentText()).strip().lower().replace(" ", "")
+            if dds_impl_value:
+                cmd_parts.extend(["--dds-impl", dds_impl_value])
+        if self.gpu_enabled.isChecked():
+            cmd_parts.append("--enable-gpu")
+        # Pruning and quantization for diagnostic pipeline (independent; if both enabled, client flow is prune -> quantize)
+        if self.pruning_enabled.isChecked():
+            cmd_parts.append("--use-pruning")
+            sparsity = self.pruning_ratio.value() / 100.0
+            cmd_parts.extend(["--pruning-sparsity", f"{sparsity:.2f}"])
+        if self.quantization_enabled.isChecked():
+            cmd_parts.append("--use-quantization")
+            cmd_parts.extend(["--quantization-bits", self.quant_bits.currentText()])
+            cmd_parts.extend(["--quantization-strategy", self.quant_strategy.currentText()])
+            if self.quant_symmetric.isChecked():
+                cmd_parts.append("--quantization-symmetric")
+        is_native = getattr(self, "exec_mode_native", None) and self.exec_mode_native.isChecked()
+        if is_native:
+            cmd_parts.append("--native")
+            mode_label = "Native (Python + namespaces, no Docker)"
+        else:
+            mode = "host_macvlan" if self.network_mode_host_macvlan.isChecked() else ("host" if self.network_mode_host.isChecked() else "gpu")
+            cmd_parts.extend(["--network-mode", mode])
+            mode_label = "Host + macvlan (per-container tc)" if mode == "host_macvlan" else ("Host network (tc on host)" if mode == "host" else "GPU (Docker bridge)")
+        num_runs = len(pipeline_selected) * len(scenario_list)
+        reply = QMessageBox.question(
+            self,
+            "Run Diagnostic Pipeline",
+            f"Run diagnostic pipeline ({num_runs} experiment(s)):\n\n"
+            f"  Protocols: {', '.join(p.upper() for p in pipeline_selected)}\n"
+            f"  Scenarios: {', '.join(scenario_list)}\n"
+            f"  Use Case: {use_case}\n"
+            f"  GPU: {'Enabled (fallback to CPU if unavailable)' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
+            f"  Execution: {mode_label}\n\n"
+            f"  Phase 1 per run: Calibration with NO channel losses (protocol & broker overhead only).\n"
+            f"  Phases 2–4 per run: Apply scenario → extract tc → lossy round → table.\n\n"
+            f"Continue?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.No:
+            return
+        command = shell_join(cmd_parts)
+        self._run_command_common(command)
+    
+    def _run_command_common(self, command):
+        """Shared logic to run a command in the experiment thread."""
+        # Stop any previous log/dashboard monitors so the next experiment's logs are shown cleanly
+        self.stop_all_monitors()
         # Clear all output
         self.clear_all_output()
         self.experiment_started_at = datetime.now()
@@ -2096,6 +2910,8 @@ class FLExperimentGUI(QMainWindow):
         
         # Update UI
         self.start_button.setEnabled(False)
+        if hasattr(self, 'diagnostic_pipeline_button'):
+            self.diagnostic_pipeline_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.progress_bar.show()
         self.statusBar().showMessage("🚀 Experiment running...")
@@ -2105,22 +2921,34 @@ class FLExperimentGUI(QMainWindow):
         self.experiment_thread.progress_update.connect(self.update_output)
         self.experiment_thread.experiment_finished.connect(self.experiment_completed)
         self.experiment_thread.start()
+
+        # Remember if this is a native (no-Docker) run so log monitors use file tailing
+        self._experiment_is_native = ("run_native_experiments.py" in (command or "") or
+                                      ("diagnostic_pipeline" in (command or "") and "--native" in (command or "")))
+        self._native_log_retry_count = 0
         
         # Start FL training dashboard monitoring
         self.start_dashboard_monitor()
         
-        # Start container log monitoring (after brief delay to let containers start)
-        QTimer.singleShot(5000, self.start_log_monitors)
+        # Diagnostic pipeline may do GPU fail + CPU compose + 15s sleep; delay first container detection so containers are up
+        is_diagnostic = "diagnostic_pipeline" in (command or "")
+        self._last_command_was_diagnostic = is_diagnostic
+        first_delay_ms = 22000 if is_diagnostic else 5000
+        first_refresh_ms = first_delay_ms + 2000
+        
+        # Start log monitoring (after delay: Docker containers up, or native log dir already created at run start)
+        QTimer.singleShot(first_delay_ms, self.start_log_monitors)
         
         # Add periodic retry for log monitors in case containers start late
-        # This ensures logs appear even if containers weren't ready at first attempt
         QTimer.singleShot(15000, self.retry_log_monitors_if_needed)
         QTimer.singleShot(30000, self.retry_log_monitors_if_needed)
+        if is_diagnostic:
+            QTimer.singleShot(45000, self.retry_log_monitors_if_needed)
         
         # Refresh server and client lists for both network targeting and log viewing
-        QTimer.singleShot(7000, self.refresh_server_list)
-        QTimer.singleShot(7000, self.refresh_client_targets)
-        QTimer.singleShot(7000, self.refresh_client_list)
+        QTimer.singleShot(first_refresh_ms, self.refresh_server_list)
+        QTimer.singleShot(first_refresh_ms, self.refresh_client_targets)
+        QTimer.singleShot(first_refresh_ms, self.refresh_client_list)
     
     def stop_experiment(self):
         """Stop the running experiment"""
@@ -2186,25 +3014,88 @@ class FLExperimentGUI(QMainWindow):
         self.dashboard_thread.dashboard_update.connect(self.update_dashboard)
         self.dashboard_thread.start()
     
+    def _try_native_log_monitors(self):
+        """If native (no-Docker) run log dir exists, start file-based monitors for server/client logs.
+        Returns True if native monitors were started, False otherwise."""
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        native_logs_dir = os.path.join(base_dir, "native_logs")
+        latest_file = os.path.join(native_logs_dir, "latest_run.txt")
+        if not os.path.isfile(latest_file):
+            return False
+        try:
+            with open(latest_file, "r", encoding="utf-8") as f:
+                log_dir = f.read().strip()
+        except Exception:
+            return False
+        if not log_dir or not os.path.isdir(log_dir):
+            return False
+        server_log = os.path.join(log_dir, "server.log")
+        if not os.path.isfile(server_log):
+            return False
+        # Replace "no containers" messages with native log monitoring
+        self.server_log_text.clear()
+        self.client_log_text.clear()
+        # Native run detected: monitor server log file
+        server_monitor = NativeLogMonitor(server_log, "server")
+        server_monitor.log_update.connect(self.update_logs)
+        server_monitor.start()
+        self.log_monitors.append(server_monitor)
+        self.server_log_text.append(f"📡 Monitoring native server log\n")
+        # Client log files: client_1.log, client_2.log, ...
+        self.client_selector.clear()
+        for i in range(1, 20):
+            cpath = os.path.join(log_dir, f"client_{i}.log")
+            if os.path.isfile(cpath):
+                self.client_selector.addItem(f"Client {i} (native)", cpath)
+        if self.client_selector.count() > 0:
+            first_path = self.client_selector.currentData()
+            client_monitor = NativeLogMonitor(first_path, "client")
+            client_monitor.log_update.connect(self.update_logs)
+            client_monitor.start()
+            self.log_monitors.append(client_monitor)
+            self.client_log_text.append(f"📡 Monitoring native client log\n")
+        else:
+            self.client_log_text.append(f"⚠️ No native client log files yet in {log_dir}\n")
+        return True
+
     def start_log_monitors(self):
-        """Start monitoring server and client container logs"""
+        """Start monitoring server and client logs (Docker containers or native run log files)."""
         # IMPORTANT: Stop any existing monitors first to avoid duplicates
-        # This ensures clean restart when running multiple experiments
-        for monitor in self.log_monitors:
+        for monitor in list(self.log_monitors):
             try:
                 monitor.stop()
-                monitor.wait(1000)  # Wait up to 1 second
-            except:
+                monitor.wait(2000)
+            except Exception:
                 pass
         self.log_monitors.clear()
-        
-        # Refresh server and client lists first to populate dropdowns
+
+        # Clear log panes so they show only the current experiment's logs (not previous run)
+        self.server_log_text.clear()
+        self.client_log_text.clear()
+        self.server_log_text.append("📡 Starting log monitors for this run...\n")
+        self.client_log_text.append("📡 Starting log monitors for this run...\n")
+
+        # Native (no-Docker) run: try file-based monitors first; log dir is created at experiment start
+        if getattr(self, "_experiment_is_native", False):
+            if self._try_native_log_monitors():
+                return
+            self.server_log_text.clear()
+            self.client_log_text.clear()
+            self.server_log_text.append("📡 Native run: waiting for log files... (retrying shortly)\n")
+            self.client_log_text.append("📡 Native run: waiting for log files... (retrying shortly)\n")
+            retries = getattr(self, "_native_log_retry_count", 0)
+            if retries < 12:  # retry every ~2.5s for up to ~30s
+                self._native_log_retry_count = retries + 1
+                QTimer.singleShot(2500, self.start_log_monitors)
+            return
+        self._native_log_retry_count = 0
+
+        # Docker run: refresh container lists and monitor containers
         if hasattr(self, 'refresh_server_list'):
             self.refresh_server_list()
         if hasattr(self, 'refresh_client_list'):
             self.refresh_client_list()
-        
-        # Get running containers
+
         try:
             result = subprocess.run(
                 ["docker", "ps", "--format", "{{.Names}}"],
@@ -2212,20 +3103,15 @@ class FLExperimentGUI(QMainWindow):
                 text=True,
                 timeout=10
             )
-            
+
             if result.returncode == 0:
                 containers = [name.strip() for name in result.stdout.split('\n') if name.strip()]
-                
-                # Find server and client containers
                 server_containers = [c for c in containers if 'server' in c.lower() and 'fl-' in c]
                 client_containers = [c for c in containers if 'client' in c.lower() and 'fl-' in c]
-                
-                # Monitor first server container (or use selected server if available)
+
                 if server_containers:
-                    # Use selected server from dropdown if available, otherwise use first
                     selected_server = self.server_selector.currentData() if hasattr(self, 'server_selector') else None
                     server_to_monitor = selected_server if selected_server and selected_server in server_containers else server_containers[0]
-                    
                     server_monitor = LogMonitor(server_to_monitor, "server")
                     server_monitor.log_update.connect(self.update_logs)
                     server_monitor.start()
@@ -2233,8 +3119,7 @@ class FLExperimentGUI(QMainWindow):
                     self.server_log_text.append(f"📡 Monitoring: {server_to_monitor}\n")
                 else:
                     self.server_log_text.append(f"⚠️ No server containers found. Waiting...\n")
-                
-                # Monitor first client container
+
                 if client_containers:
                     client_monitor = LogMonitor(client_containers[0], "client")
                     client_monitor.log_update.connect(self.update_logs)
@@ -2243,7 +3128,10 @@ class FLExperimentGUI(QMainWindow):
                     self.client_log_text.append(f"📡 Monitoring: {client_containers[0]}\n")
                 else:
                     self.client_log_text.append(f"⚠️ No client containers found. Waiting...\n")
-                    
+
+                # Fallback: no Docker containers but maybe native run from CLI
+                if not server_containers and not client_containers:
+                    self._try_native_log_monitors()
         except Exception as e:
             self.server_log_text.append(f"⚠️ Error starting log monitors: {str(e)}\n")
     
@@ -2257,15 +3145,20 @@ class FLExperimentGUI(QMainWindow):
             self.start_log_monitors()
     
     def stop_all_monitors(self):
-        """Stop all monitoring threads"""
+        """Stop all monitoring threads (with timeouts to avoid blocking the UI)."""
         if self.dashboard_thread:
-            self.dashboard_thread.stop()
-            self.dashboard_thread.wait()
+            try:
+                self.dashboard_thread.stop()
+                self.dashboard_thread.wait(2000)
+            except Exception:
+                pass
             self.dashboard_thread = None
-        
-        for monitor in self.log_monitors:
-            monitor.stop()
-            monitor.wait()
+        for monitor in list(self.log_monitors):
+            try:
+                monitor.stop()
+                monitor.wait(2000)
+            except Exception:
+                pass
         self.log_monitors.clear()
     
     def apply_network_conditions(self):
@@ -2338,7 +3231,8 @@ class FLExperimentGUI(QMainWindow):
         self.dashboard_text.clear()
         self.server_log_text.clear()
         self.client_log_text.clear()
-        
+        if hasattr(self, "_diag_json_buffer"):
+            self._diag_json_buffer = ""
         # Add informative message
         self.server_log_text.append("📋 Server logs cleared. Waiting for new experiment to start...\n")
         self.client_log_text.append("📋 Client logs cleared. Waiting for new experiment to start...\n")
@@ -2346,10 +3240,709 @@ class FLExperimentGUI(QMainWindow):
     def update_output(self, text):
         """Update output console"""
         self._extract_results_dir_from_output(text)
+        # Detect boundaries between internal experiments (within a single long-running
+        # command such as run_network_experiments.py or diagnostic_pipeline.py) so that
+        # server/client log monitors can be restarted for each new experiment. Without
+        # this, the GUI would keep following the containers from the first experiment only.
+        try:
+            if getattr(self, "experiment_thread", None) and self.experiment_thread.isRunning():
+                if ("EXPERIMENT:" in text) or ("Diagnostic run " in text):
+                    # Containers for the next experiment are started shortly after these
+                    # markers are printed; delay slightly so docker ps can see them.
+                    QTimer.singleShot(5000, self.start_log_monitors)
+        except Exception:
+            # Log monitor refresh is best-effort; never break the main output path.
+            pass
+
+        # Parse diagnostic pipeline JSON (may arrive in one chunk or split across chunks)
+        if "FL_DIAG_TABLE_JSON|" in text:
+            json_str = text.split("FL_DIAG_TABLE_JSON|", 1)[1]
+            if not hasattr(self, "_diag_json_buffer"):
+                self._diag_json_buffer = ""
+            self._diag_json_buffer = json_str
+        elif getattr(self, "_diag_json_buffer", None):
+            self._diag_json_buffer += text
+        else:
+            self._diag_json_buffer = ""
+        if getattr(self, "_diag_json_buffer", None):
+            buf = self._diag_json_buffer.strip()
+            if buf:
+                summary = None
+                try:
+                    summary = json.loads(buf)
+                except json.JSONDecodeError:
+                    # Extract JSON array by matching brackets (handles trailing text or split chunks)
+                    start = buf.find("[")
+                    if start >= 0:
+                        depth = 0
+                        for i, c in enumerate(buf[start:], start=start):
+                            if c == "[":
+                                depth += 1
+                            elif c == "]":
+                                depth -= 1
+                                if depth == 0:
+                                    try:
+                                        summary = json.loads(buf[start : i + 1])
+                                    except json.JSONDecodeError:
+                                        pass
+                                    break
+                if summary is not None:
+                    self.update_diagnostic_results_table(summary)
+                    self._diag_json_buffer = ""
         self.output_text.insertPlainText(text)
         self.output_text.verticalScrollBar().setValue(
             self.output_text.verticalScrollBar().maximum()
         )
+
+    def _diagnostic_db_path(self):
+        """Path to SQLite database for diagnostic results (shared_data/diagnostic_results.db)."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        shared = os.path.join(base_dir, "shared_data")
+        os.makedirs(shared, exist_ok=True)
+        return os.path.join(shared, "diagnostic_results.db")
+
+    def _init_diagnostic_db(self):
+        """Create diagnostic_results table if it does not exist."""
+        import sqlite3
+        path = self._diagnostic_db_path()
+        try:
+            conn = sqlite3.connect(path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS diagnostic_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_id INTEGER NOT NULL,
+                    protocol TEXT NOT NULL,
+                    scenario TEXT NOT NULL,
+                    O_app REAL NOT NULL DEFAULT 0,
+                    O_broker REAL NOT NULL DEFAULT 0,
+                    p REAL NOT NULL DEFAULT 0,
+                    T_actual REAL NOT NULL DEFAULT 0,
+                    T_calc REAL NOT NULL DEFAULT 0,
+                    error_pct REAL NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            conn.commit()
+            try:
+                conn.execute("ALTER TABLE diagnostic_results ADD COLUMN alpha REAL")
+                conn.commit()
+            except Exception:
+                pass
+            conn.close()
+        except Exception as e:
+            if hasattr(self, "output_text"):
+                self.output_text.append(f"[Diagnostic DB] Could not init DB: {e}\n")
+
+    def _seed_diagnostic_db_from_json_if_present(self):
+        """If shared_data/diagnostic_results_latest.json exists, load it and upsert into DB (replace by protocol+scenario)."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        diag_file = os.path.join(base_dir, "shared_data", "diagnostic_results_latest.json")
+        if not os.path.isfile(diag_file):
+            return
+        try:
+            with open(diag_file, "r", encoding="utf-8") as f:
+                summary = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return
+        if summary is not None:
+            rows = summary if isinstance(summary, list) else [summary]
+            self._save_diagnostic_results_to_db(rows)
+
+    def _save_diagnostic_results_to_db(self, new_rows):
+        """Persist diagnostic rows to DB: for each (protocol, scenario) in new_rows, delete existing then insert.
+        Same protocol+scenario overwrite; new combos add new entries."""
+        if not new_rows:
+            return
+        import sqlite3
+        path = self._diagnostic_db_path()
+        try:
+            conn = sqlite3.connect(path)
+            # Unique (protocol, scenario) pairs in this batch
+            seen = set()
+            for r in new_rows:
+                proto = str(r.get("protocol", "")).strip()
+                scen = str(r.get("scenario", "")).strip()
+                key = (proto.lower(), scen.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                conn.execute(
+                    "DELETE FROM diagnostic_results WHERE LOWER(TRIM(protocol)) = ? AND LOWER(TRIM(scenario)) = ?",
+                    (proto.lower(), scen.lower()),
+                )
+            for r in new_rows:
+                alpha_val = r.get("alpha")
+                if alpha_val is None:
+                    alpha_val = r.get("alpha_proto")
+                alpha_val = float(alpha_val) if alpha_val is not None else None
+                row_tuple = (
+                    int(r.get("client_id", 0)),
+                    str(r.get("protocol", "")),
+                    str(r.get("scenario", "")),
+                    float(r.get("O_app", 0)),
+                    float(r.get("O_broker", 0)),
+                    float(r.get("p", 0)),
+                    float(r.get("T_actual", 0)),
+                    float(r.get("T_calc", 0)),
+                    float(r.get("error_pct", 0)),
+                    alpha_val,
+                )
+                try:
+                    conn.execute(
+                        """INSERT INTO diagnostic_results (client_id, protocol, scenario, O_app, O_broker, p, T_actual, T_calc, error_pct, alpha)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        row_tuple,
+                    )
+                except sqlite3.OperationalError:
+                    conn.execute(
+                        """INSERT INTO diagnostic_results (client_id, protocol, scenario, O_app, O_broker, p, T_actual, T_calc, error_pct)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        row_tuple[:9],
+                    )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            if hasattr(self, "output_text"):
+                self.output_text.append(f"[Diagnostic DB] Save failed: {e}\n")
+
+    def _load_diagnostic_results_from_db(self):
+        """Load all rows from diagnostic_results table; return list of dicts for table display."""
+        import sqlite3
+        path = self._diagnostic_db_path()
+        if not os.path.isfile(path):
+            return []
+        try:
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            try:
+                cur = conn.execute(
+                    "SELECT client_id, protocol, scenario, O_app, O_broker, p, T_actual, T_calc, error_pct, alpha FROM diagnostic_results ORDER BY UPPER(protocol), LOWER(scenario), client_id"
+                )
+            except sqlite3.OperationalError:
+                cur = conn.execute(
+                    "SELECT client_id, protocol, scenario, O_app, O_broker, p, T_actual, T_calc, error_pct FROM diagnostic_results ORDER BY UPPER(protocol), LOWER(scenario), client_id"
+                )
+            rows = [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()]
+            conn.close()
+            return rows
+        except Exception:
+            return []
+
+    def _load_diagnostic_results_table_from_db(self):
+        """Populate Diagnostic Results tab from database."""
+        if not hasattr(self, "diagnostic_results_table"):
+            return
+        from PyQt5.QtWidgets import QTableWidgetItem
+        rows = self._load_diagnostic_results_from_db()
+        self.diagnostic_results_table.setRowCount(len(rows))
+        for row_idx, r in enumerate(rows):
+            self.diagnostic_results_table.setItem(row_idx, 0, QTableWidgetItem(str(r.get("client_id", row_idx + 1))))
+            self.diagnostic_results_table.setItem(row_idx, 1, QTableWidgetItem(str(r.get("protocol", ""))))
+            self.diagnostic_results_table.setItem(row_idx, 2, QTableWidgetItem(str(r.get("scenario", ""))))
+            self.diagnostic_results_table.setItem(row_idx, 3, QTableWidgetItem(f"{r.get('O_app', 0):.6f}"))
+            self.diagnostic_results_table.setItem(row_idx, 4, QTableWidgetItem(f"{r.get('O_broker', 0):.6f}"))
+            self.diagnostic_results_table.setItem(row_idx, 5, QTableWidgetItem(f"{r.get('p', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 6, QTableWidgetItem(f"{r.get('T_actual', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 7, QTableWidgetItem(f"{r.get('T_calc', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 8, QTableWidgetItem(f"{r.get('error_pct', 0):.2f}%"))
+            alpha = r.get("alpha")
+            self.diagnostic_results_table.setItem(row_idx, 9, QTableWidgetItem(f"{alpha:.4f}" if alpha is not None else ""))
+
+    def update_diagnostic_results_table(self, summary):
+        """Update Diagnostic Results: save to DB (overwrite by protocol+scenario, add new), then reload table from DB."""
+        if not hasattr(self, "diagnostic_results_table"):
+            return
+        from PyQt5.QtWidgets import QTableWidgetItem
+        new_rows = summary if isinstance(summary, list) else [summary]
+        # 1. Persist: same (protocol, scenario) overwrite; new (protocol, scenario) add
+        self._save_diagnostic_results_to_db(new_rows)
+        # 2. Load full table from DB and render
+        rows = self._load_diagnostic_results_from_db()
+        self.diagnostic_results_table.setRowCount(len(rows))
+        for row_idx, r in enumerate(rows):
+            self.diagnostic_results_table.setItem(row_idx, 0, QTableWidgetItem(str(r.get("client_id", row_idx + 1))))
+            self.diagnostic_results_table.setItem(row_idx, 1, QTableWidgetItem(str(r.get("protocol", ""))))
+            self.diagnostic_results_table.setItem(row_idx, 2, QTableWidgetItem(str(r.get("scenario", ""))))
+            self.diagnostic_results_table.setItem(row_idx, 3, QTableWidgetItem(f"{r.get('O_app', 0):.6f}"))
+            self.diagnostic_results_table.setItem(row_idx, 4, QTableWidgetItem(f"{r.get('O_broker', 0):.6f}"))
+            self.diagnostic_results_table.setItem(row_idx, 5, QTableWidgetItem(f"{r.get('p', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 6, QTableWidgetItem(f"{r.get('T_actual', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 7, QTableWidgetItem(f"{r.get('T_calc', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 8, QTableWidgetItem(f"{r.get('error_pct', 0):.2f}%"))
+            alpha = r.get("alpha")
+            self.diagnostic_results_table.setItem(row_idx, 9, QTableWidgetItem(f"{alpha:.4f}" if alpha is not None else ""))
+        for i in range(self.output_tabs.count()):
+            if self.output_tabs.tabText(i) == "📊 Diagnostic Results":
+                self.output_tabs.setCurrentIndex(i)
+                break
+
+    def download_diagnostic_results_excel(self):
+        """Export diagnostic_results.db to an Excel file."""
+        try:
+            import pandas as pd
+        except ImportError:
+            QMessageBox.warning(self, "Export", "pandas is required. Install with: pip install pandas")
+            return
+        try:
+            from openpyxl import __version__  # noqa: F401
+        except ImportError:
+            QMessageBox.warning(self, "Export", "openpyxl is required for Excel export. Install with: pip install openpyxl")
+            return
+
+        db_path = self._diagnostic_db_path()
+        if not os.path.isfile(db_path):
+            QMessageBox.information(
+                self,
+                "Export",
+                "No diagnostic_results.db found yet. Run the Diagnostic Pipeline first to generate results.",
+            )
+            return
+
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Diagnostic Results",
+            "",
+            "Excel (*.xlsx);;All Files (*)",
+        )
+        if not save_path:
+            return
+        if not save_path.endswith(".xlsx"):
+            save_path = save_path + ".xlsx"
+
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(db_path)
+            try:
+                df = pd.read_sql_query(
+                    """
+                    SELECT
+                        client_id,
+                        protocol,
+                        scenario,
+                        O_app,
+                        O_broker,
+                        p,
+                        T_actual,
+                        T_calc,
+                        error_pct,
+                        alpha,
+                        updated_at
+                    FROM diagnostic_results
+                    ORDER BY UPPER(protocol), LOWER(scenario), client_id
+                    """,
+                    conn,
+                )
+            except sqlite3.OperationalError:
+                df = pd.read_sql_query(
+                    """
+                    SELECT
+                        client_id,
+                        protocol,
+                        scenario,
+                        O_app,
+                        O_broker,
+                        p,
+                        T_actual,
+                        T_calc,
+                        error_pct,
+                        updated_at
+                    FROM diagnostic_results
+                    ORDER BY UPPER(protocol), LOWER(scenario), client_id
+                    """,
+                    conn,
+                )
+            conn.close()
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Export Error",
+                f"Could not read diagnostic_results.db:\n{e}",
+            )
+            return
+
+        if df.empty:
+            QMessageBox.information(self, "Export", "Diagnostic results database is empty. Nothing to export.")
+            return
+
+        try:
+            with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="DiagnosticResults", index=False)
+            QMessageBox.information(
+                self,
+                "Export",
+                f"Diagnostic results exported to:\n{save_path}",
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Export Error",
+                f"Failed to write Excel file:\n{e}",
+            )
+
+    def _experiment_results_db_path(self):
+        """Path to SQLite database for experimental results (shared_data/experimental_results.db)."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        shared = os.path.join(base_dir, "shared_data")
+        os.makedirs(shared, exist_ok=True)
+        return os.path.join(shared, "experimental_results.db")
+
+    def _init_experiment_results_db(self):
+        """Create experimental_results table if it does not exist."""
+        import sqlite3
+        path = self._experiment_results_db_path()
+        try:
+            conn = sqlite3.connect(path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS experimental_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    protocol TEXT NOT NULL,
+                    scenario TEXT NOT NULL,
+                    use_case TEXT NOT NULL,
+                    num_clients INTEGER NOT NULL DEFAULT 2,
+                    num_rounds INTEGER NOT NULL DEFAULT 0,
+                    avg_time_per_round REAL,
+                    min_rtt REAL,
+                    max_rtt REAL,
+                    convergence_time_sec REAL,
+                    convergence_time_min REAL,
+                    final_accuracy_pct REAL,
+                    final_loss REAL,
+                    run_timestamp TEXT,
+                    source TEXT,
+                    exp_folder TEXT,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            if hasattr(self, "output_text"):
+                self.output_text.append(f"[Experimental Results DB] Could not init DB: {e}\n")
+
+    def _scan_experiment_results_from_disk(self, results_base_dir):
+        """
+        Scan a single results directory (e.g. experiment_results/emotion_20250104_123456 or
+        experiment_results_baseline/emotion) for protocol_scenario subdirs; extract metrics and return list of row dicts.
+        """
+        import sqlite3
+        rows = []
+        if not results_base_dir or not os.path.isdir(results_base_dir):
+            return rows
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        try:
+            script_dir = os.path.join(base_dir, "Network_Simulation")
+            if script_dir not in sys.path:
+                sys.path.insert(0, script_dir)
+            from consolidate_results import extract_results_from_logs
+        except ImportError:
+            return rows
+        exp_folder = os.path.basename(results_base_dir.rstrip(os.sep))
+        is_baseline = "baseline" in results_base_dir
+        for name in os.listdir(results_base_dir):
+            subdir = os.path.join(results_base_dir, name)
+            if not os.path.isdir(subdir):
+                continue
+            # Expect names like mqtt_excellent, grpc_poor, or mqtt_excellent_congestion_moderate
+            parts = name.split("_")
+            if len(parts) < 2:
+                continue
+            protocol = parts[0].upper()
+            scenario = "_".join(parts[1:]).split("_congestion_")[0] if "_congestion_" in name else "_".join(parts[1:])
+            server_log = os.path.join(subdir, "server_logs.txt")
+            if not os.path.isfile(server_log):
+                continue
+            try:
+                extracted = extract_results_from_logs(server_log)
+            except Exception:
+                extracted = None
+            if not extracted:
+                continue
+            metadata = {}
+            meta_path = os.path.join(subdir, "metadata.json")
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        metadata = json.load(f)
+                except Exception:
+                    pass
+            rtt_data = {}
+            for rtt_name in ["rtt.json", "grpc_rtt.json", "mqtt_rtt.json", "amqp_rtt.json", "quic_rtt.json", "http3_rtt.json", "dds_rtt.json", "rl_unified_rtt.json"]:
+                rtt_path = os.path.join(subdir, rtt_name)
+                if not os.path.isfile(rtt_path):
+                    for f in (os.listdir(subdir) if os.path.isdir(subdir) else []):
+                        if "rtt" in f.lower() and f.endswith(".json"):
+                            rtt_path = os.path.join(subdir, f)
+                            break
+                if os.path.isfile(rtt_path):
+                    try:
+                        with open(rtt_path, "r", encoding="utf-8") as f:
+                            rtt_data = json.load(f)
+                        break
+                    except Exception:
+                        pass
+            num_clients = metadata.get("num_clients") or extracted.get("num_clients", 2)
+            num_rounds = metadata.get("num_rounds") or extracted.get("total_rounds", 0)
+            conv_sec = extracted.get("convergence_time_seconds") or 0
+            conv_min = extracted.get("convergence_time_minutes") or 0
+            avg_rtt = rtt_data.get("avg_rtt_per_round") or (sum(rtt_data.get("rtt_per_round", [])) / len(rtt_data.get("rtt_per_round") or [1]) if rtt_data.get("rtt_per_round") else None)
+            min_rtt = rtt_data.get("min_rtt")
+            max_rtt = rtt_data.get("max_rtt")
+            final_acc = None
+            if extracted.get("accuracy"):
+                final_acc = (extracted["accuracy"][-1] * 100.0) if isinstance(extracted["accuracy"][-1], (int, float)) else None
+            final_loss = extracted.get("loss", [None])[-1] if extracted.get("loss") else None
+            run_ts = metadata.get("timestamp", "")
+            use_case = metadata.get("use_case", "")
+            if not use_case:
+                # exp_folder is e.g. emotion_20250104_123456 or emotion for baseline
+                if exp_folder.startswith("emotion") or exp_folder.startswith("mental") or exp_folder.startswith("temperature"):
+                    use_case = exp_folder.split("_")[0]
+                if not use_case and "baseline" in results_base_dir:
+                    use_case = exp_folder
+            rows.append({
+                "protocol": protocol,
+                "scenario": scenario,
+                "use_case": use_case or "unknown",
+                "num_clients": num_clients,
+                "num_rounds": num_rounds,
+                "avg_time_per_round": avg_rtt,
+                "min_rtt": min_rtt,
+                "max_rtt": max_rtt,
+                "convergence_time_sec": conv_sec,
+                "convergence_time_min": conv_min,
+                "final_accuracy_pct": final_acc,
+                "final_loss": final_loss,
+                "run_timestamp": run_ts,
+                "source": "baseline" if is_baseline else "network",
+                "exp_folder": exp_folder,
+            })
+        return rows
+
+    def _refresh_experiment_results_from_disk(self):
+        """Scan experiment_results and experiment_results_baseline, upsert into DB, reload table."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        all_rows = []
+        for base_name in ["experiment_results", "experiment_results_baseline"]:
+            root = os.path.join(base_dir, base_name)
+            if not os.path.isdir(root):
+                continue
+            for name in os.listdir(root):
+                sub = os.path.join(root, name)
+                if os.path.isdir(sub):
+                    all_rows.extend(self._scan_experiment_results_from_disk(sub))
+        if not all_rows and hasattr(self, "output_text"):
+            self.output_text.append("[Experimental Results] No experiment result directories found. Run experiments first.\n")
+        path = self._experiment_results_db_path()
+        import sqlite3
+        try:
+            conn = sqlite3.connect(path)
+            conn.execute("DELETE FROM experimental_results")
+            for r in all_rows:
+                conn.execute("""
+                    INSERT INTO experimental_results
+                    (protocol, scenario, use_case, num_clients, num_rounds, avg_time_per_round, min_rtt, max_rtt,
+                     convergence_time_sec, convergence_time_min, final_accuracy_pct, final_loss, run_timestamp, source, exp_folder)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    r.get("protocol", ""),
+                    r.get("scenario", ""),
+                    r.get("use_case", ""),
+                    r.get("num_clients", 2),
+                    r.get("num_rounds", 0),
+                    r.get("avg_time_per_round"),
+                    r.get("min_rtt"),
+                    r.get("max_rtt"),
+                    r.get("convergence_time_sec"),
+                    r.get("convergence_time_min"),
+                    r.get("final_accuracy_pct"),
+                    r.get("final_loss"),
+                    r.get("run_timestamp", ""),
+                    r.get("source", ""),
+                    r.get("exp_folder", ""),
+                ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            if hasattr(self, "output_text"):
+                self.output_text.append(f"[Experimental Results] DB error: {e}\n")
+            return
+        self._load_experiment_results_table_from_db()
+        self._refresh_experiment_folder_selector()
+        if hasattr(self, "output_text"):
+            self.output_text.append(f"[Experimental Results] Loaded {len(all_rows)} row(s) from disk.\n")
+
+    def _refresh_experiment_folder_selector(self):
+        """Populate experiment folder dropdown from experiment_results/* (timestamped folders)."""
+        try:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            exp_root = os.path.join(base_dir, "experiment_results")
+            if not hasattr(self, "exp_folder_selector"):
+                return
+            self.exp_folder_selector.blockSignals(True)
+            current = self.exp_folder_selector.currentData()
+            self.exp_folder_selector.clear()
+            if not os.path.isdir(exp_root):
+                self.exp_folder_selector.addItem("(experiment_results not found)", None)
+                self.exp_folder_selector.setEnabled(False)
+                return
+            folders = []
+            for name in os.listdir(exp_root):
+                p = os.path.join(exp_root, name)
+                if os.path.isdir(p):
+                    try:
+                        mtime = os.path.getmtime(p)
+                    except Exception:
+                        mtime = 0
+                    folders.append((mtime, name, p))
+            folders.sort(key=lambda t: (t[0], t[1]), reverse=True)
+            for _, name, p in folders:
+                self.exp_folder_selector.addItem(name, p)
+            self.exp_folder_selector.setEnabled(True)
+            if current:
+                idx = self.exp_folder_selector.findData(current)
+                if idx >= 0:
+                    self.exp_folder_selector.setCurrentIndex(idx)
+        except Exception as e:
+            if hasattr(self, "output_text"):
+                self.output_text.append(f"[Combined Plots] Could not refresh folder selector: {e}\n")
+        finally:
+            if hasattr(self, "exp_folder_selector"):
+                self.exp_folder_selector.blockSignals(False)
+
+    def generate_combined_experiment_plots(self):
+        """Generate combined plots for selected experiment_results/<timestamp_folder>/."""
+        try:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            script_dir = os.path.join(base_dir, "Network_Simulation")
+            if script_dir not in sys.path:
+                sys.path.insert(0, script_dir)
+            from combined_experiment_plots import plot_combined
+        except Exception as e:
+            QMessageBox.critical(self, "Combine Plots", f"Could not import plotter:\n{e}")
+            return
+
+        folder_path = None
+        if hasattr(self, "exp_folder_selector"):
+            folder_path = self.exp_folder_selector.currentData()
+        if not folder_path or not os.path.isdir(folder_path):
+            QMessageBox.warning(self, "Combine Plots", "Please select a valid timestamp folder under experiment_results/.")
+            return
+
+        single = bool(getattr(self, "combine_plots_single_figure", None) and self.combine_plots_single_figure.isChecked())
+        try:
+            out = plot_combined(Path(folder_path), single_figure=single, show=True, save=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Combine Plots", f"Failed to generate combined plots:\n{e}")
+            return
+
+        msg_lines = [f"Saved to:\n{folder_path}"]
+        if out:
+            msg_lines.append("\nGenerated files:")
+            for k, v in out.items():
+                msg_lines.append(f"- {k}: {os.path.basename(str(v))}")
+        QMessageBox.information(self, "Combine Plots", "\n".join(msg_lines))
+
+    def _load_experiment_results_from_db(self):
+        """Load all rows from experimental_results table."""
+        import sqlite3
+        path = self._experiment_results_db_path()
+        rows = []
+        try:
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute("""
+                SELECT protocol, scenario, use_case, num_clients, num_rounds,
+                       avg_time_per_round, min_rtt, max_rtt, convergence_time_sec, convergence_time_min,
+                       final_accuracy_pct, final_loss, run_timestamp, source
+                FROM experimental_results
+                ORDER BY run_timestamp DESC, UPPER(protocol), scenario
+            """)
+            for row in cur.fetchall():
+                rows.append(dict(row))
+            conn.close()
+        except Exception:
+            pass
+        return rows
+
+    def _load_experiment_results_table_from_db(self):
+        """Populate Experimental Results tab from database."""
+        from PyQt5.QtWidgets import QTableWidgetItem
+        if not hasattr(self, "experiment_results_table"):
+            return
+        rows = self._load_experiment_results_from_db()
+        self.experiment_results_table.setRowCount(len(rows))
+        for row_idx, r in enumerate(rows):
+            def _cell(v, fmt=None):
+                if v is None: return ""
+                if fmt == "f" and isinstance(v, (int, float)): return f"{v:.2f}"
+                if fmt == "pct" and isinstance(v, (int, float)): return f"{v:.1f}%"
+                return str(v)
+            self.experiment_results_table.setItem(row_idx, 0, QTableWidgetItem(str(r.get("protocol", ""))))
+            self.experiment_results_table.setItem(row_idx, 1, QTableWidgetItem(str(r.get("scenario", ""))))
+            self.experiment_results_table.setItem(row_idx, 2, QTableWidgetItem(str(r.get("use_case", ""))))
+            self.experiment_results_table.setItem(row_idx, 3, QTableWidgetItem(str(r.get("num_clients", ""))))
+            self.experiment_results_table.setItem(row_idx, 4, QTableWidgetItem(str(r.get("num_rounds", ""))))
+            self.experiment_results_table.setItem(row_idx, 5, QTableWidgetItem(_cell(r.get("avg_time_per_round"), "f")))
+            self.experiment_results_table.setItem(row_idx, 6, QTableWidgetItem(_cell(r.get("min_rtt"), "f")))
+            self.experiment_results_table.setItem(row_idx, 7, QTableWidgetItem(_cell(r.get("max_rtt"), "f")))
+            self.experiment_results_table.setItem(row_idx, 8, QTableWidgetItem(_cell(r.get("convergence_time_sec"), "f")))
+            self.experiment_results_table.setItem(row_idx, 9, QTableWidgetItem(_cell(r.get("convergence_time_min"), "f")))
+            self.experiment_results_table.setItem(row_idx, 10, QTableWidgetItem(_cell(r.get("final_accuracy_pct"), "pct")))
+            self.experiment_results_table.setItem(row_idx, 11, QTableWidgetItem(_cell(r.get("final_loss"), "f")))
+            self.experiment_results_table.setItem(row_idx, 12, QTableWidgetItem(str(r.get("run_timestamp", ""))[:19] if r.get("run_timestamp") else ""))
+            self.experiment_results_table.setItem(row_idx, 13, QTableWidgetItem(str(r.get("source", ""))))
+
+    def download_experiment_results_excel(self):
+        """Export experimental_results table to Excel."""
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        try:
+            import pandas as pd
+        except ImportError:
+            QMessageBox.warning(self, "Export", "pandas and openpyxl are required to export to Excel.")
+            return
+        save_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Experimental Results",
+            os.path.join(base_dir, "experimental_results.xlsx"),
+            "Excel (*.xlsx);;All Files (*)",
+        )
+        if not save_path:
+            return
+        import sqlite3
+        db_path = self._experiment_results_db_path()
+        if not os.path.isfile(db_path):
+            QMessageBox.information(
+                self,
+                "Export",
+                "No experimental_results.db found. Use 'Refresh from experiment_results' first.",
+            )
+            return
+        try:
+            conn = sqlite3.connect(db_path)
+            df = pd.read_sql_query(
+                """
+                SELECT protocol, scenario, use_case, num_clients, num_rounds,
+                       avg_time_per_round, min_rtt, max_rtt, convergence_time_sec, convergence_time_min,
+                       final_accuracy_pct, final_loss, run_timestamp, source
+                FROM experimental_results
+                ORDER BY run_timestamp DESC, UPPER(protocol), scenario
+                """,
+                conn,
+            )
+            conn.close()
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Could not read DB: {e}")
+            return
+        if df.empty:
+            QMessageBox.information(self, "Export", "Experimental results table is empty. Run experiments and Refresh first.")
+            return
+        try:
+            with pd.ExcelWriter(save_path, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="ExperimentalResults", index=False)
+            QMessageBox.information(self, "Export", f"Experimental results exported to:\n{save_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to write Excel: {e}")
 
     def _extract_results_dir_from_output(self, text):
         """Track results directory from runner stdout."""
@@ -2363,7 +3956,7 @@ class FLExperimentGUI(QMainWindow):
 
     def _get_fallback_results_dir(self):
         """Best-effort results directory when parser didn't capture it yet."""
-        base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+        base_dir = self.project_root
         use_case = self.get_selected_use_case()
 
         if self.baseline_mode.isChecked():
@@ -2391,7 +3984,7 @@ class FLExperimentGUI(QMainWindow):
             base_results = self._get_fallback_results_dir()
 
         if not base_results:
-            base_dir = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+            base_dir = self.project_root
             base_results = os.path.join(base_dir, "experiment_results", "manual_stop_logs")
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2453,19 +4046,201 @@ class FLExperimentGUI(QMainWindow):
     def experiment_completed(self, success, message):
         """Handle experiment completion"""
         self.update_output(f"\n\n{message}\n")
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        is_diagnostic = getattr(self, "_last_command_was_diagnostic", False)
+
+        # When diagnostic pipeline completes: ensure all clients and servers are disconnected (all protocols)
+        if is_diagnostic:
+            self.update_output("Disconnecting all clients and servers...\n")
+            if getattr(self, "_experiment_is_native", False):
+                stop_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stop_native_experiment.sh")
+                if os.path.isfile(stop_script):
+                    try:
+                        subprocess.run(
+                            ["bash", stop_script],
+                            cwd=base_dir,
+                            capture_output=True,
+                            timeout=15,
+                        )
+                        self.update_output("Native FL and broker processes stopped.\n")
+                    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+                        pass
+            else:
+                try:
+                    result = subprocess.run(
+                        ["docker", "ps", "-a", "--filter", "name=fl-", "--format", "{{.Names}}"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        cwd=base_dir,
+                    )
+                    containers = [c.strip() for c in (result.stdout or "").splitlines() if c.strip()]
+                    if containers:
+                        subprocess.run(["docker", "stop"] + containers, timeout=60, cwd=base_dir, capture_output=True)
+                        subprocess.run(["docker", "rm", "-f"] + containers, timeout=60, cwd=base_dir, capture_output=True)
+                        self.update_output(f"Stopped and removed {len(containers)} container(s). All clients and servers disconnected.\n")
+                    else:
+                        self.update_output("No FL containers to stop (already disconnected).\n")
+                except Exception as e:
+                    self.update_output(f"Cleanup warning: {e}\n")
+
+        # Diagnostic Results: when diagnostic pipeline ran, always try file first (most reliable)
+        if hasattr(self, "diagnostic_results_table"):
+            summary = None
+            diag_file = os.path.join(base_dir, "shared_data", "diagnostic_results_latest.json")
+            if getattr(self, "_last_command_was_diagnostic", False) and os.path.isfile(diag_file):
+                try:
+                    with open(diag_file, "r", encoding="utf-8") as f:
+                        summary = json.load(f)
+                except (json.JSONDecodeError, IOError):
+                    pass
+            if summary is None:
+                full = self.output_text.toPlainText()
+                if "FL_DIAG_TABLE_JSON|" in full:
+                    parts = full.split("FL_DIAG_TABLE_JSON|")
+                    after = parts[-1] if parts else ""
+                    try:
+                        start = after.find("[")
+                        if start >= 0:
+                            depth = 0
+                            for i, c in enumerate(after[start:], start=start):
+                                if c == "[":
+                                    depth += 1
+                                elif c == "]":
+                                    depth -= 1
+                                    if depth == 0:
+                                        summary = json.loads(after[start : i + 1])
+                                        break
+                    except (json.JSONDecodeError, IndexError, ValueError):
+                        pass
+            if summary is None and getattr(self, "_last_command_was_diagnostic", False) and os.path.isfile(diag_file):
+                try:
+                    with open(diag_file, "r", encoding="utf-8") as f:
+                        summary = json.load(f)
+                except (json.JSONDecodeError, IOError):
+                    pass
+            if summary is not None:
+                # Merge into table: replace only rows for (protocol, scenario) in this run; keep all others
+                self.update_diagnostic_results_table(summary)
+                # Switch to Diagnostic Results tab so user sees the table
+                for i in range(self.output_tabs.count()):
+                    if self.output_tabs.tabText(i) == "📊 Diagnostic Results":
+                        self.output_tabs.setCurrentIndex(i)
+                        break
+
+        # Experimental Results: when a normal FL run (not diagnostic) completes, refresh from disk so new run appears
+        if not is_diagnostic and hasattr(self, "_refresh_experiment_results_from_disk"):
+            try:
+                self._refresh_experiment_results_from_disk()
+            except Exception:
+                pass
+
+        # Free GPU memory (non-blocking)
+        diag_script = os.path.join(base_dir, "Network_Simulation", "diagnostic_pipeline.py")
+        try:
+            subprocess.run(
+                [sys.executable, diag_script, "--kill-gpu-only"],
+                cwd=base_dir,
+                capture_output=True,
+                timeout=15,
+                env=os.environ.copy(),
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+            pass
         self.stop_all_monitors()
         self.reset_ui()
-        
+
+        # Show popup after a short delay so UI (table, status) updates first and dialog is not blocked
+        QTimer.singleShot(150, lambda: self._show_completion_popup(success, message, is_diagnostic))
+
+    def _show_completion_popup(self, success, message, is_diagnostic=False):
+        """Show experiment completion as a matplotlib plot; auto-close after 5 seconds so
+        server/client cleanup is done and next experiment can continue without user interaction."""
         if success:
-            QMessageBox.information(self, "Success", message)
             self.statusBar().showMessage("✅ Experiment completed successfully")
+            # Show matplotlib plot in a dialog; it closes after 5 seconds so next experiment can continue
+            self._show_completion_plot(success=True, is_diagnostic=is_diagnostic, message=message)
         else:
-            QMessageBox.warning(self, "Error", message)
             self.statusBar().showMessage("❌ Experiment failed")
+            QMessageBox.warning(self, "Error", message)
+
+    def _show_completion_plot(self, success=True, is_diagnostic=False, message=""):
+        """Display a matplotlib plot in a dialog; auto-close after 5 seconds."""
+        try:
+            fig = Figure(figsize=(8, 5))
+            ax = fig.add_subplot(111)
+            if is_diagnostic and getattr(self, "_diagnostic_results_cache", None):
+                rows = self._diagnostic_results_cache
+                if rows:
+                    labels = [f"{r.get('protocol', '')}\n{r.get('scenario', '')}" for r in rows]
+                    t_actual = [r.get("T_actual", 0) for r in rows]
+                    t_calc = [r.get("T_calc", 0) for r in rows]
+                    x = range(len(labels))
+                    w = 0.35
+                    ax.bar([i - w / 2 for i in x], t_actual, w, label="T_actual (s)", color="steelblue", alpha=0.8)
+                    ax.bar([i + w / 2 for i in x], t_calc, w, label="T_calc (s)", color="coral", alpha=0.8)
+                    ax.set_xticks(x)
+                    ax.set_xticklabels(labels, rotation=15, ha="right", fontsize=8)
+                    ax.set_ylabel("Time (s)")
+                    ax.set_title("Diagnostic pipeline – T_actual vs T_calc\n(Closing in 5 seconds)")
+                    ax.legend()
+                else:
+                    ax.text(0.5, 0.5, "Diagnostic pipeline completed.\n(Closing in 5 seconds)", ha="center", va="center", fontsize=12)
+                    ax.axis("off")
+            else:
+                msg = (message[:100] + "...") if len(message) > 100 else (message or "Done.")
+                ax.text(0.5, 0.5, "Experiment completed successfully.\n\n" + msg + "\n\n(Closing in 5 seconds)", ha="center", va="center", fontsize=11)
+                ax.axis("off")
+            fig.tight_layout()
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Experiment completed")
+            layout = QVBoxLayout(dialog)
+            canvas = FigureCanvas(fig)
+            canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            layout.addWidget(canvas)
+            dialog.resize(700, 450)
+            # Auto-close after 5 seconds so experiment proceeds without user interaction (capture dialog in lambda)
+            def close_after_5s(d=dialog):
+                try:
+                    d.accept()
+                    d.close()
+                except Exception:
+                    pass
+            QTimer.singleShot(5000, close_after_5s)
+            dialog.exec_()
+            plt.close(fig)
+        except Exception as e:
+            # Fallback to message box if matplotlib fails
+            QMessageBox.information(
+                self, "Experiment completed",
+                "Experiment completed.\n\n(Plot could not be shown: {}.)".format(e),
+            )
+
+    def _render_diagnostic_results_table(self):
+        """Render Diagnostic Results table from _diagnostic_results_cache."""
+        if not hasattr(self, "diagnostic_results_table") or not hasattr(self, "_diagnostic_results_cache"):
+            return
+        from PyQt5.QtWidgets import QTableWidgetItem
+        rows = self._diagnostic_results_cache
+        self.diagnostic_results_table.setRowCount(len(rows))
+        for row_idx, r in enumerate(rows):
+            self.diagnostic_results_table.setItem(row_idx, 0, QTableWidgetItem(str(r.get("client_id", row_idx + 1))))
+            self.diagnostic_results_table.setItem(row_idx, 1, QTableWidgetItem(str(r.get("protocol", ""))))
+            self.diagnostic_results_table.setItem(row_idx, 2, QTableWidgetItem(str(r.get("scenario", ""))))
+            self.diagnostic_results_table.setItem(row_idx, 3, QTableWidgetItem(f"{r.get('O_app', 0):.6f}"))
+            self.diagnostic_results_table.setItem(row_idx, 4, QTableWidgetItem(f"{r.get('O_broker', 0):.6f}"))
+            self.diagnostic_results_table.setItem(row_idx, 5, QTableWidgetItem(f"{r.get('p', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 6, QTableWidgetItem(f"{r.get('T_actual', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 7, QTableWidgetItem(f"{r.get('T_calc', 0):.4f}"))
+            self.diagnostic_results_table.setItem(row_idx, 8, QTableWidgetItem(f"{r.get('error_pct', 0):.2f}%"))
+            alpha = r.get("alpha")
+            self.diagnostic_results_table.setItem(row_idx, 9, QTableWidgetItem(f"{alpha:.4f}" if alpha is not None else ""))
     
     def reset_ui(self):
         """Reset UI after experiment"""
         self.start_button.setEnabled(True)
+        if hasattr(self, 'diagnostic_pipeline_button'):
+            self.diagnostic_pipeline_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.progress_bar.hide()
         if self.statusBar().currentMessage().startswith("🚀"):

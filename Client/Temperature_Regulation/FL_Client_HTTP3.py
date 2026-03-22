@@ -9,12 +9,27 @@ import random
 import asyncio
 import os
 import logging
+_xla_flags = os.environ.get("XLA_FLAGS", "").strip()
+if _xla_flags:
+    sanitized_flags = [f for f in _xla_flags.split() if f != "--xla_gpu_enable_command_buffer="]
+    if sanitized_flags:
+        os.environ["XLA_FLAGS"] = " ".join(sanitized_flags)
+    else:
+        os.environ.pop("XLA_FLAGS", None)
 from aioquic.asyncio import connect
 from aioquic.http3.configuration import Http3Configuration
 from aioquic.http3.events import Http3Event, StreamReset, StreamDataReceived
 from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import DataReceived, HeadersReceived, H3Event
 from aioquic.asyncio.protocol import Http3ConnectionProtocol
+
+# Add Compression_Technique to path
+compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
+if compression_path not in os.sys.path:
+    os.sys.path.insert(0, compression_path)
+
+from quantization_client import Quantization, QuantizationConfig
+from pruning_client import ModelPruning, PruningConfig
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
@@ -41,13 +56,14 @@ logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
 # HTTP/3 Configuration
 HTTP3_HOST = os.getenv("HTTP3_HOST", "localhost")
-HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))"))
+HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "5"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 
 class FederatedLearningClientProtocol(Http3ConnectionProtocol):
@@ -97,6 +113,15 @@ class FederatedLearningClient:
         else:
             self.quantizer = None
             print(f"Client {self.client_id}: Quantization disabled")
+
+        up_env = os.getenv("USE_PRUNING", "false")
+        use_pruning = up_env.lower() in ("true", "1", "yes", "y")
+        if use_pruning:
+            self.pruner = ModelPruning(PruningConfig())
+            print(f"Client {self.client_id}: Pruning enabled")
+        else:
+            self.pruner = None
+            print(f"Client {self.client_id}: Pruning disabled")
         self.x_train = None
         self.y_train = None
         self.x_test = None
@@ -221,16 +246,33 @@ class FederatedLearningClient:
     async def handle_global_model(self, message):
         """Receive and set global model weights and architecture from server"""
         round_num = message['round']
-        encoded_weights = message['weights']
         
-        # Decompress or deserialize weights
+        # Decompress/deserialize weights.
+        # If both pruning and quantization are enabled, server should send quantized payload that already reflects pruning,
+        # so we must dequantize first when available.
         if 'quantized_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['quantized_data'])
-            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            compressed_data = message['quantized_data']
+            if isinstance(compressed_data, str):
+                compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
+            weights = self.quantizer.as_training_weights(compressed_data)
+            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
         elif 'compressed_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['compressed_data'])
-            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            compressed_data = message['compressed_data']
+            if isinstance(compressed_data, str):
+                compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
+            weights = self.quantizer.as_training_weights(compressed_data)
+            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
+        elif 'pruned_data' in message and self.pruner is not None:
+            try:
+                compressed_bytes = base64.b64decode(message['pruned_data'].encode('utf-8'))
+                weights = self.pruner.decompress_pruned_weights(compressed_bytes)
+                print(f"Client {self.client_id}: Received and decompressed pruned global model")
+            except Exception as e:
+                print(f"Client {self.client_id} error decoding pruned_data: {e}")
+                encoded_weights = message['weights']
+                weights = self.deserialize_weights(encoded_weights)
         else:
+            encoded_weights = message['weights']
             weights = self.deserialize_weights(encoded_weights)
         
         # Initialize model if not yet created (works for any round)
@@ -337,6 +379,16 @@ class FederatedLearningClient:
         )
         
         updated_weights = self.model.get_weights()
+
+        # Apply pruning before quantization/transmission when enabled
+        if self.pruner is not None:
+            updated_weights = self.pruner.prune_weights(updated_weights, step=self.current_round)
+            pruning_stats = self.pruner.get_pruning_statistics(updated_weights)
+            print(
+                f"Client {self.client_id}: Pruned weights - "
+                f"Sparsity: {pruning_stats['overall_sparsity']:.2%}, "
+                f"Compression: {pruning_stats['compression_ratio']:.2f}x"
+            )
         num_samples = len(self.x_train)
         
         metrics = {
@@ -354,15 +406,68 @@ class FederatedLearningClient:
         delay = random.uniform(0.5, 3.0)
         print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
         await asyncio.sleep(delay)
-        
-        update_message = {
-            "type": "model_update",
-            "client_id": self.client_id,
-            "round": self.current_round,
-            "weights": self.serialize_weights(updated_weights),
-            "num_samples": num_samples,
-            "metrics": metrics
-        }
+
+        # Compress weights for transmission:
+        # - if quantization enabled -> quantize pruned weights
+        # - else if pruning enabled -> sparse-compress pruned weights
+        if self.quantizer is not None:
+            compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
+            stats = self.quantizer.get_compression_stats(updated_weights, compressed_data)
+            print(
+                f"Client {self.client_id}: Quantized update - "
+                f"Ratio: {stats['compression_ratio']:.2f}x, "
+                f"Size: {stats['compressed_size_mb']:.2f}MB"
+            )
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
+            model_payload_bytes = len(serialized.encode('utf-8'))
+            update_message = {
+                "type": "model_update",
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "compressed_data": serialized,
+                "model_payload_bytes": model_payload_bytes,
+                "num_samples": num_samples,
+                "metrics": metrics
+            }
+        elif self.pruner is not None:
+            try:
+                pruned_bytes, _ = self.pruner.compress_pruned_weights(updated_weights)
+                pruned_b64 = base64.b64encode(pruned_bytes).decode("utf-8")
+                model_payload_bytes = len(pruned_b64.encode("utf-8"))
+                update_message = {
+                    "type": "model_update",
+                    "client_id": self.client_id,
+                    "round": self.current_round,
+                    "pruned_data": pruned_b64,
+                    "model_payload_bytes": model_payload_bytes,
+                    "num_samples": num_samples,
+                    "metrics": metrics
+                }
+            except Exception as e:
+                print(f"Client {self.client_id} error compressing pruned weights: {e}")
+                weights_encoded = self.serialize_weights(updated_weights)
+                model_payload_bytes = len(weights_encoded.encode("utf-8"))
+                update_message = {
+                    "type": "model_update",
+                    "client_id": self.client_id,
+                    "round": self.current_round,
+                    "weights": weights_encoded,
+                    "model_payload_bytes": model_payload_bytes,
+                    "num_samples": num_samples,
+                    "metrics": metrics
+                }
+        else:
+            weights_encoded = self.serialize_weights(updated_weights)
+            model_payload_bytes = len(weights_encoded.encode('utf-8'))
+            update_message = {
+                "type": "model_update",
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "weights": weights_encoded,
+                "model_payload_bytes": model_payload_bytes,
+                "num_samples": num_samples,
+                "metrics": metrics
+            }
         
         await self.send_message(update_message)
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
@@ -404,7 +509,7 @@ class FederatedLearningClient:
             "mae": float(mae),
             "mape": float(mape)
         }
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             metrics_dict["client_converged"] = 1.0
         
         metrics_message = {
@@ -418,7 +523,7 @@ class FederatedLearningClient:
         await self.send_message(metrics_message)
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, MSE: {mse:.4f}, "
               f"MAE: {mae:.4f}, MAPE: {mape:.4f}")
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             await asyncio.sleep(2)
             import sys
@@ -429,8 +534,8 @@ class FederatedLearningClient:
         configuration = Http3Configuration(
             is_client=True,
             alpn_protocols=H3_ALPN,
-            max_stream_data=50 * 1024 * 1024,  # 50 MB per stream
-            max_data=100 * 1024 * 1024,  # 100 MB total
+            max_stream_data=16 * 1024,  # 16 KB per stream
+            max_data=32 * 1024,  # 32 KB total
             idle_timeout=3600.0,  # 60 minutes idle timeout
             max_datagram_frame_size=65536,  # Larger frame size for better throughput
             initial_rtt=0.15,  # 150ms (account for 100ms latency + jitter)
