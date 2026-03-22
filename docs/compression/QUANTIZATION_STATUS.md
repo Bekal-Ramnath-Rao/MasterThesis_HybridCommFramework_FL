@@ -36,7 +36,7 @@ All implementations support:
 - ✓ Automatic decompression when receiving weights (clients and servers)
 - ✓ Enable/disable via USE_QUANTIZATION environment variable
 - ✓ All three quantization strategies (QAT, PTQ, Parameter Quantization)
-- ✓ Configurable bit depths (8-bit, 16-bit, 32-bit)
+- ✓ Configurable bit depths (4-bit, 8-bit, 16-bit, 32-bit) - 4-bit uses nibble packing
 - ✓ Compression statistics logging
 - ✓ Graceful fallback when quantization is disabled
 

@@ -319,7 +319,6 @@ class UnifiedFLClient_Temperature:
             reward = self.rl_selector_downlink.calculate_reward(
                 communication_time=comm_time,
                 success=True,
-                convergence_time=0.0,
                 accuracy=accuracy_for_reward,
                 resource_consumption=resources,
                 t_calc=t_calc,
@@ -352,7 +351,7 @@ class UnifiedFLClient_Temperature:
                     avg_reward_last_100=avg_reward,
                     converged=q_converged,
                     metric_communication_time=reward_details.get('communication_time'),
-                    metric_convergence_time=reward_details.get('convergence_time'),
+                    metric_convergence_time=None,
                     metric_accuracy=reward_details.get('accuracy'),
                     metric_success=reward_details.get('success'),
                     metric_cpu_usage=reward_details.get('cpu_usage'),
@@ -363,7 +362,7 @@ class UnifiedFLClient_Temperature:
                     metric_t_calc=reward_details.get('t_calc'),
                     reward_base=reward_details.get('reward_base'),
                     reward_communication_time=reward_details.get('reward_communication_time'),
-                    reward_convergence_time=reward_details.get('reward_convergence_time'),
+                    reward_convergence_time=None,
                     reward_accuracy=reward_details.get('reward_accuracy'),
                     reward_resource_penalty=reward_details.get('reward_resource_penalty'),
                     reward_battery_penalty=reward_details.get('reward_battery_penalty'),
@@ -438,10 +437,15 @@ class UnifiedFLClient_Temperature:
                 self.last_protocol_query_key = query_key
                 # Real downlink reward is computed in _update_downlink_rl_after_reception()
                 # after global model arrives. We do NOT log reward=0.0 here.
+                _dl_eps = (
+                    f"{self.rl_selector_downlink.epsilon:.4f}"
+                    if self.rl_selector_downlink is not None
+                    else "N/A"
+                )
                 print(
                     f"[gRPC] Client {self.client_id} protocol selection sent: "
                     f"round={query.round_id}, global_model_id={query.global_model_id}, downlink={selected} "
-                    f"(downlink RL epsilon={self.rl_selector_downlink.epsilon:.4f if self.rl_selector_downlink else 'N/A'})"
+                    f"(downlink RL epsilon={_dl_eps})"
                 )
         except Exception as e:
             print(f"[gRPC] Client {self.client_id} protocol query handling failed: {e}")
@@ -607,11 +611,10 @@ class UnifiedFLClient_Temperature:
                 payload_bytes = self.round_metrics.get('payload_bytes', 12 * 1024 * 1024)
                 t_calc = self._get_t_calc_for_reward(protocol, payload_bytes) if USE_COMMUNICATION_MODEL_REWARD else None
                 reward = self.rl_selector_uplink.calculate_reward(
-                    self.round_metrics['communication_time'],
-                    self.round_metrics['success'],
-                    self.round_metrics['convergence_time'],
-                    self.round_metrics['accuracy'],
-                    resources,
+                    communication_time=self.round_metrics['communication_time'],
+                    success=self.round_metrics['success'],
+                    accuracy=self.round_metrics['accuracy'],
+                    resource_consumption=resources,
                     t_calc=t_calc,
                 )
                 self.rl_selector_uplink.update_q_value(reward, done=False)
@@ -636,7 +639,7 @@ class UnifiedFLClient_Temperature:
                         avg_reward_last_100=float(avg_reward),
                         converged=self.rl_selector_uplink.check_q_converged(),
                         metric_communication_time=reward_details.get('communication_time'),
-                        metric_convergence_time=reward_details.get('convergence_time'),
+                        metric_convergence_time=None,
                         metric_accuracy=reward_details.get('accuracy'),
                         metric_success=reward_details.get('success'),
                         metric_cpu_usage=reward_details.get('cpu_usage'),
@@ -647,7 +650,7 @@ class UnifiedFLClient_Temperature:
                         metric_t_calc=reward_details.get('t_calc'),
                         reward_base=reward_details.get('reward_base'),
                         reward_communication_time=reward_details.get('reward_communication_time'),
-                        reward_convergence_time=reward_details.get('reward_convergence_time'),
+                        reward_convergence_time=None,
                         reward_accuracy=reward_details.get('reward_accuracy'),
                         reward_resource_penalty=reward_details.get('reward_resource_penalty'),
                         reward_battery_penalty=reward_details.get('reward_battery_penalty'),

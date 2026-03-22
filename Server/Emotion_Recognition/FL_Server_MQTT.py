@@ -62,6 +62,7 @@ MQTT_KEEPALIVE_SEC = min(65535, max(10, int(os.getenv("MQTT_KEEPALIVE_SEC", str(
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))  # Loss improvement threshold
@@ -539,6 +540,10 @@ class FederatedLearningServer:
     
     def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore client-local convergence removal/disconnect.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         if client_id in self.active_clients:
             self.active_clients.discard(client_id)
             self.client_updates.pop(client_id, None)
@@ -576,25 +581,26 @@ class FederatedLearningServer:
         
         if client_id not in self.active_clients:
             return
-        converged = float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
+        converged = STOP_ON_CLIENT_CONVERGENCE and float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
         if converged:
             self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
             # Check if update is compressed
             if 'compressed_data' in data and self.quantization_handler is not None:
-                # Decompress quantized weights (handle base64-serialized payloads)
+                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
                 compressed_update = data['compressed_data']
                 if isinstance(compressed_update, str):
                     try:
                         compressed_update = pickle.loads(base64.b64decode(compressed_update.encode('utf-8')))
                     except Exception as e:
                         print(f"Server error decoding compressed_data from client {client_id}: {e}")
-                weights = self.quantization_handler.decompress_client_update(
-                    client_id, 
-                    compressed_update
-                )
-                print(f"Received and decompressed update from client {client_id}")
+                self.client_updates[client_id] = {
+                    'compressed_data': compressed_update,
+                    'num_samples': data['num_samples'],
+                    'metrics': data['metrics']
+                }
+                print(f"Received quantized update from client {client_id} (kept quantized)")
             else:
                 # Standard deserialization
                 weights = self.deserialize_weights(data['weights'])
@@ -605,11 +611,12 @@ class FederatedLearningServer:
                 send_start_ts = data.get("diagnostic_send_start_ts", recv_end_ts)
                 print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={send_start_ts:.9f}")
             
-            self.client_updates[client_id] = {
-                'weights': weights,
-                'num_samples': data['num_samples'],
-                'metrics': data['metrics']
-            }
+            if 'compressed_data' not in data or self.quantization_handler is None:
+                self.client_updates[client_id] = {
+                    'weights': weights,
+                    'num_samples': data['num_samples'],
+                    'metrics': data['metrics']
+                }
             
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{len(self.round_participants)})")
@@ -627,7 +634,7 @@ class FederatedLearningServer:
         
         if client_id not in self.active_clients:
             return
-        converged = float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
+        converged = STOP_ON_CLIENT_CONVERGENCE and float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
         if converged:
             self.mark_client_converged(client_id)
             return
@@ -736,6 +743,53 @@ class FederatedLearningServer:
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            serialized = base64.b64encode(pickle.dumps(self.global_compressed)).decode('utf-8')
+            global_model_message = {
+                "round": self.current_round,
+                "quantized_data": serialized,
+                "model_config": self.model_config
+            }
+
+            print(f"Publishing kept-quantized aggregated model for round {self.current_round}...")
+            for i in range(3):
+                result, _ = self._publish_global_model_with_chunking(
+                    global_model_message,
+                    extra_info="Aggregated global model distribution (kept quantized)"
+                )
+                if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                    print(f"  Attempt {i+1}/3: Aggregated model sent")
+                    break
+                else:
+                    print(f"  Attempt {i+1}/3: FAILED (rc={result.rc})")
+                    time.sleep(0.5)
+
+            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients")
+
+            time.sleep(2)
+            print("Requesting client evaluation...")
+            self.mqtt_client.publish(TOPIC_START_EVALUATION, json.dumps({"round": self.current_round}), qos=1)
+            log_sent_packet(
+                packet_size=len(json.dumps({"round": self.current_round})),
+                peer=TOPIC_START_EVALUATION,
+                protocol="MQTT",
+                round=self.current_round if hasattr(self, 'current_round') else None,
+                extra_info="Start evaluation signal"
+            )
+            return
         
         # Calculate total samples
         total_samples = sum(update['num_samples'] 

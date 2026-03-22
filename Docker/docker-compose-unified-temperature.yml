@@ -40,6 +40,7 @@ services:
       - NODE_TYPE=server
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - MQTT_BROKER=mqtt-broker-unified
@@ -85,6 +86,7 @@ services:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - USE_RL_SELECTION=true
@@ -128,6 +130,7 @@ services:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
       - NUM_ROUNDS=1000
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - USE_RL_SELECTION=true

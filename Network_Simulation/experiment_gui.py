@@ -744,7 +744,9 @@ class FLExperimentGUI(QMainWindow):
             ("Satellite", "satellite", False),
             ("Light Congestion", "congested_light", False),
             ("Moderate Congestion", "congested_moderate", False),
-            ("Heavy Congestion", "congested_heavy", False)
+            ("Heavy Congestion", "congested_heavy", False),
+            # Dynamic: randomly alternates between Excellent / Moderate / Poor / Light Congestion
+            ("Dynamic (Random Excellent/Moderate/Poor/Light Congestion)", "dynamic", False),
         ])
         layout.addWidget(scenario_group)
         self.scenario_checkboxes = scenario_group.findChildren(QCheckBox)
@@ -819,6 +821,14 @@ class FLExperimentGUI(QMainWindow):
         self.rounds_spinbox.setValue(10)
         self.rounds_spinbox.setStyleSheet("padding: 5px;")
         training_layout.addWidget(self.rounds_spinbox, 0, 1)
+        
+        training_layout.addWidget(QLabel("Termination mode:"), 3, 0)
+        self.termination_mode_combo = QComboBox()
+        self.termination_mode_combo.addItem("End on client convergence (may stop early)", "client_convergence")
+        self.termination_mode_combo.addItem("End on fixed rounds (run selected rounds)", "fixed_rounds")
+        self.termination_mode_combo.setCurrentIndex(0)  # Preserve current default behavior
+        self.termination_mode_combo.setStyleSheet("padding: 5px;")
+        training_layout.addWidget(self.termination_mode_combo, 3, 1)
         
         training_layout.addWidget(QLabel("Batch Size:"), 0, 2)
         self.batch_size = QSpinBox()
@@ -1033,7 +1043,7 @@ class FLExperimentGUI(QMainWindow):
         
         quant_options_layout.addWidget(QLabel("Quantization Bits:"), 0, 0)
         self.quant_bits = QComboBox()
-        self.quant_bits.addItems(["8", "16", "32"])
+        self.quant_bits.addItems(["4", "8", "16", "32"])
         self.quant_bits.setCurrentText("8")
         self.quant_bits.setStyleSheet("padding: 5px;")
         quant_options_layout.addWidget(self.quant_bits, 0, 1)
@@ -2091,6 +2101,25 @@ class FLExperimentGUI(QMainWindow):
         self.experiment_results_refresh_btn.setToolTip("Scan experiment_results and experiment_results_baseline folders and reload the table.")
         self.experiment_results_refresh_btn.clicked.connect(self._refresh_experiment_results_from_disk)
         exp_result_controls.addWidget(self.experiment_results_refresh_btn)
+
+        # Combined plots controls (timestamp folder selector + action)
+        self.exp_folder_selector = QComboBox()
+        self.exp_folder_selector.setMinimumWidth(360)
+        self.exp_folder_selector.setToolTip("Select which experiment_results/<timestamp_folder>/ to combine plots from.")
+        exp_result_controls.addWidget(QLabel("Folder:"))
+        exp_result_controls.addWidget(self.exp_folder_selector)
+
+        self.combine_plots_single_figure = QCheckBox("Single combined figure")
+        self.combine_plots_single_figure.setChecked(True)
+        self.combine_plots_single_figure.setToolTip("If enabled, also generates combined_metrics_grid.png (all plots in one figure).")
+        exp_result_controls.addWidget(self.combine_plots_single_figure)
+
+        self.combine_plots_btn = QPushButton("🧩 Combine Plots")
+        self.combine_plots_btn.setStyleSheet("padding: 6px 12px; font-weight: bold;")
+        self.combine_plots_btn.setToolTip("Generate combined plots (battery/accuracy/loss/model size + bar charts for rounds and convergence time). Saves PNGs to the selected experiment folder.")
+        self.combine_plots_btn.clicked.connect(self.generate_combined_experiment_plots)
+        exp_result_controls.addWidget(self.combine_plots_btn)
+
         self.experiment_results_download_excel_btn = QPushButton("📥 Download to Excel")
         self.experiment_results_download_excel_btn.setStyleSheet("padding: 6px 12px; font-weight: bold;")
         self.experiment_results_download_excel_btn.setToolTip("Export experimental results table to an Excel file.")
@@ -2122,6 +2151,7 @@ class FLExperimentGUI(QMainWindow):
         self.output_tabs.addTab(exp_result_tab, "📈 Experimental Results")
         self._init_experiment_results_db()
         self._load_experiment_results_table_from_db()
+        self._refresh_experiment_folder_selector()
 
         # Add Docker Build Logs tab
         self.docker_build_log_text = QTextEdit()
@@ -2547,6 +2577,11 @@ class FLExperimentGUI(QMainWindow):
         use_case = self.get_selected_use_case()
         cmd_parts.extend(["--use-case", use_case])
         
+        # Termination mode (controls STOP_ON_CLIENT_CONVERGENCE in runners)
+        termination_mode = self.termination_mode_combo.currentData() or self.termination_mode_combo.currentText()
+        if termination_mode == "fixed_rounds":
+            cmd_parts.extend(["--termination-mode", "fixed_rounds"])
+        
         # GPU (always enabled for baseline)
         if self.gpu_enabled.isChecked():
             cmd_parts.append("--enable-gpu")
@@ -2760,6 +2795,7 @@ class FLExperimentGUI(QMainWindow):
             f"Communication Model Reward: {'Enabled' if self.is_rl_unified_selected() and self.use_communication_model_reward.isChecked() else 'Disabled'}\n"
             f"Scenarios: {scenario_str}\n"
             f"Rounds: {self.rounds_spinbox.value()}\n"
+            f"Termination: {self.termination_mode_combo.currentText()}\n"
             f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
             f"Network: {network_str}\n\n"
             f"Command:\n{command}\n\n"
@@ -3732,8 +3768,80 @@ class FLExperimentGUI(QMainWindow):
                 self.output_text.append(f"[Experimental Results] DB error: {e}\n")
             return
         self._load_experiment_results_table_from_db()
+        self._refresh_experiment_folder_selector()
         if hasattr(self, "output_text"):
             self.output_text.append(f"[Experimental Results] Loaded {len(all_rows)} row(s) from disk.\n")
+
+    def _refresh_experiment_folder_selector(self):
+        """Populate experiment folder dropdown from experiment_results/* (timestamped folders)."""
+        try:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            exp_root = os.path.join(base_dir, "experiment_results")
+            if not hasattr(self, "exp_folder_selector"):
+                return
+            self.exp_folder_selector.blockSignals(True)
+            current = self.exp_folder_selector.currentData()
+            self.exp_folder_selector.clear()
+            if not os.path.isdir(exp_root):
+                self.exp_folder_selector.addItem("(experiment_results not found)", None)
+                self.exp_folder_selector.setEnabled(False)
+                return
+            folders = []
+            for name in os.listdir(exp_root):
+                p = os.path.join(exp_root, name)
+                if os.path.isdir(p):
+                    try:
+                        mtime = os.path.getmtime(p)
+                    except Exception:
+                        mtime = 0
+                    folders.append((mtime, name, p))
+            folders.sort(key=lambda t: (t[0], t[1]), reverse=True)
+            for _, name, p in folders:
+                self.exp_folder_selector.addItem(name, p)
+            self.exp_folder_selector.setEnabled(True)
+            if current:
+                idx = self.exp_folder_selector.findData(current)
+                if idx >= 0:
+                    self.exp_folder_selector.setCurrentIndex(idx)
+        except Exception as e:
+            if hasattr(self, "output_text"):
+                self.output_text.append(f"[Combined Plots] Could not refresh folder selector: {e}\n")
+        finally:
+            if hasattr(self, "exp_folder_selector"):
+                self.exp_folder_selector.blockSignals(False)
+
+    def generate_combined_experiment_plots(self):
+        """Generate combined plots for selected experiment_results/<timestamp_folder>/."""
+        try:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            script_dir = os.path.join(base_dir, "Network_Simulation")
+            if script_dir not in sys.path:
+                sys.path.insert(0, script_dir)
+            from combined_experiment_plots import plot_combined
+        except Exception as e:
+            QMessageBox.critical(self, "Combine Plots", f"Could not import plotter:\n{e}")
+            return
+
+        folder_path = None
+        if hasattr(self, "exp_folder_selector"):
+            folder_path = self.exp_folder_selector.currentData()
+        if not folder_path or not os.path.isdir(folder_path):
+            QMessageBox.warning(self, "Combine Plots", "Please select a valid timestamp folder under experiment_results/.")
+            return
+
+        single = bool(getattr(self, "combine_plots_single_figure", None) and self.combine_plots_single_figure.isChecked())
+        try:
+            out = plot_combined(Path(folder_path), single_figure=single, show=True, save=True)
+        except Exception as e:
+            QMessageBox.critical(self, "Combine Plots", f"Failed to generate combined plots:\n{e}")
+            return
+
+        msg_lines = [f"Saved to:\n{folder_path}"]
+        if out:
+            msg_lines.append("\nGenerated files:")
+            for k, v in out.items():
+                msg_lines.append(f"- {k}: {os.path.basename(str(v))}")
+        QMessageBox.information(self, "Combine Plots", "\n".join(msg_lines))
 
     def _load_experiment_results_from_db(self):
         """Load all rows from experimental_results table."""

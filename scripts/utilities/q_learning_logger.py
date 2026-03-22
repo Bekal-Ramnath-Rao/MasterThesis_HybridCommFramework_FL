@@ -155,6 +155,7 @@ def log_q_step(
     link_direction: str = 'uplink',
 ):
     """Log one Q-learning step. Auto-creates table if needed."""
+    effective_reward_total = reward_total if reward_total is not None else reward
     try:
         init_db()
         conn = sqlite3.connect(DB_PATH)
@@ -203,7 +204,7 @@ def log_q_step(
             reward_resource_penalty,
             reward_battery_penalty,
             reward_t_calc_penalty,
-            reward_total,
+            effective_reward_total,
         ))
         conn.commit()
         conn.close()

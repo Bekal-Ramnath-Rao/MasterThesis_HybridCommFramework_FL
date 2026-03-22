@@ -11,7 +11,7 @@ Environment Variables:
 ---------------------
 USE_QUANTIZATION=true|false          # Enable/disable quantization (default: true)
 QUANTIZATION_STRATEGY=qat|ptq|param  # Choose strategy (default: parameter_quantization)
-QUANTIZATION_BITS=8|16|32            # Quantization bits (default: 8)
+QUANTIZATION_BITS=4|8|16|32          # Quantization bits (default: 8). 4-bit uses nibble packing for 2x compression.
 QUANTIZATION_SYMMETRIC=true|false    # Symmetric quantization (default: true)
 QUANTIZATION_PER_CHANNEL=true|false  # Per-channel quantization (default: false)
 

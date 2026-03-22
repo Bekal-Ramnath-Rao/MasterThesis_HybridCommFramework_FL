@@ -7,7 +7,7 @@ system resources. RL logic is designed to run on CPU only (no TensorFlow
 ops); client-side model training uses GPU separately.
 
 Actions: MQTT, AMQP, gRPC, QUIC, DDS
-Rewards: Communication time, Success rate, Convergence, Accuracy, Resources
+Rewards (success, max 40): base 10, accuracy ≤10, communication ≤10, resource ≥-5, battery ≥-5
 Environment: Network conditions, Resources, Model size, Mobility
 """
 
@@ -18,6 +18,50 @@ import time
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 import pickle
+
+
+# --- Reward budget (success): base 10 + accuracy 10 + comm 10 + resource ≥ -5 + battery ≥ -5 → max 40 ---
+# Communication time: log spread (seconds). Tuned from q_learning backups (uplink p50≈50s, downlink≈2s):
+# T_HI 220 flattened the 10–90s band; ~120 improves slope for slow uploads without crushing totals.
+_COMM_T_LO = 1.5
+_COMM_T_HI = 120.0
+_COMM_TIME_REWARD_MAX = 10.0
+_RESOURCE_PENALTY_CAP = 5.0   # max magnitude (negative) from CPU/memory/bandwidth term
+_BATTERY_PENALTY_CAP = 5.0    # max magnitude (negative) from SoC/energy term
+# Resource penalties (pre-clip): CPU+memory and bandwidth (delta rate, not cumulative bytes).
+_RESOURCE_CPU_MEM_WEIGHT = 6.0
+_RESOURCE_BW_WEIGHT = 4.5
+# Battery: soft energy norm (Joules). Backups often had SoC≈1 so drain term vanished; add direct
+# energy_soft penalty so the [-5,0] band reflects protocol/round energy differences.
+_ENERGY_SOFT_TAU_J = 22.0
+_BATTERY_DRAIN_WEIGHT = 12.0   # (1 - SoC) * energy_soft
+_BATTERY_SOC_WEIGHT = 1.8      # (1 - SoC) even when energy_soft is small
+_BATTERY_ENERGY_WEIGHT = 3.0   # energy_soft always (uses more of the -5 cap vs SoC-only)
+# Bandwidth: recent interface rate m/(m+k) with k = half-saturation Mbps (delta-based, not lifetime totals).
+_BW_RATE_HALF_SAT_Mbps = 14.0
+
+
+def _reward_communication_time(communication_time: float) -> float:
+    """Higher reward for shorter times; log-scale spreads sensitivity in ~3–180 s range."""
+    t = max(float(communication_time), 1e-6)
+    denom = max(np.log1p(_COMM_T_HI) - np.log1p(_COMM_T_LO), 1e-9)
+    u = (np.log1p(t) - np.log1p(_COMM_T_LO)) / denom
+    u = float(np.clip(u, 0.0, 1.0))
+    return _COMM_TIME_REWARD_MAX * (1.0 - u)
+
+
+def _soft_energy_norm(energy_j: float, tau_j: float = _ENERGY_SOFT_TAU_J) -> float:
+    """Maps Joules to (0,1) with diminishing returns; typical round energy stays in mid range."""
+    e = max(float(energy_j), 0.0)
+    tau = max(float(tau_j), 1e-6)
+    return float(1.0 - np.exp(-e / tau))
+
+
+def _bandwidth_norm_from_mbps(mbps: float) -> float:
+    """Soft saturation of recent traffic rate (higher = busier link in the sampling window)."""
+    m = max(float(mbps), 0.0)
+    k = max(_BW_RATE_HALF_SAT_Mbps, 1e-6)
+    return float(m / (m + k))
 
 
 class QLearningProtocolSelector:
@@ -36,10 +80,10 @@ class QLearningProtocolSelector:
     
     def __init__(
         self,
-        learning_rate: float = 0.1,
-        discount_factor: float = 0.95,
+        learning_rate: float = 0.12,
+        discount_factor: float = 0,
         epsilon: float = 1.0,
-        epsilon_decay: float = 0.995,
+        epsilon_decay: float = 0.96,
         epsilon_min: float = 0.01,
         save_path: str = "q_table.pkl",
         initial_load_path: Optional[str] = None,
@@ -69,13 +113,17 @@ class QLearningProtocolSelector:
         self.initial_load_path = initial_load_path
         self.use_communication_model_reward = use_communication_model_reward
         
-        # Initialize Q-table
-        # State space: (network, resource, model_size, mobility)
+        # Q-table first axis = named network scenarios (simulation / experiment), extendable at runtime.
+        # Defaults match legacy coarse buckets; new keys (e.g. very_poor, good) are appended via ensure_scenario().
+        self.scenario_order: List[str] = list(self.NETWORK_CONDITIONS)
+        self._scenario_to_idx: Dict[str, int] = {
+            s: i for i, s in enumerate(self.scenario_order)
+        }
         state_space_size = (
-            len(self.NETWORK_CONDITIONS),
+            len(self.scenario_order),
             len(self.RESOURCE_LEVELS),
             len(self.MODEL_SIZES),
-            len(self.MOBILITY_LEVELS)
+            len(self.MOBILITY_LEVELS),
         )
         self.q_table = np.zeros(state_space_size + (len(self.PROTOCOLS),))
         
@@ -103,23 +151,63 @@ class QLearningProtocolSelector:
 
         # Last reward breakdown (exact values for dashboard/logging)
         self._last_reward_breakdown = {}
-        
+
+    def _scenario_key_from_state(self, state: Dict) -> str:
+        """Prefer explicit experiment/simulation scenario; else coarse measured ``network`` bucket."""
+        raw = state.get("network_scenario")
+        if raw is None:
+            raw = state.get("scenario")
+        if raw is not None and str(raw).strip():
+            return str(raw).strip().lower()
+        net = state.get("network", "moderate")
+        return str(net).strip().lower()
+
+    def _ensure_scenario_key(self, key: str) -> int:
+        """Allocate a Q-table slice for this normalized scenario key if missing."""
+        k = str(key).strip().lower() if key else "moderate"
+        if not k:
+            k = "moderate"
+        if k not in self._scenario_to_idx:
+            r = len(self.RESOURCE_LEVELS)
+            m = len(self.MODEL_SIZES)
+            mob = len(self.MOBILITY_LEVELS)
+            p = len(self.PROTOCOLS)
+            new_slice = np.zeros((1, r, m, mob, p))
+            self.q_table = np.concatenate([self.q_table, new_slice], axis=0)
+            idx = len(self.scenario_order)
+            self.scenario_order.append(k)
+            self._scenario_to_idx[k] = idx
+            print(
+                f"[Q-Learning] Extended Q-table for network scenario '{k}' "
+                f"(slice {idx}, total={len(self.scenario_order)})"
+            )
+        return self._scenario_to_idx[k]
+
+    def ensure_scenario(self, scenario_name: Optional[str]) -> int:
+        """
+        Ensure a row exists for this scenario name; grow the Q-table if needed.
+        Call when the experiment selects a new network scenario so inference uses a distinct state slice.
+        """
+        if scenario_name is None or not str(scenario_name).strip():
+            return self._ensure_scenario_key("moderate")
+        return self._ensure_scenario_key(str(scenario_name))
+
     def get_state_index(self, state: Dict) -> Tuple[int, int, int, int]:
         """
         Convert state dictionary to indices for Q-table
         
         Args:
-            state: Dictionary with network, resource, model_size, mobility
+            state: Dictionary with optional network_scenario/scenario, network, resource, model_size, mobility
             
         Returns:
             Tuple of indices for Q-table access
         """
-        network_idx = self.NETWORK_CONDITIONS.index(state.get('network', 'moderate'))
-        resource_idx = self.RESOURCE_LEVELS.index(state.get('resource', 'medium'))
+        scenario_idx = self._ensure_scenario_key(self._scenario_key_from_state(state))
+        resource_idx = self.RESOURCE_LEVELS.index(state.get('resource', 'high'))
         model_idx = self.MODEL_SIZES.index(state.get('model_size', 'medium'))
         mobility_idx = self.MOBILITY_LEVELS.index(state.get('mobility', 'static'))
         
-        return (network_idx, resource_idx, model_idx, mobility_idx)
+        return (scenario_idx, resource_idx, model_idx, mobility_idx)
     
     def select_protocol(self, state: Dict, training: bool = True) -> str:
         """
@@ -156,7 +244,6 @@ class QLearningProtocolSelector:
         self,
         communication_time: float,
         success: bool,
-        convergence_time: float,
         accuracy: float,
         resource_consumption: Dict[str, float],
         t_calc: Optional[float] = None,
@@ -165,12 +252,12 @@ class QLearningProtocolSelector:
         """
         Calculate reward based on multiple metrics.
         When t_calc (analytical transfer time from communication model) is provided,
-        higher T_calc penalizes reward; lower T_calc affects reward less negatively.
+        it reduces only the **communication** component (same 0–10 slot as wall-clock time).
 
         Args:
-            communication_time: Time for round-trip communication (seconds)
+            communication_time: One-way communication time for this agent's link (seconds):
+                uplink agent → client→server (model upload + metrics, etc.); downlink agent → server→client.
             success: Whether communication was successful
-            convergence_time: Time for model convergence (seconds)
             accuracy: Model accuracy (0-1)
             resource_consumption: Dict with cpu, memory, bandwidth usage
             t_calc: Optional analytical transfer time (seconds). If set, high T_calc
@@ -186,24 +273,26 @@ class QLearningProtocolSelector:
         memory_usage = float(resource_consumption.get('memory', 0.5))
         bandwidth_usage = float(resource_consumption.get('bandwidth', 0.5))
         battery_level = float(resource_consumption.get('battery', 1.0))
-        energy_norm = float(resource_consumption.get('energy', 0.0))
+        energy_j_raw = float(resource_consumption.get('energy_j', 0.0))
+        energy_soft_metric = _soft_energy_norm(energy_j_raw)
+        bw_mbps_est = resource_consumption.get('bandwidth_mbps_est')
 
         # Base reward for successful communication
         if not success:
             self._last_reward_breakdown = {
                 'communication_time': float(communication_time),
-                'convergence_time': float(convergence_time),
                 'accuracy': float(accuracy),
                 'success': False,
                 'cpu_usage': cpu_usage,
                 'memory_usage': memory_usage,
                 'bandwidth_usage': bandwidth_usage,
                 'battery_level': battery_level,
-                'energy_usage': energy_norm,
+                'energy_usage': float(resource_consumption.get('energy', energy_soft_metric)),
+                'energy_j': energy_j_raw,
+                'bandwidth_mbps_est': float(bw_mbps_est) if bw_mbps_est is not None else None,
                 't_calc': float(t_calc) if t_calc is not None else None,
                 'reward_base': -10.0,
                 'reward_communication_time': 0.0,
-                'reward_convergence_time': 0.0,
                 'reward_accuracy': 0.0,
                 'reward_resource_penalty': 0.0,
                 'reward_battery_penalty': 0.0,
@@ -212,54 +301,61 @@ class QLearningProtocolSelector:
             }
             return -10.0  # Large penalty for failure
 
-        reward = 10.0  # Base reward for success
+        # Budget: reward_base 10 + accuracy ≤10 + communication ≤10 + resource ≥-5 + battery ≥-5 (max 40)
+        reward_base = 10.0
+        reward = reward_base
 
-        # 1. Communication time reward (faster is better)
-        # Normalize: 0-3600 seconds (1 hour) -> reward 5 to 0
-        time_reward = max(0, 5.0 - (communication_time / 720.0))
-        reward += time_reward
-
-        # 2. Convergence time reward (faster is better)
-        conv_reward = max(0, 5.0 - (convergence_time / 20.0))
-        reward += conv_reward
-
-        # 3. Accuracy reward (higher is better)
-        accuracy_reward = accuracy * 10.0
-        reward += accuracy_reward
-
-        # 4. Resource consumption penalty (lower is better)
-        avg_resource = (cpu_usage + memory_usage + bandwidth_usage) / 3.0
-        resource_penalty = -5.0 * avg_resource
-        reward += resource_penalty
-
-        # 4b. Battery-aware penalty: when SoC is low, energy consumption hurts more
-        low_batt_penalty = -5.0 * (1.0 - battery_level) * energy_norm
-        reward += low_batt_penalty
-
+        # 1–2. Communication (wall time), max 10; optional T_calc (model) subtracts from same bucket only
+        time_reward_raw = _reward_communication_time(communication_time)
         if use_communication_model_reward is None:
             use_communication_model_reward = self.use_communication_model_reward
-
-        # 5. T_calc (communication model): higher T_calc -> more negative reward; lower T_calc -> less penalty
         t_calc_penalty = 0.0
         if use_communication_model_reward and t_calc is not None and t_calc >= 0:
-            # Penalty scale: e.g. T_calc 0->0 penalty, 10s->-2.5, 30s->-5 (cap)
-            t_calc_penalty = min(5.0, t_calc * 0.5)
-            reward -= t_calc_penalty
+            t_calc_penalty = float(_COMM_TIME_REWARD_MAX * np.clip(
+                (np.log1p(float(t_calc)) - np.log1p(_COMM_T_LO))
+                / max(np.log1p(_COMM_T_HI) - np.log1p(_COMM_T_LO), 1e-9),
+                0.0,
+                1.0,
+            ))
+        time_reward = float(np.clip(time_reward_raw - t_calc_penalty, 0.0, _COMM_TIME_REWARD_MAX))
+        reward += time_reward
+
+        # 3. Accuracy reward (higher is better), max 10
+        accuracy_reward = float(np.clip(accuracy * 10.0, 0.0, 10.0))
+        reward += accuracy_reward
+
+        # 4. Resource penalty (CPU+memory + bandwidth), clipped to [-_RESOURCE_PENALTY_CAP, 0]
+        cpu_mem = 0.5 * (cpu_usage + memory_usage)
+        resource_penalty_raw = -_RESOURCE_CPU_MEM_WEIGHT * cpu_mem - _RESOURCE_BW_WEIGHT * bandwidth_usage
+        resource_penalty = float(np.clip(resource_penalty_raw, -_RESOURCE_PENALTY_CAP, 0.0))
+        reward += resource_penalty
+
+        # 5. Battery / energy penalty, clipped to [-_BATTERY_PENALTY_CAP, 0]
+        energy_soft = _soft_energy_norm(energy_j_raw)
+        soc_stress = max(0.0, min(1.0, 1.0 - battery_level))
+        battery_penalty_raw = (
+            -_BATTERY_DRAIN_WEIGHT * soc_stress * energy_soft
+            - _BATTERY_SOC_WEIGHT * soc_stress
+            - _BATTERY_ENERGY_WEIGHT * energy_soft
+        )
+        low_batt_penalty = float(np.clip(battery_penalty_raw, -_BATTERY_PENALTY_CAP, 0.0))
+        reward += low_batt_penalty
 
         self._last_reward_breakdown = {
             'communication_time': float(communication_time),
-            'convergence_time': float(convergence_time),
             'accuracy': float(accuracy),
             'success': bool(success),
             'cpu_usage': cpu_usage,
             'memory_usage': memory_usage,
             'bandwidth_usage': bandwidth_usage,
             'battery_level': battery_level,
-            'energy_usage': energy_norm,
+            'energy_usage': float(energy_soft),
+            'energy_j': float(energy_j_raw),
+            'bandwidth_mbps_est': float(bw_mbps_est) if bw_mbps_est is not None else None,
             't_calc': float(t_calc) if t_calc is not None else None,
-            'reward_base': 10.0,
+            'reward_base': float(reward_base),
             'reward_communication_time': float(time_reward),
-            'reward_convergence_time': float(conv_reward),
+            'reward_communication_time_pre_t_calc': float(time_reward_raw),
             'reward_accuracy': float(accuracy_reward),
             'reward_resource_penalty': float(resource_penalty),
             'reward_battery_penalty': float(low_batt_penalty),
@@ -344,6 +440,7 @@ class QLearningProtocolSelector:
             self.last_experiment_id = experiment_id
         if scenario:
             self.last_scenario = scenario
+            self.ensure_scenario(scenario)
         print(f"[Q-Learning] Epsilon reset from {old_epsilon:.4f} to {self.epsilon:.4f} for re-exploration")
         if experiment_id:
             print(f"[Q-Learning] Tracking experiment ID: {experiment_id}")
@@ -369,6 +466,7 @@ class QLearningProtocolSelector:
         """Save Q-table and statistics to disk"""
         data = {
             'q_table': self.q_table,
+            'scenario_order': list(self.scenario_order),
             'epsilon': self.epsilon,
             'episode_count': self.episode_count,
             'total_rewards': self.total_rewards,
@@ -393,18 +491,36 @@ class QLearningProtocolSelector:
             with open(path, 'rb') as f:
                 data = pickle.load(f)
             loaded_q_table = data.get('q_table')
-            expected_shape = (
-                len(self.NETWORK_CONDITIONS),
+            tail_shape = (
                 len(self.RESOURCE_LEVELS),
                 len(self.MODEL_SIZES),
                 len(self.MOBILITY_LEVELS),
-                len(self.PROTOCOLS)
+                len(self.PROTOCOLS),
             )
-            if loaded_q_table is None or loaded_q_table.shape != expected_shape:
-                if loaded_q_table is not None:
-                    print(f"[Q-Learning] Q-table shape mismatch at {path}: expected {expected_shape}, got {loaded_q_table.shape}")
+            if loaded_q_table is None or loaded_q_table.ndim != 5:
+                return False
+            if loaded_q_table.shape[1:] != tail_shape:
+                print(
+                    f"[Q-Learning] Q-table tail shape mismatch at {path}: "
+                    f"expected (*,{tail_shape}), got {loaded_q_table.shape}"
+                )
+                return False
+            n_scen = int(loaded_q_table.shape[0])
+            saved_order = data.get('scenario_order')
+            if saved_order is not None and len(saved_order) == n_scen:
+                scenario_order = [str(s).strip().lower() for s in saved_order]
+            elif n_scen == len(self.NETWORK_CONDITIONS):
+                # Legacy pickle: first axis was coarse network buckets only
+                scenario_order = list(self.NETWORK_CONDITIONS)
+            else:
+                print(
+                    f"[Q-Learning] Q-table at {path}: cannot map axis 0 (size {n_scen}) "
+                    f"to scenario names; expected scenario_order of length {n_scen}"
+                )
                 return False
             self.q_table = loaded_q_table
+            self.scenario_order = scenario_order
+            self._scenario_to_idx = {s: i for i, s in enumerate(self.scenario_order)}
             self.epsilon = data.get('epsilon', self.epsilon)
             self.episode_count = data.get('episode_count', 0)
             self.total_rewards = data.get('total_rewards', [])
@@ -413,7 +529,10 @@ class QLearningProtocolSelector:
             self.protocol_failures = data.get('protocol_failures', self.protocol_failures)
             self.last_scenario = data.get('last_scenario', None)  # Load last scenario
             print(f"[Q-Learning] Loaded Q-table from {path} (past experience)")
-            print(f"[Q-Learning] Episodes: {self.episode_count}, Epsilon: {self.epsilon:.4f}")
+            print(
+                f"[Q-Learning] Episodes: {self.episode_count}, Epsilon: {self.epsilon:.4f}, "
+                f"scenarios={len(self.scenario_order)}"
+            )
             if self.last_scenario:
                 print(f"[Q-Learning] Last scenario: {self.last_scenario}")
             return True
@@ -523,16 +642,30 @@ class QLearningProtocolSelector:
         patience: Optional[int] = None,
     ) -> bool:
         """
-        Return True if Q-values have converged: last `patience` updates
-        all had delta <= threshold. Used when USE_QL_CONVERGENCE is enabled.
+        RL agent convergence (when USE_QL_CONVERGENCE is enabled):
+
+        1. Epsilon is below the exploitation cap (default strictly below 0.1).
+        2. The last N protocol selections are identical (same action index),
+           where N is `patience` if provided, else ``RL_CONVERGENCE_SAME_PROTOCOL_STREAK``
+           (default 5).
+
+        The ``threshold`` argument is kept for call-site compatibility; Q-delta
+        convergence is no longer used.
         """
-        if threshold is None:
-            threshold = float(os.getenv("Q_CONVERGENCE_THRESHOLD", "0.01"))
-        if patience is None:
-            patience = int(os.getenv("Q_CONVERGENCE_PATIENCE", "5"))
-        if len(self._q_deltas) < patience:
+        _ = threshold  # legacy parameter; Q-delta criterion removed
+        streak = (
+            patience
+            if patience is not None
+            else int(os.getenv("RL_CONVERGENCE_SAME_PROTOCOL_STREAK", "5"))
+        )
+        epsilon_cap = float(os.getenv("RL_CONVERGENCE_EPSILON_CAP", "0.1"))
+        if self.epsilon >= epsilon_cap:
             return False
-        return all(d <= threshold for d in self._q_deltas[-patience:])
+        if len(self.action_history) < streak:
+            return False
+        tail = self.action_history[-streak:]
+        first = tail[0]
+        return all(a == first for a in tail)
 
     def reset_episode(self):
         """Reset episode history"""
@@ -545,12 +678,13 @@ class QLearningProtocolSelector:
         This clears all learned knowledge and starts fresh.
         Useful when new protocols are added (e.g., HTTP/3) or starting new training.
         """
-        # Reset Q-table to zeros
+        self.scenario_order = list(self.NETWORK_CONDITIONS)
+        self._scenario_to_idx = {s: i for i, s in enumerate(self.scenario_order)}
         state_space_size = (
-            len(self.NETWORK_CONDITIONS),
+            len(self.scenario_order),
             len(self.RESOURCE_LEVELS),
             len(self.MODEL_SIZES),
-            len(self.MOBILITY_LEVELS)
+            len(self.MOBILITY_LEVELS),
         )
         self.q_table = np.zeros(state_space_size + (len(self.PROTOCOLS),))
         
@@ -582,8 +716,21 @@ class QLearningProtocolSelector:
         print(f"[Q-Learning] Q-table reset complete. Starting fresh with {len(self.PROTOCOLS)} protocols: {self.PROTOCOLS}")
 
 
-# Reference energy (J) for normalizing last-round energy in get_resource_consumption
+# Legacy constant (some docs/scripts); reward uses _soft_energy_norm / _ENERGY_SOFT_TAU_J instead.
 E_REF = 10.0
+
+# Reference payload size for normalizing "communication data footprint" in the memory term
+PAYLOAD_BYTES_REF = 12 * 1024 * 1024
+
+# Normalized protocol stack / library footprint (0..1) for RL memory — heavier stacks cost more
+PROTOCOL_MEMORY_STACK_NORM = {
+    'mqtt': 0.08,
+    'amqp': 0.12,
+    'grpc': 0.15,
+    'quic': 0.18,
+    'http3': 0.20,
+    'dds': 0.14,
+}
 
 
 class EnvironmentStateManager:
@@ -595,9 +742,11 @@ class EnvironmentStateManager:
     def __init__(self):
         self.current_state = {
             'network': 'moderate',
-            'resource': 'medium',
+            'resource': 'high',
             'model_size': 'medium',
-            'mobility': 'static'
+            'mobility': 'static',
+            # When set, RL Q-table indexes this simulation scenario (good, very_poor, ...); else use ``network``.
+            'network_scenario': None,
         }
         
         # Resource monitoring
@@ -608,6 +757,8 @@ class EnvironmentStateManager:
         # Battery / energy state (continuous; not part of Q-table state space)
         self.battery_soc = 1.0  # state of charge [0, 1]
         self.last_energy_j = 0.0  # Joules used in the last round
+        # Last psutil net_io snapshot for delta-rate bandwidth (avoids cumulative saturation)
+        self._net_io_prev: Optional[Tuple[int, int, float]] = None
 
     def update_battery(self, soc: float, last_energy_j: float) -> None:
         """Update battery state of charge [0,1] and last-round energy in Joules."""
@@ -618,6 +769,13 @@ class EnvironmentStateManager:
         """Update network condition"""
         if condition in QLearningProtocolSelector.NETWORK_CONDITIONS:
             self.current_state['network'] = condition
+
+    def update_network_scenario(self, scenario: Optional[str]) -> None:
+        """Set explicit simulation/experiment scenario for RL state (None = use measured ``network`` only)."""
+        if scenario is None or not str(scenario).strip():
+            self.current_state['network_scenario'] = None
+        else:
+            self.current_state['network_scenario'] = str(scenario).strip().lower()
     
     def update_resource_level(self, level: str):
         """Update resource availability level"""
@@ -677,39 +835,77 @@ class EnvironmentStateManager:
         """Get current environment state"""
         return self.current_state.copy()
     
-    def get_resource_consumption(self) -> Dict[str, float]:
+    def get_resource_consumption(
+        self,
+        protocol: Optional[str] = None,
+        uplink_payload_bytes: Optional[int] = None,
+        downlink_payload_bytes: Optional[int] = None,
+    ) -> Dict[str, float]:
         """
-        Get current resource consumption metrics
+        Get current resource consumption metrics.
+
+        When ``protocol`` and payload sizes are provided, the memory term blends (1) live RSS
+        pressure from psutil, (2) protocol stack weight, and (3) normalized uplink+downlink
+        payload bytes for this round so heavier protocols and larger FL transfers increase the
+        memory penalty in ``calculate_reward``.
 
         Returns:
-            Dictionary with normalized (0-1) resource usage, plus battery and energy.
+            Dictionary with normalized (0-1) resource usage, battery, soft energy norm,
+            raw ``energy_j`` (Joules), and ``bandwidth_mbps_est`` when available.
         """
         try:
             import psutil
 
             cpu = psutil.cpu_percent(interval=0.1) / 100.0
-            memory = psutil.virtual_memory().percent / 100.0
+            memory_psutil = psutil.virtual_memory().percent / 100.0
 
-            # Bandwidth estimation (simplified)
+            p = (protocol or "").strip().lower()
+            stack_norm = PROTOCOL_MEMORY_STACK_NORM.get(p, 0.12)
+            ul = float(uplink_payload_bytes or 0)
+            dl = float(downlink_payload_bytes or 0)
+            data_norm = min(1.0, (ul + dl) / float(PAYLOAD_BYTES_REF))
+            memory = min(
+                1.0,
+                0.40 * memory_psutil + 0.35 * stack_norm + 0.25 * data_norm,
+            )
+
             net_io = psutil.net_io_counters()
-            bandwidth = min(1.0, (net_io.bytes_sent + net_io.bytes_recv) / 1e9)
+            now = time.time()
+            sent, recv = int(net_io.bytes_sent), int(net_io.bytes_recv)
+            if self._net_io_prev is None:
+                self._net_io_prev = (sent, recv, now)
+                mbps = 0.0
+                bandwidth = 0.38  # neutral until a second sample establishes a rate
+            else:
+                ps, pr, pt = self._net_io_prev
+                dt = max(now - pt, 0.05)
+                d_bytes = max(0, (sent - ps) + (recv - pr))
+                mbps = (d_bytes * 8.0) / (dt * 1e6)
+                self._net_io_prev = (sent, recv, now)
+                bandwidth = _bandwidth_norm_from_mbps(mbps)
 
-            energy_norm = min(1.0, self.last_energy_j / E_REF)
+            energy_j = float(max(0.0, self.last_energy_j))
+            energy_soft = _soft_energy_norm(energy_j)
 
             return {
                 'cpu': cpu,
                 'memory': memory,
                 'bandwidth': bandwidth,
+                'bandwidth_mbps_est': float(mbps),
                 'battery': self.battery_soc,
-                'energy': energy_norm,
+                'energy': energy_soft,
+                'energy_j': energy_j,
             }
         except Exception:
+            ej = float(max(0.0, getattr(self, 'last_energy_j', 0.0)))
             return {
                 'cpu': 0.5,
                 'memory': 0.5,
-                'bandwidth': 0.5,
+                'bandwidth': 0.45,
+                'bandwidth_mbps_est': None,
                 'battery': getattr(self, 'battery_soc', 1.0),
-                'energy': min(1.0, getattr(self, 'last_energy_j', 0.0) / E_REF),
+                'energy': _soft_energy_norm(ej),
+                'energy_j': ej,
             }
 
 
@@ -749,12 +945,11 @@ if __name__ == "__main__":
         # Simulate reward (random for demo)
         success = np.random.random() > 0.2
         comm_time = np.random.uniform(0.1, 5.0)
-        conv_time = np.random.uniform(10, 100)
         accuracy = np.random.uniform(0.7, 0.95) if success else 0.0
         resources = env_manager.get_resource_consumption()
         
         reward = selector.calculate_reward(
-            comm_time, success, conv_time, accuracy, resources
+            comm_time, success, accuracy, resources
         )
         print(f"Reward: {reward:.2f}")
         

@@ -51,6 +51,7 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "16"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # EEG Settings
 SEED = 42
@@ -425,6 +426,10 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
     def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore convergence-triggered removal.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         with self.lock:
             if client_id in self.active_clients:
                 self.active_clients.discard(client_id)
@@ -441,7 +446,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             client_id = request.client_id
             round_num = request.round
             metrics = dict(request.metrics)
-            if float(metrics.get('client_converged', 0.0)) >= 1.0:
+            if STOP_ON_CLIENT_CONVERGENCE and float(metrics.get('client_converged', 0.0)) >= 1.0:
                 self.mark_client_converged(client_id)
                 return federated_learning_pb2.UpdateResponse(
                     success=True,
@@ -459,8 +464,14 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                         try:
                             candidate = pickle.loads(request.weights)
                             if isinstance(candidate, dict) and 'compressed_data' in candidate:
-                                weights = self.quantization_handler.decompress_client_update(request.client_id, candidate)
-                                print(f"Server: Received and decompressed update from client {request.client_id}")
+                                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                                self.client_updates[client_id] = {
+                                    'compressed_data': candidate,
+                                    'num_samples': request.num_samples,
+                                    'round': round_num
+                                }
+                                print(f"Server: Received quantized update from client {request.client_id} (kept quantized)")
+                                weights = None
                             else:
                                 weights = candidate
                         except Exception:
@@ -470,11 +481,12 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 else:
                     weights = None
                 
-                self.client_updates[client_id] = {
-                    'weights': weights,
-                    'num_samples': request.num_samples,
-                    'round': round_num
-                }
+                if client_id not in self.client_updates:
+                    self.client_updates[client_id] = {
+                        'weights': weights,
+                        'num_samples': request.num_samples,
+                        'round': round_num
+                    }
 
                 print(f"Received update from client {client_id} "
                       f"({len(self.client_updates)}/{len(self.active_clients)})")
@@ -509,6 +521,33 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
         # Calculate total samples
         total_samples = sum(update['num_samples'] for update in self.client_updates.values())
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            # Keep a float-cast view for evaluation (no dequantization scaling applied)
+            try:
+                self.global_weights = [np.asarray(w, dtype=np.float32) for w in aggregated_compressed.get('compressed_data', [])]
+            except Exception:
+                self.global_weights = self.global_weights
+
+            # Evaluate on global test set (captures impact of quantized training pipeline)
+            self.evaluate_global_model()
+
+            print(f"Aggregated global model from round {self.current_round} (kept quantized)")
+            print(f"Global model ready for clients (kept quantized)\n")
+            self.continue_training()
+            return
 
         # Initialize aggregated weights
         aggregated_weights = []
@@ -570,7 +609,10 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
         if len(self.active_clients) == 0:
             print("\n" + "=" * 70)
-            print("All clients converged locally. Training complete.")
+            if STOP_ON_CLIENT_CONVERGENCE:
+                print("All clients converged locally. Training complete.")
+            else:
+                print("All clients became inactive. Training complete (fixed-round mode).")
             print("=" * 70 + "\n")
             self.training_complete = True
             self.save_results()

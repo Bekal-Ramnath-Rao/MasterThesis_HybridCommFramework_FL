@@ -16,6 +16,63 @@ from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QColor
 
 
+def _prepare_q_learning_dataframe_for_excel(df):
+    """
+    Add per-step cumulative rewards and trailing SUMMARY rows (all / uplink / downlink)
+    so exported Excel backups include explicit totals at the end of each sheet.
+    """
+    try:
+        import pandas as pd
+    except ImportError:
+        return df
+    if df is None or len(df) == 0:
+        return df
+    if list(df.columns) == ["Error"]:
+        return df
+    out = df.copy()
+    r = pd.to_numeric(out.get("reward"), errors="coerce").fillna(0.0)
+    out["cumulative_reward"] = r.cumsum()
+    rt = pd.to_numeric(out.get("reward_total"), errors="coerce")
+    rt_eff = rt.fillna(r)
+    out["cumulative_reward_total"] = rt_eff.cumsum()
+    dirn = out["link_direction"].fillna("uplink").astype(str).str.lower()
+
+    def _sums(sub):
+        if sub is None or len(sub) == 0:
+            return 0.0, 0.0
+        rsub = pd.to_numeric(sub["reward"], errors="coerce").fillna(0.0)
+        rtsub = pd.to_numeric(sub["reward_total"], errors="coerce").fillna(rsub)
+        return float(rsub.sum()), float(rtsub.sum())
+
+    summary_specs = [
+        ("=== SUMMARY: all steps (total reward) ===", out),
+        ("=== SUMMARY: uplink only ===", out.loc[dirn.eq("uplink")]),
+        ("=== SUMMARY: downlink only ===", out.loc[dirn.eq("downlink")]),
+    ]
+    rows = []
+    for label, sub in summary_specs:
+        sr, srt = _sums(sub)
+        if sub is not out and len(sub) == 0:
+            continue
+        summary = {c: pd.NA for c in out.columns}
+        summary["id"] = ""
+        summary["timestamp"] = label
+        summary["reward"] = sr
+        summary["reward_total"] = srt
+        summary["cumulative_reward"] = sr
+        summary["cumulative_reward_total"] = srt
+        rows.append(summary)
+    if rows:
+        tail = pd.DataFrame(rows)
+        # New columns must exist on tail
+        for c in out.columns:
+            if c not in tail.columns:
+                tail[c] = pd.NA
+        tail = tail[out.columns.tolist()]
+        out = pd.concat([out, tail], ignore_index=True)
+    return out
+
+
 def _shared_data_dir():
     """Resolve shared_data path (works when GUI runs from project root or Network_Simulation)."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -266,7 +323,7 @@ class QLearningLogsTab(QWidget):
                     conn
                 )
                 conn.close()
-                sheets[f"Client {i}"] = df
+                sheets[f"Client {i}"] = _prepare_q_learning_dataframe_for_excel(df)
             except Exception as e:
                 sheets[f"Client {i}"] = pd.DataFrame([{"Error": str(e)}])
 
@@ -359,7 +416,7 @@ class QLearningLogsTab(QWidget):
                         )
                         conn.close()
                         if len(df) > 0:
-                            sheets[f"Client {i}"] = df
+                            sheets[f"Client {i}"] = _prepare_q_learning_dataframe_for_excel(df)
                     except Exception as e:
                         sheets[f"Client {i}"] = pd.DataFrame([{"Error": str(e)}])
                 

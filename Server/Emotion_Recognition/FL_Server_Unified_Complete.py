@@ -676,17 +676,25 @@ class UnifiedFederatedLearningServer:
                         compressed_update = pickle.loads(base64.b64decode(compressed_update.encode('utf-8')))
                     except Exception as e:
                         print(f"[Server] Error decoding compressed_data: {e}")
-                weights = self.quantization_handler.decompress_client_update(client_id, compressed_update)
+                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                self.client_updates[client_id] = {
+                    'compressed_data': compressed_update,
+                    'num_samples': data['num_samples'],
+                    'metrics': data['metrics'],
+                    'protocol': protocol
+                }
+                weights = None
             else:
                 weights = self.deserialize_weights(data['weights'])
             
             # Store update
-            self.client_updates[client_id] = {
-                'weights': weights,
-                'num_samples': data['num_samples'],
-                'metrics': data['metrics'],
-                'protocol': protocol
-            }
+            if 'compressed_data' not in data or self.quantization_handler is None:
+                self.client_updates[client_id] = {
+                    'weights': weights,
+                    'num_samples': data['num_samples'],
+                    'metrics': data['metrics'],
+                    'protocol': protocol
+                }
             
             print(f"[{protocol.upper()}] Received update from client {client_id} "
                   f"({len(self.client_updates)}/{self.num_clients})")
@@ -778,10 +786,19 @@ class UnifiedFederatedLearningServer:
     
     def broadcast_global_model(self):
         """Broadcast updated global model to all clients"""
-        message = {
-            'round': self.current_round,
-            'weights': self.serialize_weights(self.global_weights)
-        }
+        if self.quantization_handler is not None:
+            compressed_data = getattr(self, "global_compressed", None)
+            if not (isinstance(compressed_data, dict) and 'compressed_data' in compressed_data):
+                compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            message = {
+                'round': self.current_round,
+                'quantized_data': base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
+            }
+        else:
+            message = {
+                'round': self.current_round,
+                'weights': self.serialize_weights(self.global_weights)
+            }
         
         for client_id, protocol in self.registered_clients.items():
             try:
@@ -803,6 +820,29 @@ class UnifiedFederatedLearningServer:
         
         # FedAvg: weighted average by number of samples
         total_samples = sum(update['num_samples'] for update in self.client_updates.values())
+        
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+            try:
+                self.global_weights = [np.asarray(w, dtype=np.float32) for w in aggregated_compressed.get('compressed_data', [])]
+            except Exception:
+                pass
+            self.client_updates.clear()
+            self.broadcast_global_model()
+            time.sleep(1)
+            self.signal_start_evaluation()
+            return
+
         aggregated_weights = []
         
         for i in range(len(self.global_weights)):

@@ -319,6 +319,23 @@ class DistributedClientGUI(QMainWindow):
         )
         layout.addWidget(self.communication_model_reward_enabled, 4, 0, 1, 4)
         
+        # Termination mode + round cap (must match experiment GUI for fixed-rounds runs)
+        layout.addWidget(QLabel("Termination mode:"), 5, 0)
+        self.termination_mode_combo = QComboBox()
+        self.termination_mode_combo.addItem("End on client convergence (may stop early)", "client_convergence")
+        self.termination_mode_combo.addItem("End on fixed rounds (run selected rounds)", "fixed_rounds")
+        self.termination_mode_combo.setCurrentIndex(0)  # Preserve existing behavior
+        self.termination_mode_combo.setStyleSheet("padding: 5px; font-size: 12px;")
+        layout.addWidget(self.termination_mode_combo, 5, 1, 1, 3)
+        
+        layout.addWidget(QLabel("NUM_ROUNDS:"), 6, 0)
+        self.rounds_spinbox = QSpinBox()
+        self.rounds_spinbox.setRange(1, 1000)
+        self.rounds_spinbox.setValue(10)
+        self.rounds_spinbox.setStyleSheet("padding: 5px; font-size: 12px;")
+        self.rounds_spinbox.setToolTip("Round cap to keep in sync with the main experiment GUI.")
+        layout.addWidget(self.rounds_spinbox, 6, 1)
+        
         # Update state when protocol mode changes
         self.protocol_mode.currentIndexChanged.connect(self.update_ql_convergence_visibility)
         self.protocol_mode.currentIndexChanged.connect(self.update_dds_impl_visibility)
@@ -474,7 +491,7 @@ class DistributedClientGUI(QMainWindow):
         quant_options_layout = QGridLayout()
         quant_options_layout.addWidget(QLabel("Quantization Bits:"), 0, 0)
         self.quant_bits = QComboBox()
-        self.quant_bits.addItems(["8", "16", "32"])
+        self.quant_bits.addItems(["4", "8", "16", "32"])
         self.quant_bits.setCurrentText("8")
         self.quant_bits.setStyleSheet("padding: 5px;")
         quant_options_layout.addWidget(self.quant_bits, 0, 1)
@@ -901,6 +918,8 @@ class DistributedClientGUI(QMainWindow):
             f"RL Mode: {'Training' if self.is_rl_training_mode() else 'Inference'}\n"
             f"DDS Implementation: {self.dds_impl.currentText() if protocol == 'dds' else 'N/A'}\n"
             f"Network: {network_scenario}\n"
+            f"Rounds: {self.rounds_spinbox.value()}\n"
+            f"Termination: {self.termination_mode_combo.currentText()}\n"
             f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
             f"Q-Learning Convergence: {'Enabled' if self.is_rl_training_mode() else 'Disabled'}\n"
             f"Communication Model Reward: {'Enabled' if is_unified and self.communication_model_reward_enabled.isChecked() else 'Disabled'}\n"
@@ -975,6 +994,7 @@ class DistributedClientGUI(QMainWindow):
             "--cap-add", "NET_ADMIN",  # For network simulation
             "-e", f"CLIENT_ID={client_id}",
             "-e", f"NUM_CLIENTS={total_clients}",
+            "-e", f"NUM_ROUNDS={self.rounds_spinbox.value()}",
             "-e", f"NODE_TYPE=client",
             "-e", f"MQTT_BROKER={server_ip}",
             "-e", "MQTT_PORT=31883",  # External port for MQTT broker
@@ -992,6 +1012,10 @@ class DistributedClientGUI(QMainWindow):
             "-e", "HTTP3_PORT=4434",
             "-e", "DDS_DOMAIN_ID=0"
         ]
+        
+        termination_mode = self.termination_mode_combo.currentData() or self.termination_mode_combo.currentText()
+        stop_on_client_convergence = "false" if termination_mode == "fixed_rounds" else "true"
+        cmd.extend(["-e", f"STOP_ON_CLIENT_CONVERGENCE={stop_on_client_convergence}"])
         
         # DDS implementation vendor selection (passed as environment variable)
         if protocol == "dds":

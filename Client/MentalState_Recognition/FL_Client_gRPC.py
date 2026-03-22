@@ -87,6 +87,7 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Training Configuration
 AUTOTUNE = tf.data.AUTOTUNE
@@ -461,8 +462,8 @@ class FederatedLearningClient:
                     try:
                         candidate = pickle.loads(model_update.weights)
                         if isinstance(candidate, dict) and 'quantization_params' in candidate:
-                            weights = self.quantizer.decompress(candidate)
-                            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+                            weights = self.quantizer.as_training_weights(candidate)
+                            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
                         else:
                             weights = candidate
                     except Exception:
@@ -591,6 +592,10 @@ class FederatedLearningClient:
 
     def _notify_convergence_and_disconnect(self):
         """Notify server and stop this client."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore local convergence notification/disconnect.
+            print(f"Client {self.client_id} ignoring local convergence (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         try:
             self.stub.SendModelUpdate(
                 federated_learning_pb2.ModelUpdate(
@@ -605,8 +610,9 @@ class FederatedLearningClient:
         except Exception as e:
             print(f"Client {self.client_id} failed to notify convergence: {e}")
         finally:
-            import sys
-            sys.exit(0)
+            if STOP_ON_CLIENT_CONVERGENCE:
+                import sys
+                sys.exit(0)
 
 
 if __name__ == "__main__":

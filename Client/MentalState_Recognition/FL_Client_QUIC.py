@@ -76,6 +76,7 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Model initialization timeout (seconds) - longer for poor network conditions
 # Default: 300s (5 minutes) for very poor network conditions with large models
@@ -434,11 +435,11 @@ class FederatedLearningClient:
         
         # Decompress or deserialize weights
         if 'quantized_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['quantized_data'])
-            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            weights = self.quantizer.as_training_weights(message['quantized_data'])
+            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
         elif 'compressed_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['compressed_data'])
-            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            weights = self.quantizer.as_training_weights(message['compressed_data'])
+            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
         else:
             weights = self.deserialize_weights(encoded_weights)
         
@@ -555,7 +556,7 @@ class FederatedLearningClient:
             'loss': final_loss,
             'accuracy': final_acc
         }
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             metrics_dict['client_converged'] = 1.0
         
         print(f"Client {self.client_id} training complete - "
@@ -584,7 +585,7 @@ class FederatedLearningClient:
             'num_samples': int(len(self.y_train)),
             'metrics': metrics_dict
         })
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             await asyncio.sleep(2)
             import sys

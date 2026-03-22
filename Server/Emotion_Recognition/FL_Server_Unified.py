@@ -153,6 +153,7 @@ except ImportError:
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
@@ -1741,6 +1742,9 @@ class UnifiedFederatedLearningServer:
     def mark_client_converged(self, client_id):
         """Remove converged client from active training set."""
         with self.lock:
+            if not STOP_ON_CLIENT_CONVERGENCE:
+                # Fixed-round mode: ignore client-local convergence removal/disconnect.
+                return
             if client_id in self.active_clients:
                 self.active_clients.remove(client_id)
                 self.client_updates.pop(client_id, None)
@@ -1796,7 +1800,7 @@ class UnifiedFederatedLearningServer:
                 print(f"[{protocol.upper()}] Ignoring update from inactive client {client_id}")
                 return
             try:
-                converged_flag = float(client_metrics.get('client_converged', 0.0)) >= 1.0
+                converged_flag = STOP_ON_CLIENT_CONVERGENCE and float(client_metrics.get('client_converged', 0.0)) >= 1.0
             except Exception:
                 converged_flag = False
             if converged_flag:
@@ -1812,17 +1816,25 @@ class UnifiedFederatedLearningServer:
                         compressed_update = pickle.loads(base64.b64decode(compressed_update.encode('utf-8')))
                     except Exception as e:
                         print(f"[Server] Error decoding compressed_data: {e}")
-                weights = self.quantization_handler.decompress_client_update(client_id, compressed_update)
+                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                self.client_updates[client_id] = {
+                    'compressed_data': compressed_update,
+                    'num_samples': data['num_samples'],
+                    'metrics': client_metrics,
+                    'protocol': protocol
+                }
+                weights = None
             else:
                 weights = self.deserialize_weights(data['weights'])
             
             # Store update (metrics are handled separately via handle_client_metrics)
-            self.client_updates[client_id] = {
-                'weights': weights,
-                'num_samples': data['num_samples'],
-                'metrics': client_metrics,
-                'protocol': protocol
-            }
+            if 'compressed_data' not in data or self.quantization_handler is None:
+                self.client_updates[client_id] = {
+                    'weights': weights,
+                    'num_samples': data['num_samples'],
+                    'metrics': client_metrics,
+                    'protocol': protocol
+                }
             
             print(f"[{protocol.upper()}] Received update from client {client_id} "
                   f"({len(self.client_updates)}/{self.num_clients})")
@@ -1918,7 +1930,7 @@ class UnifiedFederatedLearningServer:
                 print(f"[{protocol.upper()}] Ignoring metrics from inactive client {client_id}")
                 return
             
-            if client_converged >= 1.0:
+            if STOP_ON_CLIENT_CONVERGENCE and client_converged >= 1.0:
                 print(f"[{protocol.upper()}] Received convergence metrics from client {client_id}")
                 self.mark_client_converged(client_id)
                 return
@@ -2073,7 +2085,10 @@ class UnifiedFederatedLearningServer:
         """Broadcast updated global model to all clients via their registered protocols"""
         # Prepare message with weights
         if self.quantization_handler is not None:
-            compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
+            # Keep quantized end-to-end: if we already aggregated in quantized space, broadcast it as-is.
+            compressed_data = getattr(self, "global_compressed", None)
+            if not (isinstance(compressed_data, dict) and 'compressed_data' in compressed_data):
+                compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
             weights_data = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
             weights_key = 'quantized_data'
         else:
@@ -2175,6 +2190,36 @@ class UnifiedFederatedLearningServer:
         
         # FedAvg: weighted average by number of samples
         total_samples = sum(update['num_samples'] for update in self.client_updates.values())
+        
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+            # Keep a float-cast view for any server-side code paths that still reference global_weights
+            try:
+                self.global_weights = [np.asarray(w, dtype=np.float32) for w in aggregated_compressed.get('compressed_data', [])]
+            except Exception:
+                pass
+
+            self.client_updates.clear()
+            self.prepare_downlink_protocol_negotiation(
+                target_client_ids=list(self.active_clients),
+                round_id=self.current_round,
+                global_model_id=self.current_round,
+            )
+            self.broadcast_global_model()
+            time.sleep(1)
+            self.signal_start_evaluation()
+            return
+
         aggregated_weights = []
         
         for i in range(len(self.global_weights)):
@@ -2543,7 +2588,7 @@ if GRPC_AVAILABLE:
                 )
 
                 # Convergence: accept even if chunked stream incomplete
-                converged_flag = float(metrics.get('client_converged', 0.0)) >= 1.0
+                converged_flag = STOP_ON_CLIENT_CONVERGENCE and float(metrics.get('client_converged', 0.0)) >= 1.0
                 if converged_flag and round_num <= self.server.current_round and client_id in self.server.active_clients:
                     self.server.mark_client_converged(client_id)
                     return federated_learning_pb2.UpdateResponse(success=True, message=f"Client {client_id} convergence acknowledged")

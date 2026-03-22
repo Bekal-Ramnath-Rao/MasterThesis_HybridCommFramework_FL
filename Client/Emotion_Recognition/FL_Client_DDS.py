@@ -126,6 +126,10 @@ CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
 
+# Controls whether this client should signal/exit on local convergence.
+# When false, clients keep training until the server indicates completion.
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
+
 # Chunking configuration for large messages
 CHUNK_SIZE = 64 * 1024
 
@@ -570,8 +574,8 @@ class FederatedLearningClient:
             return
         if isinstance(raw_weights, dict) and 'compressed_data' in raw_weights:
             if self.quantizer is not None:
-                weights = self.quantizer.decompress(raw_weights)
-                print(f"Client {self.client_id}: Received and decompressed quantized global model")
+                weights = self.quantizer.as_training_weights(raw_weights)
+                print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
             else:
                 print(f"Client {self.client_id}: ERROR - quantized data but quantizer not initialized")
                 return
@@ -804,7 +808,7 @@ class FederatedLearningClient:
         loss, accuracy = self.model.evaluate(self.validation_generator, verbose=0)
         
         self._update_local_convergence(float(loss))
-        client_converged = 1.0 if self.has_converged else 0.0
+        client_converged = 1.0 if (self.has_converged and STOP_ON_CLIENT_CONVERGENCE) else 0.0
         
         # Send metrics to server (include battery_soc for server battery consumption plot)
         metrics = EvaluationMetrics(
@@ -825,7 +829,7 @@ class FederatedLearningClient:
         
         print(f"Client {self.client_id} sent evaluation metrics for round {self.current_round}")
         print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}\n")
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             self.running = False
     

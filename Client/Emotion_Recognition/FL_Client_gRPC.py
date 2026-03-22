@@ -79,6 +79,13 @@ if compression_path not in sys.path:
     sys.path.insert(0, compression_path)
 
 from quantization_client import Quantization, QuantizationConfig
+try:
+    from pruning_client import ModelPruning, PruningConfig
+    PRUNING_AVAILABLE = True
+except Exception:
+    ModelPruning = None
+    PruningConfig = None
+    PRUNING_AVAILABLE = False
 
 # Add Protocols directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'Protocols'))
@@ -118,6 +125,10 @@ CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
 
+# Controls whether this client should signal/exit on local convergence.
+# When false, clients keep training until the server indicates completion.
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
+
 
 class FederatedLearningClient:
     def __init__(self, client_id, num_clients, train_generator=None, validation_generator=None):
@@ -136,6 +147,19 @@ class FederatedLearningClient:
         else:
             self.quantizer = None
             print(f"Client {self.client_id}: Quantization disabled")
+
+        # Initialize pruning (default: disabled unless explicitly enabled)
+        up_env = os.getenv("USE_PRUNING", "false")
+        use_pruning = up_env.lower() in ("true", "1", "yes", "y")
+        if use_pruning and PRUNING_AVAILABLE and ModelPruning is not None:
+            self.pruner = ModelPruning(PruningConfig())
+            print(f"Client {self.client_id}: Pruning enabled")
+        else:
+            self.pruner = None
+            if use_pruning and not PRUNING_AVAILABLE:
+                print(f"Client {self.client_id}: Pruning requested but pruning module not available")
+            else:
+                print(f"Client {self.client_id}: Pruning disabled")
         self.train_generator = train_generator
         self.validation_generator = validation_generator
         self.current_round = 0
@@ -377,20 +401,20 @@ class FederatedLearningClient:
     def receive_global_model(self, model_update):
         """Receive and set global model weights from server"""
         try:
-            # Decompress or deserialize weights
-            if self.quantizer is not None and model_update.weights:
-                try:
-                    candidate = pickle.loads(model_update.weights)
-                    if isinstance(candidate, dict) and 'quantization_params' in candidate:
-                        weights = self.quantizer.decompress(candidate)
-                        print(f"Client {self.client_id}: Received and decompressed quantized global model")
-                    else:
-                        weights = candidate
-                except Exception:
-                    # Fallback to regular deserialization if unpickle fails
-                    weights = pickle.loads(model_update.weights)
+            # Decompress/deserialize weights.
+            # If both pruning and quantization are enabled, server should send quantized payload that already reflects pruning.
+            candidate = pickle.loads(model_update.weights) if model_update.weights else None
+            if isinstance(candidate, dict) and 'quantization_params' in candidate:
+                weights = self.quantizer.as_training_weights(candidate) if self.quantizer is not None else []
+                print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
+            elif isinstance(candidate, dict) and 'pruned_data' in candidate:
+                if self.pruner is not None and candidate['pruned_data']:
+                    weights = self.pruner.decompress_pruned_weights(candidate['pruned_data'])
+                    print(f"Client {self.client_id}: Received and decompressed pruned global model")
+                else:
+                    weights = []
             else:
-                weights = pickle.loads(model_update.weights)
+                weights = candidate
             
             if model_update.round == 0 and model_update.model_config:
                 # Initial model - build from config
@@ -512,14 +536,24 @@ class FederatedLearningClient:
             # Get updated weights
             updated_weights = self.model.get_weights()
             num_samples = self.train_generator.n
+
+            # Flow: Training -> Pruning -> Quantization -> Send
+            if self.pruner is not None:
+                updated_weights = self.pruner.prune_weights(updated_weights, step=self.current_round)
             
-            # Compress or serialize weights
+            # Serialize payload for gRPC:
+            # - if quantization enabled -> send pickled quantized dict (may include pruning applied above)
+            # - else if pruning enabled -> send pickled {"pruned_data": <bytes>} sparse payload
+            # - else -> send pickled raw weights list
             if self.quantizer is not None:
                 compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
                 stats = self.quantizer.get_compression_stats(updated_weights, compressed_data)
                 print(f"Client {self.client_id}: Compressed weights - Ratio: {stats['compression_ratio']:.2f}x, Original: {stats['original_size_mb']:.2f}MB, Compressed: {stats['compressed_size_mb']:.2f}MB")
                 # Send pickled compressed dict so server can read quantization metadata
                 serialized_weights = pickle.dumps(compressed_data)
+            elif self.pruner is not None:
+                pruned_bytes, _ = self.pruner.compress_pruned_weights(updated_weights)
+                serialized_weights = pickle.dumps({"pruned_data": pruned_bytes})
             else:
                 serialized_weights = pickle.dumps(updated_weights)
             
@@ -607,7 +641,7 @@ class FederatedLearningClient:
             num_samples = self.validation_generator.n
             loss_f = float(loss)
             # Signal convergence in same message so server can proceed with remaining clients
-            client_converged = 1.0 if self._would_converge_after_eval(loss_f) else 0.0
+            client_converged = 1.0 if (STOP_ON_CLIENT_CONVERGENCE and self._would_converge_after_eval(loss_f)) else 0.0
             
             # Send metrics to server (include battery, round time, and convergence flag)
             response = self.stub.SendMetrics(
@@ -655,7 +689,8 @@ class FederatedLearningClient:
         if self.rounds_without_improvement >= CONVERGENCE_PATIENCE and not self.has_converged:
             self.has_converged = True
             print(f"Client {self.client_id} reached local convergence at round {self.current_round}")
-            self._notify_convergence_and_disconnect()
+            if STOP_ON_CLIENT_CONVERGENCE:
+                self._notify_convergence_and_disconnect()
 
     def _notify_convergence_and_disconnect(self):
         """Notify server and stop this client."""

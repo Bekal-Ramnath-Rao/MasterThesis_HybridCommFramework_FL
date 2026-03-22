@@ -782,12 +782,18 @@ class NativeExperimentRunner:
     def _spawn_clients(self, client_log_files=None) -> List[subprocess.Popen]:
         server_ep, client_eps = self._endpoints
         procs: List[subprocess.Popen] = []
+        effective_num_rounds = self._effective_num_rounds()
 
         for idx, ep in enumerate(client_eps, start=1):
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"  # Flush FL_DIAG immediately for diagnostic pipeline T_actual
             env["CLIENT_ID"] = str(idx)
             env["NUM_CLIENTS"] = str(self.num_clients)
+            if effective_num_rounds is not None:
+                env["NUM_ROUNDS"] = str(effective_num_rounds)
+            else:
+                # RL Q-convergence mode: server decides when to stop; do not impose local round cap.
+                env.pop("NUM_ROUNDS", None)
             # Match Docker defaults for convergence behaviour unless explicitly overridden
             env.setdefault("CONVERGENCE_THRESHOLD", "0.001")
             env.setdefault("CONVERGENCE_PATIENCE", "2")
@@ -1214,6 +1220,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of FL rounds (passed to server via NUM_ROUNDS env).",
     )
     parser.add_argument(
+        "--termination-mode",
+        choices=["client_convergence", "fixed_rounds"],
+        default="client_convergence",
+        help="End condition: default ends on client convergence (may stop early), fixed_rounds runs selected rounds.",
+    )
+    parser.add_argument(
         "--num-clients",
         "-n",
         type=int,
@@ -1249,8 +1261,8 @@ def parse_args() -> argparse.Namespace:
         "--quantization-bits",
         type=int,
         default=8,
-        choices=[8, 16, 32],
-        help="Quantization bit width (default: 8).",
+        choices=[4, 8, 16, 32],
+        help="Quantization bit width (default: 8). 4-bit uses nibble packing for 2x compression.",
     )
     parser.add_argument(
         "--quantization-strategy",
@@ -1296,6 +1308,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     _load_local_privileged_env()
     args = parse_args()
+    
+    # Propagate selected termination mode into native process env.
+    os.environ["STOP_ON_CLIENT_CONVERGENCE"] = "false" if args.termination_mode == "fixed_rounds" else "true"
 
     protocols = list(dict.fromkeys((args.protocols or [args.protocol]) if hasattr(args, "protocols") else [args.protocol]))
     scenarios = list(dict.fromkeys((args.scenarios or [args.scenario]) if hasattr(args, "scenarios") else [args.scenario]))

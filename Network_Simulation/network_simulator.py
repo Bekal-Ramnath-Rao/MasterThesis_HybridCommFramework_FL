@@ -9,6 +9,7 @@ import argparse
 import json
 import time
 import os
+import random
 from typing import Dict, List
 
 from network_delay_model import (
@@ -97,7 +98,20 @@ class NetworkSimulator:
             "jitter": "60ms",
             "bandwidth": "2mbit",
             "loss": "6%"
-        }
+        },
+        # Dynamic scenario: randomly selects one of these base scenarios
+        # at each application (e.g., per FL round) so that the effective
+        # network alternates between excellent / moderate / poor / congested_light.
+        "dynamic": {
+            "name": "Dynamic Network (Random Excellent/Moderate/Poor/Congested-Light)",
+            # Latency/jitter values here are placeholders and are not used
+            # when Gaussian sampling + per-round resampling is enabled.
+            # Bandwidth/loss will be taken from the randomly chosen base scenario.
+            "latency": "30ms",
+            "jitter": "10ms",
+            "bandwidth": "10mbit",
+            "loss": "0.3%"
+        },
     }
 
     # Keys passed to tc (netem: delay/jitter/loss; htb/tbf: bandwidth)
@@ -134,8 +148,17 @@ class NetworkSimulator:
         """
         if scenario_name not in cls.NETWORK_SCENARIOS:
             raise KeyError(f"Unknown scenario: {scenario_name}")
-        base_ms, jitter_ms = sample_delay_and_jitter_ms(models, scenario_name, use_extra_jitter=use_extra_jitter)
-        scenario = cls.NETWORK_SCENARIOS[scenario_name]
+
+        # Special handling for "dynamic": randomly pick one of the base
+        # scenarios and return sampled conditions for that scenario.
+        if scenario_name == "dynamic":
+            dynamic_bases = ["excellent", "moderate", "poor", "congested_light"]
+            chosen = random.choice(dynamic_bases)
+        else:
+            chosen = scenario_name
+
+        base_ms, jitter_ms = sample_delay_and_jitter_ms(models, chosen, use_extra_jitter=use_extra_jitter)
+        scenario = cls.NETWORK_SCENARIOS[chosen]
         conditions = {k: scenario[k] for k in cls._TC_CONDITION_KEYS if k in scenario}
         conditions["latency"] = f"{base_ms:.2f}ms"
         conditions["jitter"] = f"{jitter_ms:.2f}ms"

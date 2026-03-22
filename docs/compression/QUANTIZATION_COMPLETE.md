@@ -34,7 +34,7 @@ Quantization compression has been **successfully implemented across ALL 5 protoc
    - QAT (Quantization-Aware Training)
    - PTQ (Post-Training Quantization)
    - Parameter Quantization (default)
-   - Support for 8-bit, 16-bit, 32-bit quantization
+   - Support for 4-bit, 8-bit, 16-bit, 32-bit quantization (4-bit uses nibble packing)
    - Symmetric and asymmetric quantization
    - Per-channel and per-tensor options
 
@@ -341,7 +341,7 @@ Select-String -Path "Server/*/FL_Server_*.py" -Pattern "quantization_handler.dec
 | **Integration Scripts** | 4 | Auto-integration tools |
 | **Lines of Code Added** | 1000+ | Across all files |
 | **Quantization Strategies** | 3 | QAT, PTQ, Parameter |
-| **Bit Depths Supported** | 3 | 8-bit, 16-bit, 32-bit |
+| **Bit Depths Supported** | 4 | 4-bit, 8-bit, 16-bit, 32-bit |
 | **Configuration Options** | 6 | Environment variables |
 | **Coverage** | 100% | All planned implementations complete |
 

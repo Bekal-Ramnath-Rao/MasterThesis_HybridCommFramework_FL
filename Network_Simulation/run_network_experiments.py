@@ -17,6 +17,7 @@ from typing import List, Dict, Optional
 import argparse
 from pathlib import Path
 import tempfile
+import random
 
 # Set UTF-8 encoding for Windows console
 if sys.platform == 'win32':
@@ -81,6 +82,7 @@ class ExperimentRunner:
         # pruning_params expected to be a dict of simple string values
         self.pruning_params = pruning_params or {}
         self._runtime_compose_files: Dict[str, str] = {}
+        self._runtime_compose_files_stop: Dict[str, str] = {}
         
         # Map use_case values to actual Server directory names
         self.use_case_dir_map = {
@@ -89,14 +91,6 @@ class ExperimentRunner:
             "temperature": "Temperature_Regulation"
         }
         self.use_case_dir = self.use_case_dir_map.get(use_case, f"{use_case.title()}_Recognition")
-        
-        # Enforce quantization when pruning is enabled in Docker experiments,
-        # so pruning can be consistently applied in the shared compression path.
-        if self.use_pruning and not self.use_quantization:
-            self.use_quantization = True
-            self.quantization_params.setdefault("QUANTIZATION_STRATEGY", "parameter_quantization")
-            self.quantization_params.setdefault("QUANTIZATION_BITS", "8")
-            print("[INFO] Pruning requested without quantization; enabling quantization automatically.")
 
         # Print compression (quantization + pruning) status
         print(f"\n{'='*70}")
@@ -173,14 +167,16 @@ class ExperimentRunner:
         # Define network scenarios to test
         self.network_scenarios = [
             "excellent",
-            "good", 
+            "good",
             "moderate",
             "poor",
             "very_poor",
             "satellite",
             "congested_light",
             "congested_moderate",
-            "congested_heavy"
+            "congested_heavy",
+            # Dynamic: per-round random choice between a subset of scenarios
+            "dynamic",
         ]
         
         # Docker compose file mapping (relative to project root)
@@ -365,9 +361,75 @@ class ExperimentRunner:
 
     def _get_runtime_compose_file(self, compose_file: str) -> str:
         """Return compose file path used at runtime (possibly patched)."""
+        patched_path = compose_file
         if self._compose_requires_runtime_patch():
-            return self._patch_compose_pruning_env(compose_file)
-        return compose_file
+            patched_path = self._patch_compose_pruning_env(patched_path)
+        return self._patch_compose_stop_env(patched_path)
+
+    def _patch_compose_stop_env(self, compose_file: str) -> str:
+        """Create a runtime compose file that injects STOP env into fl-server/fl-client services."""
+        if compose_file in self._runtime_compose_files_stop:
+            return self._runtime_compose_files_stop[compose_file]
+
+        src_path = Path(compose_file)
+        if not src_path.exists():
+            return compose_file
+
+        try:
+            original = src_path.read_text(encoding="utf-8")
+        except Exception:
+            return compose_file
+
+        # If already present anywhere, assume it was patched already.
+        if "STOP_ON_CLIENT_CONVERGENCE" in original:
+            self._runtime_compose_files_stop[compose_file] = compose_file
+            return compose_file
+
+        lines = original.splitlines()
+        patched_lines: List[str] = []
+
+        current_service: Optional[str] = None
+        service_line_prefix = " " * 2
+
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            patched_lines.append(line)
+
+            # Track the current service we're inside by the service definition line.
+            # Compose files in this repo use 2-space indentation for service keys under `services:`.
+            if line.startswith(service_line_prefix) and stripped.endswith(":") and not stripped.startswith("#"):
+                candidate = stripped[:-1]
+                if candidate.startswith("fl-server") or candidate.startswith("fl-client"):
+                    current_service = candidate
+                else:
+                    current_service = None
+
+            # Inject into environment list blocks for fl-server/fl-client services.
+            if current_service and stripped == "environment:":
+                # If any of the next few lines already contain STOP, avoid duplicating.
+                window = "\n".join(lines[idx + 1 : idx + 12])
+                if "STOP_ON_CLIENT_CONVERGENCE" in window:
+                    continue
+
+                env_indent = line[: len(line) - len(line.lstrip(" "))]
+                item_indent = env_indent + "  "
+                patched_lines.append(
+                    f"{item_indent}- STOP_ON_CLIENT_CONVERGENCE=${{STOP_ON_CLIENT_CONVERGENCE:-true}}"
+                )
+
+        patched = "\n".join(patched_lines) + ("\n" if original.endswith("\n") else "")
+        if patched == original:
+            self._runtime_compose_files_stop[compose_file] = compose_file
+            return compose_file
+
+        tmp_dir = Path(tempfile.gettempdir()) / "fl_runtime_compose"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        patched_path = tmp_dir / f"{src_path.stem}.runtime-stop{src_path.suffix}"
+        patched_path.write_text(patched, encoding="utf-8")
+
+        self._runtime_compose_files_stop[compose_file] = str(patched_path)
+        print(f"[INFO] Using runtime patched compose file (STOP env): {patched_path}")
+        return str(patched_path)
     
     def start_containers(self, protocol: str, scenario: str = "excellent", congestion_level: str = "none"):
         """Start Docker containers for a specific protocol with staged startup"""
@@ -578,8 +640,19 @@ class ExperimentRunner:
         print(f"{'='*70}")
         
         sim = NetworkSimulator(verbose=True)
-        if scenario not in sim.NETWORK_SCENARIOS:
-            print(f"[WARNING] Unknown scenario: {scenario}, skipping network simulation")
+
+        # For the special "dynamic" scenario, we do not apply a fixed profile
+        # here. Instead, we pick a base scenario at apply-time so that the
+        # network can change over time and between experiments.
+        dynamic_bases = ["excellent", "moderate", "poor", "congested_light"]
+        if scenario == "dynamic":
+            base_scenario = random.choice(dynamic_bases)
+            print(f"[DYNAMIC] Initial dynamic base scenario selected: {base_scenario}")
+        else:
+            base_scenario = scenario
+
+        if base_scenario not in sim.NETWORK_SCENARIOS:
+            print(f"[WARNING] Unknown scenario: {base_scenario}, skipping network simulation")
             return True
         use_gaussian = os.environ.get("USE_GAUSSIAN_DELAY", "1").strip().lower() in ("1", "true", "yes")
         sigma_factor = float(os.environ.get("GAUSSIAN_SIGMA_FACTOR", "0.05"))
@@ -588,9 +661,9 @@ class ExperimentRunner:
             if use_gaussian:
                 from network_simulator import build_delay_models
                 models = build_delay_models(sim.NETWORK_SCENARIOS, sigma_factor=sigma_factor)
-                conditions = sim.get_scenario_conditions_sampled(scenario, models, use_extra_jitter=use_extra_jitter)
+                conditions = sim.get_scenario_conditions_sampled(base_scenario, models, use_extra_jitter=use_extra_jitter)
             else:
-                conditions = sim.get_scenario_conditions(scenario)
+                conditions = sim.get_scenario_conditions(base_scenario)
         except (ValueError, KeyError) as e:
             print(f"[WARNING] {e}, skipping network simulation")
             return True
@@ -710,7 +783,19 @@ class ExperimentRunner:
                                 sigma_factor = float(os.environ.get("GAUSSIAN_SIGMA_FACTOR", "0.05"))
                                 use_extra_jitter = os.environ.get("USE_EXTRA_JITTER", "0").strip().lower() in ("1", "true", "yes")
                                 models = build_delay_models(sim.NETWORK_SCENARIOS, sigma_factor=sigma_factor)
-                                conditions = sim.get_scenario_conditions_sampled(scenario, models, use_extra_jitter=use_extra_jitter)
+
+                                # For dynamic scenario, pick a fresh base scenario
+                                # every time we resample, to mimic a time-varying
+                                # network that switches between the four options
+                                # before client->server send.
+                                if scenario == "dynamic":
+                                    dynamic_bases = ["excellent", "moderate", "poor", "congested_light"]
+                                    base_scenario = random.choice(dynamic_bases)
+                                    print(f"  [DYNAMIC] Per-round base scenario (client->server send): {base_scenario}")
+                                else:
+                                    base_scenario = scenario
+
+                                conditions = sim.get_scenario_conditions_sampled(base_scenario, models, use_extra_jitter=use_extra_jitter)
                                 if self.network_mode == "host" and getattr(self, "_host_network_sim", None) is not None:
                                     self._host_network_sim.apply_network_conditions_host(conditions)
                                 else:
@@ -1374,15 +1459,18 @@ class ExperimentRunner:
             timeout = None  # No limit; completion determined by Q-learning convergence
         else:
             timeout_map = {
-                "excellent": 3600,      # 1 hour
-                "good": 3600,           # 1 hour
-                "moderate": 5400,       # 1.5 hours
-                "poor": 14400,           # 4 hours
-                "very_poor": 21600,     # 6 hours (300ms latency + 5% loss = very slow)
-                "satellite": 9000,      # 2.5 hours (600ms latency)
-                "congested_light": 5400,   # 1.5 hours
+                "excellent": 3600,          # 1 hour
+                "good": 3600,               # 1 hour
+                "moderate": 5400,           # 1.5 hours
+                "poor": 14400,              # 4 hours
+                "very_poor": 21600,         # 6 hours (300ms latency + 5% loss = very slow)
+                "satellite": 9000,          # 2.5 hours (600ms latency)
+                "congested_light": 5400,    # 1.5 hours
                 "congested_moderate": 7200, # 2 hours
-                "congested_heavy": 9000     # 2.5 hours
+                "congested_heavy": 9000,    # 2.5 hours
+                # Dynamic alternates between excellent/moderate/poor/congested_light,
+                # so use a mid-range timeout similar to moderate / light congestion.
+                "dynamic": 7200,
             }
             timeout = timeout_map.get(scenario, 3600)
         
@@ -1573,13 +1661,29 @@ def main():
                        help="Specific protocols to test (default: all). Use 'rl_unified' for RL-based dynamic protocol selection")
     parser.add_argument("--scenarios", "-s",
                        nargs="+",
-                       choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
-                               "congested_light", "congested_moderate", "congested_heavy"],
+                       choices=[
+                           "excellent",
+                           "good",
+                           "moderate",
+                           "poor",
+                           "very_poor",
+                           "satellite",
+                           "congested_light",
+                           "congested_moderate",
+                           "congested_heavy",
+                           "dynamic",
+                       ],
                        help="Specific network scenarios to test (default: all)")
     parser.add_argument("--rounds", "-r",
                        type=int,
                        default=10,
                        help="Number of FL rounds (default: 10)")
+    parser.add_argument(
+        "--termination-mode",
+        choices=["client_convergence", "fixed_rounds"],
+        default="client_convergence",
+        help="End condition: default ends on client convergence (may stop early), fixed_rounds runs selected rounds."
+    )
     parser.add_argument("--enable-congestion", action="store_true",
                        help="Enable network congestion using traffic generators")
     parser.add_argument("--congestion-level", "-c",
@@ -1595,8 +1699,18 @@ def main():
                        choices=["mqtt", "amqp", "grpc", "quic", "http3", "dds", "rl_unified"],
                        help="Protocol for single experiment (use 'rl_unified' for RL-based selection)")
     parser.add_argument("--scenario",
-                       choices=["excellent", "good", "moderate", "poor", "very_poor", "satellite",
-                               "congested_light", "congested_moderate", "congested_heavy"],
+                       choices=[
+                           "excellent",
+                           "good",
+                           "moderate",
+                           "poor",
+                           "very_poor",
+                           "satellite",
+                           "congested_light",
+                           "congested_moderate",
+                           "congested_heavy",
+                           "dynamic",
+                       ],
                        help="Network scenario for single experiment")
     parser.add_argument("--use-quantization", action="store_true",
                 help="Enable quantization for clients and servers (sets USE_QUANTIZATION env var)")
@@ -1604,8 +1718,8 @@ def main():
                 choices=["qat", "ptq", "parameter_quantization"],
                 help="Quantization strategy to set in environment (QUANTIZATION_STRATEGY)")
     parser.add_argument("--quantization-bits", type=int,
-                choices=[8, 16, 32],
-                help="Bit width for quantization (QUANTIZATION_BITS)")
+                choices=[4, 8, 16, 32],
+                help="Bit width for quantization (QUANTIZATION_BITS). 4-bit uses nibble packing.")
     parser.add_argument("--quantization-symmetric", action="store_true",
                 help="Set QUANTIZATION_SYMMETRIC=1 if symmetric quantization should be used")
     parser.add_argument("--quantization-per-channel", action="store_true",
@@ -1648,6 +1762,10 @@ def main():
     )
     
     args = parser.parse_args()
+    
+    # Propagate selected termination mode and round cap into Docker compose variable substitution.
+    os.environ["NUM_ROUNDS"] = str(args.rounds)
+    os.environ["STOP_ON_CLIENT_CONVERGENCE"] = "false" if args.termination_mode == "fixed_rounds" else "true"
     
     # Propagate DDS implementation choice to environment so compose scripts and containers can read it
     if args.dds_impl:

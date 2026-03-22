@@ -54,8 +54,8 @@ def test_parameter_quantization():
     print(f"\nOriginal weights size: {original_size:.2f} MB")
     print(f"Number of layers: {len(weights)}")
     
-    # Test different bit depths
-    for bits in [8, 16, 32]:
+    # Test different bit depths (including 4-bit with nibble packing)
+    for bits in [4, 8, 16, 32]:
         print(f"\n--- Testing {bits}-bit quantization ---")
         
         config = QuantizationConfig(

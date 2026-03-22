@@ -64,6 +64,7 @@ NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "5"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # AMQP Exchanges and Queues
 EXCHANGE_BROADCAST = "fl_broadcast"
@@ -277,7 +278,9 @@ class FederatedLearningClient:
                 return
             
             round_num = data['round']
-            # Check if weights are quantized
+            # Decompress/deserialize weights.
+            # If both pruning and quantization are enabled, server should send quantized_data that already reflects pruning,
+            # so we must dequantize first when available.
             if 'quantized_data' in data and self.quantizer is not None:
                 compressed_data = data['quantized_data']
                 # If server sent serialized base64 string, decode and unpickle
@@ -286,9 +289,20 @@ class FederatedLearningClient:
                         compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
                     except Exception as e:
                         print(f"Client {self.client_id} error decoding quantized_data: {e}")
-                weights = self.quantizer.decompress(compressed_data)
+                # Keep quantized end-to-end: do NOT dequantize/decompress.
+                weights = self.quantizer.as_training_weights(compressed_data)
                 if round_num > 0:
-                    print(f"Client {self.client_id}: Received and decompressed quantized global model")
+                    print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
+            elif 'pruned_data' in data and self.pruner is not None:
+                try:
+                    compressed_bytes = base64.b64decode(data['pruned_data'].encode('utf-8'))
+                    weights = self.pruner.decompress_pruned_weights(compressed_bytes)
+                    if round_num > 0:
+                        print(f"Client {self.client_id}: Received and decompressed pruned global model")
+                except Exception as e:
+                    print(f"Client {self.client_id} error decoding pruned_data: {e}")
+                    encoded_weights = data['weights']
+                    weights = self.deserialize_weights(encoded_weights)
             else:
                 encoded_weights = data['weights']
                 weights = self.deserialize_weights(encoded_weights)
@@ -442,7 +456,9 @@ class FederatedLearningClient:
             "val_mape": float(history.history["val_mape"][-1]),
         }
         
-        # Compress weights if quantization is enabled
+        # Compress weights for transmission:
+        # - if quantization enabled -> quantize pruned weights
+        # - else if pruning enabled -> sparse-compress pruned weights
         if self.quantizer is not None:
             compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
             stats = self.quantizer.get_compression_stats(updated_weights, compressed_data)
@@ -461,6 +477,31 @@ class FederatedLearningClient:
                 "num_samples": num_samples,
                 "metrics": metrics
             }
+        elif self.pruner is not None:
+            try:
+                pruned_bytes, _ = self.pruner.compress_pruned_weights(updated_weights)
+                pruned_b64 = base64.b64encode(pruned_bytes).decode("utf-8")
+                model_payload_bytes = len(pruned_b64.encode("utf-8"))
+                update_message = {
+                    "client_id": self.client_id,
+                    "round": self.current_round,
+                    "pruned_data": pruned_b64,
+                    "model_payload_bytes": model_payload_bytes,
+                    "num_samples": num_samples,
+                    "metrics": metrics
+                }
+            except Exception as e:
+                print(f"Client {self.client_id} error compressing pruned weights: {e}")
+                weights_encoded = self.serialize_weights(updated_weights)
+                model_payload_bytes = len(weights_encoded.encode("utf-8"))
+                update_message = {
+                    "client_id": self.client_id,
+                    "round": self.current_round,
+                    "weights": weights_encoded,
+                    "model_payload_bytes": model_payload_bytes,
+                    "num_samples": num_samples,
+                    "metrics": metrics
+                }
         else:
             weights_encoded = self.serialize_weights(updated_weights)
             model_payload_bytes = len(weights_encoded.encode('utf-8'))
@@ -519,7 +560,7 @@ class FederatedLearningClient:
             "mae": float(mae),
             "mape": float(mape)
         }
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             metrics_dict["client_converged"] = 1.0
         
         metrics_message = {
@@ -538,7 +579,7 @@ class FederatedLearningClient:
         
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, MSE: {mse:.4f}, "
               f"MAE: {mae:.4f}, MAPE: {mape:.4f}")
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             time.sleep(2)
             self.stop()

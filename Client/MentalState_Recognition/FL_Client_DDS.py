@@ -93,6 +93,7 @@ NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Chunking configuration for large messages
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for better DDS performance in poor networks
@@ -631,8 +632,8 @@ class FederatedLearningClient:
                     # Check if weights are compressed (quantized)
                     if isinstance(raw_weights, dict) and 'compressed_data' in raw_weights:
                         if self.quantizer is not None:
-                            weights = self.quantizer.decompress(raw_weights)
-                            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+                            weights = self.quantizer.as_training_weights(raw_weights)
+                            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
                         else:
                             print(f"Client {self.client_id}: ERROR - Received quantized data but quantizer not initialized!")
                             # Clear buffers and continue
@@ -704,7 +705,7 @@ class FederatedLearningClient:
         final_loss = float(history.history['loss'][-1]) if 'loss' in history.history else 0.0
         final_acc = float(history.history['acc'][-1]) if 'acc' in history.history else 0.0
         self._update_local_convergence(final_loss)
-        client_converged = 1.0 if self.has_converged else 0.0
+        client_converged = 1.0 if (self.has_converged and STOP_ON_CLIENT_CONVERGENCE) else 0.0
         
         # Get model weights
         weights = self.model.get_weights()
@@ -735,7 +736,7 @@ class FederatedLearningClient:
         
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
         print(f"Training metrics - Loss: {final_loss:.4f}, Accuracy: {final_acc:.4f}")
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             print(f"Client {self.client_id} notifying server of convergence and stopping")
             self.running = False
         

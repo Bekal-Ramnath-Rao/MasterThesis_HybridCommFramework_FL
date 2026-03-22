@@ -207,6 +207,101 @@ class ServerQuantizationHandler:
         print(f"{'='*70}\n")
         
         return aggregated, stats
+
+    def aggregate_compressed_updates(
+        self,
+        client_updates: Dict[int, Dict],
+        aggregation_method: str = "fedavg"
+    ) -> Tuple[Dict, Dict]:
+        """
+        Aggregate client updates while keeping them quantized end-to-end.
+
+        This aggregates directly on the received quantized tensors (e.g., uint8 arrays),
+        without calling decompress/dequantize anywhere.
+
+        Expected per-client update shape:
+          client_updates[client_id] = {
+            'compressed_data': <dict produced by Quantization.compress()>,
+            'num_samples': <int>
+          }
+
+        Returns:
+          (aggregated_compressed_data_dict, stats)
+        """
+        print(f"\n{'='*70}")
+        print(f"Aggregating *Compressed* Quantized Updates from {len(client_updates)} Clients")
+        print(f"{'='*70}")
+
+        if not client_updates:
+            raise ValueError("No client updates provided")
+
+        # Extract first payload to determine structure/dtype/ranges
+        first = next(iter(client_updates.values()))
+        first_cd = first.get("compressed_data") or {}
+        first_q = first_cd.get("compressed_data")
+        if not isinstance(first_q, list) or not first_q:
+            raise ValueError("Invalid compressed_data format: expected dict with non-empty list 'compressed_data'")
+
+        total_samples = sum(int(u.get("num_samples", 1)) for u in client_updates.values())
+        if total_samples <= 0:
+            total_samples = len(client_updates)
+
+        # Determine dtype and clamp range from first tensor
+        def _dtype_limits(arr: np.ndarray):
+            if np.issubdtype(arr.dtype, np.integer):
+                info = np.iinfo(arr.dtype)
+                return info.min, info.max
+            # If already float, keep as float; no clamping needed.
+            return None, None
+
+        aggregated_qweights: List[np.ndarray] = []
+        num_layers = len(first_q)
+
+        for layer_idx in range(num_layers):
+            layer0 = np.asarray(first_q[layer_idx])
+            target_dtype = layer0.dtype
+            qmin, qmax = _dtype_limits(layer0)
+
+            acc = np.zeros_like(layer0, dtype=np.float64)
+            for client_id, upd in client_updates.items():
+                cd = upd.get("compressed_data") or {}
+                qws = cd.get("compressed_data")
+                if not isinstance(qws, list) or layer_idx >= len(qws):
+                    raise ValueError(f"Client {client_id} compressed_data missing layer {layer_idx}")
+
+                ns = int(upd.get("num_samples", 1))
+                w = ns / total_samples
+                acc += np.asarray(qws[layer_idx], dtype=np.float64) * w
+
+            # Round back into quantized representation
+            if qmin is not None and qmax is not None:
+                out = np.clip(np.rint(acc), qmin, qmax).astype(target_dtype)
+            else:
+                out = acc.astype(target_dtype)
+
+            aggregated_qweights.append(out)
+
+        aggregated_compressed = {
+            "compressed_data": aggregated_qweights,
+            # Intentionally keep params/config/strategy as provided (clients will not dequantize)
+            "quantization_params": first_cd.get("quantization_params", {}) or {},
+            "strategy": first_cd.get("strategy", self.config.strategy),
+            "config": first_cd.get("config", getattr(self.config, "to_dict", lambda: {})()),
+            "data_type": first_cd.get("data_type", "weights"),
+        }
+
+        stats = {
+            "num_clients": len(client_updates),
+            "total_samples": total_samples,
+            "aggregation_method": aggregation_method,
+            "num_layers": len(aggregated_qweights),
+            "kept_quantized": True,
+        }
+
+        print(f"✓ Compressed aggregation complete: {len(aggregated_qweights)} layers")
+        print(f"{'='*70}\n")
+
+        return aggregated_compressed, stats
     
     def _federated_averaging(
         self,

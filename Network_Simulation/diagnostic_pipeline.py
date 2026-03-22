@@ -1349,7 +1349,7 @@ def main():
     parser.add_argument("--use-pruning", action="store_true", help="Enable model pruning (client flow includes pruning before send).")
     parser.add_argument("--pruning-sparsity", type=float, default=0.5, help="Pruning sparsity (fraction, e.g. 0.5 for 50%%).")
     parser.add_argument("--use-quantization", action="store_true", help="Enable quantization (independent of pruning; if both enabled, pruning runs first).")
-    parser.add_argument("--quantization-bits", type=int, default=8, choices=[8, 16, 32], help="Quantization bit width.")
+    parser.add_argument("--quantization-bits", type=int, default=8, choices=[4, 8, 16, 32], help="Quantization bit width.")
     parser.add_argument("--quantization-strategy", type=str, default="parameter_quantization", help="Quantization strategy.")
     parser.add_argument("--quantization-symmetric", action="store_true", help="Use symmetric quantization.")
     args = parser.parse_args()

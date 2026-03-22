@@ -47,6 +47,7 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "16"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Convergence Settings
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -373,6 +374,10 @@ class FederatedLearningServer:
 
     def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore client-local convergence removal/disconnect.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         if client_id in self.active_clients:
             self.active_clients.discard(client_id)
             self.client_updates.pop(client_id, None)
@@ -393,7 +398,7 @@ class FederatedLearningServer:
         if client_id not in self.active_clients:
             return
         m = data.get('metrics', data) if isinstance(data.get('metrics'), dict) else data
-        if float(m.get('client_converged', 0.0)) >= 1.0:
+        if STOP_ON_CLIENT_CONVERGENCE and float(m.get('client_converged', 0.0)) >= 1.0:
             self.mark_client_converged(client_id)
             return
         if round_num == self.current_round:
@@ -406,18 +411,18 @@ class FederatedLearningServer:
                         compressed_update = pickle.loads(base64.b64decode(compressed_update.encode('utf-8')))
                     except Exception as e:
                         print(f"Server error decoding compressed_data from client {client_id}: {e}")
-                weights = self.quantization_handler.decompress_client_update(
-                    client_id, 
-                    compressed_update
-                )
-                print(f"Received and decompressed update from client {client_id}")
+                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                self.client_updates[client_id] = {
+                    'compressed_data': compressed_update,
+                    'num_samples': data['num_samples']
+                }
+                print(f"Received quantized update from client {client_id} (kept quantized)")
             else:
                 weights = self.deserialize_weights(data['weights'])
-            
-            self.client_updates[client_id] = {
-                'weights': weights,
-                'num_samples': data['num_samples']
-            }
+                self.client_updates[client_id] = {
+                    'weights': weights,
+                    'num_samples': data['num_samples']
+                }
 
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{self.num_clients})")
@@ -433,7 +438,7 @@ class FederatedLearningServer:
         if client_id not in self.active_clients:
             return
         m = data.get('metrics', data) if isinstance(data.get('metrics'), dict) else data
-        if float(m.get('client_converged', 0.0)) >= 1.0:
+        if STOP_ON_CLIENT_CONVERGENCE and float(m.get('client_converged', 0.0)) >= 1.0:
             self.mark_client_converged(client_id)
             return
         # Store client metrics
@@ -498,6 +503,32 @@ class FederatedLearningServer:
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and len(self.client_updates) > 0
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            serialized = base64.b64encode(pickle.dumps(self.global_compressed)).decode('utf-8')
+            global_model_message = {
+                "round": self.current_round,
+                "quantized_data": serialized,
+                "model_config": self.model_config
+            }
+
+            self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, json.dumps(global_model_message))
+            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients\n")
+
+            self.continue_training()
+            return
 
         # Calculate total samples
         total_samples = sum(update['num_samples'] for update in self.client_updates.values())

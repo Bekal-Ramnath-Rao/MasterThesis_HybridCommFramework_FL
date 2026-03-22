@@ -93,6 +93,10 @@ CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
 
+# Controls whether this client should signal/exit on local convergence.
+# When false, clients keep training until the server indicates completion.
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
+
 # Model initialization timeout (seconds) - longer for poor network conditions
 # Default: 300s (5 minutes) for very poor network conditions with large models
 MODEL_INIT_TIMEOUT = float(os.getenv("MODEL_INIT_TIMEOUT", "300"))
@@ -312,11 +316,11 @@ class FederatedLearningClient:
         if 'quantized_data' in message and self.quantizer is not None:
             # Deserialize base64+pickle encoded quantized data
             compressed_data = pickle.loads(base64.b64decode(message['quantized_data']))
-            weights = self.quantizer.decompress(compressed_data)
-            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            weights = self.quantizer.as_training_weights(compressed_data)
+            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
         elif 'compressed_data' in message and self.quantizer is not None:
-            weights = self.quantizer.decompress(message['compressed_data'])
-            print(f"Client {self.client_id}: Received and decompressed quantized global model")
+            weights = self.quantizer.as_training_weights(message['compressed_data'])
+            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
         elif 'weights' in message:
             encoded_weights = message['weights']
             weights = self.deserialize_weights(encoded_weights)
@@ -529,7 +533,8 @@ class FederatedLearningClient:
             'accuracy': float(accuracy)
         }
         if self.has_converged:
-            metrics_dict['client_converged'] = 1.0
+            # Avoid sending client_converged=1.0 when fixed-round mode is enabled.
+            metrics_dict['client_converged'] = 1.0 if STOP_ON_CLIENT_CONVERGENCE else 0.0
         
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
         
@@ -540,7 +545,7 @@ class FederatedLearningClient:
             'num_samples': self.validation_generator.n,
             'metrics': metrics_dict
         })
-        if self.has_converged:
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             await asyncio.sleep(0.5)
             self.running = False

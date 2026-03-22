@@ -11,7 +11,7 @@ This implementation provides three comprehensive quantization strategies for com
 ## Features
 
 ✓ **Three Quantization Strategies** - Choose the best approach for your use case  
-✓ **Flexible Bit Depths** - Support for 8-bit, 16-bit, and 32-bit quantization  
+✓ **Flexible Bit Depths** - Support for 4-bit, 8-bit, 16-bit, and 32-bit quantization (4-bit uses nibble packing for 2x compression)  
 ✓ **Per-Tensor & Per-Channel** - Fine-grained quantization options  
 ✓ **Symmetric & Asymmetric** - Different quantization modes  
 ✓ **Client & Server Integration** - Complete FL workflow support  

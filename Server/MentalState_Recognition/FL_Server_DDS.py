@@ -56,6 +56,7 @@ DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "16"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # Chunking configuration for large messages
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for better DDS performance in poor networks
@@ -605,6 +606,10 @@ class FederatedLearningServer:
     
     def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
+        if not STOP_ON_CLIENT_CONVERGENCE:
+            # Fixed-round mode: ignore client-local convergence removal/disconnect.
+            print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
+            return
         if client_id in self.active_clients:
             self.active_clients.discard(client_id)
             self.client_updates.pop(client_id, None)
@@ -639,7 +644,7 @@ class FederatedLearningServer:
                 client_id = sample.client_id
                 if client_id not in self.active_clients:
                     continue
-                if getattr(sample, 'client_converged', 0.0) >= 1.0:
+                if STOP_ON_CLIENT_CONVERGENCE and getattr(sample, 'client_converged', 0.0) >= 1.0:
                     self.mark_client_converged(client_id)
                     if len(self.active_clients) == 0:
                         return
@@ -681,19 +686,26 @@ class FederatedLearningServer:
                         if self.quantization_handler is not None:
                             try:
                                 compressed_data = pickle.loads(bytes(reassembled_data))
-                                weights = self.quantization_handler.decompress_client_update(client_id, compressed_data)
-                                print(f"Server: Received and decompressed update from client {client_id}")
+                                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
+                                metadata = self.model_update_metadata[client_id]
+                                self.client_updates[client_id] = {
+                                    'compressed_data': compressed_data,
+                                    'num_samples': metadata['num_samples']
+                                }
+                                print(f"Server: Received quantized update from client {client_id} (kept quantized)")
+                                weights = None
                             except Exception as e:
                                 print(f"Server: Failed to decompress from client {client_id}, falling back: {e}")
                                 weights = self.deserialize_weights(reassembled_data)
                         else:
                             weights = self.deserialize_weights(reassembled_data)
                         
-                        metadata = self.model_update_metadata[client_id]
-                        self.client_updates[client_id] = {
-                            'weights': weights,
-                            'num_samples': metadata['num_samples']
-                        }
+                        if self.quantization_handler is None:
+                            metadata = self.model_update_metadata[client_id]
+                            self.client_updates[client_id] = {
+                                'weights': weights,
+                                'num_samples': metadata['num_samples']
+                            }
                         
                         # Clear chunk buffers for this client
                         del self.model_update_chunks[client_id]
@@ -713,6 +725,36 @@ class FederatedLearningServer:
         # Safety check: ensure we have at least one client update
         if len(self.client_updates) == 0:
             print("ERROR: aggregate_models called with 0 client updates. Skipping aggregation.")
+            return
+
+        # Quantization end-to-end: aggregate directly on compressed quantized tensors.
+        if (
+            self.quantization_handler is not None
+            and 'compressed_data' in list(self.client_updates.values())[0]
+        ):
+            compressed_updates = {
+                cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
+                for cid, upd in self.client_updates.items()
+            }
+            aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
+            self.global_compressed = aggregated_compressed
+
+            # Keep float-cast view for evaluation
+            try:
+                self.global_weights = [np.asarray(w, dtype=np.float32) for w in aggregated_compressed.get('compressed_data', [])]
+            except Exception:
+                pass
+            self.evaluate_global_model()
+
+            model_config = {
+                "architecture": "CNN+BiLSTM+MHA",
+                "input_shape": [256, 20],
+                "num_classes": NUM_CLASSES
+            }
+            serialized_weights = list(pickle.dumps(self.global_compressed))
+            self.send_global_model_chunked(self.current_round, serialized_weights, json.dumps(model_config))
+            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients in chunks\n")
+            self.continue_training()
             return
 
         # Calculate total samples

@@ -382,11 +382,27 @@ CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
 ENABLE_LOCAL_CONVERGENCE_STOP = os.getenv("ENABLE_LOCAL_CONVERGENCE_STOP", "false").lower() == "true"
+# Controls whether this client should signal/exit on local convergence.
+# When false, clients keep training until the server indicates completion.
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 # When True, training ends when Q-learning value converges; when False, ends on accuracy convergence
 USE_QL_CONVERGENCE = os.getenv("USE_QL_CONVERGENCE", "false").lower() == "true"
 Q_CONVERGENCE_THRESHOLD = float(os.getenv("Q_CONVERGENCE_THRESHOLD", "0.01"))
 Q_CONVERGENCE_PATIENCE = int(os.getenv("Q_CONVERGENCE_PATIENCE", "5"))
 USE_COMMUNICATION_MODEL_REWARD = os.getenv("USE_COMMUNICATION_MODEL_REWARD", "true").lower() == "true"
+
+
+def _coarse_network_bucket_for_scenario(name: str) -> str:
+    """Map NetworkSimulator-style scenario names onto the three RL ``network`` buckets (for logs/metrics)."""
+    n = (name or "").strip().lower()
+    if n in ("excellent", "good"):
+        return "excellent"
+    if n in ("moderate", "congested_light", "dynamic"):
+        return "moderate"
+    if n in ("poor", "very_poor", "satellite", "congested_moderate", "congested_heavy"):
+        return "poor"
+    return "moderate"
+
 
 # Energy / battery model constants (tunable)
 k_tx = 1e-8
@@ -634,7 +650,7 @@ class UnifiedFLClient_Emotion:
                             # Parse all fields
                             for line in content.split('\n'):
                                 if line.startswith('scenario='):
-                                    scenario_info = line.split('=', 1)[1]
+                                    scenario_info = line.split('=', 1)[1].strip()
                                 elif line.startswith('experiment_id='):
                                     experiment_id = line.split('=', 1)[1]
                                 elif line.startswith('reset_epsilon='):
@@ -704,8 +720,11 @@ class UnifiedFLClient_Emotion:
                     self.rl_selector_uplink.last_experiment_id = experiment_id
                     self.rl_selector_downlink.last_experiment_id = experiment_id
                     if scenario_info:
+                        _sn = scenario_info.strip().lower()
                         self.rl_selector_uplink.last_scenario = scenario_info
                         self.rl_selector_downlink.last_scenario = scenario_info
+                        self.rl_selector_uplink.ensure_scenario(_sn)
+                        self.rl_selector_downlink.ensure_scenario(_sn)
                     # Save both Q-tables to persist the tracking
                     try:
                         self.rl_selector_uplink.save_q_table()
@@ -722,6 +741,13 @@ class UnifiedFLClient_Emotion:
                 # 3. Experiment ID tracking prevents multiple resets for the same experiment
             
             self.env_manager = EnvironmentStateManager()
+            # Named simulation scenario → distinct Q-table slice; extend table if this name is new.
+            if scenario_info:
+                _sn = scenario_info.strip().lower()
+                self.env_manager.update_network_scenario(_sn)
+                self.env_manager.update_network_condition(_coarse_network_bucket_for_scenario(_sn))
+                self.rl_selector_uplink.ensure_scenario(_sn)
+                self.rl_selector_downlink.ensure_scenario(_sn)
         else:
             self.rl_selector_uplink = None
             self.rl_selector_downlink = None
@@ -736,6 +762,9 @@ class UnifiedFLClient_Emotion:
         self.selected_downlink_protocol = 'grpc'
         self.round_metrics = {
             'communication_time': 0.0,
+            # Client→server only (uplink); downlink is tracked separately in downlink RL / logs
+            'uplink_model_comm_time': 0.0,
+            'uplink_metrics_comm_time': 0.0,
             'training_time': 0.0,
             'accuracy': 0.0,
             'success': False
@@ -1117,7 +1146,7 @@ class UnifiedFLClient_Emotion:
                 if isinstance(raw, str):
                     raw = base64.b64decode(raw.encode('utf-8'))
                 compressed_data = pickle.loads(raw) if isinstance(raw, bytes) else raw
-                weights = self.quantizer.decompress(compressed_data)
+                weights = self.quantizer.as_training_weights(compressed_data)
             else:
                 weights = self.deserialize_weights(data['weights'])
             
@@ -1150,7 +1179,7 @@ class UnifiedFLClient_Emotion:
             if round_num == self.current_round and round_num not in self.evaluated_rounds:
                 self.evaluated_rounds.add(round_num)  # Add BEFORE evaluate to prevent race condition
                 print(f"[AMQP] Client {self.client_id} starting evaluation for round {round_num}")
-                self.evaluate_model()
+                self.evaluate_model(evaluation_round_num=round_num)
                 print(f"[AMQP] Client {self.client_id} evaluation completed for round {round_num}.")
                 
         except Exception as e:
@@ -1321,7 +1350,7 @@ class UnifiedFLClient_Emotion:
                 if sample.round not in self.evaluated_rounds:
                     self.evaluated_rounds.add(sample.round)  # Add BEFORE evaluate to prevent race condition
                     print(f"[DDS] Client {self.client_id} starting evaluation for round {sample.round}")
-                    self.evaluate_model()
+                    self.evaluate_model(evaluation_round_num=sample.round)
                     print(f"[DDS] Client {self.client_id} evaluation completed for round {sample.round}.")
                     
         except Exception as e:
@@ -1443,8 +1472,8 @@ class UnifiedFLClient_Emotion:
             if isinstance(decoded, dict) and 'compressed_data' in decoded:
                 if self.quantizer is None:
                     raise ValueError("Received quantized gRPC global model but client quantizer is not initialized")
-                weights = self.quantizer.decompress(decoded)
-                print(f"[gRPC] Client {self.client_id} decompressed quantized global model")
+                weights = self.quantizer.as_training_weights(decoded)
+                print(f"[gRPC] Client {self.client_id} received quantized global model (kept quantized)")
             else:
                 weights = decoded
 
@@ -1466,7 +1495,7 @@ class UnifiedFLClient_Emotion:
                     if round_num not in self.evaluated_rounds:
                         self.evaluated_rounds.add(round_num)  # Add BEFORE evaluate to prevent race condition
                         print(f"[gRPC] Client {self.client_id} starting evaluation for round {round_num}")
-                        self.evaluate_model()
+                        self.evaluate_model(evaluation_round_num=round_num)
                         print(f"[gRPC] Client {self.client_id} evaluation completed for round {round_num}.")
                         
         except Exception as e:
@@ -1562,12 +1591,12 @@ class UnifiedFLClient_Emotion:
                     import base64, pickle
                     compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
                 if hasattr(self, 'quantization') and self.quantization is not None:
-                    weights = self.quantization.decompress(compressed_data)
+                    weights = self.quantization.as_training_weights(compressed_data)
                 elif hasattr(self, 'quantizer') and self.quantizer is not None:
-                    weights = self.quantizer.decompress(compressed_data)
+                    weights = self.quantizer.as_training_weights(compressed_data)
                 else:
                     weights = compressed_data
-                print(f"Client {self.client_id} decompressed quantized model")
+                print(f"Client {self.client_id} received quantized model (kept quantized)")
             else:
                 # Normal weights
                 if 'weights' in data:
@@ -1634,7 +1663,7 @@ class UnifiedFLClient_Emotion:
                 if round_num not in self.evaluated_rounds:
                     self.evaluated_rounds.add(round_num)
                     print(f"[{source}] Client {self.client_id} processing deferred start_evaluation for round {round_num}")
-                    self.evaluate_model()
+                    self.evaluate_model(evaluation_round_num=round_num)
             return True
 
         return False
@@ -1657,7 +1686,15 @@ class UnifiedFLClient_Emotion:
             self._last_downlink_rl_state = None  # reset
 
             protocol = self.selected_downlink_protocol or 'grpc'
-            resources = self.env_manager.get_resource_consumption() if self.env_manager else {}
+            resources = (
+                self.env_manager.get_resource_consumption(
+                    protocol=protocol,
+                    uplink_payload_bytes=self.round_metrics.get('payload_bytes'),
+                    downlink_payload_bytes=getattr(self, '_downlink_payload_bytes', None),
+                )
+                if self.env_manager
+                else {}
+            )
             # Estimate payload of received global model (model weights size)
             payload_bytes = getattr(self, '_downlink_payload_bytes', None) or (12 * 1024 * 1024)
             t_calc = None
@@ -1677,7 +1714,6 @@ class UnifiedFLClient_Emotion:
             reward = self.rl_selector_downlink.calculate_reward(
                 communication_time=comm_time,
                 success=True,
-                convergence_time=0.0,   # convergence time not applicable for downlink
                 accuracy=accuracy_for_reward,
                 resource_consumption=resources,
                 t_calc=t_calc,
@@ -1712,7 +1748,7 @@ class UnifiedFLClient_Emotion:
                     avg_reward_last_100=avg_reward,
                     converged=q_converged,
                     metric_communication_time=reward_details.get('communication_time'),
-                    metric_convergence_time=reward_details.get('convergence_time'),
+                    metric_convergence_time=None,
                     metric_accuracy=reward_details.get('accuracy'),
                     metric_success=reward_details.get('success'),
                     metric_cpu_usage=reward_details.get('cpu_usage'),
@@ -1723,12 +1759,12 @@ class UnifiedFLClient_Emotion:
                     metric_t_calc=reward_details.get('t_calc'),
                     reward_base=reward_details.get('reward_base'),
                     reward_communication_time=reward_details.get('reward_communication_time'),
-                    reward_convergence_time=reward_details.get('reward_convergence_time'),
+                    reward_convergence_time=None,
                     reward_accuracy=reward_details.get('reward_accuracy'),
                     reward_resource_penalty=reward_details.get('reward_resource_penalty'),
                     reward_battery_penalty=reward_details.get('reward_battery_penalty'),
                     reward_t_calc_penalty=reward_details.get('reward_t_calc_penalty'),
-                    reward_total=reward_details.get('reward_total'),
+                    reward_total=reward_details.get('reward_total', reward),
                     link_direction='downlink',
                 )
         except Exception as e:
@@ -1820,7 +1856,7 @@ class UnifiedFLClient_Emotion:
                 return
             self.evaluated_rounds.add(round_num)  # Add BEFORE evaluate to prevent race condition
             print(f"Client {self.client_id} starting evaluation for round {round_num}...")
-            self.evaluate_model()
+            self.evaluate_model(evaluation_round_num=round_num)
             print(f"Client {self.client_id} evaluation completed for round {round_num}.")
         else:
             print(f"Client {self.client_id} skipping evaluation signal for round {round_num} (current: {self.current_round})")
@@ -1913,9 +1949,13 @@ class UnifiedFLClient_Emotion:
                     self.env_manager.update_resource_level(resource_level)
                     if USE_QL_CONVERGENCE:
                         reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
-                        if reward_scenario and reward_scenario in self.rl_selector_downlink.NETWORK_CONDITIONS:
-                            self.env_manager.update_network_condition(reward_scenario)
+                        if reward_scenario:
+                            self.env_manager.update_network_scenario(reward_scenario)
+                            self.env_manager.update_network_condition(
+                                _coarse_network_bucket_for_scenario(reward_scenario)
+                            )
                         else:
+                            self.env_manager.update_network_scenario(None)
                             self.measure_network_condition()
                     else:
                         self.measure_network_condition()
@@ -1980,11 +2020,16 @@ class UnifiedFLClient_Emotion:
             # Note: we do NOT log reward=0.0 here anymore.
             # The real downlink reward is computed and logged in _update_downlink_rl_after_reception()
             # once the global model actually arrives via the selected protocol.
+            _dl_eps = (
+                f"{self.rl_selector_downlink.epsilon:.4f}"
+                if self.rl_selector_downlink is not None
+                else "N/A"
+            )
             print(
                 f"[gRPC] Client {self.client_id} replied ProtocolSelection: "
                 f"round={round_id}, global_model_id={global_model_id}, "
                 f"downlink={selected_downlink_protocol} "
-                f"(downlink RL agent epsilon={self.rl_selector_downlink.epsilon:.4f if self.rl_selector_downlink else 'N/A'})"
+                f"(downlink RL agent epsilon={_dl_eps})"
             )
         else:
             print(f"[gRPC] Client {self.client_id} ProtocolSelection rejected: {response.message}")
@@ -2245,9 +2290,13 @@ class UnifiedFLClient_Emotion:
                     # Otherwise use actual measured network so we learn/select for real conditions.
                     if USE_QL_CONVERGENCE:
                         reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
-                        if reward_scenario and reward_scenario in self.rl_selector_uplink.NETWORK_CONDITIONS:
-                            self.env_manager.update_network_condition(reward_scenario)
+                        if reward_scenario:
+                            self.env_manager.update_network_scenario(reward_scenario)
+                            self.env_manager.update_network_condition(
+                                _coarse_network_bucket_for_scenario(reward_scenario)
+                            )
                         else:
+                            self.env_manager.update_network_scenario(None)
                             self.measure_network_condition()
                     else:
                         self.measure_network_condition()
@@ -2510,17 +2559,37 @@ class UnifiedFLClient_Emotion:
                 continue
         
         if success:
-            self.round_metrics['communication_time'] = time.time() - comm_start
+            self.round_metrics['uplink_model_comm_time'] = time.time() - comm_start
+            # Total uplink time is completed after evaluation metrics are sent
+            self.round_metrics['uplink_metrics_comm_time'] = 0.0
+            self.round_metrics['communication_time'] = self.round_metrics['uplink_model_comm_time']
             self.round_metrics['success'] = True
             self.waiting_for_aggregated_model = True
         else:
             print(f"Client {self.client_id} ERROR: All protocols failed!")
             self.round_metrics['success'] = False
+            self.round_metrics['uplink_model_comm_time'] = 0.0
+            self.round_metrics['uplink_metrics_comm_time'] = 0.0
     
-    def evaluate_model(self):
-        """Evaluate model on validation data and send metrics to server via RL-selected protocol"""
+    def evaluate_model(self, evaluation_round_num: Optional[int] = None):
+        """Evaluate model on validation data and send metrics to server via RL-selected protocol.
+
+        Args:
+            evaluation_round_num: Round index for metrics payload and uplink Q-learning log.
+                When omitted, uses ``self.current_round``. Pass explicitly when evaluation
+                follows ``_apply_global_model_weights`` and ``current_round`` may already
+                have been advanced by a deferred ``start_training`` for the *next* round —
+                otherwise downlink rows (tied to the global model round) and uplink rows
+                disagree in the database, and the server can reject metrics.
+        """
         if not self.is_active:
             return
+
+        report_round = (
+            int(evaluation_round_num)
+            if evaluation_round_num is not None
+            else int(self.current_round)
+        )
 
         loss, accuracy = self.model.evaluate(
             self.validation_generator,
@@ -2534,38 +2603,16 @@ class UnifiedFLClient_Emotion:
         if self.env_manager is not None:
             self._last_rl_state = self.env_manager.get_current_state()
         
-        # Update battery for this round before sending metrics (so server gets current SoC)
-        if USE_RL_SELECTION and self.env_manager:
-            try:
-                protocol_for_energy = self.selected_protocol or 'mqtt'
-                try:
-                    bytes_sent, bytes_recv = get_round_bytes_sent_received(self.current_round, protocol_for_energy)
-                except Exception:
-                    bytes_sent, bytes_recv = 0, 0
-                t_round = self.round_metrics.get('training_time', 0.0) + self.round_metrics.get('communication_time', 0.0)
-                try:
-                    import psutil
-                    cpu_util = psutil.cpu_percent(interval=0.0)
-                except Exception:
-                    cpu_util = 50.0
-                alpha = PROTOCOL_ENERGY_ALPHA.get(protocol_for_energy, 1.0)
-                beta = PROTOCOL_CPU_BETA.get(protocol_for_energy, 1.0)
-                E_radio_baseline = k_tx * (bytes_sent * 8) + k_rx * (bytes_recv * 8) + E_fixed
-                E_radio = alpha * E_radio_baseline
-                E_cpu = P_CPU_MAX * (cpu_util / 100.0) * t_round * beta
-                E_total = E_radio + E_cpu
-                soc = self.env_manager.battery_soc
-                delta_soc = E_total / BATTERY_CAP_J
-                new_soc = soc - delta_soc
-                self.env_manager.update_battery(new_soc, E_total)
-            except Exception:
-                pass
-        round_time_sec = self.round_metrics.get('training_time', 0.0) + self.round_metrics.get('communication_time', 0.0)
+        round_time_sec = (
+            self.round_metrics.get('training_time', 0.0)
+            + self.round_metrics.get('uplink_model_comm_time', 0.0)
+            + self.round_metrics.get('uplink_metrics_comm_time', 0.0)
+        )
         battery_soc = self.env_manager.battery_soc if (USE_RL_SELECTION and self.env_manager) else 1.0
 
         metrics_message = {
             "client_id": self.client_id,
-            "round": self.current_round,
+            "round": report_round,
             "num_samples": num_samples,
             "loss": float(loss),
             "accuracy": float(accuracy),
@@ -2579,7 +2626,7 @@ class UnifiedFLClient_Emotion:
             },
         }
         
-        comm_start = time.time()
+        metrics_comm_start = time.time()
         try:
             if protocol == 'mqtt':
                 self._send_metrics_via_mqtt(metrics_message)
@@ -2598,8 +2645,43 @@ class UnifiedFLClient_Emotion:
             else:
                 raise ValueError(f"Unknown protocol {protocol}")
             
-            self.round_metrics['communication_time'] = time.time() - comm_start
-            print(f"Client {self.client_id} sent evaluation metrics for round {self.current_round}")
+            self.round_metrics['uplink_metrics_comm_time'] = time.time() - metrics_comm_start
+            self.round_metrics['communication_time'] = (
+                self.round_metrics.get('uplink_model_comm_time', 0.0)
+                + self.round_metrics['uplink_metrics_comm_time']
+            )
+            # Battery from radio (TX and RX bits) + CPU; use all protocols' bytes for the round
+            if USE_RL_SELECTION and self.env_manager:
+                try:
+                    protocol_for_energy = self.selected_protocol or 'mqtt'
+                    try:
+                        bytes_sent, bytes_recv = get_round_bytes_sent_received(
+                            report_round, protocol=None
+                        )
+                    except Exception:
+                        bytes_sent, bytes_recv = 0, 0
+                    t_round = (
+                        self.round_metrics.get('training_time', 0.0)
+                        + self.round_metrics['communication_time']
+                    )
+                    try:
+                        import psutil
+                        cpu_util = psutil.cpu_percent(interval=0.0)
+                    except Exception:
+                        cpu_util = 50.0
+                    alpha = PROTOCOL_ENERGY_ALPHA.get(protocol_for_energy, 1.0)
+                    beta = PROTOCOL_CPU_BETA.get(protocol_for_energy, 1.0)
+                    E_radio_baseline = k_tx * (bytes_sent * 8) + k_rx * (bytes_recv * 8) + E_fixed
+                    E_radio = alpha * E_radio_baseline
+                    E_cpu = P_CPU_MAX * (cpu_util / 100.0) * t_round * beta
+                    E_total = E_radio + E_cpu
+                    soc = self.env_manager.battery_soc
+                    delta_soc = E_total / BATTERY_CAP_J
+                    new_soc = soc - delta_soc
+                    self.env_manager.update_battery(new_soc, E_total)
+                except Exception:
+                    pass
+            print(f"Client {self.client_id} sent evaluation metrics for round {report_round}")
             print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
             # RL update and optional Q-convergence end condition (battery already updated above for metrics)
             # When RL is enabled: always update Q and log to DB (so GUI shows data and agent learns).
@@ -2607,10 +2689,18 @@ class UnifiedFLClient_Emotion:
             # Uses the dedicated UPLINK Q-learning agent.
             if USE_RL_SELECTION and self.rl_selector_uplink and self.env_manager:
                 try:
-                    resources = self.env_manager.get_resource_consumption()
+                    resources = self.env_manager.get_resource_consumption(
+                        protocol=self.selected_protocol or 'mqtt',
+                        uplink_payload_bytes=self.round_metrics.get('payload_bytes'),
+                        downlink_payload_bytes=getattr(self, '_downlink_payload_bytes', None),
+                    )
                     payload_bytes = self.round_metrics.get('payload_bytes') or (12 * 1024 * 1024)
                     protocol = self.selected_protocol or 'mqtt'
-                    comm_time_for_reward = self.round_metrics['communication_time']
+                    # Uplink reward: client→server (model upload + evaluation/metrics send), not downlink
+                    comm_time_for_reward = (
+                        self.round_metrics.get('uplink_model_comm_time', 0.0)
+                        + self.round_metrics.get('uplink_metrics_comm_time', 0.0)
+                    )
                     t_calc_for_reward = None
                     reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
                     if USE_COMMUNICATION_MODEL_REWARD and reward_scenario:
@@ -2623,11 +2713,10 @@ class UnifiedFLClient_Emotion:
                     elif USE_COMMUNICATION_MODEL_REWARD:
                         t_calc_for_reward = self._get_t_calc_for_reward(protocol, payload_bytes)
                     reward = self.rl_selector_uplink.calculate_reward(
-                        comm_time_for_reward,
-                        self.round_metrics['success'],
-                        self.round_metrics.get('training_time', 0.0),
-                        self.round_metrics['accuracy'],
-                        resources,
+                        communication_time=comm_time_for_reward,
+                        success=self.round_metrics['success'],
+                        accuracy=self.round_metrics['accuracy'],
+                        resource_consumption=resources,
                         t_calc=t_calc_for_reward,
                     )
                     self.rl_selector_uplink.update_q_value(reward, next_state=None, done=True)
@@ -2645,7 +2734,7 @@ class UnifiedFLClient_Emotion:
                         reward_details = self.rl_selector_uplink.get_last_reward_breakdown()
                         log_q_step(
                             client_id=self.client_id,
-                            round_num=self.current_round,
+                            round_num=report_round,
                             episode=self.rl_selector_uplink.episode_count - 1,
                             state_network=st.get('network', ''),
                             state_resource=st.get('resource', ''),
@@ -2658,7 +2747,7 @@ class UnifiedFLClient_Emotion:
                             avg_reward_last_100=float(avg_reward),
                             converged=q_converged,
                             metric_communication_time=reward_details.get('communication_time'),
-                            metric_convergence_time=reward_details.get('convergence_time'),
+                            metric_convergence_time=None,
                             metric_accuracy=reward_details.get('accuracy'),
                             metric_success=reward_details.get('success'),
                             metric_cpu_usage=reward_details.get('cpu_usage'),
@@ -2669,18 +2758,22 @@ class UnifiedFLClient_Emotion:
                             metric_t_calc=reward_details.get('t_calc'),
                             reward_base=reward_details.get('reward_base'),
                             reward_communication_time=reward_details.get('reward_communication_time'),
-                            reward_convergence_time=reward_details.get('reward_convergence_time'),
+                            reward_convergence_time=None,
                             reward_accuracy=reward_details.get('reward_accuracy'),
                             reward_resource_penalty=reward_details.get('reward_resource_penalty'),
                             reward_battery_penalty=reward_details.get('reward_battery_penalty'),
                             reward_t_calc_penalty=reward_details.get('reward_t_calc_penalty'),
-                            reward_total=reward_details.get('reward_total'),
+                            reward_total=reward_details.get('reward_total', reward),
                             link_direction='uplink',
                         )
                     # End training on Q-convergence only when USE_QL_CONVERGENCE is True
-                    if USE_QL_CONVERGENCE and q_converged:
+                    if USE_QL_CONVERGENCE and q_converged and STOP_ON_CLIENT_CONVERGENCE:
                         self.has_converged = True
-                        print(f"[Client {self.client_id}] Q-learning convergence reached at round {self.current_round}")
+                        print(
+                            f"[Client {self.client_id}] RL convergence reached at round {report_round} "
+                            f"(epsilon<{os.getenv('RL_CONVERGENCE_EPSILON_CAP', '0.1')}, "
+                            f"last {Q_CONVERGENCE_PATIENCE} uplink protocols identical)"
+                        )
                         try:
                             self.rl_selector_uplink.save_q_table()
                         except Exception as e:
@@ -2694,7 +2787,7 @@ class UnifiedFLClient_Emotion:
                         return
                 except Exception as rl_e:
                     print(f"[Client {self.client_id}] Uplink RL update error: {rl_e}")
-            if not USE_QL_CONVERGENCE and ENABLE_LOCAL_CONVERGENCE_STOP:
+            if not USE_QL_CONVERGENCE and ENABLE_LOCAL_CONVERGENCE_STOP and STOP_ON_CLIENT_CONVERGENCE:
                 self._update_client_convergence_and_maybe_disconnect(loss)
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending metrics: {e}")
@@ -2716,8 +2809,9 @@ class UnifiedFLClient_Emotion:
         if self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
             self.has_converged = True
             print(f"[Client {self.client_id}] Local convergence reached at round {self.current_round}")
-            self._notify_convergence_to_server()
-            self._disconnect_after_convergence()
+            if STOP_ON_CLIENT_CONVERGENCE:
+                self._notify_convergence_to_server()
+                self._disconnect_after_convergence()
 
     def _notify_convergence_to_server(self):
         """Notify server this client is converged using gRPC control signal."""
@@ -3264,7 +3358,7 @@ class UnifiedFLClient_Emotion:
                 if isinstance(raw, str):
                     raw = base64.b64decode(raw.encode('utf-8'))
                 compressed_data = pickle.loads(raw) if isinstance(raw, bytes) else raw
-                weights = self.quantizer.decompress(compressed_data)
+                weights = self.quantizer.as_training_weights(compressed_data)
             else:
                 weights = self.deserialize_weights(message['weights'])
             
@@ -3672,7 +3766,7 @@ class UnifiedFLClient_Emotion:
                 if isinstance(raw, str):
                     raw = base64.b64decode(raw.encode('utf-8'))
                 compressed_data = pickle.loads(raw) if isinstance(raw, bytes) else raw
-                weights = self.quantizer.decompress(compressed_data)
+                weights = self.quantizer.as_training_weights(compressed_data)
             else:
                 weights = self.deserialize_weights(message['weights'])
             
