@@ -33,6 +33,10 @@ MACVLAN_GATEWAY = os.environ.get("FL_MACVLAN_GATEWAY", "192.168.254.1")
 class NetworkSimulator:
     """Simulates various network conditions on Docker containers using tc (traffic control)"""
 
+    # Debian/Ubuntu iproute2 paths in FL client images; explicit paths avoid docker exec PATH gaps.
+    _CONTAINER_TC_BIN = "/usr/sbin/tc"
+    _CONTAINER_IP_BIN = "/usr/sbin/ip"
+
     # Predefined network scenarios. All four keys (latency, jitter, bandwidth, loss) are applied
     # verbatim to tc: netem for delay/jitter/loss, htb or tbf for bandwidth.
     NETWORK_SCENARIOS = {
@@ -513,13 +517,13 @@ class NetworkSimulator:
         """Show current tc qdisc on a container's interface. Use to verify tc was applied."""
         try:
             r = subprocess.run(
-                ["docker", "exec", container_name, "tc", "qdisc", "show", "dev", interface],
+                ["docker", "exec", container_name, self._CONTAINER_TC_BIN, "qdisc", "show", "dev", interface],
                 capture_output=True, text=True, timeout=5
             )
             out = (r.stdout or r.stderr or "").strip()
             if r.returncode == 0 and "htb" in out:
                 r2 = subprocess.run(
-                    ["docker", "exec", container_name, "tc", "class", "show", "dev", interface],
+                    ["docker", "exec", container_name, self._CONTAINER_TC_BIN, "class", "show", "dev", interface],
                     capture_output=True, text=True, timeout=5
                 )
                 out += "\n" + (r2.stdout or r2.stderr or "").strip()
@@ -528,12 +532,19 @@ class NetworkSimulator:
             return f"[ERROR] Could not show tc for {container_name}: {e}"
 
     def check_tc_available(self, container_name: str) -> bool:
-        """Check if tc command is available in the container"""
+        """Return True if iproute2 tc is present and executable in the container."""
         try:
-            result = self.run_command([
-                "docker", "exec", container_name,
-                "sh", "-c", "command -v tc"
-            ], check=False)
+            result = self.run_command(
+                [
+                    "docker",
+                    "exec",
+                    container_name,
+                    "test",
+                    "-x",
+                    self._CONTAINER_TC_BIN,
+                ],
+                check=False,
+            )
             return result.returncode == 0
         except Exception:
             return False
@@ -565,11 +576,11 @@ class NetworkSimulator:
 
             # Check if tc command is available
             if not self.check_tc_available(container_name):
-                print(f"[WARNING] Container {container_name} does not have 'tc' command (iproute2 package)")
+                print(f"[WARNING] Container {container_name} has no executable {self._CONTAINER_TC_BIN} (install iproute2 in the image)")
                 print(f"[WARNING] Skipping network conditions for {container_name}")
-                print(f"[INFO] To enable network simulation on this container, install iproute2 package")
+                print(f"[INFO] Rebuild the client image (e.g. docker compose build fl-client-unified-emotion-1) so iproute2 is included")
                 print(f"{'='*60}\n")
-                return True  # Return True to not count as failure, just skipped
+                return False
             
             # First, reset any existing tc rules
             self.reset_container_network(container_name)
@@ -594,22 +605,23 @@ class NetworkSimulator:
             # Egress: apply delay/jitter/loss (and optionally bandwidth) on the interface root
             if has_netem and has_bandwidth:
                 # Hierarchical setup: htb root, class 1:1 with rate, netem as child (netem is classless)
+                tc = self._CONTAINER_TC_BIN
                 self.run_command([
                     "docker", "exec", container_name,
                     "sh", "-c",
-                    f"tc qdisc add dev {interface} root handle 1: htb default 1"
+                    f"{tc} qdisc add dev {interface} root handle 1: htb default 1"
                 ])
                 self.run_command([
                     "docker", "exec", container_name,
                     "sh", "-c",
-                    f"tc class add dev {interface} parent 1: classid 1:1 htb "
+                    f"{tc} class add dev {interface} parent 1: classid 1:1 htb "
                     f"rate {conditions['bandwidth']} ceil {conditions['bandwidth']}"
                 ])
                 netem_cmd = " ".join(netem_params)
                 self.run_command([
                     "docker", "exec", container_name,
                     "sh", "-c",
-                    f"tc qdisc add dev {interface} parent 1:1 handle 10: netem {netem_cmd}"
+                    f"{tc} qdisc add dev {interface} parent 1:1 handle 10: netem {netem_cmd}"
                 ])
                 print(f"  Applied htb+netem: rate {conditions['bandwidth']}, netem {netem_cmd}")
                 
@@ -619,7 +631,7 @@ class NetworkSimulator:
                 self.run_command([
                     "docker", "exec", container_name,
                     "sh", "-c",
-                    f"tc qdisc add dev {interface} root netem {netem_cmd}"
+                    f"{self._CONTAINER_TC_BIN} qdisc add dev {interface} root netem {netem_cmd}"
                 ])
                 print(f"  Applied netem: {netem_cmd}")
                 
@@ -628,7 +640,7 @@ class NetworkSimulator:
                 self.run_command([
                     "docker", "exec", container_name,
                     "sh", "-c", 
-                    f"tc qdisc add dev {interface} root tbf rate {conditions['bandwidth']} "
+                    f"{self._CONTAINER_TC_BIN} qdisc add dev {interface} root tbf rate {conditions['bandwidth']} "
                     f"burst 32kbit latency 400ms"
                 ])
                 print(f"  Applied tbf: rate {conditions['bandwidth']}")
@@ -638,42 +650,42 @@ class NetworkSimulator:
             if has_netem or has_bandwidth:
                 try:
                     self.run_command(
-                        ["docker", "exec", container_name, "tc", "qdisc", "del", "dev", interface, "ingress"],
+                        ["docker", "exec", container_name, self._CONTAINER_TC_BIN, "qdisc", "del", "dev", interface, "ingress"],
                         check=False,
                     )
                     self.run_command(
-                        ["docker", "exec", container_name, "tc", "qdisc", "del", "dev", ifb_name, "root"],
+                        ["docker", "exec", container_name, self._CONTAINER_TC_BIN, "qdisc", "del", "dev", ifb_name, "root"],
                         check=False,
                     )
                     self.run_command(
-                        ["docker", "exec", container_name, "ip", "link", "set", ifb_name, "down"],
+                        ["docker", "exec", container_name, self._CONTAINER_IP_BIN, "link", "set", ifb_name, "down"],
                         check=False,
                     )
                     self.run_command(
-                        ["docker", "exec", container_name, "ip", "link", "del", ifb_name],
+                        ["docker", "exec", container_name, self._CONTAINER_IP_BIN, "link", "del", ifb_name],
                         check=False,
                     )
                 except Exception:
                     pass
                 try:
                     r = self.run_command(
-                        ["docker", "exec", container_name, "ip", "link", "add", "name", ifb_name, "type", "ifb"],
+                        ["docker", "exec", container_name, self._CONTAINER_IP_BIN, "link", "add", "name", ifb_name, "type", "ifb"],
                         check=False,
                     )
                     if r.returncode != 0:
                         self.log(f"Container {container_name}: ip link add ifb failed (ingress skipped): {getattr(r, 'stderr', '') or getattr(r, 'stdout', '')}")
                     else:
                         self.run_command(
-                            ["docker", "exec", container_name, "ip", "link", "set", ifb_name, "up"],
+                            ["docker", "exec", container_name, self._CONTAINER_IP_BIN, "link", "set", ifb_name, "up"],
                             check=False,
                         )
                         self.run_command(
-                            ["docker", "exec", container_name, "tc", "qdisc", "add", "dev", interface, "ingress"],
+                            ["docker", "exec", container_name, self._CONTAINER_TC_BIN, "qdisc", "add", "dev", interface, "ingress"],
                             check=False,
                         )
                         self.run_command(
                             [
-                                "docker", "exec", container_name, "tc", "filter", "add", "dev", interface,
+                                "docker", "exec", container_name, self._CONTAINER_TC_BIN, "filter", "add", "dev", interface,
                                 "parent", "ffff:", "protocol", "all", "u32", "match", "u32", "0", "0",
                                 "flowid", "1:1", "action", "mirred", "egress", "redirect", "dev", ifb_name,
                             ],
@@ -681,7 +693,7 @@ class NetworkSimulator:
                         )
                         for cmd in self._tc_egress_commands(ifb_name, conditions):
                             r = self.run_command(
-                                ["docker", "exec", container_name, "tc"] + cmd,
+                                ["docker", "exec", container_name, self._CONTAINER_TC_BIN] + cmd,
                                 check=False,
                             )
                             if r.returncode != 0:
@@ -704,24 +716,24 @@ class NetworkSimulator:
             interface = self.get_container_interface(container_name)
             # Delete ingress and IFB first, then egress
             self.run_command(
-                ["docker", "exec", container_name, "tc", "qdisc", "del", "dev", interface, "ingress"],
+                ["docker", "exec", container_name, self._CONTAINER_TC_BIN, "qdisc", "del", "dev", interface, "ingress"],
                 check=False,
             )
             self.run_command(
-                ["docker", "exec", container_name, "tc", "qdisc", "del", "dev", "ifb0", "root"],
+                ["docker", "exec", container_name, self._CONTAINER_TC_BIN, "qdisc", "del", "dev", "ifb0", "root"],
                 check=False,
             )
             self.run_command(
-                ["docker", "exec", container_name, "ip", "link", "set", "ifb0", "down"],
+                ["docker", "exec", container_name, self._CONTAINER_IP_BIN, "link", "set", "ifb0", "down"],
                 check=False,
             )
             self.run_command(
-                ["docker", "exec", container_name, "ip", "link", "del", "ifb0"],
+                ["docker", "exec", container_name, self._CONTAINER_IP_BIN, "link", "del", "ifb0"],
                 check=False,
             )
             self.run_command([
                 "docker", "exec", container_name,
-                "sh", "-c", f"tc qdisc del dev {interface} root"
+                "sh", "-c", f"{self._CONTAINER_TC_BIN} qdisc del dev {interface} root"
             ], check=False)
             self.log(f"Reset network conditions for {container_name}")
         except Exception as e:

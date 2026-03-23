@@ -337,6 +337,31 @@ class ExperimentRunner:
             cwd = str(Path(__file__).parent.parent)
         return subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', check=check, env=env, cwd=cwd)
 
+    def _running_docker_container_names(self) -> set:
+        """Names of currently running containers (``docker ps``)."""
+        result = self.run_command(["docker", "ps", "--format", "{{.Names}}"], check=False)
+        if result.returncode != 0 or not (result.stdout or "").strip():
+            return set()
+        return {n.strip() for n in result.stdout.strip().splitlines() if n.strip()}
+
+    def _docker_container_exists(self, name: str) -> bool:
+        """True if a container exists (running or stopped) with this exact name."""
+        r = self.run_command(["docker", "inspect", "-f", "{{.Id}}", name], check=False)
+        return r.returncode == 0 and bool((r.stdout or "").strip())
+
+    def _running_fl_client_containers(self, protocol: str) -> List[str]:
+        """Client service names from the protocol list that are actually running (e.g. RL single-client)."""
+        running = self._running_docker_container_names()
+        services = self.service_patterns[self.use_case][protocol]
+        return [
+            s
+            for s in services
+            if "client" in s
+            and "broker" not in s.lower()
+            and "rabbitmq" not in s.lower()
+            and s in running
+        ]
+
     def _compose_requires_runtime_patch(self) -> bool:
         """Whether compose files should be patched at runtime to expose pruning env vars."""
         return bool(getattr(self, "use_pruning", False))
@@ -808,18 +833,28 @@ class ExperimentRunner:
             print(f"{'='*70}\n")
             return True
 
-        # gpu or host_macvlan: per-container tc
+        # gpu or host_macvlan: per-container tc (only running client containers; RL training may start one client)
+        running = self._running_docker_container_names()
         success_count = 0
+        client_targets = 0
         for container in services:
             if 'broker' in container.lower() or 'rabbitmq' in container.lower() or 'server' in container.lower():
                 print(f"[INFO] Skipping network conditions for broker/server: {container} (infrastructure)")
                 continue
+            if container not in running:
+                print(f"[INFO] Skipping network conditions for {container}: container not running (e.g. single-client RL mode)")
+                continue
+            client_targets += 1
             try:
                 if sim.apply_network_conditions(container, conditions):
                     success_count += 1
             except Exception as e:
                 print(f"[WARNING] Failed to apply conditions to {container}: {e}")
-        print(f"\nApplied network conditions to {success_count}/{len(services)} containers")
+        if client_targets == 0:
+            print(f"\n[INFO] No running FL client containers in compose list; network scenario not applied to clients")
+            print(f"{'='*70}\n")
+            return True
+        print(f"\nApplied network conditions to {success_count}/{client_targets} running client container(s)")
         time.sleep(2)
         return success_count > 0
     
@@ -836,7 +871,6 @@ class ExperimentRunner:
         # Get server container name and client containers (for per-round tc re-apply)
         services = self.service_patterns[self.use_case][protocol]
         server_container = [s for s in services if "server" in s][0]
-        client_containers = [s for s in services if "client" in s and ("broker" not in s.lower() and "rabbitmq" not in s.lower())]
         use_gaussian = os.environ.get("USE_GAUSSIAN_DELAY", "1").strip().lower() in ("1", "true", "yes")
         resample_tc_per_round = scenario and use_gaussian
         last_round_tc_applied = 0  # re-apply tc before each round's send when round completes
@@ -927,7 +961,7 @@ class ExperimentRunner:
                                 if self.network_mode == "host" and getattr(self, "_host_network_sim", None) is not None:
                                     self._host_network_sim.apply_network_conditions_host(conditions)
                                 else:
-                                    for container in client_containers:
+                                    for container in self._running_fl_client_containers(protocol):
                                         try:
                                             sim.apply_network_conditions(container, conditions)
                                         except Exception as e:
@@ -1017,8 +1051,10 @@ class ExperimentRunner:
                 except Exception as e:
                     print(f"[WARNING] Failed to collect logs for {broker}: {e}")
 
-        # Save client logs as well for debugging client-side behavior
-        client_containers = [s for s in services if "client" in s]
+        # Save client logs as well for debugging client-side behavior (only containers that exist this run)
+        client_containers = [
+            s for s in services if "client" in s and self._docker_container_exists(s)
+        ]
         if client_containers:
             print(f"Collecting logs for clients: {', '.join(client_containers)}")
             for client in client_containers:
