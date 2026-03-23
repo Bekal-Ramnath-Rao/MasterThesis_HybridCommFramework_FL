@@ -402,7 +402,8 @@ class UnifiedFederatedLearningServer:
             protocol = 'grpc' if self.current_round == 1 else self._get_delivery_protocol(client_id)
             message = {
                 'round': self.current_round,
-                'weights': weights_b64
+                'weights': weights_b64,
+                'server_sent_unix': time.time(),
             }
             
             try:
@@ -496,12 +497,14 @@ if GRPC_PROTO_AVAILABLE:
         def GetGlobalModel(self, request, context):
             if self.server.global_weights is None:
                 return federated_learning_pb2.GlobalModel(
-                    round=0, weights=b'', available=False, model_config='', chunk_index=0, total_chunks=1
+                    round=0, weights=b'', available=False, model_config='', chunk_index=0, total_chunks=1,
+                    server_sent_unix=0.0,
                 )
             ready_round = self.server.grpc_model_ready.get(request.client_id)
             if ready_round is None:
                 return federated_learning_pb2.GlobalModel(
-                    round=request.round, weights=b'', available=False, model_config='', chunk_index=0, total_chunks=1
+                    round=request.round, weights=b'', available=False, model_config='', chunk_index=0, total_chunks=1,
+                    server_sent_unix=0.0,
                 )
             serialized = pickle.dumps(self.server.global_weights)
             return federated_learning_pb2.GlobalModel(
@@ -511,6 +514,7 @@ if GRPC_PROTO_AVAILABLE:
                 model_config='',
                 chunk_index=0,
                 total_chunks=1,
+                server_sent_unix=time.time(),
             )
 
         def CheckTrainingStatus(self, request, context):

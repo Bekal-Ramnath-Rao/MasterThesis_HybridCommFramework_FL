@@ -7,7 +7,7 @@ system resources. RL logic is designed to run on CPU only (no TensorFlow
 ops); client-side model training uses GPU separately.
 
 Actions: MQTT, AMQP, gRPC, QUIC, DDS
-Rewards (success, max 40): base 10, accuracy ≤10, communication ≤10, resource ≥-5, battery ≥-5
+Rewards (success, max 30): base 10, communication ≤10, resource ≥-5, battery ≥-5
 Environment: Network conditions, Resources, Model size, Mobility
 """
 
@@ -18,6 +18,8 @@ import time
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 import pickle
+import re
+import shutil
 import tempfile
 
 try:
@@ -28,7 +30,7 @@ except ImportError:
     _HAS_FCNTL = False
 
 
-# --- Reward budget (success): base 10 + accuracy 10 + comm 10 + resource ≥ -5 + battery ≥ -5 → max 40 ---
+# --- Reward budget (success): base 10 + comm 10 + resource ≥ -5 + battery ≥ -5 → max 30 ---
 # Communication time: log spread (seconds). Tuned from q_learning backups (uplink p50≈50s, downlink≈2s):
 # T_HI 220 flattened the 10–90s band; ~120 improves slope for slow uploads without crushing totals.
 _COMM_T_LO = 1.5
@@ -72,6 +74,16 @@ def _bandwidth_norm_from_mbps(mbps: float) -> float:
     return float(m / (m + k))
 
 
+def _safe_scenario_filename_tag(scenario: Optional[str]) -> str:
+    """Filesystem-safe fragment for archive filenames."""
+    s = (scenario or "unknown").strip().lower()
+    if not s:
+        s = "unknown"
+    s = re.sub(r"[^a-z0-9._-]+", "_", s)
+    s = s.strip("_") or "unknown"
+    return s[:80]
+
+
 class QLearningProtocolSelector:
     """
     Q-Learning agent for selecting optimal communication protocol
@@ -89,7 +101,7 @@ class QLearningProtocolSelector:
     def __init__(
         self,
         learning_rate: float = 0.12,
-        discount_factor: float = 0,
+        discount_factor: float = 0.8,
         epsilon: float = 1.0,
         epsilon_decay: float = 0.96,
         epsilon_min: float = 0.01,
@@ -277,7 +289,6 @@ class QLearningProtocolSelector:
         self,
         communication_time: float,
         success: bool,
-        accuracy: float,
         resource_consumption: Dict[str, float],
         t_calc: Optional[float] = None,
         use_communication_model_reward: Optional[bool] = None,
@@ -291,7 +302,6 @@ class QLearningProtocolSelector:
             communication_time: One-way communication time for this agent's link (seconds):
                 uplink agent → client→server (model upload + metrics, etc.); downlink agent → server→client.
             success: Whether communication was successful
-            accuracy: Model accuracy (0-1)
             resource_consumption: Dict with cpu, memory, bandwidth usage
             t_calc: Optional analytical transfer time (seconds). If set, high T_calc
                     reduces reward; low T_calc reduces reward less (communication model impact).
@@ -314,7 +324,6 @@ class QLearningProtocolSelector:
         if not success:
             self._last_reward_breakdown = {
                 'communication_time': float(communication_time),
-                'accuracy': float(accuracy),
                 'success': False,
                 'cpu_usage': cpu_usage,
                 'memory_usage': memory_usage,
@@ -326,7 +335,6 @@ class QLearningProtocolSelector:
                 't_calc': float(t_calc) if t_calc is not None else None,
                 'reward_base': -10.0,
                 'reward_communication_time': 0.0,
-                'reward_accuracy': 0.0,
                 'reward_resource_penalty': 0.0,
                 'reward_battery_penalty': 0.0,
                 'reward_t_calc_penalty': 0.0,
@@ -334,11 +342,11 @@ class QLearningProtocolSelector:
             }
             return -10.0  # Large penalty for failure
 
-        # Budget: reward_base 10 + accuracy ≤10 + communication ≤10 + resource ≥-5 + battery ≥-5 (max 40)
+        # Budget: reward_base 10 + communication ≤10 + resource ≥-5 + battery ≥-5 (max 30)
         reward_base = 10.0
         reward = reward_base
 
-        # 1–2. Communication (wall time), max 10; optional T_calc (model) subtracts from same bucket only
+        # Communication (wall time), max 10; optional T_calc (model) subtracts from same bucket only
         time_reward_raw = _reward_communication_time(communication_time)
         if use_communication_model_reward is None:
             use_communication_model_reward = self.use_communication_model_reward
@@ -353,17 +361,13 @@ class QLearningProtocolSelector:
         time_reward = float(np.clip(time_reward_raw - t_calc_penalty, 0.0, _COMM_TIME_REWARD_MAX))
         reward += time_reward
 
-        # 3. Accuracy reward (higher is better), max 10
-        accuracy_reward = float(np.clip(accuracy * 10.0, 0.0, 10.0))
-        reward += accuracy_reward
-
-        # 4. Resource penalty (CPU+memory + bandwidth), clipped to [-_RESOURCE_PENALTY_CAP, 0]
+        # Resource penalty (CPU+memory + bandwidth), clipped to [-_RESOURCE_PENALTY_CAP, 0]
         cpu_mem = 0.5 * (cpu_usage + memory_usage)
         resource_penalty_raw = -_RESOURCE_CPU_MEM_WEIGHT * cpu_mem - _RESOURCE_BW_WEIGHT * bandwidth_usage
         resource_penalty = float(np.clip(resource_penalty_raw, -_RESOURCE_PENALTY_CAP, 0.0))
         reward += resource_penalty
 
-        # 5. Battery / energy penalty, clipped to [-_BATTERY_PENALTY_CAP, 0]
+        # Battery / energy penalty, clipped to [-_BATTERY_PENALTY_CAP, 0]
         energy_soft = _soft_energy_norm(energy_j_raw)
         soc_stress = max(0.0, min(1.0, 1.0 - battery_level))
         battery_penalty_raw = (
@@ -376,7 +380,6 @@ class QLearningProtocolSelector:
 
         self._last_reward_breakdown = {
             'communication_time': float(communication_time),
-            'accuracy': float(accuracy),
             'success': bool(success),
             'cpu_usage': cpu_usage,
             'memory_usage': memory_usage,
@@ -389,7 +392,6 @@ class QLearningProtocolSelector:
             'reward_base': float(reward_base),
             'reward_communication_time': float(time_reward),
             'reward_communication_time_pre_t_calc': float(time_reward_raw),
-            'reward_accuracy': float(accuracy_reward),
             'reward_resource_penalty': float(resource_penalty),
             'reward_battery_penalty': float(low_batt_penalty),
             'reward_t_calc_penalty': -float(t_calc_penalty),
@@ -479,6 +481,82 @@ class QLearningProtocolSelector:
             print(f"[Q-Learning] Tracking experiment ID: {experiment_id}")
         if scenario:
             print(f"[Q-Learning] Tracking scenario: {scenario}")
+
+    def _archive_canonical_pickle(self, scenario: Optional[str]) -> Optional[str]:
+        """
+        Copy save_path to same directory with timestamp + scenario in the name.
+        Returns path to the archive file, or None if nothing was copied.
+        """
+        if not self.save_path or not os.path.isfile(self.save_path):
+            return None
+        d = os.path.dirname(os.path.abspath(self.save_path)) or "."
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            pass
+        base = os.path.basename(self.save_path)
+        stem, ext = os.path.splitext(base)
+        if not ext:
+            ext = ".pkl"
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tag = _safe_scenario_filename_tag(scenario)
+        archive_name = f"{stem}_archive_{ts}_{tag}{ext}"
+        archive_path = os.path.join(d, archive_name)
+        try:
+            shutil.copy2(self.save_path, archive_path)
+            print(f"[Q-Learning] Archived Q-table snapshot → {archive_path}")
+            return archive_path
+        except Exception as e:
+            print(f"[Q-Learning] Warning: could not archive {self.save_path}: {e}")
+            return None
+
+    def begin_fresh_training_for_scenario(
+        self,
+        scenario: Optional[str],
+        experiment_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Start an isolated training run for one network scenario while keeping a **single**
+        canonical pickle (``save_path``) for inference across scenarios.
+
+        1. If ``save_path`` exists, copy it to ``<stem>_archive_<timestamp>_<scenario>.pkl``.
+        2. Zero only this scenario's Q-table slice; other scenario rows are unchanged.
+        3. Reset epsilon, episode/history counters, and protocol stats (same run bookkeeping).
+
+        Use this when switching training experiments so argmax for this scenario does not
+        reuse Q-values from a previous run on the same scenario name.
+        """
+        archive_path = self._archive_canonical_pickle(scenario)
+        skey = (
+            str(scenario).strip().lower()
+            if scenario and str(scenario).strip()
+            else "moderate"
+        )
+        si = self.ensure_scenario(skey)
+        self.q_table[si, :, :, :, :] = 0.0
+
+        old_epsilon = self.epsilon
+        self.epsilon = 1.0
+        if experiment_id:
+            self.last_experiment_id = experiment_id
+        self.last_scenario = str(scenario).strip() if scenario and str(scenario).strip() else None
+
+        self.episode_count = 0
+        self.total_rewards = []
+        self.protocol_usage = {p: 0 for p in self.PROTOCOLS}
+        self.protocol_success = {p: 0 for p in self.PROTOCOLS}
+        self.protocol_failures = {p: 0 for p in self.PROTOCOLS}
+        self.state_history = []
+        self.action_history = []
+        self.reward_history = []
+        self._q_deltas = []
+        self._last_reward_breakdown = {}
+
+        print(
+            f"[Q-Learning] Fresh training for scenario '{skey}' (slice {si}): "
+            f"Q-slice zeroed, epsilon {old_epsilon:.4f} → 1.0; other scenario slices unchanged"
+        )
+        return archive_path
     
     def end_episode(self):
         """Mark end of episode and update statistics"""
@@ -1147,11 +1225,10 @@ if __name__ == "__main__":
         # Simulate reward (random for demo)
         success = np.random.random() > 0.2
         comm_time = np.random.uniform(0.1, 5.0)
-        accuracy = np.random.uniform(0.7, 0.95) if success else 0.0
         resources = env_manager.get_resource_consumption()
         
         reward = selector.calculate_reward(
-            comm_time, success, accuracy, resources
+            comm_time, success, resources
         )
         print(f"Reward: {reward:.2f}")
         

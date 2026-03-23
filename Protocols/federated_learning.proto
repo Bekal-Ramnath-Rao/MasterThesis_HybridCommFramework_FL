@@ -49,6 +49,8 @@ message GlobalModel {
     string model_config = 4;  // JSON string; only set on chunk 0 when chunked
     int32 chunk_index = 5;   // 0-based chunk index
     int32 total_chunks = 6;  // Total chunks (1 = single message, no chunking)
+    // Server wall-clock time when this downlink transfer started (chunk 0); same value on all chunks.
+    double server_sent_unix = 7;
 }
 
 message ModelUpdate {

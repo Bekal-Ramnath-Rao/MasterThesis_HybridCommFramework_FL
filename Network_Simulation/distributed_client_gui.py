@@ -275,6 +275,20 @@ class DistributedClientGUI(QMainWindow):
         self.protocol_mode.addItem("DDS", "dds")
         self.protocol_mode.setStyleSheet("padding: 8px; font-size: 12px;")
         layout.addWidget(self.protocol_mode, 1, 3)
+
+        self.data_shard_label = QLabel("Data shard (1–3):")
+        self.data_shard_combo = QComboBox()
+        self.data_shard_combo.addItem("Auto (use Client ID as shard)", None)
+        for s in (1, 2, 3):
+            self.data_shard_combo.addItem(f"Shard {s}", s)
+        self.data_shard_combo.setStyleSheet("padding: 8px; font-size: 12px;")
+        self.data_shard_combo.setToolTip(
+            "Emotion: Dataset/client_N. Mental state: non-IID partition N (1-based).\n"
+            "Auto leaves DATASET_CLIENT_ID unset so the client matches folder/partition to Client ID.\n"
+            "Temperature uses one shared CSV — shard has no effect."
+        )
+        layout.addWidget(self.data_shard_label, 2, 0)
+        layout.addWidget(self.data_shard_combo, 2, 1, 1, 3)
         
         # DDS implementation selector (only meaningful when DDS protocol is selected)
         self.dds_impl_label = QLabel("DDS Implementation:")
@@ -282,11 +296,11 @@ class DistributedClientGUI(QMainWindow):
         self.dds_impl.addItem("CycloneDDS", "cyclonedds")
         self.dds_impl.addItem("Fast DDS", "fastdds")
         self.dds_impl.setStyleSheet("padding: 8px; font-size: 12px;")
-        layout.addWidget(self.dds_impl_label, 2, 0)
-        layout.addWidget(self.dds_impl, 2, 1)
+        layout.addWidget(self.dds_impl_label, 3, 0)
+        layout.addWidget(self.dds_impl, 3, 1)
 
         # RL-unified mode selector
-        layout.addWidget(QLabel("RL-Unified Mode:"), 2, 2)
+        layout.addWidget(QLabel("RL-Unified Mode:"), 3, 2)
         rl_mode_layout = QHBoxLayout()
         self.rl_mode_group = QButtonGroup(self)
         self.rl_mode_training = QRadioButton("Training")
@@ -297,18 +311,18 @@ class DistributedClientGUI(QMainWindow):
         rl_mode_layout.addWidget(self.rl_mode_training)
         rl_mode_layout.addWidget(self.rl_mode_inference)
         rl_mode_layout.addStretch()
-        layout.addLayout(rl_mode_layout, 2, 3)
+        layout.addLayout(rl_mode_layout, 3, 3)
         
         # GPU Support
         self.gpu_enabled = QCheckBox("Enable GPU (if available)")
         self.gpu_enabled.setStyleSheet("padding: 5px; font-size: 12px;")
-        layout.addWidget(self.gpu_enabled, 3, 0, 1, 2)
+        layout.addWidget(self.gpu_enabled, 4, 0, 1, 2)
         
         # Q-learning mode note (mirrors experiment GUI behavior)
         self.ql_convergence_enabled = QCheckBox("End RL training when Q-learning values converge")
         self.ql_convergence_enabled.setStyleSheet("padding: 5px; font-size: 12px;")
         self.ql_convergence_enabled.setToolTip("Automatically enabled in RL training mode, disabled in inference mode.")
-        layout.addWidget(self.ql_convergence_enabled, 3, 2, 1, 2)
+        layout.addWidget(self.ql_convergence_enabled, 4, 2, 1, 2)
 
         self.communication_model_reward_enabled = QCheckBox("Include communication model in RL rewards")
         self.communication_model_reward_enabled.setChecked(True)
@@ -317,32 +331,34 @@ class DistributedClientGUI(QMainWindow):
             "When enabled, RL rewards include the communication-model T_calc penalty. "
             "Disable this to train or run RL without reward influence from the communication model."
         )
-        layout.addWidget(self.communication_model_reward_enabled, 4, 0, 1, 4)
+        layout.addWidget(self.communication_model_reward_enabled, 5, 0, 1, 4)
         
         # Termination mode + round cap (must match experiment GUI for fixed-rounds runs)
-        layout.addWidget(QLabel("Termination mode:"), 5, 0)
+        layout.addWidget(QLabel("Termination mode:"), 6, 0)
         self.termination_mode_combo = QComboBox()
         self.termination_mode_combo.addItem("End on client convergence (may stop early)", "client_convergence")
         self.termination_mode_combo.addItem("End on fixed rounds (run selected rounds)", "fixed_rounds")
         self.termination_mode_combo.setCurrentIndex(0)  # Preserve existing behavior
         self.termination_mode_combo.setStyleSheet("padding: 5px; font-size: 12px;")
-        layout.addWidget(self.termination_mode_combo, 5, 1, 1, 3)
+        layout.addWidget(self.termination_mode_combo, 6, 1, 1, 3)
         
-        layout.addWidget(QLabel("NUM_ROUNDS:"), 6, 0)
+        layout.addWidget(QLabel("NUM_ROUNDS:"), 7, 0)
         self.rounds_spinbox = QSpinBox()
         self.rounds_spinbox.setRange(1, 1000)
         self.rounds_spinbox.setValue(10)
         self.rounds_spinbox.setStyleSheet("padding: 5px; font-size: 12px;")
         self.rounds_spinbox.setToolTip("Round cap to keep in sync with the main experiment GUI.")
-        layout.addWidget(self.rounds_spinbox, 6, 1)
+        layout.addWidget(self.rounds_spinbox, 7, 1)
         
         # Update state when protocol mode changes
         self.protocol_mode.currentIndexChanged.connect(self.update_ql_convergence_visibility)
         self.protocol_mode.currentIndexChanged.connect(self.update_dds_impl_visibility)
+        self.use_case.currentIndexChanged.connect(self.update_data_shard_visibility_for_use_case)
         self.rl_mode_training.toggled.connect(self.update_ql_convergence_visibility)
         self.rl_mode_inference.toggled.connect(self.update_ql_convergence_visibility)
         self.update_ql_convergence_visibility()
         self.update_dds_impl_visibility()
+        self.update_data_shard_visibility_for_use_case()
         
         group.setLayout(layout)
         outer_layout.addWidget(group)
@@ -705,6 +721,15 @@ class DistributedClientGUI(QMainWindow):
         self.dds_impl_label.setEnabled(is_dds)
         self.dds_impl.setEnabled(is_dds)
 
+    def update_data_shard_visibility_for_use_case(self):
+        """Enable data-shard selector for emotion and mental state only."""
+        if not hasattr(self, "data_shard_combo"):
+            return
+        uc = self.use_case.currentData()
+        en = uc in ("emotion", "mentalstate")
+        self.data_shard_combo.setEnabled(en)
+        self.data_shard_label.setEnabled(en)
+
     def is_rl_training_mode(self):
         """Return True when RL-unified is configured in training mode"""
         return self.protocol_mode.currentData() == "rl_unified" and self.rl_mode_training.isChecked()
@@ -896,6 +921,7 @@ class DistributedClientGUI(QMainWindow):
         use_case = self.use_case.currentData() or self.use_case.currentText()
         protocol = self.protocol_mode.currentData()
         network_scenario = self.network_scenario.currentData()
+        data_shard = self.data_shard_combo.currentData()
         
         # Validate
         if not server_ip:
@@ -914,6 +940,7 @@ class DistributedClientGUI(QMainWindow):
             f"Total Clients: {total_clients}\n"
             f"Server: {server_ip}\n"
             f"Use Case: {use_case}\n"
+            f"Data shard: {data_shard if data_shard is not None else 'Auto (Client ID)'}\n"
             f"Protocol: {protocol}\n"
             f"RL Mode: {'Training' if self.is_rl_training_mode() else 'Inference'}\n"
             f"DDS Implementation: {self.dds_impl.currentText() if protocol == 'dds' else 'N/A'}\n"
@@ -994,6 +1021,11 @@ class DistributedClientGUI(QMainWindow):
             "--cap-add", "NET_ADMIN",  # For network simulation
             "-e", f"CLIENT_ID={client_id}",
             "-e", f"NUM_CLIENTS={total_clients}",
+        ]
+        ds_val = self.data_shard_combo.currentData()
+        if ds_val is not None and str(use_case).lower() in ("emotion", "mentalstate"):
+            cmd.extend(["-e", f"DATASET_CLIENT_ID={int(ds_val)}"])
+        cmd.extend([
             "-e", f"NUM_ROUNDS={self.rounds_spinbox.value()}",
             "-e", f"NODE_TYPE=client",
             "-e", f"MQTT_BROKER={server_ip}",
@@ -1010,8 +1042,8 @@ class DistributedClientGUI(QMainWindow):
             "-e", "QUIC_PORT=4433",
             "-e", f"HTTP3_HOST={server_ip}",
             "-e", "HTTP3_PORT=4434",
-            "-e", "DDS_DOMAIN_ID=0"
-        ]
+            "-e", "DDS_DOMAIN_ID=0",
+        ])
         
         termination_mode = self.termination_mode_combo.currentData() or self.termination_mode_combo.currentText()
         stop_on_client_convergence = "false" if termination_mode == "fixed_rounds" else "true"
@@ -1032,11 +1064,15 @@ class DistributedClientGUI(QMainWindow):
             if self.is_rl_training_mode():
                 cmd.extend([
                     "-e", "USE_QL_CONVERGENCE=true",
+                    "-e", "USE_RL_EXPLORATION=true",
                     "-e", "Q_CONVERGENCE_THRESHOLD=0.01",
                     "-e", "Q_CONVERGENCE_PATIENCE=5"
                 ])
             else:
-                cmd.extend(["-e", "USE_QL_CONVERGENCE=false"])
+                cmd.extend([
+                    "-e", "USE_QL_CONVERGENCE=false",
+                    "-e", "USE_RL_EXPLORATION=false",
+                ])
         else:
             cmd.extend([
                 "-e", f"PROTOCOL={protocol.upper()}"

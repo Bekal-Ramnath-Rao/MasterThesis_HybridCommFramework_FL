@@ -89,6 +89,13 @@ CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 USE_RL_SELECTION = os.getenv("USE_RL_SELECTION", "true").lower() == "true"
 USE_QL_CONVERGENCE = os.getenv("USE_QL_CONVERGENCE", "false").lower() == "true"
+_ue = os.getenv("USE_RL_EXPLORATION", "").strip().lower()
+if _ue in ("true", "1", "yes"):
+    USE_RL_EXPLORATION = True
+elif _ue in ("false", "0", "no"):
+    USE_RL_EXPLORATION = False
+else:
+    USE_RL_EXPLORATION = USE_QL_CONVERGENCE
 USE_COMMUNICATION_MODEL_REWARD = os.getenv("USE_COMMUNICATION_MODEL_REWARD", "true").lower() == "true"
 
 TOPIC_CLIENT_UPDATE = f"fl/client/{CLIENT_ID}/update"
@@ -223,6 +230,9 @@ class UnifiedFLClient_MentalState:
         print(f"Training Samples: {len(self.y_train)}")
         print(f"RL Protocol Selection: {'ENABLED' if USE_RL_SELECTION else 'DISABLED'}")
         if USE_RL_SELECTION:
+            print(f"RL Exploration (epsilon-greedy): {'ENABLED' if USE_RL_EXPLORATION else 'DISABLED (greedy)'}")
+            print(f"Q-Convergence Stop: {'ENABLED' if USE_QL_CONVERGENCE else 'DISABLED'}")
+        if USE_RL_SELECTION:
             print(f"Communication Model in Reward: {'ENABLED' if USE_COMMUNICATION_MODEL_REWARD else 'DISABLED'}")
         print(f"{'='*70}\n")
     
@@ -270,7 +280,7 @@ class UnifiedFLClient_MentalState:
                     
                     state = self.env_manager.get_current_state()
                     # Inference: use learned Q-table only (training=False); training: epsilon-greedy (training=True)
-                    protocol = self.rl_selector_uplink.select_protocol(state, training=USE_QL_CONVERGENCE)
+                    protocol = self.rl_selector_uplink.select_protocol(state, training=USE_RL_EXPLORATION)
                 
                 print(f"\n[Uplink RL Selection] State: {state}")
                 print(f"[Uplink RL Selection] Selected Protocol: {protocol.upper()}")
@@ -316,11 +326,9 @@ class UnifiedFLClient_MentalState:
             resources = self.env_manager.get_resource_consumption() if self.env_manager else {}
             payload_bytes = 12 * 1024 * 1024
             t_calc = self._get_t_calc_for_reward(protocol, payload_bytes) if USE_COMMUNICATION_MODEL_REWARD else None
-            accuracy_for_reward = self.round_metrics.get('accuracy', 0.0)
             reward = self.rl_selector_downlink.calculate_reward(
                 communication_time=comm_time,
                 success=True,
-                accuracy=accuracy_for_reward,
                 resource_consumption=resources,
                 t_calc=t_calc,
             )
@@ -353,7 +361,6 @@ class UnifiedFLClient_MentalState:
                     converged=q_converged,
                     metric_communication_time=reward_details.get('communication_time'),
                     metric_convergence_time=None,
-                    metric_accuracy=reward_details.get('accuracy'),
                     metric_success=reward_details.get('success'),
                     metric_cpu_usage=reward_details.get('cpu_usage'),
                     metric_memory_usage=reward_details.get('memory_usage'),
@@ -364,7 +371,6 @@ class UnifiedFLClient_MentalState:
                     reward_base=reward_details.get('reward_base'),
                     reward_communication_time=reward_details.get('reward_communication_time'),
                     reward_convergence_time=None,
-                    reward_accuracy=reward_details.get('reward_accuracy'),
                     reward_resource_penalty=reward_details.get('reward_resource_penalty'),
                     reward_battery_penalty=reward_details.get('reward_battery_penalty'),
                     reward_t_calc_penalty=reward_details.get('reward_t_calc_penalty'),
@@ -394,7 +400,7 @@ class UnifiedFLClient_MentalState:
             try:
                 with tf.device('/CPU:0'):
                     state = self.env_manager.get_current_state()
-                    selected = self.rl_selector_downlink.select_protocol(state, training=USE_QL_CONVERGENCE)
+                    selected = self.rl_selector_downlink.select_protocol(state, training=USE_RL_EXPLORATION)
                 self._last_downlink_rl_state = state
                 self._downlink_select_time = time.time()
                 print(f"[Downlink RL] selected {selected.upper()} "
@@ -613,7 +619,6 @@ class UnifiedFLClient_MentalState:
                 reward = self.rl_selector_uplink.calculate_reward(
                     communication_time=self.round_metrics['communication_time'],
                     success=self.round_metrics['success'],
-                    accuracy=self.round_metrics['accuracy'],
                     resource_consumption=resources,
                     t_calc=t_calc,
                 )
@@ -640,7 +645,6 @@ class UnifiedFLClient_MentalState:
                         converged=self.rl_selector_uplink.check_q_converged(),
                         metric_communication_time=reward_details.get('communication_time'),
                         metric_convergence_time=None,
-                        metric_accuracy=reward_details.get('accuracy'),
                         metric_success=reward_details.get('success'),
                         metric_cpu_usage=reward_details.get('cpu_usage'),
                         metric_memory_usage=reward_details.get('memory_usage'),
@@ -651,7 +655,6 @@ class UnifiedFLClient_MentalState:
                         reward_base=reward_details.get('reward_base'),
                         reward_communication_time=reward_details.get('reward_communication_time'),
                         reward_convergence_time=None,
-                        reward_accuracy=reward_details.get('reward_accuracy'),
                         reward_resource_penalty=reward_details.get('reward_resource_penalty'),
                         reward_battery_penalty=reward_details.get('reward_battery_penalty'),
                         reward_t_calc_penalty=reward_details.get('reward_t_calc_penalty'),
@@ -707,7 +710,18 @@ def main():
     print(f"{'='*70}")
     
     try:
-        X_train, y_train = get_client_data(CLIENT_ID, NUM_CLIENTS)
+        ds_raw = os.getenv("DATASET_CLIENT_ID", "").strip()
+        if ds_raw:
+            partition_idx = int(ds_raw) - 1
+            if partition_idx < 0 or partition_idx >= NUM_CLIENTS:
+                print(
+                    f"[Error] DATASET_CLIENT_ID={ds_raw} implies partition {partition_idx}, "
+                    f"but NUM_CLIENTS={NUM_CLIENTS} (valid shards: 1..{NUM_CLIENTS})."
+                )
+                return
+            X_train, y_train = get_client_data(partition_idx, NUM_CLIENTS)
+        else:
+            X_train, y_train = get_client_data(CLIENT_ID, NUM_CLIENTS)
         print(f"[Dataset] Loaded successfully")
         print(f"[Dataset] Shape: {X_train.shape}")
         print(f"[Dataset] Samples: {len(y_train)}")

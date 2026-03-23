@@ -387,6 +387,15 @@ ENABLE_LOCAL_CONVERGENCE_STOP = os.getenv("ENABLE_LOCAL_CONVERGENCE_STOP", "fals
 STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 # When True, training ends when Q-learning value converges; when False, ends on accuracy convergence
 USE_QL_CONVERGENCE = os.getenv("USE_QL_CONVERGENCE", "false").lower() == "true"
+# Epsilon-greedy exploration for protocol selection (actual RL training). Independent of USE_QL_CONVERGENCE
+# when USE_RL_EXPLORATION is set explicitly; if unset, matches USE_QL_CONVERGENCE for backward compatibility.
+_ue = os.getenv("USE_RL_EXPLORATION", "").strip().lower()
+if _ue in ("true", "1", "yes"):
+    USE_RL_EXPLORATION = True
+elif _ue in ("false", "0", "no"):
+    USE_RL_EXPLORATION = False
+else:
+    USE_RL_EXPLORATION = USE_QL_CONVERGENCE
 Q_CONVERGENCE_THRESHOLD = float(os.getenv("Q_CONVERGENCE_THRESHOLD", "0.01"))
 Q_CONVERGENCE_PATIENCE = int(os.getenv("Q_CONVERGENCE_PATIENCE", "5"))
 USE_COMMUNICATION_MODEL_REWARD = os.getenv("USE_COMMUNICATION_MODEL_REWARD", "true").lower() == "true"
@@ -473,6 +482,7 @@ if DDS_AVAILABLE:
         total_chunks: int
         payload: sequence[int]
         model_config_json: str = ""  # JSON string containing model configuration
+        server_sent_unix: float = 0.0
     
     @dataclass
     class TrainingCommand(IdlStruct):
@@ -681,7 +691,10 @@ class UnifiedFLClient_Emotion:
                     should_reset = False
                 else:
                     print(f"\n{'='*70}")
-                    print(f"[Client {client_id}] 🔄 RESETTING EPSILON TO 1.0 (Fresh Training) for UPLINK + DOWNLINK agents")
+                    print(
+                        f"[Client {client_id}] 🔄 FRESH RL TRAINING: archive pickle, zero this scenario's Q-slice, "
+                        f"epsilon→1.0 (uplink + downlink)"
+                    )
                     if experiment_id:
                         print(f"[Client {client_id}]   New experiment ID: {experiment_id}")
                         if last_experiment_id:
@@ -690,11 +703,22 @@ class UnifiedFLClient_Emotion:
                         print(f"[Client {client_id}]   Training scenario: {scenario_info}")
                     print(f"[Client {client_id}]   Uplink epsilon before reset: {self.rl_selector_uplink.epsilon:.4f}")
                     print(f"[Client {client_id}]   Downlink epsilon before reset: {self.rl_selector_downlink.epsilon:.4f}")
-                    self.rl_selector_uplink.reset_epsilon(experiment_id=experiment_id, scenario=scenario_info)
-                    self.rl_selector_downlink.reset_epsilon(experiment_id=experiment_id, scenario=scenario_info)
-                    print(f"[Client {client_id}]   ✓ Uplink epsilon reset to: {self.rl_selector_uplink.epsilon:.4f}")
-                    print(f"[Client {client_id}]   ✓ Downlink epsilon reset to: {self.rl_selector_downlink.epsilon:.4f}")
-                    print(f"[Client {client_id}]   📊 Q-tables will accumulate learning across all scenarios")
+                    uplink_arch = self.rl_selector_uplink.begin_fresh_training_for_scenario(
+                        scenario_info, experiment_id=experiment_id
+                    )
+                    downlink_arch = self.rl_selector_downlink.begin_fresh_training_for_scenario(
+                        scenario_info, experiment_id=experiment_id
+                    )
+                    print(f"[Client {client_id}]   ✓ Uplink epsilon: {self.rl_selector_uplink.epsilon:.4f}")
+                    print(f"[Client {client_id}]   ✓ Downlink epsilon: {self.rl_selector_downlink.epsilon:.4f}")
+                    if uplink_arch:
+                        print(f"[Client {client_id}]   Uplink archive: {uplink_arch}")
+                    if downlink_arch:
+                        print(f"[Client {client_id}]   Downlink archive: {downlink_arch}")
+                    print(
+                        f"[Client {client_id}]   Canonical Q-tables (multi-scenario, inference-ready): "
+                        f"{self.rl_selector_uplink.save_path} / {self.rl_selector_downlink.save_path}"
+                    )
                     print(f"{'='*70}\n")
 
                     # Save both Q-tables immediately to persist the reset and experiment tracking
@@ -776,7 +800,9 @@ class UnifiedFLClient_Emotion:
         self._last_rl_state = None  # for Q-learning log (state at time of uplink action)
         self._last_update_protocol = None  # protocol used to send local model update
         self._last_downlink_rl_state = None  # state at time of downlink protocol selection
-        self._downlink_select_time = None    # wall-clock time when downlink was selected (for comm-time reward)
+        self._downlink_select_time = None    # fallback when server_sent_unix is unavailable (legacy)
+        self._downlink_server_sent_unix = None  # server wall time when downlink send started
+        self._downlink_receive_complete_unix = None  # client wall time when model apply finished
         
         # DDS chunk reassembly buffers (FAIR CONFIG: matching standalone)
         self.global_model_chunks = {}  # {chunk_id: payload}
@@ -909,6 +935,8 @@ class UnifiedFLClient_Emotion:
         print(f"Client ID: {self.client_id}/{self.num_clients}")
         print(f"RL Protocol Selection: {'ENABLED' if USE_RL_SELECTION else 'DISABLED'}")
         if USE_RL_SELECTION:
+            print(f"RL Exploration (epsilon-greedy): {'ENABLED' if USE_RL_EXPLORATION else 'DISABLED (greedy)'}")
+            print(f"Q-Convergence Stop (USE_QL_CONVERGENCE): {'ENABLED' if USE_QL_CONVERGENCE else 'DISABLED'}")
             print(f"Communication Model in Reward: {'ENABLED' if USE_COMMUNICATION_MODEL_REWARD else 'DISABLED'}")
         print(f"{'='*70}\n")
         
@@ -1159,7 +1187,8 @@ class UnifiedFLClient_Emotion:
                 round_num=round_num,
                 weights=weights,
                 model_config=data.get('model_config'),
-                source="AMQP"
+                source="AMQP",
+                server_sent_unix=data.get('server_sent_unix'),
             )
                 
         except Exception as e:
@@ -1427,7 +1456,8 @@ class UnifiedFLClient_Emotion:
                                     available=True,
                                     model_config=first.model_config,
                                     chunk_index=0,
-                                    total_chunks=1
+                                    total_chunks=1,
+                                    server_sent_unix=float(getattr(first, 'server_sent_unix', 0.0) or 0.0),
                                 )
                         # Accept model if:
                         # 1. We don't have a model yet (first round) and server has one, OR
@@ -1484,11 +1514,13 @@ class UnifiedFLClient_Emotion:
                 weights = decoded
 
             model_config = json.loads(response.model_config) if response.model_config else None
+            srv_sent = float(getattr(response, 'server_sent_unix', 0.0) or 0.0)
             applied = self._apply_global_model_weights(
                 round_num=round_num,
                 weights=weights,
                 model_config=model_config,
-                source="gRPC"
+                source="gRPC",
+                server_sent_unix=srv_sent if srv_sent > 0.0 else None,
             )
             if applied:
                 self.waiting_for_aggregated_model = False  # Clear flag: received aggregated model
@@ -1621,7 +1653,8 @@ class UnifiedFLClient_Emotion:
                 round_num=round_num,
                 weights=weights,
                 model_config=data.get('model_config'),
-                source="MQTT"
+                source="MQTT",
+                server_sent_unix=data.get('server_sent_unix'),
             )
             
         except Exception as e:
@@ -1629,7 +1662,7 @@ class UnifiedFLClient_Emotion:
             import traceback
             traceback.print_exc()
 
-    def _apply_global_model_weights(self, round_num, weights, model_config=None, source="UNKNOWN"):
+    def _apply_global_model_weights(self, round_num, weights, model_config=None, source="UNKNOWN", server_sent_unix=None):
         """Initialize model if needed and apply incoming global weights."""
         recv_t0 = getattr(self, "_global_model_receive_t0", None)
         if recv_t0 is not None:
@@ -1657,6 +1690,16 @@ class UnifiedFLClient_Emotion:
             self.last_global_round = round_num
             self.waiting_for_aggregated_model = False
             print(f"[{source}] Client {self.client_id} updated model weights (round {round_num})")
+
+            # Downlink comm time for RL: prefer server_sent_unix → client receive-complete (requires synced clocks).
+            try:
+                ss = float(server_sent_unix) if server_sent_unix is not None else None
+            except (TypeError, ValueError):
+                ss = None
+            if ss is not None and ss <= 0.0:
+                ss = None
+            self._downlink_server_sent_unix = ss
+            self._downlink_receive_complete_unix = time.time()
 
             # If gRPC protocol negotiation did not arm state/time (timeout, bootstrap, race), align
             # downlink Q-learning with the actual delivery path so updates match uplink cadence per round.
@@ -1761,15 +1804,34 @@ class UnifiedFLClient_Emotion:
         Compute and log the downlink Q-learning reward after the global model is received.
         Called from _apply_global_model_weights() on successful model reception.
         Uses the dedicated DOWNLINK RL agent (separate Q-table from uplink).
+
+        Downlink communication time uses server ``server_sent_unix`` (wall clock at send start on server)
+        through client receive-complete time set in ``_apply_global_model_weights`` (requires time sync).
+        Falls back to (receive_complete - protocol_selection_time) if the server did not send a timestamp.
         """
         if (not USE_RL_SELECTION
                 or self.rl_selector_downlink is None
-                or self._downlink_select_time is None
                 or self._last_downlink_rl_state is None):
             return
+        recv_end = getattr(self, '_downlink_receive_complete_unix', None)
+        srv_sent = getattr(self, '_downlink_server_sent_unix', None)
+
+        if recv_end is None:
+            recv_end = time.time()
+        if srv_sent is not None:
+            comm_time = max(0.0, float(recv_end) - float(srv_sent))
+        elif self._downlink_select_time is not None:
+            comm_time = max(0.0, float(recv_end) - float(self._downlink_select_time))
+        else:
+            self._downlink_receive_complete_unix = None
+            self._downlink_server_sent_unix = None
+            return
+
+        self._downlink_receive_complete_unix = None
+        self._downlink_server_sent_unix = None
+        self._downlink_select_time = None
+
         try:
-            comm_time = time.time() - self._downlink_select_time
-            self._downlink_select_time = None  # reset so it won't fire again for this selection
             downlink_state = self._last_downlink_rl_state
             self._last_downlink_rl_state = None  # reset
 
@@ -1796,13 +1858,9 @@ class UnifiedFLClient_Emotion:
                 except Exception:
                     t_calc = None
 
-            # Accuracy from previous round (0.0 on first round since not yet evaluated)
-            accuracy_for_reward = self.round_metrics.get('accuracy', 0.0)
-
             reward = self.rl_selector_downlink.calculate_reward(
                 communication_time=comm_time,
                 success=True,
-                accuracy=accuracy_for_reward,
                 resource_consumption=resources,
                 t_calc=t_calc,
             )
@@ -1840,7 +1898,6 @@ class UnifiedFLClient_Emotion:
                     converged=q_converged,
                     metric_communication_time=reward_details.get('communication_time'),
                     metric_convergence_time=None,
-                    metric_accuracy=reward_details.get('accuracy'),
                     metric_success=reward_details.get('success'),
                     metric_cpu_usage=reward_details.get('cpu_usage'),
                     metric_memory_usage=reward_details.get('memory_usage'),
@@ -1851,7 +1908,6 @@ class UnifiedFLClient_Emotion:
                     reward_base=reward_details.get('reward_base'),
                     reward_communication_time=reward_details.get('reward_communication_time'),
                     reward_convergence_time=None,
-                    reward_accuracy=reward_details.get('reward_accuracy'),
                     reward_resource_penalty=reward_details.get('reward_resource_penalty'),
                     reward_battery_penalty=reward_details.get('reward_battery_penalty'),
                     reward_t_calc_penalty=reward_details.get('reward_t_calc_penalty'),
@@ -2053,7 +2109,7 @@ class UnifiedFLClient_Emotion:
                     else:
                         self.measure_network_condition()
                     state = self.env_manager.get_current_state()
-                    training_mode = USE_QL_CONVERGENCE
+                    training_mode = USE_RL_EXPLORATION
                     selected = self.rl_selector_downlink.select_protocol(state, training=training_mode)
                 # Store downlink state and selection time so reward can be computed after model arrives
                 self._last_downlink_rl_state = state
@@ -2439,7 +2495,7 @@ class UnifiedFLClient_Emotion:
                     state = self.env_manager.get_current_state()
                     # During RL-table training we keep epsilon-greedy exploration enabled.
                     # Once training is done, clients load and use the converged Q-table greedily.
-                    training_mode = USE_QL_CONVERGENCE
+                    training_mode = USE_RL_EXPLORATION
                     protocol = self.rl_selector_uplink.select_protocol(state, training=training_mode)
                 
                 print(f"\n[Uplink RL Protocol Selection]")
@@ -2850,7 +2906,6 @@ class UnifiedFLClient_Emotion:
                     reward = self.rl_selector_uplink.calculate_reward(
                         communication_time=comm_time_for_reward,
                         success=self.round_metrics['success'],
-                        accuracy=self.round_metrics['accuracy'],
                         resource_consumption=resources,
                         t_calc=t_calc_for_reward,
                     )
@@ -2896,7 +2951,6 @@ class UnifiedFLClient_Emotion:
                             ),
                             metric_communication_time=reward_details.get('communication_time'),
                             metric_convergence_time=None,
-                            metric_accuracy=reward_details.get('accuracy'),
                             metric_success=reward_details.get('success'),
                             metric_cpu_usage=reward_details.get('cpu_usage'),
                             metric_memory_usage=reward_details.get('memory_usage'),
@@ -2907,7 +2961,6 @@ class UnifiedFLClient_Emotion:
                             reward_base=reward_details.get('reward_base'),
                             reward_communication_time=reward_details.get('reward_communication_time'),
                             reward_convergence_time=None,
-                            reward_accuracy=reward_details.get('reward_accuracy'),
                             reward_resource_penalty=reward_details.get('reward_resource_penalty'),
                             reward_battery_penalty=reward_details.get('reward_battery_penalty'),
                             reward_t_calc_penalty=reward_details.get('reward_t_calc_penalty'),
@@ -3524,7 +3577,8 @@ class UnifiedFLClient_Emotion:
                 round_num=round_num,
                 weights=weights,
                 model_config=message.get('model_config'),
-                source="QUIC"
+                source="QUIC",
+                server_sent_unix=message.get('server_sent_unix'),
             )
             
             # Set event to signal model is ready
@@ -3933,7 +3987,8 @@ class UnifiedFLClient_Emotion:
                 round_num=round_num,
                 weights=weights,
                 model_config=message.get('model_config'),
-                source="HTTP/3"
+                source="HTTP/3",
+                server_sent_unix=message.get('server_sent_unix'),
             )
             
             # Set event to signal model is ready
@@ -4282,12 +4337,18 @@ class UnifiedFLClient_Emotion:
                     raise
 
 
+def emotion_dataset_folder_id() -> int:
+    """Which Dataset/client_N folder to load (defaults to CLIENT_ID). Set DATASET_CLIENT_ID to override."""
+    raw = os.getenv("DATASET_CLIENT_ID", "").strip()
+    return int(raw) if raw else CLIENT_ID
+
+
 def load_emotion_data(client_id: int):
     """
     Load emotion recognition dataset for a specific client
     
     Args:
-        client_id: Client identifier
+        client_id: Client identifier (folder Dataset/client_{client_id}/)
         
     Returns:
         Tuple of (train_generator, validation_generator)
@@ -4358,13 +4419,14 @@ def main():
     print("LOADING EMOTION RECOGNITION DATASET")
     print(f"{'='*70}")
     
+    data_folder_id = emotion_dataset_folder_id()
     try:
-        train_generator, validation_generator = load_emotion_data(CLIENT_ID)
+        train_generator, validation_generator = load_emotion_data(data_folder_id)
     except Exception as e:
         print(f"[Error] Failed to load dataset: {e}")
         print(f"\nPlease ensure dataset exists at:")
-        print(f"  Dataset/client_{CLIENT_ID}/train/")
-        print(f"  Dataset/client_{CLIENT_ID}/validation/")
+        print(f"  Dataset/client_{data_folder_id}/train/")
+        print(f"  Dataset/client_{data_folder_id}/validation/")
         return
     
     # Create client

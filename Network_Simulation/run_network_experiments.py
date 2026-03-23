@@ -42,6 +42,20 @@ if _env_path.exists():
         pass
 
 
+def parse_fl_dataset_for_client(entries: Optional[List[str]]) -> Optional[Dict[int, int]]:
+    """Parse --fl-dataset-for-client CLIENT=SHARD into a map of CLIENT_ID -> shard index (1-based)."""
+    if not entries:
+        return None
+    out: Dict[int, int] = {}
+    for raw in entries:
+        item = str(raw).strip()
+        if "=" not in item:
+            continue
+        left, _, right = item.partition("=")
+        out[int(left.strip())] = int(right.strip())
+    return out or None
+
+
 class ExperimentRunner:
     """Automates running FL experiments across different network conditions"""
     
@@ -58,9 +72,11 @@ class ExperimentRunner:
         network_mode: str = "gpu",
         baseline_mode: bool = False,
         use_ql_convergence: bool = False,
+        rl_inference_only: bool = False,
         local_clients: int = 2,
         use_communication_model_reward: bool = True,
         reset_epsilon: bool = True,
+        dataset_client_map: Optional[Dict[int, int]] = None,
     ):
         self.use_case = use_case
         self.num_rounds = num_rounds
@@ -73,6 +89,7 @@ class ExperimentRunner:
             self.network_mode = "gpu"
         self.baseline_mode = baseline_mode
         self.use_ql_convergence = use_ql_convergence
+        self.rl_inference_only = bool(rl_inference_only)
         self.use_communication_model_reward = use_communication_model_reward
         self.reset_epsilon = reset_epsilon
         # Number of client containers started from this runner on the central machine
@@ -83,6 +100,8 @@ class ExperimentRunner:
         self.pruning_params = pruning_params or {}
         self._runtime_compose_files: Dict[str, str] = {}
         self._runtime_compose_files_stop: Dict[str, str] = {}
+        self.dataset_client_map: Dict[int, int] = dict(dataset_client_map or {})
+        self._runtime_compose_files_dataset: Dict[tuple, str] = {}
         
         # Map use_case values to actual Server directory names
         self.use_case_dir_map = {
@@ -104,12 +123,17 @@ class ExperimentRunner:
             print(f"Pruning params: {self.pruning_params}")
         else:
             print("PRUNING DISABLED")
+        if self.dataset_client_map:
+            print(f"DATASET_CLIENT_ID map (by CLIENT_ID): {self.dataset_client_map}")
         print(f"{'='*70}\n")
         
         # Get the script's directory and project root
         script_dir = Path(__file__).parent.absolute()
         project_root = script_dir.parent
-        
+        # Used when compose is copied to /tmp: build context and volumes must be absolute
+        self.project_root = project_root.resolve()
+        self.docker_dir = (project_root / "Docker").resolve()
+
         # Build descriptive folder name
         if baseline_mode:
             # Baseline results go to dedicated baseline folder
@@ -317,6 +341,42 @@ class ExperimentRunner:
         """Whether compose files should be patched at runtime to expose pruning env vars."""
         return bool(getattr(self, "use_pruning", False))
 
+    def _absolutize_compose_paths_for_runtime_copy(self, content: str) -> str:
+        """
+        Runtime-patched compose files live under /tmp; Docker resolves ``context: ..`` and
+        ``../...`` volumes relative to that file, which breaks (e.g. /tmp/Server).
+        Rewrite to absolute paths anchored at the real project and Docker/ directory.
+        """
+        pr = str(self.project_root)
+        dd = str(self.docker_dir)
+        out_lines: List[str] = []
+        vol_re = re.compile(r"^(\s*-\s*)((?:\.\./|\./)[^:]+)(:.+)?\s*$")
+        for line in content.splitlines():
+            if re.match(r"^\s*context:\s*\.\.\s*$", line):
+                ind = re.match(r"^(\s*)", line).group(1)
+                line = f"{ind}context: {pr}"
+            elif re.match(r"^\s*context:\s*\.\s*$", line):
+                ind = re.match(r"^(\s*)", line).group(1)
+                line = f"{ind}context: {dd}"
+            else:
+                m = vol_re.match(line)
+                if m:
+                    host = m.group(2)
+                    abs_host = str((self.docker_dir / host).resolve())
+                    line = m.group(1) + abs_host + (m.group(3) or "")
+            out_lines.append(line)
+        result = "\n".join(out_lines)
+        if content.endswith("\n"):
+            result += "\n"
+        return result
+
+    def _write_runtime_compose_patch(self, patched_path: Path, content: str) -> None:
+        """Write a compose file copy under /tmp with absolute build/volume paths."""
+        patched_path.write_text(
+            self._absolutize_compose_paths_for_runtime_copy(content),
+            encoding="utf-8",
+        )
+
     def _patch_compose_pruning_env(self, compose_file: str) -> str:
         """Create a runtime compose file that injects pruning env placeholders next to quantization vars."""
         if compose_file in self._runtime_compose_files:
@@ -354,7 +414,7 @@ class ExperimentRunner:
         tmp_dir = Path(tempfile.gettempdir()) / "fl_runtime_compose"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         patched_path = tmp_dir / f"{src_path.stem}.runtime-pruning{src_path.suffix}"
-        patched_path.write_text(patched, encoding="utf-8")
+        self._write_runtime_compose_patch(patched_path, patched)
         self._runtime_compose_files[compose_file] = str(patched_path)
         print(f"[INFO] Using runtime patched compose file: {patched_path}")
         return str(patched_path)
@@ -364,7 +424,64 @@ class ExperimentRunner:
         patched_path = compose_file
         if self._compose_requires_runtime_patch():
             patched_path = self._patch_compose_pruning_env(patched_path)
-        return self._patch_compose_stop_env(patched_path)
+        patched_path = self._patch_compose_stop_env(patched_path)
+        return self._patch_compose_dataset_env(patched_path)
+
+    def _patch_compose_dataset_env(self, compose_file: str) -> str:
+        """Inject DATASET_CLIENT_ID next to matching CLIENT_ID lines for per-container data shards."""
+        if not self.dataset_client_map:
+            return compose_file
+
+        cache_key = (compose_file, frozenset(self.dataset_client_map.items()))
+        if cache_key in self._runtime_compose_files_dataset:
+            return self._runtime_compose_files_dataset[cache_key]
+
+        src_path = Path(compose_file)
+        if not src_path.exists():
+            self._runtime_compose_files_dataset[cache_key] = compose_file
+            return compose_file
+
+        try:
+            original = src_path.read_text(encoding="utf-8")
+        except Exception:
+            self._runtime_compose_files_dataset[cache_key] = compose_file
+            return compose_file
+
+        lines = original.splitlines()
+        new_lines: List[str] = []
+        i = 0
+        n = len(lines)
+        changed = False
+        while i < n:
+            line = lines[i]
+            m = re.match(r"^(\s*)-\s*CLIENT_ID=(\d+)\s*$", line)
+            if not m:
+                new_lines.append(line)
+                i += 1
+                continue
+            indent, cid = m.group(1), int(m.group(2))
+            new_lines.append(line)
+            i += 1
+            v = self.dataset_client_map.get(cid)
+            if v is None:
+                continue
+            changed = True
+            if i < n and re.match(r"^\s*-\s*DATASET_CLIENT_ID=\s*\S+", lines[i]):
+                i += 1
+            new_lines.append(f"{indent}- DATASET_CLIENT_ID={v}")
+
+        if not changed:
+            self._runtime_compose_files_dataset[cache_key] = compose_file
+            return compose_file
+
+        patched = "\n".join(new_lines) + ("\n" if original.endswith("\n") else "")
+        tmp_dir = Path(tempfile.gettempdir()) / "fl_runtime_compose"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        patched_path = tmp_dir / f"{src_path.stem}.runtime-dataset{src_path.suffix}"
+        self._write_runtime_compose_patch(patched_path, patched)
+        self._runtime_compose_files_dataset[cache_key] = str(patched_path)
+        print(f"[INFO] Using runtime compose (DATASET_CLIENT_ID): {patched_path}")
+        return str(patched_path)
 
     def _patch_compose_stop_env(self, compose_file: str) -> str:
         """Create a runtime compose file that injects STOP env into fl-server/fl-client services."""
@@ -425,7 +542,7 @@ class ExperimentRunner:
         tmp_dir = Path(tempfile.gettempdir()) / "fl_runtime_compose"
         tmp_dir.mkdir(parents=True, exist_ok=True)
         patched_path = tmp_dir / f"{src_path.stem}.runtime-stop{src_path.suffix}"
-        patched_path.write_text(patched, encoding="utf-8")
+        self._write_runtime_compose_patch(patched_path, patched)
 
         self._runtime_compose_files_stop[compose_file] = str(patched_path)
         print(f"[INFO] Using runtime patched compose file (STOP env): {patched_path}")
@@ -446,17 +563,28 @@ class ExperimentRunner:
                 print("End condition: Q-learning convergence (multiple episodes)")
             else:
                 print("End condition: accuracy convergence (current behavior)")
+            if self.use_ql_convergence:
+                print("RL exploration: epsilon-greedy (USE_RL_EXPLORATION=true)")
+            elif self.rl_inference_only:
+                print("RL exploration: OFF (greedy / inference-only)")
+            else:
+                print("RL exploration: epsilon-greedy on multi-client FL (USE_RL_EXPLORATION=true)")
             print("="*70 + "\n")
             
             compose_file = self._get_runtime_compose_file(self.unified_compose_files[self.use_case])
             if self.use_ql_convergence:
                 os.environ["USE_QL_CONVERGENCE"] = "true"
+                os.environ["USE_RL_EXPLORATION"] = "true"
                 # RL training: only one client runs; server waits for 1 client; run until Q converges and exit
                 os.environ["MIN_CLIENTS"] = "1"
                 os.environ["NUM_CLIENTS"] = "1"
                 print("RL training mode: starting only 1 client (converge and exit)")
             else:
                 os.environ["USE_QL_CONVERGENCE"] = "false"
+                # Multi-client FL: explore (train Q) unless explicit inference-only from GUI/CLI.
+                os.environ["USE_RL_EXPLORATION"] = (
+                    "false" if self.rl_inference_only else "true"
+                )
             os.environ["USE_COMMUNICATION_MODEL_REWARD"] = "true" if self.use_communication_model_reward else "false"
             
             # host_macvlan: ensure fl-macvlan network exists before up
@@ -1739,6 +1867,11 @@ def main():
     parser.add_argument("--use-ql-convergence", action="store_true",
                 help="Unified only: End training when Q-learning value converges (multiple episodes); else end on accuracy convergence")
     parser.add_argument(
+        "--rl-inference-only",
+        action="store_true",
+        help="Unified only (with --use-ql-convergence off): greedy protocol selection, no epsilon exploration. GUI Inference mode sets this.",
+    )
+    parser.add_argument(
         "--disable-communication-model-reward",
         action="store_true",
         help="Unified only: do not let communication-model T_calc affect RL rewards.",
@@ -1759,6 +1892,17 @@ def main():
         choices=["cyclonedds", "fastdds"],
         default="cyclonedds",
         help="DDS implementation vendor to use when running DDS experiments.",
+    )
+    parser.add_argument(
+        "--fl-dataset-for-client",
+        action="append",
+        metavar="CLIENT=SHARD",
+        default=None,
+        help=(
+            "Map container CLIENT_ID to data shard (1-based): emotion uses Dataset/client_SHARD; "
+            "mental state uses non-IID partition SHARD (converted to 0-based internally). "
+            "Repeatable, e.g. --fl-dataset-for-client 1=3 --fl-dataset-for-client 2=1"
+        ),
     )
     
     args = parser.parse_args()
@@ -1801,6 +1945,8 @@ def main():
         if args.pruning_structured:
             pruning_params["PRUNING_STRUCTURED"] = "true"
 
+    dataset_client_map = parse_fl_dataset_for_client(getattr(args, "fl_dataset_for_client", None))
+
     runner = ExperimentRunner(
         use_case=args.use_case,
         num_rounds=args.rounds,
@@ -1813,9 +1959,11 @@ def main():
         network_mode=args.network_mode,
         baseline_mode=args.baseline,
         use_ql_convergence=args.use_ql_convergence,
+        rl_inference_only=getattr(args, "rl_inference_only", False),
         local_clients=args.local_clients,
         use_communication_model_reward=not args.disable_communication_model_reward,
         reset_epsilon=not args.no_reset_epsilon,  # Default True (reset), --no-reset-epsilon makes it False
+        dataset_client_map=dataset_client_map,
     )
     
     # In baseline mode, run all protocols with excellent scenario (no network conditions)

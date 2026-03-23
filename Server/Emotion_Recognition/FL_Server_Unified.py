@@ -199,6 +199,7 @@ if DDS_AVAILABLE:
         total_chunks: int
         payload: sequence[int]
         model_config_json: str = ""  # JSON string containing model configuration
+        server_sent_unix: float = 0.0  # same on all chunks: time when server started this downlink
     
     @dataclass
     class TrainingCommand(IdlStruct):
@@ -308,6 +309,8 @@ class UnifiedFederatedLearningServer:
         self.grpc_should_train = {}  # Maps client_id -> should_train (bool)
         self.grpc_should_evaluate = {}  # Maps client_id -> should_evaluate (bool)
         self.grpc_model_ready = {}  # Maps client_id -> model_ready_for_round (int)
+        # (client_id, round) -> server wall time when gRPC downlink transfer started (chunk 0)
+        self.grpc_downlink_sent_unix = {}
         
         # Training configuration
         self.training_config = {"batch_size": 32, "local_epochs": 20}
@@ -407,6 +410,7 @@ class UnifiedFederatedLearningServer:
         """Send global model as chunks via DDS"""
         chunks = self.split_into_chunks(serialized_weights)
         total_chunks = len(chunks)
+        server_sent_unix = time.time()
         
         print(f"Sending global model in {total_chunks} chunks ({len(serialized_weights)} bytes total)")
         
@@ -416,7 +420,8 @@ class UnifiedFederatedLearningServer:
                 chunk_id=chunk_id,
                 total_chunks=total_chunks,
                 payload=chunk_data,
-                model_config_json=model_config if chunk_id == 0 else ""  # Only send config with first chunk
+                model_config_json=model_config if chunk_id == 0 else "",  # Only send config with first chunk
+                server_sent_unix=server_sent_unix,
             )
             self.dds_writers['global_model_chunk'].write(chunk)
             # Reliable QoS handles delivery, no artificial delay needed
@@ -2107,7 +2112,8 @@ class UnifiedFederatedLearningServer:
                 if protocol == 'mqtt':
                     message = {
                         'round': self.current_round,
-                        weights_key: weights_data
+                        weights_key: weights_data,
+                        'server_sent_unix': time.time(),
                     }
                     if self._payload_fits_protocol('mqtt', message):
                         self.send_via_mqtt(client_id, "fl/global_model", message)
@@ -2118,7 +2124,8 @@ class UnifiedFederatedLearningServer:
                 elif protocol == 'amqp':
                     message = {
                         'round': self.current_round,
-                        weights_key: weights_data
+                        weights_key: weights_data,
+                        'server_sent_unix': time.time(),
                     }
                     if self._payload_fits_protocol('amqp', message):
                         self.send_via_amqp(client_id, 'global_model', message)
@@ -2131,7 +2138,8 @@ class UnifiedFederatedLearningServer:
                     message = {
                         'type': 'global_model',
                         'round': self.current_round,
-                        weights_key: weights_data
+                        weights_key: weights_data,
+                        'server_sent_unix': time.time(),
                     }
                     self.send_quic_message(client_id, message)
                     print(f"[QUIC] Sent global model to client {client_id}")
@@ -2141,7 +2149,8 @@ class UnifiedFederatedLearningServer:
                     message = {
                         'type': 'global_model',
                         'round': self.current_round,
-                        weights_key: weights_data
+                        weights_key: weights_data,
+                        'server_sent_unix': time.time(),
                     }
                     if self._payload_fits_protocol('http3', message):
                         self.send_http3_message(client_id, message)
@@ -2499,7 +2508,7 @@ if GRPC_AVAILABLE:
                 if self.server.global_weights is None:
                     return federated_learning_pb2.GlobalModel(
                         round=0, weights=b"", available=False, model_config="",
-                        chunk_index=0, total_chunks=1
+                        chunk_index=0, total_chunks=1, server_sent_unix=0.0,
                     )
                 if self.server.quantization_handler is not None:
                     compressed_data = self.server.quantization_handler.compress_global_model(self.server.global_weights)
@@ -2520,11 +2529,15 @@ if GRPC_AVAILABLE:
                 else:
                     return federated_learning_pb2.GlobalModel(
                         round=request.round, weights=b"", available=False, model_config="",
-                        chunk_index=0, total_chunks=1
+                        chunk_index=0, total_chunks=1, server_sent_unix=0.0,
                     )
+
+                sent_key = (int(client_id), int(round_to_serve))
 
                 # Single message if within chunk size
                 if total_size <= GRPC_CHUNK_SIZE:
+                    server_sent_unix = time.time()
+                    self.server.grpc_downlink_sent_unix[sent_key] = server_sent_unix
                     log_sent_packet(
                         packet_size=total_size, peer=f"client_{client_id}", protocol="gRPC",
                         round=round_to_serve, extra_info="global_model"
@@ -2535,7 +2548,8 @@ if GRPC_AVAILABLE:
                         available=True,
                         model_config=model_config_json,
                         chunk_index=0,
-                        total_chunks=1
+                        total_chunks=1,
+                        server_sent_unix=server_sent_unix,
                     )
 
                 # Chunked transfer
@@ -2544,12 +2558,18 @@ if GRPC_AVAILABLE:
                 if chunk_index < 0 or chunk_index >= total_chunks:
                     return federated_learning_pb2.GlobalModel(
                         round=round_to_serve, weights=b"", available=False, model_config="",
-                        chunk_index=chunk_index, total_chunks=total_chunks
+                        chunk_index=chunk_index, total_chunks=total_chunks, server_sent_unix=0.0,
                     )
                 chunk_data = chunks[chunk_index]
                 cfg = model_config_json if chunk_index == 0 else ""
                 if chunk_index == 0:
+                    server_sent_unix = time.time()
+                    self.server.grpc_downlink_sent_unix[sent_key] = server_sent_unix
                     print(f"[gRPC] Client {client_id}: Sending global model (round {round_to_serve}, {total_size/1024:.2f} KB in {total_chunks} chunks)")
+                else:
+                    server_sent_unix = float(self.server.grpc_downlink_sent_unix.get(sent_key, 0.0))
+                    if server_sent_unix <= 0.0:
+                        server_sent_unix = time.time()
                 log_sent_packet(
                     packet_size=len(chunk_data), peer=f"client_{client_id}", protocol="gRPC",
                     round=round_to_serve, extra_info="global_model_chunk"
@@ -2560,14 +2580,15 @@ if GRPC_AVAILABLE:
                     available=True,
                     model_config=cfg,
                     chunk_index=chunk_index,
-                    total_chunks=total_chunks
+                    total_chunks=total_chunks,
+                    server_sent_unix=server_sent_unix,
                 )
             except Exception as e:
                 print(f"[gRPC] Error in GetGlobalModel: {e}")
                 return federated_learning_pb2.GlobalModel(
                     round=getattr(request, 'round', 0),
                     weights=b"", available=False, model_config="",
-                    chunk_index=0, total_chunks=1
+                    chunk_index=0, total_chunks=1, server_sent_unix=0.0,
                 )
         
         def SendModelUpdate(self, request, context):

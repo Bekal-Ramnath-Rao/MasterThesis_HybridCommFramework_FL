@@ -34,6 +34,21 @@ from typing import Dict, List, Optional, Tuple
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 NETWORK_SIM_DIR = PROJECT_ROOT / "Network_Simulation"
 
+try:
+    from run_network_experiments import parse_fl_dataset_for_client
+except ImportError:
+    def parse_fl_dataset_for_client(entries: Optional[List[str]]) -> Optional[Dict[int, int]]:
+        if not entries:
+            return None
+        out: Dict[int, int] = {}
+        for raw in entries:
+            item = str(raw).strip()
+            if "=" not in item:
+                continue
+            left, _, right = item.partition("=")
+            out[int(left.strip())] = int(right.strip())
+        return out or None
+
 
 def _load_local_privileged_env() -> None:
     """Load local privileged env files into process env if values are missing."""
@@ -179,9 +194,11 @@ class NativeExperimentRunner:
         quantization_strategy: Optional[str] = None,
         quantization_symmetric: bool = False,
         use_ql_convergence: bool = False,
+        rl_inference_only: bool = False,
         rl_reward_scenario: Optional[str] = None,
         use_communication_model_reward: bool = True,
         reset_epsilon: bool = True,
+        dataset_client_map: Optional[Dict[int, int]] = None,
     ) -> None:
         self.use_case = use_case
         self.protocol = protocol
@@ -203,10 +220,12 @@ class NativeExperimentRunner:
         self.quantization_strategy = quantization_strategy or "parameter_quantization"
         self.quantization_symmetric = quantization_symmetric
         self.use_ql_convergence = use_ql_convergence
+        self.rl_inference_only = bool(rl_inference_only)
         # When set (e.g. "good", "moderate", "poor"): run in excellent conditions but reward/state as if in that scenario (RL_REWARD_SCENARIO)
         self.rl_reward_scenario = (rl_reward_scenario or "").strip().lower() or None
         self.use_communication_model_reward = use_communication_model_reward
         self.reset_epsilon = reset_epsilon
+        self.dataset_client_map: Dict[int, int] = dict(dataset_client_map or {})
 
         # Resolve concrete script paths for this (use_case, protocol)
         self.server_script = _resolve_script_path(use_case, protocol, role="server")
@@ -789,6 +808,8 @@ class NativeExperimentRunner:
             env["PYTHONUNBUFFERED"] = "1"  # Flush FL_DIAG immediately for diagnostic pipeline T_actual
             env["CLIENT_ID"] = str(idx)
             env["NUM_CLIENTS"] = str(self.num_clients)
+            if idx in self.dataset_client_map:
+                env["DATASET_CLIENT_ID"] = str(self.dataset_client_map[idx])
             if effective_num_rounds is not None:
                 env["NUM_ROUNDS"] = str(effective_num_rounds)
             else:
@@ -834,6 +855,10 @@ class NativeExperimentRunner:
                 env["QUIC_HOST"] = server_ep.ip
                 env["HTTP3_HOST"] = server_ep.ip
                 env["USE_QL_CONVERGENCE"] = "true" if self.use_ql_convergence else "false"
+                if self.use_ql_convergence:
+                    env["USE_RL_EXPLORATION"] = "true"
+                else:
+                    env["USE_RL_EXPLORATION"] = "false" if self.rl_inference_only else "true"
                 env["USE_COMMUNICATION_MODEL_REWARD"] = "true" if self.use_communication_model_reward else "false"
                 if getattr(self, "rl_reward_scenario", None):
                     env["RL_REWARD_SCENARIO"] = self.rl_reward_scenario
@@ -1292,6 +1317,11 @@ def parse_args() -> argparse.Namespace:
         help="For protocol=rl_unified: run RL training mode and stop when the learned Q-table converges.",
     )
     parser.add_argument(
+        "--rl-inference-only",
+        action="store_true",
+        help="For protocol=rl_unified (without --use-ql-convergence): greedy protocol selection, no epsilon exploration.",
+    )
+    parser.add_argument(
         "--disable-communication-model-reward",
         action="store_true",
         help="For protocol=rl_unified: do not let communication-model T_calc affect RL rewards.",
@@ -1301,6 +1331,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="For protocol=rl_unified training: do NOT reset epsilon to 1.0 on start. Continue with previous epsilon value (useful for resuming interrupted training).",
     )
+    parser.add_argument(
+        "--fl-dataset-for-client",
+        action="append",
+        metavar="CLIENT=SHARD",
+        default=None,
+        help=(
+            "Map native client index (CLIENT_ID) to data shard 1..3 (emotion: Dataset/client_N; "
+            "mental state: partition N). Repeatable."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -1308,7 +1348,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     _load_local_privileged_env()
     args = parse_args()
-    
+    native_dataset_map = parse_fl_dataset_for_client(getattr(args, "fl_dataset_for_client", None))
+
     # Propagate selected termination mode into native process env.
     os.environ["STOP_ON_CLIENT_CONVERGENCE"] = "false" if args.termination_mode == "fixed_rounds" else "true"
 
@@ -1351,9 +1392,11 @@ def main() -> None:
                 quantization_strategy=getattr(args, "quantization_strategy", "parameter_quantization"),
                 quantization_symmetric=getattr(args, "quantization_symmetric", False),
                 use_ql_convergence=getattr(args, "use_ql_convergence", False),
+                rl_inference_only=getattr(args, "rl_inference_only", False),
                 rl_reward_scenario=getattr(args, "rl_reward_scenario", None),
                 use_communication_model_reward=not getattr(args, "disable_communication_model_reward", False),
                 reset_epsilon=not getattr(args, "no_reset_epsilon", False),  # Default True (reset), --no-reset-epsilon makes it False
+                dataset_client_map=native_dataset_map,
             )
             _install_signal_handlers(runner)
             code = runner.run()

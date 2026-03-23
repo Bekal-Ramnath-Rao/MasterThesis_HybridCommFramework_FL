@@ -640,6 +640,7 @@ class FLExperimentGUI(QMainWindow):
         ])
         layout.addWidget(use_case_group)
         self.use_case_group = use_case_group
+        self.use_case_group.button_group.buttonClicked.connect(self.update_dataset_shard_training_visibility)
         
         # Protocol Selection
         protocol_group = self.create_checkbox_group("📡 Communication Protocols", [
@@ -862,6 +863,36 @@ class FLExperimentGUI(QMainWindow):
             "You can start the remaining clients from other PCs using the Distributed Client GUI."
         )
         training_layout.addWidget(self.gui_clients, 2, 1)
+
+        # Optional mapping: compose CLIENT_ID -> data shard (emotion: Dataset/client_N; mental: partition N)
+        self.dataset_shard_widget = QWidget()
+        ds_layout = QGridLayout(self.dataset_shard_widget)
+        ds_layout.setContentsMargins(0, 0, 0, 0)
+        ds_layout.setHorizontalSpacing(8)
+        self.dataset_shard_override = QCheckBox("Override data shard per local CLIENT_ID (1 & 2)")
+        self.dataset_shard_override.setStyleSheet("font-size: 12px; padding: 2px;")
+        self.dataset_shard_override.setToolTip(
+            "When enabled, injects DATASET_CLIENT_ID into matching client containers.\n"
+            "Emotion: loads Dataset/client_N.\n"
+            "Mental state: uses non-IID partition N (1-based; must be ≤ NUM_CLIENTS).\n"
+            "Temperature: single shared dataset — override has no effect."
+        )
+        ds_layout.addWidget(self.dataset_shard_override, 0, 0, 1, 4)
+        ds_layout.addWidget(QLabel("Shard for CLIENT_ID=1:"), 1, 0)
+        self.dataset_spin_client1 = QSpinBox()
+        self.dataset_spin_client1.setRange(1, 3)
+        self.dataset_spin_client1.setValue(1)
+        self.dataset_spin_client1.setStyleSheet("padding: 5px;")
+        ds_layout.addWidget(self.dataset_spin_client1, 1, 1)
+        ds_layout.addWidget(QLabel("Shard for CLIENT_ID=2:"), 1, 2)
+        self.dataset_spin_client2 = QSpinBox()
+        self.dataset_spin_client2.setRange(1, 3)
+        self.dataset_spin_client2.setValue(2)
+        self.dataset_spin_client2.setStyleSheet("padding: 5px;")
+        ds_layout.addWidget(self.dataset_spin_client2, 1, 3)
+        training_layout.addWidget(self.dataset_shard_widget, 4, 0, 1, 4)
+        self.dataset_shard_override.toggled.connect(self._update_dataset_spin_enabled)
+        self._update_dataset_spin_enabled()
         
         training_group.setLayout(training_layout)
         layout.addWidget(training_group)
@@ -875,6 +906,7 @@ class FLExperimentGUI(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         scroll.setMinimumHeight(380)
+        self.update_dataset_shard_training_visibility()
         return scroll
     
     def create_network_config_tab(self):
@@ -2559,6 +2591,35 @@ class FLExperimentGUI(QMainWindow):
         if hasattr(self, "use_communication_model_reward"):
             self.use_communication_model_reward.setEnabled(enabled)
 
+    def update_dataset_shard_training_visibility(self):
+        """Show data-shard override only for emotion and mental state."""
+        if not hasattr(self, "dataset_shard_widget"):
+            return
+        uc = self.get_selected_use_case()
+        show = uc in ("emotion", "mentalstate")
+        self.dataset_shard_widget.setVisible(show)
+
+    def _update_dataset_spin_enabled(self):
+        if not hasattr(self, "dataset_spin_client1"):
+            return
+        en = self.dataset_shard_override.isChecked()
+        self.dataset_spin_client1.setEnabled(en)
+        self.dataset_spin_client2.setEnabled(en)
+
+    def _append_fl_dataset_args(self, cmd_parts):
+        if not getattr(self, "dataset_shard_override", None) or not self.dataset_shard_override.isChecked():
+            return
+        if self.get_selected_use_case() not in ("emotion", "mentalstate"):
+            return
+        cmd_parts.extend(
+            [
+                "--fl-dataset-for-client",
+                f"1={self.dataset_spin_client1.value()}",
+                "--fl-dataset-for-client",
+                f"2={self.dataset_spin_client2.value()}",
+            ]
+        )
+
     def build_command(self):
         """Build the experiment command"""
         base_dir = Path(self.project_root)
@@ -2614,6 +2675,8 @@ class FLExperimentGUI(QMainWindow):
                     cmd_parts.append("--quantization-symmetric")
             if self.is_rl_training_mode():
                 cmd_parts.append("--use-ql-convergence")
+            if self.is_rl_unified_selected() and not self.is_rl_training_mode():
+                cmd_parts.append("--rl-inference-only")
             if self.is_rl_unified_selected() and not self.use_communication_model_reward.isChecked():
                 cmd_parts.append("--disable-communication-model-reward")
         else:
@@ -2686,6 +2749,8 @@ class FLExperimentGUI(QMainWindow):
             # RL-unified training/inference mode
             if self.is_rl_training_mode():
                 cmd_parts.append("--use-ql-convergence")
+            if self.is_rl_unified_selected() and not self.is_rl_training_mode():
+                cmd_parts.append("--rl-inference-only")
             if self.is_rl_unified_selected() and not self.use_communication_model_reward.isChecked():
                 cmd_parts.append("--disable-communication-model-reward")
 
@@ -2702,6 +2767,8 @@ class FLExperimentGUI(QMainWindow):
                 dds_impl_value = impl.currentData() or str(impl.currentText()).strip().lower().replace(" ", "")
                 if dds_impl_value:
                     cmd_parts.extend(["--dds-impl", dds_impl_value])
+
+        self._append_fl_dataset_args(cmd_parts)
 
         return shell_join(cmd_parts)
     
@@ -2783,10 +2850,8 @@ class FLExperimentGUI(QMainWindow):
                 else ("Host (tc on host)" if self.network_mode_host.isChecked() else "GPU (Docker bridge)")
             )
         rl_mode_str = "Training" if self.is_rl_training_mode() else ("Inference" if self.is_rl_unified_selected() else "N/A")
-        
-        reply = QMessageBox.question(
-            self,
-            "Confirm Experiment",
+
+        reply_text = (
             f"Ready to start {mode_str} with:\n\n"
             f"Mode: {mode_str}\n"
             f"Use Case: {self.get_selected_use_case()}\n"
@@ -2797,10 +2862,24 @@ class FLExperimentGUI(QMainWindow):
             f"Rounds: {self.rounds_spinbox.value()}\n"
             f"Termination: {self.termination_mode_combo.currentText()}\n"
             f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
-            f"Network: {network_str}\n\n"
-            f"Command:\n{command}\n\n"
-            f"This may take a long time. Continue?",
-            QMessageBox.Yes | QMessageBox.No
+            f"Network: {network_str}\n"
+        )
+        if (
+            getattr(self, "dataset_shard_override", None)
+            and self.dataset_shard_override.isChecked()
+            and self.get_selected_use_case() in ("emotion", "mentalstate")
+        ):
+            reply_text += (
+                f"Data shards: CLIENT_ID 1 → {self.dataset_spin_client1.value()}, "
+                f"CLIENT_ID 2 → {self.dataset_spin_client2.value()}\n"
+            )
+        reply_text += f"\nCommand:\n{command}\n\nThis may take a long time. Continue?"
+
+        reply = QMessageBox.question(
+            self,
+            "Confirm Experiment",
+            reply_text,
+            QMessageBox.Yes | QMessageBox.No,
         )
         
         if reply == QMessageBox.No:

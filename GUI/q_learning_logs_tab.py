@@ -142,14 +142,13 @@ class QLearningLogsTab(QWidget):
         layout.addWidget(stats_group)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(33)
+        self.table.setColumnCount(31)
         self.table.setHorizontalHeaderLabels([
             "ID", "Timestamp", "Round", "Episode", "Direction",
             "State (net)", "State (res)", "State (size)", "State (mob)",
             "Action", "Reward", "Q Delta", "Epsilon", "Avg R(100)", "Converged",
             "Comm Time", "R_comm",
             "Conv Time", "R_conv",
-            "Accuracy", "R_acc",
             "Success", "R_base",
             "CPU", "Memory", "Bandwidth", "R_resource",
             "Battery", "Energy", "R_battery",
@@ -203,7 +202,6 @@ class QLearningLogsTab(QWidget):
                        avg_reward_last_100, converged,
                        metric_communication_time, reward_communication_time,
                        metric_convergence_time, reward_convergence_time,
-                       metric_accuracy, reward_accuracy,
                        metric_success, reward_base,
                        metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage, reward_resource_penalty,
                        metric_battery_level, metric_energy_usage, reward_battery_penalty,
@@ -310,7 +308,6 @@ class QLearningLogsTab(QWidget):
                        avg_reward_last_100, converged,
                        metric_communication_time, reward_communication_time,
                        metric_convergence_time, reward_convergence_time,
-                       metric_accuracy, reward_accuracy,
                        metric_success, reward_base,
                        metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage, reward_resource_penalty,
                        metric_battery_level, metric_energy_usage, reward_battery_penalty,
@@ -402,7 +399,6 @@ class QLearningLogsTab(QWidget):
                                avg_reward_last_100, converged,
                                metric_communication_time, reward_communication_time,
                                metric_convergence_time, reward_convergence_time,
-                               metric_accuracy, reward_accuracy,
                                metric_success, reward_base,
                                metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage, reward_resource_penalty,
                                metric_battery_level, metric_energy_usage, reward_battery_penalty,
