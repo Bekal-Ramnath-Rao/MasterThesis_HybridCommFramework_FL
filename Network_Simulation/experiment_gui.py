@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 LOCAL_PRIVILEGED_ENV_FILE = PROJECT_ROOT / "Network_Simulation" / ".privileged_ops.env"
 
+from python_cmd import get_python_executable
+
 
 def shell_join(parts):
     """Quote command parts so shell=True still works from any project path."""
@@ -85,7 +87,7 @@ class DashboardMonitor(QThread):
             dashboard_script = os.path.join(script_dir, "fl_training_dashboard.py")
             
             self.process = subprocess.Popen(
-                ["python3", dashboard_script, "--use-case", self.use_case, "--interval", "5"],
+                [get_python_executable(), dashboard_script, "--use-case", self.use_case, "--interval", "5"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -203,15 +205,16 @@ class NetworkController(QThread):
             monitor_script = os.path.join(script_dir, "fl_network_monitor.py")
             
             # Build command based on target
+            py = get_python_executable()
             if self.target == "all":
-                cmd = ["python3", monitor_script, "--all"]
+                cmd = [py, monitor_script, "--all"]
             elif self.target == "server":
-                cmd = ["python3", monitor_script, "--server"]
+                cmd = [py, monitor_script, "--server"]
             else:
                 # Specific client container - extract client ID
                 # Assumes container names like "client_1", "client_2", etc.
                 client_id = self.target.split('_')[-1] if '_' in self.target else "1"
-                cmd = ["python3", monitor_script, "--client-id", client_id]
+                cmd = [py, monitor_script, "--client-id", client_id]
             
             if self.latency > 0:
                 cmd.extend(["--latency", f"{self.latency}ms"])
@@ -2625,14 +2628,15 @@ class FLExperimentGUI(QMainWindow):
         base_dir = Path(self.project_root)
         
         # Decide which backend to use: Docker experiment runner or native (namespaces) runner
+        py_exe = get_python_executable()
         if self.exec_mode_native.isChecked():
             # Native: run server + clients as Python scripts in Linux namespaces (no Docker).
             script = base_dir / "Network_Simulation" / "run_native_experiments.py"
-            cmd_parts = ["python3", script]
+            cmd_parts = [py_exe, script]
         else:
             # Existing Docker-based experiment runner.
             script = base_dir / "Network_Simulation" / "run_network_experiments.py"
-            cmd_parts = ["python3", script]
+            cmd_parts = [py_exe, script]
         
         # Use case
         use_case = self.get_selected_use_case()
@@ -2931,7 +2935,7 @@ class FLExperimentGUI(QMainWindow):
         use_case = self.get_selected_use_case()
         base_dir = Path(self.project_root)
         script = base_dir / "Network_Simulation" / "diagnostic_pipeline.py"
-        cmd_parts = ["python3", script, "--protocols", *pipeline_selected, "--scenarios", *scenario_list, "--use-case", use_case]
+        cmd_parts = [get_python_executable(), script, "--protocols", *pipeline_selected, "--scenarios", *scenario_list, "--use-case", use_case]
         # DDS implementation selection applies when DDS is part of the diagnostic protocols
         if any(p.lower() == "dds" for p in pipeline_selected) and hasattr(self, "dds_impl"):
             dds_impl_value = self.dds_impl.currentData() or str(self.dds_impl.currentText()).strip().lower().replace(" ", "")

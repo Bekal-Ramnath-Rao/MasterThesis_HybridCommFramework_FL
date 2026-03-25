@@ -97,7 +97,7 @@ def _wait_for_port(host: str, port: int, timeout_sec: float = 30, ns_name: Optio
         try:
             if ns_name:
                 # ip netns exec requires root; use sudo so the check matches what server/clients will see
-                cmd = ["sudo", "-E", "ip", "netns", "exec", ns_name, "python3", "-c",
+                cmd = ["sudo", "-E", "ip", "netns", "exec", ns_name, sys.executable, "-c",
                        f"import socket; s=socket.socket(); s.settimeout(2); s.connect(('{host}', {port})); s.close()"]
                 result = subprocess.run(
                     cmd,

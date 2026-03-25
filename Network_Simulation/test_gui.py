@@ -142,7 +142,7 @@ def main():
         print("  ./launch_experiment_gui.sh")
         print()
         print("Or directly:")
-        print("  python3 Network_Simulation/experiment_gui.py")
+        print(f"  {sys.executable} Network_Simulation/experiment_gui.py")
         return 0
     else:
         print("⚠️  Some tests failed. Please fix the issues above.")

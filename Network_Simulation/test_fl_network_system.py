@@ -9,6 +9,8 @@ import sys
 import os
 from typing import Tuple
 
+from python_cmd import get_python_executable
+
 def run_command(command: list) -> Tuple[bool, str, str]:
     """Execute command and return result"""
     try:
@@ -32,6 +34,7 @@ def print_result(test_name: str, passed: bool, details: str = ""):
         print(f"       {details}")
 
 def main():
+    py = get_python_executable()
     print("=" * 70)
     print("FL Network Control System - Verification Test")
     print("=" * 70)
@@ -117,7 +120,7 @@ def main():
     
     # Test 7: Test fl_network_monitor.py help
     print("\n[7/10] Testing fl_network_monitor.py...")
-    success, stdout, stderr = run_command(['python3', 'fl_network_monitor.py', '--help'])
+    success, stdout, stderr = run_command([py, 'fl_network_monitor.py', '--help'])
     print_result("fl_network_monitor.py --help", success, stderr)
     if success:
         tests_passed += 1
@@ -126,7 +129,7 @@ def main():
     
     # Test 8: Test fl_training_dashboard.py help
     print("\n[8/10] Testing fl_training_dashboard.py...")
-    success, stdout, stderr = run_command(['python3', 'fl_training_dashboard.py', '--help'])
+    success, stdout, stderr = run_command([py, 'fl_training_dashboard.py', '--help'])
     print_result("fl_training_dashboard.py --help", success, stderr)
     if success:
         tests_passed += 1
@@ -146,7 +149,7 @@ def main():
     
     # Test 10: Check Python dependencies
     print("\n[10/10] Checking Python environment...")
-    success, stdout, stderr = run_command(['python3', '--version'])
+    success, stdout, stderr = run_command([py, '--version'])
     print_result("Python 3 available", success, stderr)
     if success:
         tests_passed += 1
@@ -166,8 +169,8 @@ def main():
         print("\n\033[92m✓ All tests passed! System is ready to use.\033[0m")
         print("\nNext steps:")
         print("  1. Start FL containers: docker-compose up -d")
-        print("  2. Start monitoring: python3 fl_training_dashboard.py")
-        print("  3. Control network: python3 fl_network_monitor.py --monitor")
+        print(f"  2. Start monitoring: {py} fl_training_dashboard.py")
+        print(f"  3. Control network: {py} fl_network_monitor.py --monitor")
         return 0
     else:
         print("\n\033[91m✗ Some tests failed. Please fix the issues above.\033[0m")
