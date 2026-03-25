@@ -1,19 +1,21 @@
 @echo off
 setlocal EnableExtensions
-rem Requires Python 3 on PATH (or use "py -3" instead of "python" below if you use the launcher).
 cd /d "%~dp0"
+
+call "%~dp0..\..\scripts\lib\resolve_python.bat"
+if errorlevel 1 exit /b 1
 
 echo Launching FL Experiment GUI...
 echo.
 
-python -c "import PyQt5" 2>nul
+%PYEXE% %PYFLAG% -c "import PyQt5" 2>nul
 if errorlevel 1 (
     echo PyQt5 not found. Installing...
-    python -m pip install -r "..\..\Network_Simulation\gui_requirements.txt"
+    %PYEXE% %PYFLAG% -m pip install -r "..\..\Network_Simulation\gui_requirements.txt"
     echo.
 )
 
-python "..\..\Network_Simulation\experiment_gui.py"
+%PYEXE% %PYFLAG% "..\..\Network_Simulation\experiment_gui.py"
 set "EXITCODE=%ERRORLEVEL%"
 
 if %EXITCODE% equ 0 (

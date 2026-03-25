@@ -1,4 +1,9 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../../scripts/lib/resolve_python.sh
+source "$REPO_ROOT/scripts/lib/resolve_python.sh" || exit 1
 
 # ===============================================================================
 # FL EXPERIMENT GUI - DEMO MODE
@@ -20,13 +25,13 @@ echo "Press Ctrl+C to cancel, or Enter to continue..."
 read
 
 # Check PyQt5
-if ! python3 -c "import PyQt5" 2>/dev/null; then
+if ! "$PYTHON" -c "import PyQt5" 2>/dev/null; then
     echo "📦 Installing PyQt5..."
-    pip install PyQt5
+    "$PYTHON" -m pip install PyQt5
 fi
 
 # Launch GUI
-python3 Network_Simulation/experiment_gui.py
+"$PYTHON" "$REPO_ROOT/Network_Simulation/experiment_gui.py"
 
 echo ""
 echo "✅ GUI Demo Complete!"

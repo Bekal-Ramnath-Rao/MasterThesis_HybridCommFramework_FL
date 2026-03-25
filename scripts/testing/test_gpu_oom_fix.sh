@@ -1,10 +1,13 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Quick Test Script for GPU OOM Fix
 # Tests the moderate scenario with reduced batch size and GPU isolation
 
 set -e  # Exit on error
 
-PROJECT_ROOT="/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../../scripts/lib/resolve_python.sh
+source "$PROJECT_ROOT/scripts/lib/resolve_python.sh" || exit 1
 cd "$PROJECT_ROOT"
 
 echo "=============================================================================="
@@ -21,7 +24,7 @@ docker-compose -f Docker/docker-compose-emotion.gpu-isolated.yml build --no-cach
 echo ""
 
 echo "Step 3: Run quick test (2 rounds, moderate scenario, MQTT protocol)..."
-echo "Running: python3 Network_Simulation/run_network_experiments.py"
+echo "Running: $PYTHON Network_Simulation/run_network_experiments.py"
 echo "         --use-case emotion"
 echo "         --enable-gpu"
 echo "         --single"
@@ -30,7 +33,7 @@ echo "         --scenario moderate"
 echo "         --rounds 2"
 echo ""
 
-python3 Network_Simulation/run_network_experiments.py \
+"$PYTHON" Network_Simulation/run_network_experiments.py \
     --use-case emotion \
     --enable-gpu \
     --single \

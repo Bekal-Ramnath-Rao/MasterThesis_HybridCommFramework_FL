@@ -1,4 +1,10 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../../scripts/lib/resolve_python.sh
+source "$REPO_ROOT/scripts/lib/resolve_python.sh" || exit 1
+cd "$REPO_ROOT"
 
 LOG_DIR="experiment_logs"
 mkdir -p $LOG_DIR
@@ -8,7 +14,7 @@ echo "Logging to: $LOG_DIR"
 
 # # Experiment 1: Without Quantization mqtt amqp grpc
 # echo "Running Experiment 1 (without quantization - baseline)..."
-# python3 Network_Simulation/run_network_experiments.py \
+# "$PYTHON" Network_Simulation/run_network_experiments.py \
 #     --use-case emotion --enable-gpu \
 #     --rounds 1000 --protocols mqtt amqp grpc --scenarios excellent good moderate poor very_poor congested_light congested_moderate congested_heavy\
 #     2>&1 | tee "$LOG_DIR/exp1_baseline_${TIMESTAMP}.log"
@@ -20,7 +26,7 @@ echo "Logging to: $LOG_DIR"
 
 # # Experiment 2: With Quantization mqtt amqp grpc
 # echo "Running Experiment 2 (with quantization)..."
-# python3 Network_Simulation/run_network_experiments.py \
+# "$PYTHON" Network_Simulation/run_network_experiments.py \
 #     --use-case emotion --enable-gpu --use-quantization \
 #     --quantization-strategy parameter_quantization \
 #     --quantization-bits 16 --rounds 1000 \
@@ -34,7 +40,7 @@ echo "Logging to: $LOG_DIR"
 
 # Experiment 3: Without Quantization dds quic
 echo "Running Experiment 3 (without quantization - baseline)..."
-python3 Network_Simulation/run_network_experiments.py \
+"$PYTHON" Network_Simulation/run_network_experiments.py \
     --use-case emotion --enable-gpu \
     --rounds 1000 --protocols quic dds --scenarios excellent good moderate congested_light congested_moderate congested_heavy poor very_poor\
     2>&1 | tee "$LOG_DIR/exp3_baseline_${TIMESTAMP}.log"
@@ -45,7 +51,7 @@ fi
 
 # Experiment 4: With Quantization dds quic
 echo "Running Experiment 4 (with quantization)..."
-python3 Network_Simulation/run_network_experiments.py \
+"$PYTHON" Network_Simulation/run_network_experiments.py \
     --use-case emotion --enable-gpu --use-quantization \
     --quantization-strategy parameter_quantization \
     --quantization-bits 16 --rounds 1000 \

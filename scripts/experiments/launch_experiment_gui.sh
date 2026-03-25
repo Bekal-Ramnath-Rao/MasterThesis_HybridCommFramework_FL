@@ -1,21 +1,25 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # ===============================================================================
 # Federated Learning Experiment GUI Launcher
 # ===============================================================================
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../scripts/lib/resolve_python.sh
+source "${SCRIPT_DIR}/../../scripts/lib/resolve_python.sh" || exit 1
+
 echo "🚀 Launching FL Experiment GUI..."
 echo ""
 
 # Check if PyQt5 is installed
-if ! python3 -c "import PyQt5" 2>/dev/null; then
+if ! "$PYTHON" -c "import PyQt5" 2>/dev/null; then
     echo "📦 PyQt5 not found. Installing..."
-    pip install -r ../../Network_Simulation/gui_requirements.txt
+    "$PYTHON" -m pip install -r "${SCRIPT_DIR}/../../Network_Simulation/gui_requirements.txt"
     echo ""
 fi
 
 # Launch the GUI
-python3 ../../Network_Simulation/experiment_gui.py
+"$PYTHON" "${SCRIPT_DIR}/../../Network_Simulation/experiment_gui.py"
 
 # Check exit code
 if [ $? -eq 0 ]; then

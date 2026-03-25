@@ -1,7 +1,6 @@
 @echo off
-rem Requires Python 3 on PATH (or replace "python" with "py -3" if you use the launcher).
-rem Run this on a remote PC to connect a client to the central experiment server.
-rem Equivalent to Network_Simulation\launch_distributed_client.sh
+rem Run on a remote PC to connect a client to the central experiment server.
+rem Override Python: set PYTHON_CMD=path\to\python.exe before running.
 
 cd /d "%~dp0..\..\Network_Simulation"
 if not exist "distributed_client_gui.py" (
@@ -10,16 +9,19 @@ if not exist "distributed_client_gui.py" (
     exit /b 1
 )
 
+call "%~dp0..\..\scripts\lib\resolve_python.bat"
+if errorlevel 1 exit /b 1
+
 echo Starting Distributed FL Client GUI...
 echo.
 
-python -c "import PyQt5" 2>nul
+%PYEXE% %PYFLAG% -c "import PyQt5" 2>nul
 if errorlevel 1 (
     echo PyQt5 not found. Installing...
-    python -m pip install PyQt5
+    %PYEXE% %PYFLAG% -m pip install PyQt5
 )
 
-python "distributed_client_gui.py"
+%PYEXE% %PYFLAG% "distributed_client_gui.py"
 set "EXITCODE=%ERRORLEVEL%"
 
 echo.

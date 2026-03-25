@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # ============================================================================
 # DEPENDENCY FIX VERIFICATION & REBUILD COMMANDS
@@ -7,7 +7,10 @@
 # rebuild all Docker images with proper dependency resolution.
 # ============================================================================
 
-PROJECT_DIR="/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../../scripts/lib/resolve_python.sh
+source "$PROJECT_DIR/scripts/lib/resolve_python.sh" || exit 1
 
 echo "==============================================="
 echo "📋 DEPENDENCY FIX SUMMARY"
@@ -49,14 +52,14 @@ echo "==============================================="
 echo ""
 echo "# Quick test (2 rounds, 1 protocol, 1 scenario)"
 echo "cd $PROJECT_DIR"
-echo "python3 Network_Simulation/run_network_experiments.py --use-case emotion --enable-gpu --single --protocol mqtt --scenario excellent --rounds 2"
+echo "$PYTHON Network_Simulation/run_network_experiments.py --use-case emotion --enable-gpu --single --protocol mqtt --scenario excellent --rounds 2"
 echo ""
 echo "# Full test all protocols for emotion (2 rounds)"
-echo "python3 Network_Simulation/run_network_experiments.py --use-case emotion --enable-gpu --rounds 2"
+echo "$PYTHON Network_Simulation/run_network_experiments.py --use-case emotion --enable-gpu --rounds 2"
 echo ""
 echo "# Full test all 3 use cases (10 rounds, ~6-12 hours)"
 echo "for use_case in emotion mentalstate temperature; do"
-echo "  python3 Network_Simulation/run_network_experiments.py --use-case \$use_case --enable-gpu --rounds 10"
+echo "  $PYTHON Network_Simulation/run_network_experiments.py --use-case \$use_case --enable-gpu --rounds 10"
 echo "done"
 echo ""
 echo "==============================================="

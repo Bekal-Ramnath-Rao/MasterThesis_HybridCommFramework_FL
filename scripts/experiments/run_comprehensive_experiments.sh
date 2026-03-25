@@ -35,6 +35,8 @@ set -e  # Exit on error
 # Script configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+# shellcheck source=../../scripts/lib/resolve_python.sh
+source "${SCRIPT_DIR}/../../scripts/lib/resolve_python.sh" || exit 1
 
 # Color codes for output
 RED='\033[0;31m'
@@ -110,12 +112,12 @@ verify_environment() {
     fi
     print_success "Docker Compose V2 found: $(docker compose version | head -1)"
     
-    # Check Python
-    if ! command -v python3 &> /dev/null; then
-        print_error "Python3 not found. Please install Python3."
+    # Check Python (resolve_python.sh sets PYTHON for Linux vs Windows Git Bash)
+    if ! command -v "$PYTHON" &> /dev/null; then
+        print_error "Python not found ($PYTHON). Install Python 3 or set PYTHON_CMD."
         exit 1
     fi
-    print_success "Python3 found: $(python3 --version)"
+    print_success "Python found: $($PYTHON --version)"
     
     # Check GPU availability
     if command -v nvidia-smi &> /dev/null; then
@@ -200,7 +202,7 @@ run_experiment() {
     local log_file="$LOG_DIR/${use_case}_scenario${scenario_num}_${network_scenario}_${quantization}_${protocol}.log"
     
     # Build command
-    local cmd="python3 Network_Simulation/run_network_experiments.py"
+    local cmd="$PYTHON Network_Simulation/run_network_experiments.py"
     cmd="$cmd --use-case $use_case"
     cmd="$cmd --single"
     cmd="$cmd --protocol $protocol"
@@ -319,7 +321,7 @@ consolidate_results() {
     local folder_name=$(basename "$latest_folder")
     
     # Run consolidation
-    if python3 Network_Simulation/consolidate_results.py \
+    if "$PYTHON" Network_Simulation/consolidate_results.py \
         --use-case "$use_case" \
         --experiment-folder "$folder_name" \
         >> "$LOG_DIR/consolidate_${use_case}.log" 2>&1; then

@@ -1,5 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Quick start script to create packet logger databases and test the setup
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../../scripts/lib/resolve_python.sh
+source "$REPO_ROOT/scripts/lib/resolve_python.sh" || exit 1
+cd "$REPO_ROOT"
 
 echo "=================================================="
 echo "Packet Logger Database Quick Start"
@@ -36,7 +42,7 @@ echo "  docker-compose -f docker-compose-unified-emotion.yml up"
 echo ""
 echo "OPTION 2: Use the GUI"
 echo "  cd Network_Simulation"
-echo "  python3 experiment_gui.py"
+echo "  $PYTHON experiment_gui.py"
 echo "  → Go to 'Basic Config' tab"
 echo "  → Check '🤖 RL-Unified (Dynamic Selection)'"
 echo "  → Click '▶️ Start Experiment'"
@@ -75,7 +81,7 @@ else
     echo "  ls -lh shared_data/"
     echo ""
     echo "View packets in GUI:"
-    echo "  python3 Network_Simulation/experiment_gui.py"
+    echo "  $PYTHON Network_Simulation/experiment_gui.py"
     echo "  → Go to 'Packet Logs' tab"
     echo ""
 fi

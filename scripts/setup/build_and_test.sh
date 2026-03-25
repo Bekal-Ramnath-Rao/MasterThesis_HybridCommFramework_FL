@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # ============================================================================
 # Comprehensive Dependency Fix - Build and Test Script
@@ -9,7 +9,10 @@
 
 set -e
 
-PROJECT_DIR="/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../../scripts/lib/resolve_python.sh
+source "$PROJECT_DIR/scripts/lib/resolve_python.sh" || exit 1
 DOCKER_DIR="$PROJECT_DIR/Docker"
 
 echo "==============================================="
@@ -43,7 +46,7 @@ echo "==============================================="
 
 cd "$PROJECT_DIR"
 
-python3 Network_Simulation/run_network_experiments.py \
+"$PYTHON" Network_Simulation/run_network_experiments.py \
   --use-case emotion \
   --enable-gpu \
   --single \
@@ -60,6 +63,6 @@ echo "To run comprehensive experiments:"
 echo ""
 echo "# All 3 use cases with GPU (3 x 5 protocols x 9 scenarios = 135 experiments)"
 echo "for use_case in emotion mentalstate temperature; do"
-echo "  python3 Network_Simulation/run_network_experiments.py --use-case \$use_case --enable-gpu --rounds 10"
+echo "  $PYTHON Network_Simulation/run_network_experiments.py --use-case \$use_case --enable-gpu --rounds 10"
 echo "done"
 echo ""

@@ -1,5 +1,10 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # GPU Setup and Verification Script for Emotion Recognition FL
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../../scripts/lib/resolve_python.sh
+source "$REPO_ROOT/scripts/lib/resolve_python.sh" || exit 1
 
 echo "================================"
 echo "GPU Setup Verification Script"
@@ -24,7 +29,7 @@ fi
 
 echo ""
 echo "3. Checking TensorFlow..."
-python3 -c "
+"$PYTHON" -c "
 import tensorflow as tf
 print('TensorFlow version:', tf.__version__)
 gpus = tf.config.list_physical_devices('GPU')

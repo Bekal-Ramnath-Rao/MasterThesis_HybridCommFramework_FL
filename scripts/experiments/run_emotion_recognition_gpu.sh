@@ -1,7 +1,13 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Quick Start Script for GPU-Enabled Emotion Recognition FL
 
 set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=../../scripts/lib/resolve_python.sh
+source "$REPO_ROOT/scripts/lib/resolve_python.sh" || exit 1
+cd "$REPO_ROOT"
 
 echo "================================"
 echo "GPU-Enabled Emotion Recognition FL"
@@ -28,7 +34,7 @@ echo ""
 
 # Verify GPU
 echo -e "${BLUE}Verifying GPU Setup...${NC}"
-python3 << 'EOF'
+"$PYTHON" << 'EOF'
 import tensorflow as tf
 import os
 
@@ -67,23 +73,23 @@ cd Client/Emotion_Recognition
 case $PROTOCOL in
     amqp)
         echo -e "${GREEN}Running AMQP Client...${NC}"
-        python3 FL_Client_AMQP.py
+        "$PYTHON" FL_Client_AMQP.py
         ;;
     grpc|grpc)
         echo -e "${GREEN}Running gRPC Client...${NC}"
-        python3 FL_Client_gRPC.py
+        "$PYTHON" FL_Client_gRPC.py
         ;;
     mqtt)
         echo -e "${GREEN}Running MQTT Client...${NC}"
-        python3 FL_Client_MQTT.py
+        "$PYTHON" FL_Client_MQTT.py
         ;;
     dds)
         echo -e "${GREEN}Running DDS Client...${NC}"
-        python3 FL_Client_DDS.py
+        "$PYTHON" FL_Client_DDS.py
         ;;
     quic)
         echo -e "${GREEN}Running QUIC Client...${NC}"
-        python3 FL_Client_QUIC.py
+        "$PYTHON" FL_Client_QUIC.py
         ;;
     *)
         echo "Unknown protocol: $PROTOCOL"

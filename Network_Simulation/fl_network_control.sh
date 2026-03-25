@@ -1,8 +1,10 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # FL Network Control - Quick Commands
 # Helper script for common network control operations during FL training
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../scripts/lib/resolve_python.sh
+source "${SCRIPT_DIR}/../scripts/lib/resolve_python.sh" || exit 1
 
 # Colors for output
 RED='\033[0;31m'
@@ -65,21 +67,21 @@ list_clients() {
 # Function to show status
 show_status() {
     print_info "Current network conditions:"
-    python3 "$SCRIPT_DIR/fl_network_monitor.py" --show-status
+    "$PYTHON" "$SCRIPT_DIR/fl_network_monitor.py" --show-status
 }
 
 # Function to start monitor
 start_monitor() {
     print_info "Starting FL Training Dashboard..."
     echo ""
-    python3 "$SCRIPT_DIR/fl_training_dashboard.py"
+    "$PYTHON" "$SCRIPT_DIR/fl_training_dashboard.py"
 }
 
 # Function to start interactive control
 start_control() {
     print_info "Starting Interactive Network Controller..."
     echo ""
-    python3 "$SCRIPT_DIR/fl_network_monitor.py" --monitor
+    "$PYTHON" "$SCRIPT_DIR/fl_network_monitor.py" --monitor
 }
 
 # Function to apply conditions to specific client
@@ -100,7 +102,7 @@ apply_to_client() {
     read -p "Packet loss % (e.g., 2) [Enter to skip]: " loss
     read -p "Jitter (e.g., 10ms) [Enter to skip]: " jitter
     
-    cmd="python3 $SCRIPT_DIR/fl_network_monitor.py --client-id $client_id"
+    cmd="$PYTHON $SCRIPT_DIR/fl_network_monitor.py --client-id $client_id"
     
     [ -n "$latency" ] && cmd="$cmd --latency $latency"
     [ -n "$bandwidth" ] && cmd="$cmd --bandwidth $bandwidth"
@@ -122,7 +124,7 @@ apply_to_all() {
     read -p "Packet loss % (e.g., 2) [Enter to skip]: " loss
     read -p "Jitter (e.g., 10ms) [Enter to skip]: " jitter
     
-    cmd="python3 $SCRIPT_DIR/fl_network_monitor.py --all"
+    cmd="$PYTHON $SCRIPT_DIR/fl_network_monitor.py --all"
     
     [ -n "$latency" ] && cmd="$cmd --latency $latency"
     [ -n "$bandwidth" ] && cmd="$cmd --bandwidth $bandwidth"
@@ -145,7 +147,7 @@ clear_client() {
     fi
     
     print_warning "Clearing network conditions from client $client_id"
-    python3 "$SCRIPT_DIR/fl_network_monitor.py" --client-id "$client_id" --clear
+    "$PYTHON" "$SCRIPT_DIR/fl_network_monitor.py" --client-id "$client_id" --clear
 }
 
 # Function to clear all conditions
@@ -154,7 +156,7 @@ clear_all() {
     read -p "Are you sure? (y/n): " confirm
     
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        python3 "$SCRIPT_DIR/fl_network_monitor.py" --all --clear
+        "$PYTHON" "$SCRIPT_DIR/fl_network_monitor.py" --all --clear
     else
         print_info "Operation cancelled"
     fi
@@ -184,19 +186,19 @@ quick_change() {
     case $choice in
         1)
             read -p "New latency (e.g., 200ms, 300ms): " value
-            [ -n "$value" ] && python3 "$SCRIPT_DIR/fl_network_monitor.py" --client-id "$client_id" --latency "$value"
+            [ -n "$value" ] && "$PYTHON" "$SCRIPT_DIR/fl_network_monitor.py" --client-id "$client_id" --latency "$value"
             ;;
         2)
             read -p "New bandwidth (e.g., 1mbit, 500kbit): " value
-            [ -n "$value" ] && python3 "$SCRIPT_DIR/fl_network_monitor.py" --client-id "$client_id" --bandwidth "$value"
+            [ -n "$value" ] && "$PYTHON" "$SCRIPT_DIR/fl_network_monitor.py" --client-id "$client_id" --bandwidth "$value"
             ;;
         3)
             read -p "New packet loss % (e.g., 2, 5): " value
-            [ -n "$value" ] && python3 "$SCRIPT_DIR/fl_network_monitor.py" --client-id "$client_id" --loss "$value"
+            [ -n "$value" ] && "$PYTHON" "$SCRIPT_DIR/fl_network_monitor.py" --client-id "$client_id" --loss "$value"
             ;;
         4)
             read -p "New jitter (e.g., 10ms, 30ms): " value
-            [ -n "$value" ] && python3 "$SCRIPT_DIR/fl_network_monitor.py" --client-id "$client_id" --jitter "$value"
+            [ -n "$value" ] && "$PYTHON" "$SCRIPT_DIR/fl_network_monitor.py" --client-id "$client_id" --jitter "$value"
             ;;
         *)
             print_error "Invalid choice"
