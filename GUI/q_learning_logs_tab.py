@@ -73,6 +73,24 @@ def _prepare_q_learning_dataframe_for_excel(df):
     return out
 
 
+def _ensure_q_learning_columns(db_path):
+    """Migrate older q_learning_log DBs: add 3D RL state columns if missing."""
+    if not os.path.isfile(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("PRAGMA table_info(q_learning_log)")
+        cols = {row[1] for row in c.fetchall()}
+        for col, typ in (("state_comm_level", "TEXT"), ("state_battery_level", "TEXT")):
+            if col not in cols:
+                c.execute(f"ALTER TABLE q_learning_log ADD COLUMN {col} {typ}")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
 def _shared_data_dir():
     """Resolve shared_data path (works when GUI runs from project root or Network_Simulation)."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -142,10 +160,10 @@ class QLearningLogsTab(QWidget):
         layout.addWidget(stats_group)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(31)
+        self.table.setColumnCount(30)
         self.table.setHorizontalHeaderLabels([
             "ID", "Timestamp", "Round", "Episode", "Direction",
-            "State (net)", "State (res)", "State (size)", "State (mob)",
+            "Comm level", "Resource", "Battery (RL)",
             "Action", "Reward", "Q Delta", "Epsilon", "Avg R(100)", "Converged",
             "Comm Time", "R_comm",
             "Conv Time", "R_conv",
@@ -192,13 +210,16 @@ class QLearningLogsTab(QWidget):
             self.converged_label.setText("Converged: No")
             return
         try:
+            _ensure_q_learning_columns(db_path)
             conn = sqlite3.connect(db_path)
             cur = conn.cursor()
             cur.execute("""
                 SELECT id, timestamp, round_num, episode,
                        COALESCE(link_direction, 'uplink') AS link_direction,
-                       state_network, state_resource,
-                       state_model_size, state_mobility, action, reward, q_delta, epsilon,
+                       COALESCE(NULLIF(TRIM(state_comm_level), ''), state_network) AS state_comm_level,
+                       state_resource,
+                       COALESCE(NULLIF(TRIM(state_battery_level), ''), '') AS state_battery_level,
+                       action, reward, q_delta, epsilon,
                        avg_reward_last_100, converged,
                        metric_communication_time, reward_communication_time,
                        metric_convergence_time, reward_convergence_time,
@@ -218,10 +239,10 @@ class QLearningLogsTab(QWidget):
             print(f"Q-Learning tab error: {e}")
             return
         self.table.setRowCount(0)
-        # Column index where 'link_direction' lives (0-based, index 4)
+        # Column indices (0-based): 3D RL state = comm, resource, battery
         DIR_COL = 4
-        CONVERGED_COL = 14  # shifted by 1 due to new column
-        REWARD_COL = 10
+        CONVERGED_COL = 13
+        REWARD_COL = 9
         for r in rows:
             self.table.insertRow(self.table.rowCount())
             row_idx = self.table.rowCount() - 1
@@ -299,12 +320,15 @@ class QLearningLogsTab(QWidget):
             if not os.path.exists(db_path):
                 continue
             try:
+                _ensure_q_learning_columns(db_path)
                 conn = sqlite3.connect(db_path)
                 df = pd.read_sql_query(
                     """SELECT id, timestamp, round_num, episode,
                        COALESCE(link_direction, 'uplink') AS link_direction,
-                       state_network, state_resource,
-                       state_model_size, state_mobility, action, reward, q_delta, epsilon,
+                       COALESCE(NULLIF(TRIM(state_comm_level), ''), state_network) AS state_comm_level,
+                       state_resource,
+                       COALESCE(NULLIF(TRIM(state_battery_level), ''), '') AS state_battery_level,
+                       action, reward, q_delta, epsilon,
                        avg_reward_last_100, converged,
                        metric_communication_time, reward_communication_time,
                        metric_convergence_time, reward_convergence_time,
@@ -390,12 +414,15 @@ class QLearningLogsTab(QWidget):
                     if not os.path.exists(db_path):
                         continue
                     try:
+                        _ensure_q_learning_columns(db_path)
                         conn = sqlite3.connect(db_path)
                         df = pd.read_sql_query(
                             """SELECT id, timestamp, round_num, episode,
                                COALESCE(link_direction, 'uplink') AS link_direction,
-                               state_network, state_resource,
-                               state_model_size, state_mobility, action, reward, q_delta, epsilon,
+                               COALESCE(NULLIF(TRIM(state_comm_level), ''), state_network) AS state_comm_level,
+                               state_resource,
+                               COALESCE(NULLIF(TRIM(state_battery_level), ''), '') AS state_battery_level,
+                               action, reward, q_delta, epsilon,
                                avg_reward_last_100, converged,
                                metric_communication_time, reward_communication_time,
                                metric_convergence_time, reward_convergence_time,

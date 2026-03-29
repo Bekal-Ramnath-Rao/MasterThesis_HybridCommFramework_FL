@@ -90,6 +90,8 @@ def init_db():
     c.execute("PRAGMA table_info(q_learning_log)")
     existing_cols = {row[1] for row in c.fetchall()}
     required_new_cols = {
+        'state_comm_level': 'TEXT',
+        'state_battery_level': 'TEXT',
         'link_direction': "TEXT DEFAULT 'uplink'",
         'metric_communication_time': 'REAL',
         'metric_convergence_time': 'REAL',
@@ -146,10 +148,19 @@ def log_q_step(
     reward_battery_penalty: float = None,
     reward_t_calc_penalty: float = None,
     reward_total: float = None,
+    state_comm_level: str = None,
+    state_battery_level: str = None,
     link_direction: str = 'uplink',
 ):
-    """Log one Q-learning step. Auto-creates table if needed."""
+    """Log one Q-learning step. Auto-creates table if needed.
+
+    RL state is 3D: comm_level, resource, battery_level. Use ``state_comm_level`` and
+    ``state_battery_level``; ``state_network`` remains a legacy mirror for comm bucket
+    when the new columns are omitted.
+    """
     effective_reward_total = reward_total if reward_total is not None else reward
+    eff_comm = (state_comm_level if state_comm_level is not None else state_network) or ''
+    eff_batt = (state_battery_level if state_battery_level is not None else '') or ''
     try:
         init_db()
         conn = sqlite3.connect(DB_PATH)
@@ -158,23 +169,26 @@ def log_q_step(
             INSERT INTO q_learning_log (
                 client_id, timestamp, link_direction, round_num, episode,
                 state_network, state_resource, state_model_size, state_mobility,
+                state_comm_level, state_battery_level,
                 action, reward, q_delta, epsilon, avg_reward_last_100, converged,
                 metric_communication_time, metric_convergence_time, metric_success,
                 metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage, metric_battery_level,
                 metric_energy_usage, metric_t_calc,
                 reward_base, reward_communication_time, reward_convergence_time,
                 reward_resource_penalty, reward_battery_penalty, reward_t_calc_penalty, reward_total
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             client_id,
             datetime.now().isoformat(),
             (link_direction or 'uplink').strip().lower(),
             round_num,
             episode,
-            state_network or '',
+            eff_comm,
             state_resource or '',
             state_model_size or '',
             state_mobility or '',
+            eff_comm,
+            eff_batt,
             action,
             reward,
             q_delta if q_delta is not None else 0.0,
@@ -212,7 +226,9 @@ def log_q_step(
                 metric_energy_usage, metric_t_calc,
                 reward_base, reward_communication_time, reward_convergence_time,
                 reward_resource_penalty, reward_battery_penalty, reward_t_calc_penalty, reward_total,
-                link_direction,
+                state_comm_level=state_comm_level,
+                state_battery_level=state_battery_level,
+                link_direction=link_direction,
             )
         else:
             print(f"[QLearningLogger] Error: {e}")

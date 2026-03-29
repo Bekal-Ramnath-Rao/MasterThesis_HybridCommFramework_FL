@@ -326,10 +326,15 @@ except ImportError:
 # Import custom modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
-    from rl_q_learning_selector import QLearningProtocolSelector, EnvironmentStateManager
+    from rl_q_learning_selector import (
+        QLearningProtocolSelector,
+        EnvironmentStateManager,
+        collect_comm_resource_battery_stats,
+    )
 except ImportError:
     QLearningProtocolSelector = None
     EnvironmentStateManager = None
+    collect_comm_resource_battery_stats = None
 
 # Suppress TensorFlow warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -397,6 +402,8 @@ else:
     USE_RL_EXPLORATION = USE_QL_CONVERGENCE
 Q_CONVERGENCE_THRESHOLD = float(os.getenv("Q_CONVERGENCE_THRESHOLD", "0.01"))
 Q_CONVERGENCE_PATIENCE = int(os.getenv("Q_CONVERGENCE_PATIENCE", "5"))
+# Phase 0: synthetic bucket-discovery rounds before Phase 1 Q-learning (0 = skip)
+RL_PHASE0_ROUNDS = int(os.getenv("RL_PHASE0_ROUNDS", "20"))
 USE_COMMUNICATION_MODEL_REWARD = os.getenv("USE_COMMUNICATION_MODEL_REWARD", "true").lower() == "true"
 
 # One-shot hints when T_calc / R_tcalc stay zero in q_learning_log
@@ -748,8 +755,6 @@ class UnifiedFLClient_Emotion:
                     self.rl_selector_downlink.last_experiment_id = experiment_id
                     if scenario_info:
                         _sn = scenario_info.strip().lower()
-                        self.rl_selector_uplink.last_scenario = scenario_info
-                        self.rl_selector_downlink.last_scenario = scenario_info
                         self.rl_selector_uplink.ensure_scenario(_sn)
                         self.rl_selector_downlink.ensure_scenario(_sn)
                     # Save both Q-tables to persist the tracking
@@ -768,7 +773,68 @@ class UnifiedFLClient_Emotion:
                 # 3. Experiment ID tracking prevents multiple resets for the same experiment
             
             self.env_manager = EnvironmentStateManager()
-            # Named simulation scenario → distinct Q-table slice; extend table if this name is new.
+            self.env_manager.sync_comm_thresholds_from_selector(self.rl_selector_uplink)
+
+            # Phase 0: bucket discovery (epsilon=1.0, no Q-updates) → tune comm/battery thresholds, then fresh Q-tables
+            if (
+                RL_PHASE0_ROUNDS > 0
+                and collect_comm_resource_battery_stats is not None
+            ):
+                try:
+                    print(
+                        f"[Client {client_id}] Phase 0: collecting comm/resource/battery stats "
+                        f"for uplink ({RL_PHASE0_ROUNDS} rounds, exploration only)..."
+                    )
+                    comm_times, _resource_labels, battery_socs = collect_comm_resource_battery_stats(
+                        self.rl_selector_uplink,
+                        self.env_manager,
+                        n_rounds=RL_PHASE0_ROUNDS,
+                    )
+                    if comm_times:
+                        comm_times_sorted = sorted(comm_times)
+                        n = len(comm_times_sorted)
+                        low_idx = max(0, int(0.33 * n) - 1)
+                        high_idx = max(0, int(0.66 * n) - 1)
+                        comm_t_low = float(comm_times_sorted[low_idx])
+                        comm_t_high = float(comm_times_sorted[high_idx])
+                        if comm_t_low > comm_t_high:
+                            comm_t_low, comm_t_high = comm_t_high, comm_t_low
+                        if battery_socs:
+                            battery_socs_sorted = sorted(battery_socs)
+                            nb = len(battery_socs_sorted)
+                            b_idx = max(0, int(0.33 * nb) - 1)
+                            battery_soc_threshold = float(battery_socs_sorted[b_idx])
+                        else:
+                            battery_soc_threshold = float(self.env_manager.battery_soc_threshold)
+
+                        self.rl_selector_uplink.comm_t_low = comm_t_low
+                        self.rl_selector_uplink.comm_t_high = comm_t_high
+                        self.env_manager.sync_comm_thresholds_from_selector(self.rl_selector_uplink)
+                        self.env_manager.battery_soc_threshold = battery_soc_threshold
+
+                        self.rl_selector_downlink.comm_t_low = comm_t_low
+                        self.rl_selector_downlink.comm_t_high = comm_t_high
+
+                        print(
+                            f"[Client {client_id}] Phase 0 tuned comm thresholds: "
+                            f"low={comm_t_low:.3f}s, high={comm_t_high:.3f}s"
+                        )
+                        print(
+                            f"[Client {client_id}] Phase 0 tuned battery SoC threshold: "
+                            f"{battery_soc_threshold:.3f}"
+                        )
+
+                        self.rl_selector_uplink.begin_fresh_training(
+                            experiment_id=f"client{client_id}_uplink_phase1",
+                        )
+                        self.rl_selector_downlink.begin_fresh_training(
+                            experiment_id=f"client{client_id}_downlink_phase1",
+                        )
+                    else:
+                        print(f"[Client {client_id}] Phase 0: no comm samples; keeping default thresholds")
+                except Exception as e:
+                    print(f"[Client {client_id}] Phase 0 bucket discovery failed (continuing with defaults): {e}")
+
             if scenario_info:
                 _sn = scenario_info.strip().lower()
                 self.env_manager.update_network_scenario(_sn)
@@ -1724,10 +1790,29 @@ class UnifiedFLClient_Emotion:
 
         return False
 
+    def _sync_env_rl_comm_from_round_metrics(self) -> None:
+        """Set env ``comm_level`` from last round uplink communication time (for next Q-state)."""
+        if not self.env_manager:
+            return
+        try:
+            rm = self.round_metrics or {}
+            t = float(
+                rm.get("communication_time")
+                or (
+                    float(rm.get("uplink_model_comm_time", 0) or 0)
+                    + float(rm.get("uplink_metrics_comm_time", 0) or 0)
+                )
+            )
+            if t > 0:
+                self.env_manager.update_comm_level_from_time(t)
+        except Exception:
+            pass
+
     def _gather_state_for_downlink_rl(self):
         """Build env state dict for downlink Q-learning (same signals as protocol negotiation)."""
         if not self.env_manager:
             return None
+        self._sync_env_rl_comm_from_round_metrics()
         with tf.device('/CPU:0'):
             import psutil
             cpu = psutil.cpu_percent(interval=0.1)
@@ -1861,7 +1946,17 @@ class UnifiedFLClient_Emotion:
                 resource_consumption=resources,
                 t_calc=t_calc,
             )
-            self.rl_selector_downlink.update_q_value(reward, next_state=None, done=True)
+            if self.env_manager:
+                self.env_manager.update_comm_level_from_time(comm_time)
+                self.env_manager.sync_battery_level_from_soc(None)
+                next_state = self.env_manager.get_current_state()
+            else:
+                next_state = None
+            self.rl_selector_downlink.update_q_value(
+                reward,
+                next_state=next_state,
+                done=False if next_state is not None else True,
+            )
             q_delta = self.rl_selector_downlink.get_last_q_delta()
             avg_reward = (
                 float(np.mean(self.rl_selector_downlink.total_rewards[-100:]))
@@ -1883,10 +1978,12 @@ class UnifiedFLClient_Emotion:
                     client_id=self.client_id,
                     round_num=round_num or self.current_round,
                     episode=self.rl_selector_downlink.episode_count - 1,
-                    state_network=downlink_state.get('network', ''),
+                    state_network=downlink_state.get('comm_level', downlink_state.get('network', '')),
                     state_resource=downlink_state.get('resource', ''),
-                    state_model_size=downlink_state.get('model_size', ''),
-                    state_mobility=downlink_state.get('mobility', ''),
+                    state_model_size='',
+                    state_mobility='',
+                    state_comm_level=downlink_state.get('comm_level', ''),
+                    state_battery_level=downlink_state.get('battery_level', ''),
                     action=protocol,
                     reward=reward,
                     q_delta=q_delta,
@@ -2087,6 +2184,7 @@ class UnifiedFLClient_Emotion:
         # Use the dedicated DOWNLINK Q-learning agent (separate Q-table from uplink)
         if USE_RL_SELECTION and self.rl_selector_downlink and self.env_manager:
             try:
+                self._sync_env_rl_comm_from_round_metrics()
                 with tf.device('/CPU:0'):
                     import psutil
                     cpu = psutil.cpu_percent(interval=0.1)
@@ -2463,6 +2561,7 @@ class UnifiedFLClient_Emotion:
         """
         if USE_RL_SELECTION and self.rl_selector_uplink and self.env_manager:
             try:
+                self._sync_env_rl_comm_from_round_metrics()
                 # RL logic runs on CPU only (no GPU); keeps Q-table updates off GPU
                 with tf.device('/CPU:0'):
                     import psutil
@@ -2904,7 +3003,17 @@ class UnifiedFLClient_Emotion:
                         resource_consumption=resources,
                         t_calc=t_calc_for_reward,
                     )
-                    self.rl_selector_uplink.update_q_value(reward, next_state=None, done=True)
+                    if self.env_manager:
+                        self.env_manager.update_comm_level_from_time(comm_time_for_reward)
+                        self.env_manager.sync_battery_level_from_soc(None)
+                        next_state = self.env_manager.get_current_state()
+                    else:
+                        next_state = None
+                    self.rl_selector_uplink.update_q_value(
+                        reward,
+                        next_state=next_state,
+                        done=False if next_state is not None else True,
+                    )
                     q_delta = self.rl_selector_uplink.get_last_q_delta()
                     avg_reward = (np.mean(self.rl_selector_uplink.total_rewards[-100:])
                                  if self.rl_selector_uplink.total_rewards else 0.0)
@@ -2930,10 +3039,12 @@ class UnifiedFLClient_Emotion:
                             client_id=self.client_id,
                             round_num=report_round,
                             episode=self.rl_selector_uplink.episode_count - 1,
-                            state_network=st.get('network', ''),
+                            state_network=st.get('comm_level', st.get('network', '')),
                             state_resource=st.get('resource', ''),
-                            state_model_size=st.get('model_size', ''),
-                            state_mobility=st.get('mobility', ''),
+                            state_model_size='',
+                            state_mobility='',
+                            state_comm_level=st.get('comm_level', ''),
+                            state_battery_level=st.get('battery_level', ''),
                             action=self._last_update_protocol or self.selected_protocol or 'mqtt',
                             reward=reward,
                             q_delta=q_delta,
