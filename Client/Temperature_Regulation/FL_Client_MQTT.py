@@ -274,11 +274,9 @@ class FederatedLearningClient:
                     compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
                 except Exception as e:
                     print(f"Client {self.client_id} error decoding quantized_data: {e}")
-            # Keep quantized end-to-end: do NOT dequantize/decompress.
-            # Cast quantized tensors to float32 only so TF can load them.
-            weights = self.quantizer.as_training_weights(compressed_data)
+            weights = self.quantizer.decompress(compressed_data)
             if round_num > 0:
-                print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
+                print(f"Client {self.client_id}: Received global model (dequantized for training)")
         else:
             if 'pruned_data' not in data:
                 encoded_weights = data['weights']

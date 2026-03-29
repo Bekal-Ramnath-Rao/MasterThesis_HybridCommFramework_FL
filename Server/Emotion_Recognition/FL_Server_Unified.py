@@ -153,7 +153,7 @@ except ImportError:
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))
-STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
+from fl_termination_env import stop_on_client_convergence
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
@@ -1747,7 +1747,7 @@ class UnifiedFederatedLearningServer:
     def mark_client_converged(self, client_id):
         """Remove converged client from active training set."""
         with self.lock:
-            if not STOP_ON_CLIENT_CONVERGENCE:
+            if not stop_on_client_convergence():
                 # Fixed-round mode: ignore client-local convergence removal/disconnect.
                 return
             if client_id in self.active_clients:
@@ -1805,7 +1805,7 @@ class UnifiedFederatedLearningServer:
                 print(f"[{protocol.upper()}] Ignoring update from inactive client {client_id}")
                 return
             try:
-                converged_flag = STOP_ON_CLIENT_CONVERGENCE and float(client_metrics.get('client_converged', 0.0)) >= 1.0
+                converged_flag = stop_on_client_convergence() and float(client_metrics.get('client_converged', 0.0)) >= 1.0
             except Exception:
                 converged_flag = False
             if converged_flag:
@@ -1935,7 +1935,7 @@ class UnifiedFederatedLearningServer:
                 print(f"[{protocol.upper()}] Ignoring metrics from inactive client {client_id}")
                 return
             
-            if STOP_ON_CLIENT_CONVERGENCE and client_converged >= 1.0:
+            if stop_on_client_convergence() and client_converged >= 1.0:
                 print(f"[{protocol.upper()}] Received convergence metrics from client {client_id}")
                 self.mark_client_converged(client_id)
                 return
@@ -2090,7 +2090,7 @@ class UnifiedFederatedLearningServer:
         """Broadcast updated global model to all clients via their registered protocols"""
         # Prepare message with weights
         if self.quantization_handler is not None:
-            # Keep quantized end-to-end: if we already aggregated in quantized space, broadcast it as-is.
+            # Prefer latest recompressed global payload from aggregation; else compress float global_weights.
             compressed_data = getattr(self, "global_compressed", None)
             if not (isinstance(compressed_data, dict) and 'compressed_data' in compressed_data):
                 compressed_data = self.quantization_handler.compress_global_model(self.global_weights)
@@ -2212,11 +2212,9 @@ class UnifiedFederatedLearningServer:
             }
             aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
             self.global_compressed = aggregated_compressed
-            # Keep a float-cast view for any server-side code paths that still reference global_weights
-            try:
-                self.global_weights = [np.asarray(w, dtype=np.float32) for w in aggregated_compressed.get('compressed_data', [])]
-            except Exception:
-                pass
+            lw = getattr(self.quantization_handler, "last_aggregated_float_weights", None)
+            if lw is not None:
+                self.global_weights = lw
 
             self.client_updates.clear()
             self.prepare_downlink_protocol_negotiation(
@@ -2609,7 +2607,7 @@ if GRPC_AVAILABLE:
                 )
 
                 # Convergence: accept even if chunked stream incomplete
-                converged_flag = STOP_ON_CLIENT_CONVERGENCE and float(metrics.get('client_converged', 0.0)) >= 1.0
+                converged_flag = stop_on_client_convergence() and float(metrics.get('client_converged', 0.0)) >= 1.0
                 if converged_flag and round_num <= self.server.current_round and client_id in self.server.active_clients:
                     self.server.mark_client_converged(client_id)
                     return federated_learning_pb2.UpdateResponse(success=True, message=f"Client {client_id} convergence acknowledged")

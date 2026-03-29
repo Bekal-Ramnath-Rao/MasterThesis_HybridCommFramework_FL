@@ -462,7 +462,7 @@ class FederatedLearningClient:
                     try:
                         candidate = pickle.loads(model_update.weights)
                         if isinstance(candidate, dict) and 'quantization_params' in candidate:
-                            weights = self.quantizer.as_training_weights(candidate)
+                            weights = self.quantizer.decompress(candidate)
                             print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
                         else:
                             weights = candidate

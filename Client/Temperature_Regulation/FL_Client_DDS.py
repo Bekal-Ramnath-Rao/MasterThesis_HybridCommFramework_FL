@@ -481,7 +481,7 @@ class FederatedLearningClient:
                     # Check if weights are compressed (quantized)
                     if isinstance(raw_weights, dict) and 'compressed_data' in raw_weights:
                         if self.quantizer is not None:
-                            weights = self.quantizer.as_training_weights(raw_weights)
+                            weights = self.quantizer.decompress(raw_weights)
                             print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
                         else:
                             print(f"Client {self.client_id}: ERROR - Received quantized data but quantizer not initialized!")

@@ -52,7 +52,7 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "5"))
-STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
+from fl_termination_env import stop_on_client_convergence
 
 # Convergence Settings
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -216,7 +216,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         do_aggregate_metrics = False
         do_aggregate_updates = False
         with self.lock:
-            if not STOP_ON_CLIENT_CONVERGENCE:
+            if not stop_on_client_convergence():
                 # Fixed-round mode: ignore client-local convergence removal/disconnect.
                 print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
                 return
@@ -326,7 +326,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             metrics = dict(request.metrics)
 
             # Check convergence first: accept convergence even if round advanced (late-arriving message)
-            converged_flag = STOP_ON_CLIENT_CONVERGENCE and float(metrics.get('client_converged', 0.0)) >= 1.0
+            converged_flag = stop_on_client_convergence() and float(metrics.get('client_converged', 0.0)) >= 1.0
             if converged_flag:
                 # Allow convergence for current or previous round so we don't reject when server already advanced
                 if round_num <= self.current_round and client_id in self.active_clients:
@@ -460,7 +460,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             # Process convergence in same RPC (so active_clients is updated before "all evaluated" check)
             client_converged = float(getattr(request, 'client_converged', 0.0)) or 0.0
             all_just_converged = False
-            if STOP_ON_CLIENT_CONVERGENCE and client_converged >= 1.0 and client_id in self.active_clients:
+            if stop_on_client_convergence() and client_converged >= 1.0 and client_id in self.active_clients:
                 self.active_clients.remove(client_id)
                 self.client_updates.pop(client_id, None)
                 # Keep last client's metrics so aggregate_metrics can record final round and then run completion (save, plot, stop server)
@@ -478,7 +478,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             
             print(f"Received evaluation metrics from client {client_id}")
             print(f"  Loss: {loss_value:.4f}, Accuracy: {acc_value:.4f}")
-            if STOP_ON_CLIENT_CONVERGENCE and client_converged >= 1.0:
+            if stop_on_client_convergence() and client_converged >= 1.0:
                 print(f"  Client {client_id} signalled convergence in this metrics message")
             print(f"  Progress: {len(self.clients_evaluated)}/{len(self.active_clients)} active clients evaluated")
             
@@ -553,10 +553,13 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
 
             with self.lock:
                 self.global_compressed = aggregated_compressed
+                lw = getattr(self.quantization_handler, "last_aggregated_float_weights", None)
+                if lw is not None:
+                    self.global_weights = lw
                 self.client_updates.clear()
                 self.evaluation_phase = True
 
-            print(f"Global model updated for round {self.current_round} (kept quantized)")
+            print(f"Global model updated for round {self.current_round} (dequantize→FedAvg→requantize)")
             print(f"Clients should now evaluate the model\n")
             return
         

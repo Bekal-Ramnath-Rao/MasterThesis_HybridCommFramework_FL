@@ -1352,6 +1352,9 @@ def main() -> None:
 
     # Propagate selected termination mode into native process env.
     os.environ["STOP_ON_CLIENT_CONVERGENCE"] = "false" if args.termination_mode == "fixed_rounds" else "true"
+    os.environ["TRAINING_TERMINATION_MODE"] = (
+        "fixed_rounds" if args.termination_mode == "fixed_rounds" else "client_convergence"
+    )
 
     protocols = list(dict.fromkeys((args.protocols or [args.protocol]) if hasattr(args, "protocols") else [args.protocol]))
     scenarios = list(dict.fromkeys((args.scenarios or [args.scenario]) if hasattr(args, "scenarios") else [args.scenario]))

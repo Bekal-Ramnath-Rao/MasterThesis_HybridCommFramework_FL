@@ -76,7 +76,7 @@ DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
-STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
+from fl_termination_env import stop_on_client_convergence
 
 # Chunking configuration for large messages
 CHUNK_SIZE = 64 * 1024
@@ -740,7 +740,7 @@ class FederatedLearningServer:
     
     def mark_client_converged(self, client_id):
         """Remove converged client from active federation; proceed with remaining clients."""
-        if not STOP_ON_CLIENT_CONVERGENCE:
+        if not stop_on_client_convergence():
             # Fixed-round mode: ignore client-local convergence removal/disconnect.
             print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
             return
@@ -784,7 +784,7 @@ class FederatedLearningServer:
                 if sample.round == self.current_round:
                     client_id = sample.client_id
                     conv = getattr(sample, 'client_converged', 0.0) or 0.0
-                    if STOP_ON_CLIENT_CONVERGENCE and float(conv) >= 1.0:
+                    if stop_on_client_convergence() and float(conv) >= 1.0:
                         self.mark_client_converged(client_id)
                         continue
                     if client_id not in self.active_clients:
@@ -827,9 +827,12 @@ class FederatedLearningServer:
             }
             aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
             self.global_compressed = aggregated_compressed
+            lw = getattr(self.quantization_handler, "last_aggregated_float_weights", None)
+            if lw is not None:
+                self.global_weights = lw
 
-            print(f"Aggregated (kept-quantized) global model from round {self.current_round}")
-            print(f"Sending (kept-quantized) global model to clients...\n")
+            print(f"Aggregated global model from round {self.current_round} (dequantize→FedAvg→requantize)")
+            print(f"Sending global model to clients (dequantize→FedAvg→requantize on aggregate)...\n")
 
             serialized_weights = list(pickle.dumps(self.global_compressed))
 
@@ -960,7 +963,7 @@ class FederatedLearningServer:
                 if sample.round == self.current_round:
                     client_id = sample.client_id
                     conv = getattr(sample, 'client_converged', 0.0) or 0.0
-                    if STOP_ON_CLIENT_CONVERGENCE and float(conv) >= 1.0:
+                    if stop_on_client_convergence() and float(conv) >= 1.0:
                         self.mark_client_converged(client_id)
                         continue
                     if client_id not in self.active_clients:

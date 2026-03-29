@@ -29,6 +29,37 @@ except ImportError:
     fcntl = None  # type: ignore
     _HAS_FCNTL = False
 
+# region agent log
+_AGENT_DEBUG_LOG_PATH = "/home/ubuntu/Desktop/MT_Ramnath/MasterThesis_HybridCommFramework_FL/.cursor/debug-c387e1.log"
+
+
+def _agent_debug_log(
+    location: str,
+    message: str,
+    data: dict,
+    hypothesis_id: str = "",
+    run_id: str = "pre-fix",
+) -> None:
+    try:
+        line = json.dumps(
+            {
+                "sessionId": "c387e1",
+                "runId": run_id,
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "message": message,
+                "data": data,
+                "timestamp": int(time.time() * 1000),
+            },
+            default=str,
+        )
+        with open(_AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+# endregion
 
 # --- Reward budget (success): base 10 + comm 10 + resource ≥ -5 + battery ≥ -5 → max 30 ---
 # Communication time: log spread (seconds). Tuned from q_learning backups (uplink p50≈50s, downlink≈2s):
@@ -222,11 +253,46 @@ class QLearningProtocolSelector:
         Returns:
             Tuple of indices for Q-table access
         """
-        scenario_idx = self._ensure_scenario_key(self._scenario_key_from_state(state))
-        resource_idx = self.RESOURCE_LEVELS.index(state.get('resource', 'high'))
-        model_idx = self.MODEL_SIZES.index(state.get('model_size', 'medium'))
-        mobility_idx = self.MOBILITY_LEVELS.index(state.get('mobility', 'static'))
-        
+        try:
+            scenario_idx = self._ensure_scenario_key(self._scenario_key_from_state(state))
+            resource_idx = self.RESOURCE_LEVELS.index(state.get('resource', 'high'))
+            model_idx = self.MODEL_SIZES.index(state.get('model_size', 'medium'))
+            mobility_idx = self.MOBILITY_LEVELS.index(state.get('mobility', 'static'))
+        except ValueError as e:
+            # region agent log
+            _agent_debug_log(
+                "rl_q_learning_selector.py:get_state_index",
+                "invalid_discrete_state_key",
+                {
+                    "error": str(e),
+                    "resource": state.get("resource"),
+                    "model_size": state.get("model_size"),
+                    "mobility": state.get("mobility"),
+                    "allowed_resource": list(self.RESOURCE_LEVELS),
+                    "allowed_model_size": list(self.MODEL_SIZES),
+                    "allowed_mobility": list(self.MOBILITY_LEVELS),
+                },
+                hypothesis_id="H1",
+            )
+            # endregion
+            raise
+
+        # region agent log
+        _agent_debug_log(
+            "rl_q_learning_selector.py:get_state_index",
+            "state_to_q_indices",
+            {
+                "scenario_key": self._scenario_key_from_state(state),
+                "scenario_idx": int(scenario_idx),
+                "resource": state.get("resource", "high"),
+                "model_size": state.get("model_size", "medium"),
+                "mobility": state.get("mobility", "static"),
+                "idx": [int(scenario_idx), int(resource_idx), int(model_idx), int(mobility_idx)],
+            },
+            hypothesis_id="H5",
+        )
+        # endregion
+
         return (scenario_idx, resource_idx, model_idx, mobility_idx)
     
     def select_protocol(self, state: Dict, training: bool = True) -> str:
@@ -246,11 +312,29 @@ class QLearningProtocolSelector:
         if training and np.random.random() < self.epsilon:
             # Explore: random action
             action_idx = np.random.randint(len(self.PROTOCOLS))
+            explored = True
         else:
             # Exploit: best known action (uses learned Q-table)
             # When training=False, this always uses the learned Q-table for inference
             action_idx = np.argmax(self.q_table[state_idx])
+            explored = False
         
+        # region agent log
+        _agent_debug_log(
+            "rl_q_learning_selector.py:select_protocol",
+            "protocol_choice",
+            {
+                "training": bool(training),
+                "epsilon": float(self.epsilon),
+                "explored": explored,
+                "action_idx": int(action_idx),
+                "protocol": self.PROTOCOLS[int(action_idx)],
+                "max_q": float(np.max(self.q_table[state_idx])),
+            },
+            hypothesis_id="H4",
+        )
+        # endregion
+
         protocol = self.PROTOCOLS[action_idx]
         self.protocol_usage[protocol] += 1
         
@@ -415,6 +499,18 @@ class QLearningProtocolSelector:
             done: Whether episode is complete
         """
         if not self.state_history or not self.action_history:
+            # region agent log
+            _agent_debug_log(
+                "rl_q_learning_selector.py:update_q_value",
+                "skipped_empty_history",
+                {
+                    "state_hist_len": len(self.state_history),
+                    "action_hist_len": len(self.action_history),
+                    "reward": float(reward),
+                },
+                hypothesis_id="H2",
+            )
+            # endregion
             return
         
         state_idx = self.state_history[-1]
@@ -438,6 +534,23 @@ class QLearningProtocolSelector:
         # Update Q-table
         q_delta = abs(new_q - current_q)
         self.q_table[state_idx][action_idx] = new_q
+
+        # region agent log
+        _agent_debug_log(
+            "rl_q_learning_selector.py:update_q_value",
+            "q_updated",
+            {
+                "reward": float(reward),
+                "current_q": float(current_q),
+                "new_q": float(new_q),
+                "q_delta": float(q_delta),
+                "action_idx": int(action_idx),
+                "protocol": self.PROTOCOLS[int(action_idx)],
+                "terminal": bool(done or next_state is None),
+            },
+            hypothesis_id="H2",
+        )
+        # endregion
 
         # Track Q-deltas for convergence check
         self._q_deltas.append(q_delta)
@@ -824,10 +937,51 @@ class QLearningProtocolSelector:
         """Load Q-table from disk: try initial_load_path (past experience) first, then save_path."""
         # Try optional pretrained / past-experience path first
         if self.initial_load_path and self._try_load_from_path(self.initial_load_path):
+            # region agent log
+            _agent_debug_log(
+                "rl_q_learning_selector.py:load_q_table",
+                "q_table_loaded",
+                {
+                    "source": "initial_load_path",
+                    "path": self.initial_load_path,
+                    "q_shape": list(self.q_table.shape),
+                    "epsilon": float(self.epsilon),
+                    "n_scenarios": len(self.scenario_order),
+                },
+                hypothesis_id="H3",
+            )
+            # endregion
             return
         # Then try default save path (e.g. shared_data or cwd)
         if self._try_load_from_path(self.save_path):
+            # region agent log
+            _agent_debug_log(
+                "rl_q_learning_selector.py:load_q_table",
+                "q_table_loaded",
+                {
+                    "source": "save_path",
+                    "path": self.save_path,
+                    "q_shape": list(self.q_table.shape),
+                    "epsilon": float(self.epsilon),
+                    "n_scenarios": len(self.scenario_order),
+                },
+                hypothesis_id="H3",
+            )
+            # endregion
             return
+        # region agent log
+        _agent_debug_log(
+            "rl_q_learning_selector.py:load_q_table",
+            "q_table_fresh",
+            {
+                "source": "none",
+                "initial_load_path": self.initial_load_path,
+                "save_path": self.save_path,
+                "q_shape": list(self.q_table.shape),
+            },
+            hypothesis_id="H3",
+        )
+        # endregion
         print(f"[Q-Learning] No existing Q-table found. Starting with fresh Q-table for {len(self.PROTOCOLS)} protocols: {self.PROTOCOLS}")
     
     def get_statistics(self) -> Dict:

@@ -662,8 +662,11 @@ class FederatedLearningServer:
             }
             aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
             self.global_compressed = aggregated_compressed
+            lw = getattr(self.quantization_handler, "last_aggregated_float_weights", None)
+            if lw is not None:
+                self.global_weights = lw
 
-            print(f"Aggregated (kept-quantized) global model from round {self.current_round}")
+            print(f"Aggregated global model from round {self.current_round} (dequantize→FedAvg→requantize)")
             print(f"Sending (kept-quantized) global model to clients...\n")
 
             serialized_weights = list(pickle.dumps(self.global_compressed))

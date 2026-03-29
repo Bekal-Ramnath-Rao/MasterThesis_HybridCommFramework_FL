@@ -480,7 +480,7 @@ class FederatedLearningClient:
                         compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
                     except Exception as e:
                         print(f"Client {self.client_id} error decoding quantized_data: {e}")
-                weights = self.quantizer.as_training_weights(compressed_data)
+                weights = self.quantizer.decompress(compressed_data)
                 if round_num > 0:
                     print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
             else:

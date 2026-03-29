@@ -833,10 +833,9 @@ class UnifiedFederatedLearningServer:
             }
             aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
             self.global_compressed = aggregated_compressed
-            try:
-                self.global_weights = [np.asarray(w, dtype=np.float32) for w in aggregated_compressed.get('compressed_data', [])]
-            except Exception:
-                pass
+            lw = getattr(self.quantization_handler, "last_aggregated_float_weights", None)
+            if lw is not None:
+                self.global_weights = lw
             self.client_updates.clear()
             self.broadcast_global_model()
             time.sleep(1)

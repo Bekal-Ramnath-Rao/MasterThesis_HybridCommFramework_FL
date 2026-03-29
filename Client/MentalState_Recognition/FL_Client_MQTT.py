@@ -349,12 +349,12 @@ class FederatedLearningClient:
                     import base64, pickle
                     compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
                 if hasattr(self, 'quantization') and self.quantization is not None:
-                    weights = self.quantization.as_training_weights(compressed_data)
+                    weights = self.quantization.decompress(compressed_data)
                 elif hasattr(self, 'quantizer') and self.quantizer is not None:
-                    weights = self.quantizer.as_training_weights(compressed_data)
+                    weights = self.quantizer.decompress(compressed_data)
                 else:
                     weights = compressed_data
-                print(f"Client {self.client_id} received quantized model (kept quantized)")
+                print(f"Client {self.client_id} received global model (dequantized for training)")
             else:
                 # Normal weights
                 if 'weights' in data:

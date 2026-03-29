@@ -125,7 +125,7 @@ AMQP_CHUNK_PAYLOAD_BYTES = 96 * 1024
 
 # Controls whether this client should signal/exit on local convergence.
 # When false, clients keep training until the server indicates completion.
-STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
+from fl_termination_env import stop_on_client_convergence
 
 # AMQP delivery mode: 2=persistent (default), 1=non-persistent (for diagnostics/experiments)
 try:
@@ -666,21 +666,16 @@ class FederatedLearningClient:
                 return
             
             round_num = data['round']
-            # Decompress/deserialize weights.
-            # If both pruning and quantization are enabled, server should send quantized_data that already reflects pruning,
-            # so we must dequantize first when available.
             if 'quantized_data' in data and self.quantizer is not None:
                 compressed_data = data['quantized_data']
-                # If server sent serialized base64 string, decode and unpickle
                 if isinstance(compressed_data, str):
                     try:
                         compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
                     except Exception as e:
                         print(f"Client {self.client_id} error decoding quantized_data: {e}")
-                # Keep quantized end-to-end: do NOT dequantize/decompress.
-                weights = self.quantizer.as_training_weights(compressed_data)
+                weights = self.quantizer.decompress(compressed_data)
                 if round_num > 0:
-                    print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
+                    print(f"Client {self.client_id}: Received global model (dequantized for training)")
             elif 'pruned_data' in data and PRUNING_AVAILABLE and ModelPruning is not None:
                 try:
                     compressed_bytes = base64.b64decode(data['pruned_data'].encode('utf-8'))
@@ -988,7 +983,7 @@ class FederatedLearningClient:
         }
         if self.has_converged:
             # Avoid sending client_converged=1.0 when fixed-round mode is enabled.
-            metrics_dict["client_converged"] = 1.0 if STOP_ON_CLIENT_CONVERGENCE else 0.0
+            metrics_dict["client_converged"] = 1.0 if stop_on_client_convergence() else 0.0
         
         metrics_message = {
             "client_id": self.client_id,
@@ -1011,7 +1006,7 @@ class FederatedLearningClient:
                 round=self.current_round,
                 extra_info="Evaluation metrics"
             )
-            if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
+            if self.has_converged and stop_on_client_convergence():
                 print(f"Client {self.client_id} notifying server of convergence and disconnecting")
                 time.sleep(2)
                 self.stop()

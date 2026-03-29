@@ -382,9 +382,8 @@ CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
 ENABLE_LOCAL_CONVERGENCE_STOP = os.getenv("ENABLE_LOCAL_CONVERGENCE_STOP", "false").lower() == "true"
-# Controls whether this client should signal/exit on local convergence.
-# When false, clients keep training until the server indicates completion.
-STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
+# Controls whether this client should signal/exit on local convergence (see fl_termination_env).
+from fl_termination_env import stop_on_client_convergence
 # When True, training ends when Q-learning value converges; when False, ends on accuracy convergence
 USE_QL_CONVERGENCE = os.getenv("USE_QL_CONVERGENCE", "false").lower() == "true"
 # Epsilon-greedy exploration for protocol selection (actual RL training). Independent of USE_QL_CONVERGENCE
@@ -1178,7 +1177,7 @@ class UnifiedFLClient_Emotion:
                 if isinstance(raw, str):
                     raw = base64.b64decode(raw.encode('utf-8'))
                 compressed_data = pickle.loads(raw) if isinstance(raw, bytes) else raw
-                weights = self.quantizer.as_training_weights(compressed_data)
+                weights = self.quantizer.decompress(compressed_data)
             else:
                 weights = self.deserialize_weights(data['weights'])
             
@@ -1508,8 +1507,8 @@ class UnifiedFLClient_Emotion:
             if isinstance(decoded, dict) and 'compressed_data' in decoded:
                 if self.quantizer is None:
                     raise ValueError("Received quantized gRPC global model but client quantizer is not initialized")
-                weights = self.quantizer.as_training_weights(decoded)
-                print(f"[gRPC] Client {self.client_id} received quantized global model (kept quantized)")
+                weights = self.quantizer.decompress(decoded)
+                print(f"[gRPC] Client {self.client_id} received quantized global model (dequantized to float32)")
             else:
                 weights = decoded
 
@@ -1629,13 +1628,11 @@ class UnifiedFLClient_Emotion:
                 if isinstance(compressed_data, str):
                     import base64, pickle
                     compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
-                if hasattr(self, 'quantization') and self.quantization is not None:
-                    weights = self.quantization.as_training_weights(compressed_data)
-                elif hasattr(self, 'quantizer') and self.quantizer is not None:
-                    weights = self.quantizer.as_training_weights(compressed_data)
+                if self.quantizer is not None:
+                    weights = self.quantizer.decompress(compressed_data)
                 else:
                     weights = compressed_data
-                print(f"Client {self.client_id} received quantized model (kept quantized)")
+                print(f"Client {self.client_id} received quantized global model (dequantized to float32)")
             else:
                 # Normal weights
                 if 'weights' in data:
@@ -2266,15 +2263,13 @@ class UnifiedFLClient_Emotion:
                     ) / len(self.latency_history)
                     stddev = variance ** 0.5
 
-                    # Simple buckets for mobility based on latency jitter
+                    # Map jitter to Q-learning mobility: only {static, mobile} exist in
+                    # QLearningProtocolSelector.MOBILITY_LEVELS; previous low/medium/high
+                    # labels were ignored by EnvironmentStateManager.update_mobility.
                     if stddev < 5:
                         mobility = "static"
-                    elif stddev < 20:
-                        mobility = "low"
-                    elif stddev < 50:
-                        mobility = "medium"
                     else:
-                        mobility = "high"
+                        mobility = "mobile"
 
                     self.env_manager.update_mobility(mobility)
             except Exception as e:
@@ -2977,7 +2972,7 @@ class UnifiedFLClient_Emotion:
                             f"has not; continuing (uplink Q-updates unchanged)."
                         )
                     # End training only when both uplink and downlink Q-learning converged
-                    if USE_QL_CONVERGENCE and q_both_converged and STOP_ON_CLIENT_CONVERGENCE:
+                    if USE_QL_CONVERGENCE and q_both_converged and stop_on_client_convergence():
                         self.has_converged = True
                         print(
                             f"[Client {self.client_id}] RL convergence reached at round {report_round} "
@@ -2997,7 +2992,7 @@ class UnifiedFLClient_Emotion:
                         return
                 except Exception as rl_e:
                     print(f"[Client {self.client_id}] Uplink RL update error: {rl_e}")
-            if not USE_QL_CONVERGENCE and ENABLE_LOCAL_CONVERGENCE_STOP and STOP_ON_CLIENT_CONVERGENCE:
+            if not USE_QL_CONVERGENCE and ENABLE_LOCAL_CONVERGENCE_STOP and stop_on_client_convergence():
                 self._update_client_convergence_and_maybe_disconnect(loss)
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending metrics: {e}")
@@ -3019,7 +3014,7 @@ class UnifiedFLClient_Emotion:
         if self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
             self.has_converged = True
             print(f"[Client {self.client_id}] Local convergence reached at round {self.current_round}")
-            if STOP_ON_CLIENT_CONVERGENCE:
+            if stop_on_client_convergence():
                 self._notify_convergence_to_server()
                 self._disconnect_after_convergence()
 
@@ -3568,7 +3563,7 @@ class UnifiedFLClient_Emotion:
                 if isinstance(raw, str):
                     raw = base64.b64decode(raw.encode('utf-8'))
                 compressed_data = pickle.loads(raw) if isinstance(raw, bytes) else raw
-                weights = self.quantizer.as_training_weights(compressed_data)
+                weights = self.quantizer.decompress(compressed_data)
             else:
                 weights = self.deserialize_weights(message['weights'])
             
@@ -3978,7 +3973,7 @@ class UnifiedFLClient_Emotion:
                 if isinstance(raw, str):
                     raw = base64.b64decode(raw.encode('utf-8'))
                 compressed_data = pickle.loads(raw) if isinstance(raw, bytes) else raw
-                weights = self.quantizer.as_training_weights(compressed_data)
+                weights = self.quantizer.decompress(compressed_data)
             else:
                 weights = self.deserialize_weights(message['weights'])
             

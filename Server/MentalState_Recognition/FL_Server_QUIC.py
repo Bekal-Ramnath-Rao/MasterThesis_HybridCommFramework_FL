@@ -541,12 +541,9 @@ class FederatedLearningServer:
             }
             aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
             self.global_compressed = aggregated_compressed
-
-            # Keep float-cast view for evaluation
-            try:
-                self.global_weights = [np.asarray(w, dtype=np.float32) for w in aggregated_compressed.get('compressed_data', [])]
-            except Exception:
-                pass
+            lw = getattr(self.quantization_handler, "last_aggregated_float_weights", None)
+            if lw is not None:
+                self.global_weights = lw
 
             await self.evaluate_global_model()
 
@@ -561,7 +558,7 @@ class FederatedLearningServer:
                 }
             })
 
-            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients")
+            print(f"Aggregated global model from round {self.current_round} sent to all clients (dequantize→FedAvg→requantize)")
             await self.continue_training()
             return
 

@@ -254,14 +254,14 @@ class FederatedLearningClient:
             compressed_data = message['quantized_data']
             if isinstance(compressed_data, str):
                 compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
-            weights = self.quantizer.as_training_weights(compressed_data)
-            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
+            weights = self.quantizer.decompress(compressed_data)
+            print(f"Client {self.client_id}: Received global model (dequantized for training)")
         elif 'compressed_data' in message and self.quantizer is not None:
             compressed_data = message['compressed_data']
             if isinstance(compressed_data, str):
                 compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
-            weights = self.quantizer.as_training_weights(compressed_data)
-            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
+            weights = self.quantizer.decompress(compressed_data)
+            print(f"Client {self.client_id}: Received global model (dequantized for training)")
         elif 'pruned_data' in message and self.pruner is not None:
             try:
                 compressed_bytes = base64.b64decode(message['pruned_data'].encode('utf-8'))

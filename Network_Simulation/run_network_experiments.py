@@ -1946,6 +1946,9 @@ def main():
     # Propagate selected termination mode and round cap into Docker compose variable substitution.
     os.environ["NUM_ROUNDS"] = str(args.rounds)
     os.environ["STOP_ON_CLIENT_CONVERGENCE"] = "false" if args.termination_mode == "fixed_rounds" else "true"
+    os.environ["TRAINING_TERMINATION_MODE"] = (
+        "fixed_rounds" if args.termination_mode == "fixed_rounds" else "client_convergence"
+    )
     
     # Propagate DDS implementation choice to environment so compose scripts and containers can read it
     if args.dds_impl:

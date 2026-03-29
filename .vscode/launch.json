@@ -1239,6 +1239,7 @@
                 "CLIENT_ID": "1",
                 "NUM_CLIENTS": "2",
                 "USE_RL_SELECTION": "true",
+                "USE_RL_EXPLORATION": "true",
                 "DEFAULT_PROTOCOL": "mqtt",
                 "MQTT_BROKER": "localhost",
                 "AMQP_HOST": "localhost",
@@ -1267,6 +1268,7 @@
                 "CLIENT_ID": "2",
                 "NUM_CLIENTS": "2",
                 "USE_RL_SELECTION": "true",
+                "USE_RL_EXPLORATION": "true",
                 "DEFAULT_PROTOCOL": "mqtt",
                 "MQTT_BROKER": "localhost",
                 "AMQP_HOST": "localhost",
@@ -2229,10 +2231,11 @@
             }
         },
         {
-            "name": "RL System Test - Unified Server + Client (Emotion)",
+            "name": "Emotion Recognition: RL Agent Training (Server + 2 Clients)",
             "configurations": [
                 "RL Unified Server - Emotion (Local)",
-                "RL Unified Client - Emotion (Local)"
+                "RL Unified Client 1- Emotion (Local)",
+                "RL Unified Client 2- Emotion (Local)"
             ],
             "stopAll": true,
             "presentation": {

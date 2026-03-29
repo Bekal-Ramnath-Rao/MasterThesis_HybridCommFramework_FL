@@ -500,8 +500,11 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             }
             aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
             self.global_compressed = aggregated_compressed
-            print(f"Aggregated (kept-quantized) global model from round {self.current_round}")
-            print(f"Global model ready for clients (kept quantized)\n")
+            lw = getattr(self.quantization_handler, "last_aggregated_float_weights", None)
+            if lw is not None:
+                self.global_weights = lw
+            print(f"Aggregated global model from round {self.current_round} (dequantize→FedAvg→requantize)")
+            print(f"Global model ready for clients\n")
             self.evaluation_phase = True
             return
         

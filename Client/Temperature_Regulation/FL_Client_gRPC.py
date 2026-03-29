@@ -270,7 +270,7 @@ class FederatedLearningClient:
                             candidate = pickle.loads(global_model.weights)
                             if isinstance(candidate, dict) and 'quantization_params' in candidate:
                                 # Quantized payload (may already include pruning applied on server)
-                                weights = self.quantizer.as_training_weights(candidate) if self.quantizer is not None else []
+                                weights = self.quantizer.decompress(candidate) if self.quantizer is not None else []
                             elif isinstance(candidate, dict) and 'pruned_data' in candidate:
                                 # Pruned-compressed payload (bytes) for pruning-only mode
                                 if self.pruner is not None and candidate['pruned_data']:
@@ -290,7 +290,7 @@ class FederatedLearningClient:
                         try:
                             candidate = pickle.loads(global_model.weights)
                             if isinstance(candidate, dict) and 'quantization_params' in candidate:
-                                weights = self.quantizer.as_training_weights(candidate) if self.quantizer is not None else []
+                                weights = self.quantizer.decompress(candidate) if self.quantizer is not None else []
                             elif isinstance(candidate, dict) and 'pruned_data' in candidate:
                                 if self.pruner is not None and candidate['pruned_data']:
                                     weights = self.pruner.decompress_pruned_weights(candidate['pruned_data'])

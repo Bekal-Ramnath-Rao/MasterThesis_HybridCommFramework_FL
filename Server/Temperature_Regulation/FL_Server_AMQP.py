@@ -478,6 +478,9 @@ class FederatedLearningServer:
             }
             aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
             self.global_compressed = aggregated_compressed
+            lw = getattr(self.quantization_handler, "last_aggregated_float_weights", None)
+            if lw is not None:
+                self.global_weights = lw
 
             serialized = base64.b64encode(pickle.dumps(self.global_compressed)).decode('utf-8')
             global_model_message = {

@@ -227,14 +227,13 @@ class FederatedLearningClient:
         round_num = message['round']
         encoded_weights = message['weights']
         
-        # Decompress/deserialize weights.
-        # Keep quantized end-to-end: do NOT dequantize/decompress.
         if 'quantized_data' in message and self.quantizer is not None:
-            weights = self.quantizer.as_training_weights(message['quantized_data'])
-            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
+            compressed_data = pickle.loads(base64.b64decode(message['quantized_data']))
+            weights = self.quantizer.decompress(compressed_data)
+            print(f"Client {self.client_id}: Received global model (dequantized for training)")
         elif 'compressed_data' in message and self.quantizer is not None:
-            weights = self.quantizer.as_training_weights(message['compressed_data'])
-            print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
+            weights = self.quantizer.decompress(message['compressed_data'])
+            print(f"Client {self.client_id}: Received global model (dequantized for training)")
         elif 'pruned_data' in message and self.pruner is not None:
             try:
                 compressed_bytes = base64.b64decode(message['pruned_data'].encode('utf-8'))

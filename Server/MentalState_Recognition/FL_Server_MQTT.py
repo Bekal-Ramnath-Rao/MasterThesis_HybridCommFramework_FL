@@ -516,6 +516,9 @@ class FederatedLearningServer:
             }
             aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
             self.global_compressed = aggregated_compressed
+            lw = getattr(self.quantization_handler, "last_aggregated_float_weights", None)
+            if lw is not None:
+                self.global_weights = lw
 
             serialized = base64.b64encode(pickle.dumps(self.global_compressed)).decode('utf-8')
             global_model_message = {
@@ -525,7 +528,7 @@ class FederatedLearningServer:
             }
 
             self.mqtt_client.publish(TOPIC_GLOBAL_MODEL, json.dumps(global_model_message))
-            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients\n")
+            print(f"Aggregated global model from round {self.current_round} sent to all clients (dequantize→FedAvg→requantize)\n")
 
             self.continue_training()
             return

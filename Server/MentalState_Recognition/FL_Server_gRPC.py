@@ -534,18 +534,15 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             }
             aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
             self.global_compressed = aggregated_compressed
-
-            # Keep a float-cast view for evaluation (no dequantization scaling applied)
-            try:
-                self.global_weights = [np.asarray(w, dtype=np.float32) for w in aggregated_compressed.get('compressed_data', [])]
-            except Exception:
-                self.global_weights = self.global_weights
+            lw = getattr(self.quantization_handler, "last_aggregated_float_weights", None)
+            if lw is not None:
+                self.global_weights = lw
 
             # Evaluate on global test set (captures impact of quantized training pipeline)
             self.evaluate_global_model()
 
-            print(f"Aggregated global model from round {self.current_round} (kept quantized)")
-            print(f"Global model ready for clients (kept quantized)\n")
+            print(f"Aggregated global model from round {self.current_round} (dequantize→FedAvg→requantize)")
+            print(f"Global model ready for clients\n")
             self.continue_training()
             return
 

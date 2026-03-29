@@ -32,7 +32,9 @@ services:
       - MQTT_BROKER=mqtt-broker-mental
       - MQTT_PORT=1883
       - NUM_CLIENTS=2
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -133,7 +135,9 @@ services:
       - AMQP_HOST=rabbitmq-mental
       - AMQP_PORT=5672
       - NUM_CLIENTS=2
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
     command: python -u Server/MentalState_Recognition/FL_Server_AMQP.py
     networks:
       - fl-amqp-network
@@ -198,7 +202,9 @@ services:
     environment:
       - GRPC_PORT=50051
       - NUM_CLIENTS=2
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
     command: python -u Server/MentalState_Recognition/FL_Server_gRPC.py
     networks:
       - fl-grpc-network
@@ -267,7 +273,9 @@ services:
       - QUIC_HOST=0.0.0.0
       - QUIC_PORT=4433
       - NUM_CLIENTS=2
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
     command: python -u Server/MentalState_Recognition/FL_Server_QUIC.py
     networks:
       - fl-quic-network
@@ -337,7 +345,9 @@ services:
       - HTTP3_HOST=0.0.0.0
       - HTTP3_PORT=4434
       - NUM_CLIENTS=2
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -423,7 +433,9 @@ services:
     environment:
       - DDS_DOMAIN_ID=0
       - NUM_CLIENTS=2
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
     command: python -u Server/MentalState_Recognition/FL_Server_DDS.py
     networks:
       - fl-dds-network

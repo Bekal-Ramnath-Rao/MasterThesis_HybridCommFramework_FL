@@ -28,7 +28,9 @@ services:
       - PROTOCOL=MQTT
       - USE_CASE=mentalstate
       - MQTT_BROKER=mqtt-broker:1883
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - CUDA_VISIBLE_DEVICES=0,1
@@ -54,6 +56,8 @@ services:
     environment:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=MQTT
       - USE_CASE=mentalstate
       - MQTT_BROKER=mqtt-broker:1883
@@ -82,6 +86,8 @@ services:
     environment:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=MQTT
       - USE_CASE=mentalstate
       - MQTT_BROKER=mqtt-broker:1883
@@ -127,7 +133,9 @@ services:
       - PROTOCOL=AMQP
       - USE_CASE=mentalstate
       - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - CUDA_VISIBLE_DEVICES=0,1
@@ -153,6 +161,8 @@ services:
     environment:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=AMQP
       - USE_CASE=mentalstate
       - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
@@ -181,6 +191,8 @@ services:
     environment:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=AMQP
       - USE_CASE=mentalstate
       - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
@@ -214,7 +226,9 @@ services:
       - PROTOCOL=gRPC
       - USE_CASE=mentalstate
       - GRPC_PORT=50051
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - CUDA_VISIBLE_DEVICES=0,1
@@ -240,6 +254,8 @@ services:
     environment:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=gRPC
       - USE_CASE=mentalstate
       - GRPC_SERVER=fl-server-grpc-mentalstate:50051
@@ -267,6 +283,8 @@ services:
     environment:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=gRPC
       - USE_CASE=mentalstate
       - GRPC_SERVER=fl-server-grpc-mentalstate:50051
@@ -299,7 +317,9 @@ services:
       - PROTOCOL=QUIC
       - USE_CASE=mentalstate
       - QUIC_PORT=4433
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - CUDA_VISIBLE_DEVICES=0,1
@@ -325,6 +345,8 @@ services:
     environment:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=QUIC
       - USE_CASE=mentalstate
       - QUIC_SERVER=fl-server-quic-mentalstate:4433
@@ -352,6 +374,8 @@ services:
     environment:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=QUIC
       - USE_CASE=mentalstate
       - QUIC_SERVER=fl-server-quic-mentalstate:4433
@@ -385,7 +409,9 @@ services:
       - USE_CASE=mentalstate
       - HTTP3_HOST=0.0.0.0
       - HTTP3_PORT=4434
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
@@ -414,6 +440,8 @@ services:
     environment:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=HTTP3
       - USE_CASE=mentalstate
       - HTTP3_HOST=fl-server-http3-mentalstate
@@ -450,6 +478,8 @@ services:
     environment:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=HTTP3
       - USE_CASE=mentalstate
       - HTTP3_HOST=fl-server-http3-mentalstate
@@ -490,7 +520,9 @@ services:
     environment:
       - PROTOCOL=DDS
       - USE_CASE=mentalstate
-      - NUM_ROUNDS=1000
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - CUDA_VISIBLE_DEVICES=0,1
@@ -516,6 +548,8 @@ services:
     environment:
       - CLIENT_ID=1
       - NUM_CLIENTS=2
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=DDS
       - USE_CASE=mentalstate
       - CUDA_VISIBLE_DEVICES=0
@@ -544,6 +578,8 @@ services:
     environment:
       - CLIENT_ID=2
       - NUM_CLIENTS=2
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=DDS
       - USE_CASE=mentalstate
       - CUDA_VISIBLE_DEVICES=1

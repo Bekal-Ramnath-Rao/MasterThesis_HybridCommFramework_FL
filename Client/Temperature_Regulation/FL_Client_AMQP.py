@@ -290,7 +290,7 @@ class FederatedLearningClient:
                     except Exception as e:
                         print(f"Client {self.client_id} error decoding quantized_data: {e}")
                 # Keep quantized end-to-end: do NOT dequantize/decompress.
-                weights = self.quantizer.as_training_weights(compressed_data)
+                weights = self.quantizer.decompress(compressed_data)
                 if round_num > 0:
                     print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
             elif 'pruned_data' in data and self.pruner is not None:

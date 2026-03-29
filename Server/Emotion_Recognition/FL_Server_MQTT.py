@@ -62,7 +62,7 @@ MQTT_KEEPALIVE_SEC = min(65535, max(10, int(os.getenv("MQTT_KEEPALIVE_SEC", str(
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "1000"))  # High default - will stop at convergence
-STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
+from fl_termination_env import stop_on_client_convergence
 
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))  # Loss improvement threshold
@@ -540,7 +540,7 @@ class FederatedLearningServer:
     
     def mark_client_converged(self, client_id):
         """Remove converged client from active federation."""
-        if not STOP_ON_CLIENT_CONVERGENCE:
+        if not stop_on_client_convergence():
             # Fixed-round mode: ignore client-local convergence removal/disconnect.
             print(f"Ignoring convergence signal from client {client_id} (STOP_ON_CLIENT_CONVERGENCE=false)")
             return
@@ -581,7 +581,7 @@ class FederatedLearningServer:
         
         if client_id not in self.active_clients:
             return
-        converged = STOP_ON_CLIENT_CONVERGENCE and float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
+        converged = stop_on_client_convergence() and float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
         if converged:
             self.mark_client_converged(client_id)
             return
@@ -634,7 +634,7 @@ class FederatedLearningServer:
         
         if client_id not in self.active_clients:
             return
-        converged = STOP_ON_CLIENT_CONVERGENCE and float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
+        converged = stop_on_client_convergence() and float(data.get('metrics', {}).get('client_converged', 0.0)) >= 1.0
         if converged:
             self.mark_client_converged(client_id)
             return
@@ -756,6 +756,9 @@ class FederatedLearningServer:
             }
             aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
             self.global_compressed = aggregated_compressed
+            lw = getattr(self.quantization_handler, "last_aggregated_float_weights", None)
+            if lw is not None:
+                self.global_weights = lw
 
             serialized = base64.b64encode(pickle.dumps(self.global_compressed)).decode('utf-8')
             global_model_message = {
@@ -764,11 +767,11 @@ class FederatedLearningServer:
                 "model_config": self.model_config
             }
 
-            print(f"Publishing kept-quantized aggregated model for round {self.current_round}...")
+            print(f"Publishing aggregated global model for round {self.current_round} (dequantize→FedAvg→requantize)...")
             for i in range(3):
                 result, _ = self._publish_global_model_with_chunking(
                     global_model_message,
-                    extra_info="Aggregated global model distribution (kept quantized)"
+                    extra_info="Aggregated global model distribution (dequantize→FedAvg→requantize)"
                 )
                 if result.rc == mqtt.MQTT_ERR_SUCCESS:
                     print(f"  Attempt {i+1}/3: Aggregated model sent")
@@ -777,7 +780,7 @@ class FederatedLearningServer:
                     print(f"  Attempt {i+1}/3: FAILED (rc={result.rc})")
                     time.sleep(0.5)
 
-            print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients")
+            print(f"Aggregated global model from round {self.current_round} sent to all clients (dequantize→FedAvg→requantize)")
 
             time.sleep(2)
             print("Requesting client evaluation...")

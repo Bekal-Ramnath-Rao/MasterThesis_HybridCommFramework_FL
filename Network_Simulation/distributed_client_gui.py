@@ -1048,6 +1048,10 @@ class DistributedClientGUI(QMainWindow):
         termination_mode = self.termination_mode_combo.currentData() or self.termination_mode_combo.currentText()
         stop_on_client_convergence = "false" if termination_mode == "fixed_rounds" else "true"
         cmd.extend(["-e", f"STOP_ON_CLIENT_CONVERGENCE={stop_on_client_convergence}"])
+        cmd.extend([
+            "-e",
+            f"TRAINING_TERMINATION_MODE={'fixed_rounds' if termination_mode == 'fixed_rounds' else 'client_convergence'}",
+        ])
         
         # DDS implementation vendor selection (passed as environment variable)
         if protocol == "dds":

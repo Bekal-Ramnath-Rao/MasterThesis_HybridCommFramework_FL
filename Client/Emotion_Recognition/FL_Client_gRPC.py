@@ -125,9 +125,7 @@ CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "16"))
 
-# Controls whether this client should signal/exit on local convergence.
-# When false, clients keep training until the server indicates completion.
-STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
+from fl_termination_env import stop_on_client_convergence
 
 
 class FederatedLearningClient:
@@ -405,8 +403,8 @@ class FederatedLearningClient:
             # If both pruning and quantization are enabled, server should send quantized payload that already reflects pruning.
             candidate = pickle.loads(model_update.weights) if model_update.weights else None
             if isinstance(candidate, dict) and 'quantization_params' in candidate:
-                weights = self.quantizer.as_training_weights(candidate) if self.quantizer is not None else []
-                print(f"Client {self.client_id}: Received quantized global model (kept quantized)")
+                weights = self.quantizer.decompress(candidate) if self.quantizer is not None else []
+                print(f"Client {self.client_id}: Received global model (dequantized for training)")
             elif isinstance(candidate, dict) and 'pruned_data' in candidate:
                 if self.pruner is not None and candidate['pruned_data']:
                     weights = self.pruner.decompress_pruned_weights(candidate['pruned_data'])
@@ -641,7 +639,7 @@ class FederatedLearningClient:
             num_samples = self.validation_generator.n
             loss_f = float(loss)
             # Signal convergence in same message so server can proceed with remaining clients
-            client_converged = 1.0 if (STOP_ON_CLIENT_CONVERGENCE and self._would_converge_after_eval(loss_f)) else 0.0
+            client_converged = 1.0 if (stop_on_client_convergence() and self._would_converge_after_eval(loss_f)) else 0.0
             
             # Send metrics to server (include battery, round time, and convergence flag)
             response = self.stub.SendMetrics(
@@ -689,7 +687,7 @@ class FederatedLearningClient:
         if self.rounds_without_improvement >= CONVERGENCE_PATIENCE and not self.has_converged:
             self.has_converged = True
             print(f"Client {self.client_id} reached local convergence at round {self.current_round}")
-            if STOP_ON_CLIENT_CONVERGENCE:
+            if stop_on_client_convergence():
                 self._notify_convergence_and_disconnect()
 
     def _notify_convergence_and_disconnect(self):
