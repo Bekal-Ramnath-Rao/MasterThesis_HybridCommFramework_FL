@@ -600,6 +600,9 @@ class ExperimentRunner:
             if self.use_ql_convergence:
                 os.environ["USE_QL_CONVERGENCE"] = "true"
                 os.environ["USE_RL_EXPLORATION"] = "true"
+                # Emotion unified client: collect→boundaries→RL training (override via env if needed)
+                os.environ.setdefault("RL_BOUNDARY_PIPELINE", "true")
+                os.environ.setdefault("RL_PHASE0_ROUNDS", "20")
                 # RL training: only one client runs; server waits for 1 client; run until Q converges and exit
                 os.environ["MIN_CLIENTS"] = "1"
                 os.environ["NUM_CLIENTS"] = "1"

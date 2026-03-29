@@ -106,6 +106,9 @@ services:
       - USE_RL_EXPLORATION=${USE_RL_EXPLORATION:-}
       - Q_CONVERGENCE_THRESHOLD=${Q_CONVERGENCE_THRESHOLD:-0.01}
       - Q_CONVERGENCE_PATIENCE=${Q_CONVERGENCE_PATIENCE:-5}
+      # Phase 1 collect rounds → Phase 2 boundaries → Phase 3 Q-learning (emotion unified training)
+      - RL_BOUNDARY_PIPELINE=${RL_BOUNDARY_PIPELINE:-true}
+      - RL_PHASE0_ROUNDS=${RL_PHASE0_ROUNDS:-20}
       # Parallel scenario training: RL_QTABLE_MERGE=1 + RL_QTABLE_OVERLAY_SCENARIOS=excellent (per stack)
       - RL_QTABLE_MERGE=${RL_QTABLE_MERGE:-false}
       - RL_QTABLE_OVERLAY_SCENARIOS=${RL_QTABLE_OVERLAY_SCENARIOS:-}
@@ -163,6 +166,9 @@ services:
       - USE_RL_EXPLORATION=${USE_RL_EXPLORATION:-}
       - Q_CONVERGENCE_THRESHOLD=${Q_CONVERGENCE_THRESHOLD:-0.01}
       - Q_CONVERGENCE_PATIENCE=${Q_CONVERGENCE_PATIENCE:-5}
+      # Phase 1 collect rounds → Phase 2 boundaries → Phase 3 Q-learning (emotion unified training)
+      - RL_BOUNDARY_PIPELINE=${RL_BOUNDARY_PIPELINE:-true}
+      - RL_PHASE0_ROUNDS=${RL_PHASE0_ROUNDS:-20}
       # Parallel scenario training: RL_QTABLE_MERGE=1 + RL_QTABLE_OVERLAY_SCENARIOS=excellent (per stack)
       - RL_QTABLE_MERGE=${RL_QTABLE_MERGE:-false}
       - RL_QTABLE_OVERLAY_SCENARIOS=${RL_QTABLE_OVERLAY_SCENARIOS:-}

@@ -329,12 +329,12 @@ try:
     from rl_q_learning_selector import (
         QLearningProtocolSelector,
         EnvironmentStateManager,
-        collect_comm_resource_battery_stats,
+        finalize_rl_boundary_collection_and_start_training,
     )
 except ImportError:
     QLearningProtocolSelector = None
     EnvironmentStateManager = None
-    collect_comm_resource_battery_stats = None
+    finalize_rl_boundary_collection_and_start_training = None
 
 # Suppress TensorFlow warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -402,8 +402,10 @@ else:
     USE_RL_EXPLORATION = USE_QL_CONVERGENCE
 Q_CONVERGENCE_THRESHOLD = float(os.getenv("Q_CONVERGENCE_THRESHOLD", "0.01"))
 Q_CONVERGENCE_PATIENCE = int(os.getenv("Q_CONVERGENCE_PATIENCE", "5"))
-# Phase 0: synthetic bucket-discovery rounds before Phase 1 Q-learning (0 = skip)
+# Phase 1 — data collection: real FL rounds with epsilon=1, no Q-updates (0 = skip → train immediately)
 RL_PHASE0_ROUNDS = int(os.getenv("RL_PHASE0_ROUNDS", "20"))
+# When true (default), unified RL training runs: collect → compute boundaries → Q-learning training
+RL_BOUNDARY_PIPELINE = os.getenv("RL_BOUNDARY_PIPELINE", "true").lower() in ("1", "true", "yes")
 USE_COMMUNICATION_MODEL_REWARD = os.getenv("USE_COMMUNICATION_MODEL_REWARD", "true").lower() == "true"
 
 # One-shot hints when T_calc / R_tcalc stay zero in q_learning_log
@@ -775,69 +777,37 @@ class UnifiedFLClient_Emotion:
             self.env_manager = EnvironmentStateManager()
             self.env_manager.sync_comm_thresholds_from_selector(self.rl_selector_uplink)
 
-            # Phase 0: bucket discovery (epsilon=1.0, no Q-updates) → tune comm/battery thresholds, then fresh Q-tables
-            if (
-                RL_PHASE0_ROUNDS > 0
-                and collect_comm_resource_battery_stats is not None
-            ):
-                try:
-                    print(
-                        f"[Client {client_id}] Phase 0: collecting comm/resource/battery stats "
-                        f"for uplink ({RL_PHASE0_ROUNDS} rounds, exploration only)..."
-                    )
-                    comm_times, _resource_labels, battery_socs = collect_comm_resource_battery_stats(
-                        self.rl_selector_uplink,
-                        self.env_manager,
-                        n_rounds=RL_PHASE0_ROUNDS,
-                    )
-                    if comm_times:
-                        comm_times_sorted = sorted(comm_times)
-                        n = len(comm_times_sorted)
-                        low_idx = max(0, int(0.33 * n) - 1)
-                        high_idx = max(0, int(0.66 * n) - 1)
-                        comm_t_low = float(comm_times_sorted[low_idx])
-                        comm_t_high = float(comm_times_sorted[high_idx])
-                        if comm_t_low > comm_t_high:
-                            comm_t_low, comm_t_high = comm_t_high, comm_t_low
-                        if battery_socs:
-                            battery_socs_sorted = sorted(battery_socs)
-                            nb = len(battery_socs_sorted)
-                            b_idx = max(0, int(0.33 * nb) - 1)
-                            battery_soc_threshold = float(battery_socs_sorted[b_idx])
-                        else:
-                            battery_soc_threshold = float(self.env_manager.battery_soc_threshold)
-
-                        self.rl_selector_uplink.comm_t_low = comm_t_low
-                        self.rl_selector_uplink.comm_t_high = comm_t_high
-                        self.env_manager.sync_comm_thresholds_from_selector(self.rl_selector_uplink)
-                        self.env_manager.battery_soc_threshold = battery_soc_threshold
-
-                        self.rl_selector_downlink.comm_t_low = comm_t_low
-                        self.rl_selector_downlink.comm_t_high = comm_t_high
-
-                        print(
-                            f"[Client {client_id}] Phase 0 tuned comm thresholds: "
-                            f"low={comm_t_low:.3f}s, high={comm_t_high:.3f}s"
-                        )
-                        print(
-                            f"[Client {client_id}] Phase 0 tuned battery SoC threshold: "
-                            f"{battery_soc_threshold:.3f}"
-                        )
-
-                        self.rl_selector_uplink.begin_fresh_training(
-                            experiment_id=f"client{client_id}_uplink_phase1",
-                        )
-                        self.rl_selector_downlink.begin_fresh_training(
-                            experiment_id=f"client{client_id}_downlink_phase1",
-                        )
-                    else:
-                        print(f"[Client {client_id}] Phase 0: no comm samples; keeping default thresholds")
-                except Exception as e:
-                    print(f"[Client {client_id}] Phase 0 bucket discovery failed (continuing with defaults): {e}")
+            # Phase 1 (data collection) runs during real FL rounds in evaluate_model — not here.
+            self._rl_boundary_collection_phase = bool(
+                RL_BOUNDARY_PIPELINE
+                and RL_PHASE0_ROUNDS > 0
+                and USE_RL_EXPLORATION
+                and finalize_rl_boundary_collection_and_start_training is not None
+            )
+            self._rl_boundary_comm_samples: List[float] = []
+            self._rl_boundary_downlink_comm_samples: List[float] = []
+            self._rl_boundary_res_samples: List[float] = []
+            self._rl_boundary_batt_samples: List[float] = []
+            self._rl_boundary_res_samples_dl: List[float] = []
+            self._rl_boundary_batt_samples_dl: List[float] = []
+            self._last_downlink_comm_wall_s: float = 0.0
+            self._last_uplink_rl_state: Optional[Dict] = None
+            if self._rl_boundary_collection_phase:
+                self.rl_selector_uplink.epsilon = 1.0
+                self.rl_selector_downlink.epsilon = 1.0
+                print(
+                    f"[Client {client_id}] RL pipeline: Phase 1 = first {RL_PHASE0_ROUNDS} FL rounds "
+                    f"(uplink+downlink wall comm time, resource load, battery SoC; epsilon=1; no Q-updates). "
+                    f"Then Phase 2 = boundaries, Phase 3 = Q-learning training."
+                )
 
             if scenario_info:
                 _sn = scenario_info.strip().lower()
-                self.env_manager.update_network_scenario(_sn)
+                self.env_manager.update_network_scenario(
+                    _sn,
+                    rl_uplink=self.rl_selector_uplink,
+                    rl_downlink=self.rl_selector_downlink,
+                )
                 self.env_manager.update_network_condition(_coarse_network_bucket_for_scenario(_sn))
                 self.rl_selector_uplink.ensure_scenario(_sn)
                 self.rl_selector_downlink.ensure_scenario(_sn)
@@ -846,6 +816,7 @@ class UnifiedFLClient_Emotion:
             self.rl_selector_downlink = None
             self.rl_selector = None
             self.env_manager = None
+            self._rl_boundary_collection_phase = False
 
         # Track recent network latency samples for mobility estimation
         self.latency_history: List[float] = []
@@ -936,7 +907,8 @@ class UnifiedFLClient_Emotion:
         
         # Initialize packet logger and Q-learning logger
         init_db()
-        if init_qlearning_db is not None:
+        # Phase 1 (RL boundary data collection): do not create/migrate q_learning_*.db until Q-logging starts
+        if init_qlearning_db is not None and self._rl_q_logging_allowed():
             init_qlearning_db()
 
         # Pruning and quantization (flow when both enabled: receive global model -> train -> prune -> quantize -> send)
@@ -1003,6 +975,12 @@ class UnifiedFLClient_Emotion:
             print(f"RL Exploration (epsilon-greedy): {'ENABLED' if USE_RL_EXPLORATION else 'DISABLED (greedy)'}")
             print(f"Q-Convergence Stop (USE_QL_CONVERGENCE): {'ENABLED' if USE_QL_CONVERGENCE else 'DISABLED'}")
             print(f"Communication Model in Reward: {'ENABLED' if USE_COMMUNICATION_MODEL_REWARD else 'DISABLED'}")
+            if getattr(self, "_rl_boundary_collection_phase", False):
+                print(
+                    f"RL boundary pipeline: ENABLED (Phase 1: {RL_PHASE0_ROUNDS} FL rounds collect metrics → "
+                    f"Phase 2: min/max tercile boundaries → Phase 3: Q-learning). "
+                    f"RL_BOUNDARY_PIPELINE={RL_BOUNDARY_PIPELINE}"
+                )
         print(f"{'='*70}\n")
         
         # Start protocol listeners in background threads
@@ -1794,6 +1772,9 @@ class UnifiedFLClient_Emotion:
         """Set env ``comm_level`` from last round uplink communication time (for next Q-state)."""
         if not self.env_manager:
             return
+        # Phase 1: only collect raw times; discrete levels come after min/max over all rounds
+        if getattr(self, "_rl_boundary_collection_phase", False):
+            return
         try:
             rm = self.round_metrics or {}
             t = float(
@@ -1803,35 +1784,71 @@ class UnifiedFLClient_Emotion:
                     + float(rm.get("uplink_metrics_comm_time", 0) or 0)
                 )
             )
-            if t > 0:
+            if t > 0 and self.rl_selector_uplink is not None:
+                self.env_manager.update_comm_level_from_time(
+                    t,
+                    self.rl_selector_uplink.comm_t_low,
+                    self.rl_selector_uplink.comm_t_high,
+                )
+            elif t > 0:
                 self.env_manager.update_comm_level_from_time(t)
         except Exception:
             pass
 
+    def _rl_discrete_state_for_selector(
+        self,
+        selector,
+        comm_time: float,
+        cpu: float,
+        memory: float,
+    ):
+        """Map measurements to Q-state, or a fixed placeholder during Phase 1 (no provisional thresholds)."""
+        if getattr(self, "_rl_boundary_collection_phase", False) and self.env_manager:
+            return self.env_manager.neutral_rl_state_before_boundaries()
+        return self.env_manager.state_for_rl_selector(selector, comm_time, cpu, memory)
+
     def _gather_state_for_downlink_rl(self):
-        """Build env state dict for downlink Q-learning (same signals as protocol negotiation)."""
-        if not self.env_manager:
+        """Build env state dict for downlink Q-learning (downlink-specific comm/resource/battery thresholds)."""
+        if not self.env_manager or self.rl_selector_downlink is None:
             return None
         self._sync_env_rl_comm_from_round_metrics()
         with tf.device('/CPU:0'):
             import psutil
             cpu = psutil.cpu_percent(interval=0.1)
             memory = psutil.virtual_memory().percent
-            resource_level = self.env_manager.detect_resource_level(cpu, memory)
-            self.env_manager.update_resource_level(resource_level)
             if USE_QL_CONVERGENCE:
                 reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
                 if reward_scenario:
-                    self.env_manager.update_network_scenario(reward_scenario)
+                    self.env_manager.update_network_scenario(
+                        reward_scenario,
+                        rl_uplink=self.rl_selector_uplink,
+                        rl_downlink=self.rl_selector_downlink,
+                    )
                     self.env_manager.update_network_condition(
                         _coarse_network_bucket_for_scenario(reward_scenario)
                     )
                 else:
-                    self.env_manager.update_network_scenario(None)
+                    self.env_manager.update_network_scenario(
+                        None,
+                        rl_uplink=self.rl_selector_uplink,
+                        rl_downlink=self.rl_selector_downlink,
+                    )
                     self.measure_network_condition()
             else:
                 self.measure_network_condition()
-            return self.env_manager.get_current_state()
+            t_dl = float(getattr(self, "_last_downlink_comm_wall_s", 0.0) or 0.0)
+            if t_dl <= 0.0:
+                rm = self.round_metrics or {}
+                t_dl = float(
+                    (rm.get("communication_time") or 0)
+                    or (
+                        float(rm.get("uplink_model_comm_time", 0) or 0)
+                        + float(rm.get("uplink_metrics_comm_time", 0) or 0)
+                    )
+                )
+            return self._rl_discrete_state_for_selector(
+                self.rl_selector_downlink, t_dl, cpu, memory
+            )
 
     def _downlink_protocol_from_delivery_source(self, source: str) -> str:
         """Map global-model receive path to a Q-table action name."""
@@ -1881,6 +1898,10 @@ class UnifiedFLClient_Emotion:
         except Exception as e:
             print(f"[Downlink RL] Client {self.client_id} fallback arm failed: {e}")
 
+    def _rl_q_logging_allowed(self) -> bool:
+        """False during Phase 1 boundary data collection — no q_learning_log writes or DB init."""
+        return not getattr(self, "_rl_boundary_collection_phase", False)
+
     def _update_downlink_rl_after_reception(self, round_num: int = 0):
         """
         Compute and log the downlink Q-learning reward after the global model is received.
@@ -1912,6 +1933,25 @@ class UnifiedFLClient_Emotion:
         self._downlink_receive_complete_unix = None
         self._downlink_server_sent_unix = None
         self._downlink_select_time = None
+
+        self._last_downlink_comm_wall_s = float(comm_time)
+
+        if getattr(self, "_rl_boundary_collection_phase", False):
+            import psutil
+            cpu_m = psutil.cpu_percent(interval=0.0)
+            mem_m = psutil.virtual_memory().percent
+            resource_load_dl = (cpu_m + mem_m) / 2.0
+            batt_dl = float(self.env_manager.battery_soc) if self.env_manager else 1.0
+            self._rl_boundary_downlink_comm_samples.append(comm_time)
+            self._rl_boundary_res_samples_dl.append(resource_load_dl)
+            self._rl_boundary_batt_samples_dl.append(batt_dl)
+            nd = len(self._rl_boundary_downlink_comm_samples)
+            print(
+                f"[Client {self.client_id}] RL Phase 1 (downlink data collection): sample {nd} "
+                f"(wall comm={comm_time:.3f}s, load={resource_load_dl:.1f}%, SoC={batt_dl:.3f})"
+            )
+            self._last_downlink_rl_state = None
+            return
 
         try:
             downlink_state = self._last_downlink_rl_state
@@ -1947,7 +1987,11 @@ class UnifiedFLClient_Emotion:
                 t_calc=t_calc,
             )
             if self.env_manager:
-                self.env_manager.update_comm_level_from_time(comm_time)
+                self.env_manager.update_comm_level_from_time(
+                    comm_time,
+                    self.rl_selector_downlink.comm_t_low,
+                    self.rl_selector_downlink.comm_t_high,
+                )
                 self.env_manager.sync_battery_level_from_soc(None)
                 next_state = self.env_manager.get_current_state()
             else:
@@ -1972,17 +2016,14 @@ class UnifiedFLClient_Emotion:
                   f"comm_time={comm_time:.3f}s | reward={reward:.2f} | q_delta={q_delta:.4f} | "
                   f"epsilon={self.rl_selector_downlink.epsilon:.4f} | q_conv_dl={q_converged}")
 
-            if log_q_step is not None:
+            if log_q_step is not None and self._rl_q_logging_allowed():
                 reward_details = self.rl_selector_downlink.get_last_reward_breakdown()
                 log_q_step(
                     client_id=self.client_id,
                     round_num=round_num or self.current_round,
                     episode=self.rl_selector_downlink.episode_count - 1,
-                    state_network=downlink_state.get('comm_level', downlink_state.get('network', '')),
-                    state_resource=downlink_state.get('resource', ''),
-                    state_model_size='',
-                    state_mobility='',
                     state_comm_level=downlink_state.get('comm_level', ''),
+                    state_resource=downlink_state.get('resource', ''),
                     state_battery_level=downlink_state.get('battery_level', ''),
                     action=protocol,
                     reward=reward,
@@ -1991,20 +2032,16 @@ class UnifiedFLClient_Emotion:
                     avg_reward_last_100=avg_reward,
                     converged=q_converged,
                     metric_communication_time=reward_details.get('communication_time'),
-                    metric_convergence_time=None,
                     metric_success=reward_details.get('success'),
                     metric_cpu_usage=reward_details.get('cpu_usage'),
                     metric_memory_usage=reward_details.get('memory_usage'),
                     metric_bandwidth_usage=reward_details.get('bandwidth_usage'),
                     metric_battery_level=reward_details.get('battery_level'),
                     metric_energy_usage=reward_details.get('energy_usage'),
-                    metric_t_calc=reward_details.get('t_calc'),
                     reward_base=reward_details.get('reward_base'),
                     reward_communication_time=reward_details.get('reward_communication_time'),
-                    reward_convergence_time=None,
                     reward_resource_penalty=reward_details.get('reward_resource_penalty'),
                     reward_battery_penalty=reward_details.get('reward_battery_penalty'),
-                    reward_t_calc_penalty=reward_details.get('reward_t_calc_penalty'),
                     reward_total=reward_details.get('reward_total', reward),
                     link_direction='downlink',
                 )
@@ -2189,29 +2226,55 @@ class UnifiedFLClient_Emotion:
                     import psutil
                     cpu = psutil.cpu_percent(interval=0.1)
                     memory = psutil.virtual_memory().percent
-                    resource_level = self.env_manager.detect_resource_level(cpu, memory)
-                    self.env_manager.update_resource_level(resource_level)
                     if USE_QL_CONVERGENCE:
                         reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
                         if reward_scenario:
-                            self.env_manager.update_network_scenario(reward_scenario)
+                            self.env_manager.update_network_scenario(
+                                reward_scenario,
+                                rl_uplink=self.rl_selector_uplink,
+                                rl_downlink=self.rl_selector_downlink,
+                            )
                             self.env_manager.update_network_condition(
                                 _coarse_network_bucket_for_scenario(reward_scenario)
                             )
                         else:
-                            self.env_manager.update_network_scenario(None)
+                            self.env_manager.update_network_scenario(
+                                None,
+                                rl_uplink=self.rl_selector_uplink,
+                                rl_downlink=self.rl_selector_downlink,
+                            )
                             self.measure_network_condition()
                     else:
                         self.measure_network_condition()
-                    state = self.env_manager.get_current_state()
+                    t_dl = float(getattr(self, "_last_downlink_comm_wall_s", 0.0) or 0.0)
+                    if t_dl <= 0.0:
+                        rm = self.round_metrics or {}
+                        t_dl = float(
+                            (rm.get("communication_time") or 0)
+                            or (
+                                float(rm.get("uplink_model_comm_time", 0) or 0)
+                                + float(rm.get("uplink_metrics_comm_time", 0) or 0)
+                            )
+                        )
+                    state = self._rl_discrete_state_for_selector(
+                        self.rl_selector_downlink, t_dl, cpu, memory
+                    )
                     training_mode = USE_RL_EXPLORATION
+                    if getattr(self, "_rl_boundary_collection_phase", False):
+                        self.rl_selector_downlink.epsilon = 1.0
                     selected = self.rl_selector_downlink.select_protocol(state, training=training_mode)
                 # Store downlink state and selection time so reward can be computed after model arrives
                 self._last_downlink_rl_state = state
                 self._downlink_select_time = time.time()
                 downlink_rl_armed = True
-                print(f"[Downlink RL] Client {self.client_id} selected {selected.upper()} "
-                      f"(downlink agent, epsilon={self.rl_selector_downlink.epsilon:.4f})")
+                if getattr(self, "_rl_boundary_collection_phase", False):
+                    print(
+                        f"[Downlink RL] Client {self.client_id} selected {selected.upper()} "
+                        f"(Phase 1: placeholder state for exploration; epsilon={self.rl_selector_downlink.epsilon:.4f})"
+                    )
+                else:
+                    print(f"[Downlink RL] Client {self.client_id} selected {selected.upper()} "
+                          f"(downlink agent, epsilon={self.rl_selector_downlink.epsilon:.4f})")
             except Exception as e:
                 print(f"[Downlink RL] Error: {e}, falling back to uplink agent")
                 selected = self.select_protocol()
@@ -2567,34 +2630,61 @@ class UnifiedFLClient_Emotion:
                     import psutil
                     cpu = psutil.cpu_percent(interval=0.1)
                     memory = psutil.virtual_memory().percent
-                    
-                    resource_level = self.env_manager.detect_resource_level(cpu, memory)
-                    self.env_manager.update_resource_level(resource_level)
 
                     # When USE_QL_CONVERGENCE: use RL_REWARD_SCENARIO for state if set (train in target scenario).
                     # Otherwise use actual measured network so we learn/select for real conditions.
                     if USE_QL_CONVERGENCE:
                         reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
                         if reward_scenario:
-                            self.env_manager.update_network_scenario(reward_scenario)
+                            self.env_manager.update_network_scenario(
+                                reward_scenario,
+                                rl_uplink=self.rl_selector_uplink,
+                                rl_downlink=self.rl_selector_downlink,
+                            )
                             self.env_manager.update_network_condition(
                                 _coarse_network_bucket_for_scenario(reward_scenario)
                             )
                         else:
-                            self.env_manager.update_network_scenario(None)
+                            self.env_manager.update_network_scenario(
+                                None,
+                                rl_uplink=self.rl_selector_uplink,
+                                rl_downlink=self.rl_selector_downlink,
+                            )
                             self.measure_network_condition()
                     else:
                         self.measure_network_condition()
 
-                    state = self.env_manager.get_current_state()
+                    rm = self.round_metrics or {}
+                    t_comm = float(
+                        (rm.get("communication_time") or 0)
+                        or (
+                            float(rm.get("uplink_model_comm_time", 0) or 0)
+                            + float(rm.get("uplink_metrics_comm_time", 0) or 0)
+                        )
+                    )
+                    state = self._rl_discrete_state_for_selector(
+                        self.rl_selector_uplink, t_comm, cpu, memory
+                    )
+                    self._last_uplink_rl_state = state
                     # During RL-table training we keep epsilon-greedy exploration enabled.
                     # Once training is done, clients load and use the converged Q-table greedily.
                     training_mode = USE_RL_EXPLORATION
+                    if getattr(self, "_rl_boundary_collection_phase", False):
+                        self.rl_selector_uplink.epsilon = 1.0
                     protocol = self.rl_selector_uplink.select_protocol(state, training=training_mode)
                 
                 print(f"\n[Uplink RL Protocol Selection]")
                 print(f"  CPU: {cpu:.1f}%, Memory: {memory:.1f}%")
-                print(f"  State: {state}")
+                if getattr(self, "_rl_boundary_collection_phase", False):
+                    soc = float(self.env_manager.battery_soc) if self.env_manager else float("nan")
+                    print(
+                        f"  Phase 1 (boundary collection): raw uplink wall comm ≈ {t_comm:.3f}s, "
+                        f"SoC={soc:.3f} — discrete levels are assigned only after all "
+                        f"{RL_PHASE0_ROUNDS} rounds (min/max → thresholds)."
+                    )
+                    print(f"  Placeholder state for random exploration only: {state}")
+                else:
+                    print(f"  State: {state}")
                 print(f"  Selected Protocol: {protocol.upper()}")
                 print(f"  Round: {self.current_round}")
                 print(f"  Uplink epsilon: {self.rl_selector_uplink.epsilon:.4f}\n")
@@ -2883,10 +2973,12 @@ class UnifiedFLClient_Emotion:
         
         num_samples = self.validation_generator.n
         
-        # Select protocol based on RL (store state for Q-learning log)
+        # Select protocol based on RL (store state for Q-learning log — uplink thresholds)
         protocol = self.select_protocol()
         if self.env_manager is not None:
-            self._last_rl_state = self.env_manager.get_current_state()
+            self._last_rl_state = (
+                getattr(self, "_last_uplink_rl_state", None) or self.env_manager.get_current_state()
+            )
         
         round_time_sec = (
             self.round_metrics.get('training_time', 0.0)
@@ -2981,11 +3073,12 @@ class UnifiedFLClient_Emotion:
                     )
                     payload_bytes = self.round_metrics.get('payload_bytes') or (12 * 1024 * 1024)
                     protocol = self.selected_protocol or 'mqtt'
-                    # Uplink reward: client→server (model upload + evaluation/metrics send), not downlink
-                    comm_time_for_reward = (
+                    comm_wall_actual = float(
                         self.round_metrics.get('uplink_model_comm_time', 0.0)
                         + self.round_metrics.get('uplink_metrics_comm_time', 0.0)
                     )
+                    # Uplink reward may use communication model (T_calc); data collection always uses wall time
+                    comm_time_for_reward = comm_wall_actual
                     t_calc_for_reward = None
                     reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
                     if USE_COMMUNICATION_MODEL_REWARD and reward_scenario:
@@ -2997,110 +3090,157 @@ class UnifiedFLClient_Emotion:
                             t_calc_for_reward = self._get_t_calc_for_reward(protocol, payload_bytes)
                     elif USE_COMMUNICATION_MODEL_REWARD:
                         t_calc_for_reward = self._get_t_calc_for_reward(protocol, payload_bytes)
-                    reward = self.rl_selector_uplink.calculate_reward(
-                        communication_time=comm_time_for_reward,
-                        success=self.round_metrics['success'],
-                        resource_consumption=resources,
-                        t_calc=t_calc_for_reward,
-                    )
-                    if self.env_manager:
-                        self.env_manager.update_comm_level_from_time(comm_time_for_reward)
-                        self.env_manager.sync_battery_level_from_soc(None)
-                        next_state = self.env_manager.get_current_state()
-                    else:
-                        next_state = None
-                    self.rl_selector_uplink.update_q_value(
-                        reward,
-                        next_state=next_state,
-                        done=False if next_state is not None else True,
-                    )
-                    q_delta = self.rl_selector_uplink.get_last_q_delta()
-                    avg_reward = (np.mean(self.rl_selector_uplink.total_rewards[-100:])
-                                 if self.rl_selector_uplink.total_rewards else 0.0)
-                    self.rl_selector_uplink.end_episode()
-                    q_uplink_converged = self.rl_selector_uplink.check_q_converged(
-                        threshold=Q_CONVERGENCE_THRESHOLD,
-                        patience=Q_CONVERGENCE_PATIENCE,
-                    )
-                    q_downlink_converged = (
-                        self.rl_selector_downlink.check_q_converged(
+
+                    skip_uplink_training = False
+                    if (
+                        getattr(self, "_rl_boundary_collection_phase", False)
+                        and finalize_rl_boundary_collection_and_start_training is not None
+                    ):
+                        import psutil
+                        cpu_m = psutil.cpu_percent(interval=0.0)
+                        mem_m = psutil.virtual_memory().percent
+                        resource_load = (cpu_m + mem_m) / 2.0
+                        batt = float(self.env_manager.battery_soc)
+                        self._rl_boundary_comm_samples.append(comm_wall_actual)
+                        self._rl_boundary_res_samples.append(resource_load)
+                        self._rl_boundary_batt_samples.append(batt)
+                        n_r = len(self._rl_boundary_comm_samples)
+                        print(
+                            f"[Client {self.client_id}] RL Phase 1 (uplink data collection): sample {n_r}/{RL_PHASE0_ROUNDS} "
+                            f"(wall comm={comm_wall_actual:.3f}s, mean load={resource_load:.1f}%, SoC={batt:.3f})"
+                        )
+                        if n_r >= RL_PHASE0_ROUNDS:
+                            finalize_rl_boundary_collection_and_start_training(
+                                self.rl_selector_uplink,
+                                self.rl_selector_downlink,
+                                self.env_manager,
+                                self._rl_boundary_comm_samples,
+                                self._rl_boundary_res_samples,
+                                self._rl_boundary_batt_samples,
+                                client_id=self.client_id,
+                                downlink_comm_times=self._rl_boundary_downlink_comm_samples,
+                                resource_loads_downlink=self._rl_boundary_res_samples_dl,
+                                battery_socs_downlink=self._rl_boundary_batt_samples_dl,
+                            )
+                            self._rl_boundary_collection_phase = False
+                            self._rl_boundary_comm_samples = []
+                            self._rl_boundary_downlink_comm_samples = []
+                            self._rl_boundary_res_samples = []
+                            self._rl_boundary_batt_samples = []
+                            self._rl_boundary_res_samples_dl = []
+                            self._rl_boundary_batt_samples_dl = []
+                            print(
+                                f"[Client {self.client_id}] RL Phase 3: Q-learning training started "
+                                f"(epsilon decay on episodes)."
+                            )
+                        skip_uplink_training = True
+
+                    if not skip_uplink_training:
+                        reward = self.rl_selector_uplink.calculate_reward(
+                            communication_time=comm_time_for_reward,
+                            success=self.round_metrics['success'],
+                            resource_consumption=resources,
+                            t_calc=t_calc_for_reward,
+                        )
+                        if self.env_manager:
+                            self.env_manager.update_comm_level_from_time(
+                                comm_time_for_reward,
+                                self.rl_selector_uplink.comm_t_low,
+                                self.rl_selector_uplink.comm_t_high,
+                            )
+                            self.env_manager.sync_battery_level_from_soc(None)
+                            next_state = self.env_manager.get_current_state()
+                        else:
+                            next_state = None
+                        self.rl_selector_uplink.update_q_value(
+                            reward,
+                            next_state=next_state,
+                            done=False if next_state is not None else True,
+                        )
+                        q_delta = self.rl_selector_uplink.get_last_q_delta()
+                        avg_reward = (np.mean(self.rl_selector_uplink.total_rewards[-100:])
+                                     if self.rl_selector_uplink.total_rewards else 0.0)
+                        self.rl_selector_uplink.end_episode()
+                        q_uplink_converged = self.rl_selector_uplink.check_q_converged(
                             threshold=Q_CONVERGENCE_THRESHOLD,
                             patience=Q_CONVERGENCE_PATIENCE,
                         )
-                        if self.rl_selector_downlink is not None
-                        else True
-                    )
-                    q_both_converged = q_uplink_converged and q_downlink_converged
-                    # Always log uplink Q-step so GUI Q-learning database stays updated
-                    if log_q_step is not None and self._last_rl_state is not None:
-                        st = self._last_rl_state
-                        reward_details = self.rl_selector_uplink.get_last_reward_breakdown()
-                        log_q_step(
-                            client_id=self.client_id,
-                            round_num=report_round,
-                            episode=self.rl_selector_uplink.episode_count - 1,
-                            state_network=st.get('comm_level', st.get('network', '')),
-                            state_resource=st.get('resource', ''),
-                            state_model_size='',
-                            state_mobility='',
-                            state_comm_level=st.get('comm_level', ''),
-                            state_battery_level=st.get('battery_level', ''),
-                            action=self._last_update_protocol or self.selected_protocol or 'mqtt',
-                            reward=reward,
-                            q_delta=q_delta,
-                            epsilon=self.rl_selector_uplink.epsilon,
-                            avg_reward_last_100=float(avg_reward),
-                            converged=(
-                                q_both_converged
-                                if USE_QL_CONVERGENCE
-                                else q_uplink_converged
-                            ),
-                            metric_communication_time=reward_details.get('communication_time'),
-                            metric_convergence_time=None,
-                            metric_success=reward_details.get('success'),
-                            metric_cpu_usage=reward_details.get('cpu_usage'),
-                            metric_memory_usage=reward_details.get('memory_usage'),
-                            metric_bandwidth_usage=reward_details.get('bandwidth_usage'),
-                            metric_battery_level=reward_details.get('battery_level'),
-                            metric_energy_usage=reward_details.get('energy_usage'),
-                            metric_t_calc=reward_details.get('t_calc'),
-                            reward_base=reward_details.get('reward_base'),
-                            reward_communication_time=reward_details.get('reward_communication_time'),
-                            reward_convergence_time=None,
-                            reward_resource_penalty=reward_details.get('reward_resource_penalty'),
-                            reward_battery_penalty=reward_details.get('reward_battery_penalty'),
-                            reward_t_calc_penalty=reward_details.get('reward_t_calc_penalty'),
-                            reward_total=reward_details.get('reward_total', reward),
-                            link_direction='uplink',
+                        q_downlink_converged = (
+                            self.rl_selector_downlink.check_q_converged(
+                                threshold=Q_CONVERGENCE_THRESHOLD,
+                                patience=Q_CONVERGENCE_PATIENCE,
+                            )
+                            if self.rl_selector_downlink is not None
+                            else True
                         )
-                    if (
-                        USE_QL_CONVERGENCE
-                        and q_uplink_converged
-                        and not q_downlink_converged
-                    ):
-                        print(
-                            f"[Client {self.client_id}] Uplink Q converged at round {report_round} but downlink "
-                            f"has not; continuing (uplink Q-updates unchanged)."
-                        )
-                    # End training only when both uplink and downlink Q-learning converged
-                    if USE_QL_CONVERGENCE and q_both_converged and stop_on_client_convergence():
-                        self.has_converged = True
-                        print(
-                            f"[Client {self.client_id}] RL convergence reached at round {report_round} "
-                            f"(epsilon<{os.getenv('RL_CONVERGENCE_EPSILON_CAP', '0.1')}, "
-                            f"last {Q_CONVERGENCE_PATIENCE} protocols identical on uplink AND downlink)"
-                        )
-                        try:
-                            self.rl_selector_uplink.save_q_table()
-                        except Exception as e:
-                            print(f"[Client {self.client_id}] Warning: could not save uplink Q-table on convergence: {e}")
-                        try:
-                            self.rl_selector_downlink.save_q_table()
-                        except Exception as e:
-                            print(f"[Client {self.client_id}] Warning: could not save downlink Q-table on convergence: {e}")
-                        self._notify_convergence_to_server()
-                        self._disconnect_after_convergence()
-                        return
+                        q_both_converged = q_uplink_converged and q_downlink_converged
+                        # Log uplink Q-step (skipped during Phase 1 data collection)
+                        if (
+                            log_q_step is not None
+                            and self._last_rl_state is not None
+                            and self._rl_q_logging_allowed()
+                        ):
+                            st = self._last_rl_state
+                            reward_details = self.rl_selector_uplink.get_last_reward_breakdown()
+                            log_q_step(
+                                client_id=self.client_id,
+                                round_num=report_round,
+                                episode=self.rl_selector_uplink.episode_count - 1,
+                                state_comm_level=st.get('comm_level', ''),
+                                state_resource=st.get('resource', ''),
+                                state_battery_level=st.get('battery_level', ''),
+                                action=self._last_update_protocol or self.selected_protocol or 'mqtt',
+                                reward=reward,
+                                q_delta=q_delta,
+                                epsilon=self.rl_selector_uplink.epsilon,
+                                avg_reward_last_100=float(avg_reward),
+                                converged=(
+                                    q_both_converged
+                                    if USE_QL_CONVERGENCE
+                                    else q_uplink_converged
+                                ),
+                                metric_communication_time=reward_details.get('communication_time'),
+                                metric_success=reward_details.get('success'),
+                                metric_cpu_usage=reward_details.get('cpu_usage'),
+                                metric_memory_usage=reward_details.get('memory_usage'),
+                                metric_bandwidth_usage=reward_details.get('bandwidth_usage'),
+                                metric_battery_level=reward_details.get('battery_level'),
+                                metric_energy_usage=reward_details.get('energy_usage'),
+                                reward_base=reward_details.get('reward_base'),
+                                reward_communication_time=reward_details.get('reward_communication_time'),
+                                reward_resource_penalty=reward_details.get('reward_resource_penalty'),
+                                reward_battery_penalty=reward_details.get('reward_battery_penalty'),
+                                reward_total=reward_details.get('reward_total', reward),
+                                link_direction='uplink',
+                            )
+                        if (
+                            USE_QL_CONVERGENCE
+                            and q_uplink_converged
+                            and not q_downlink_converged
+                        ):
+                            print(
+                                f"[Client {self.client_id}] Uplink Q converged at round {report_round} but downlink "
+                                f"has not; continuing (uplink Q-updates unchanged)."
+                            )
+                        # End training only when both uplink and downlink Q-learning converged
+                        if USE_QL_CONVERGENCE and q_both_converged and stop_on_client_convergence():
+                            self.has_converged = True
+                            print(
+                                f"[Client {self.client_id}] RL convergence reached at round {report_round} "
+                                f"(last {Q_CONVERGENCE_PATIENCE} consecutive protocol selections identical "
+                                f"on uplink AND downlink)"
+                            )
+                            try:
+                                self.rl_selector_uplink.save_q_table()
+                            except Exception as e:
+                                print(f"[Client {self.client_id}] Warning: could not save uplink Q-table on convergence: {e}")
+                            try:
+                                self.rl_selector_downlink.save_q_table()
+                            except Exception as e:
+                                print(f"[Client {self.client_id}] Warning: could not save downlink Q-table on convergence: {e}")
+                            self._notify_convergence_to_server()
+                            self._disconnect_after_convergence()
+                            return
                 except Exception as rl_e:
                     print(f"[Client {self.client_id}] Uplink RL update error: {rl_e}")
             if not USE_QL_CONVERGENCE and ENABLE_LOCAL_CONVERGENCE_STOP and stop_on_client_convergence():

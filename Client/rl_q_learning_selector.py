@@ -166,7 +166,14 @@ class QLearningProtocolSelector:
         # Data-driven comm-time bucket boundaries (seconds); tune after Phase-1 collection
         self.comm_t_low = 30.0
         self.comm_t_high = 90.0
-        
+        # Mean CPU+memory load (0–100): <= threshold → resource "high"; separate per uplink/downlink agent
+        self.resource_load_threshold = 30.0
+        # SoC in [0,1]: >= threshold → battery "high"; separate per uplink/downlink agent
+        self.battery_soc_threshold = 0.35
+
+        # Training/inference metadata only: not used in Q-state indexing (comm/resource/battery).
+        self.data_network_scenario: Optional[str] = None
+
         self.q_table = np.zeros(
             (
                 len(self.COMM_LEVELS),
@@ -207,9 +214,20 @@ class QLearningProtocolSelector:
             return "mid"
         return "high"
 
+    def set_data_network_scenario(self, scenario: Optional[str]) -> None:
+        """Persisted with the Q-table; for inference/logging only — not part of RL state."""
+        if scenario is None or (isinstance(scenario, str) and not str(scenario).strip()):
+            self.data_network_scenario = None
+        else:
+            self.data_network_scenario = str(scenario).strip().lower()
+
+    def get_data_network_scenario(self) -> Optional[str]:
+        """Scenario tag stored with this agent (same Q-table file); not used in ``get_state_index``."""
+        return self.data_network_scenario
+
     def ensure_scenario(self, scenario_name: Optional[str]) -> None:
-        """Backward compatibility: Q-table no longer has a scenario axis."""
-        return
+        """Backward compatibility: no scenario axis on the Q-table; store tag for pickle + inference."""
+        self.set_data_network_scenario(scenario_name)
 
     def get_state_index(self, state: Dict) -> Tuple[int, int, int]:
         """
@@ -492,17 +510,36 @@ class QLearningProtocolSelector:
         current_q = self.q_table[state_idx + (action_idx,)]
         
         # Calculate new Q-value
+        max_next_q = None
         if done or next_state is None:
-            # Terminal state
+            # Terminal state (no bootstrap from next state)
             new_q = current_q + self.learning_rate * (reward - current_q)
+            if done:
+                _boot_reason = "done=True"
+            else:
+                _boot_reason = "next_state=None"
         else:
-            # Non-terminal state: use Bellman equation
+            # Non-terminal state: use Bellman equation (r + γ max_a' Q(s',a'))
             next_state_idx = self.get_state_index(next_state)
-            max_next_q = np.max(self.q_table[next_state_idx])
+            max_next_q = float(np.max(self.q_table[next_state_idx]))
             new_q = current_q + self.learning_rate * (
                 reward + self.discount_factor * max_next_q - current_q
             )
-        
+            _boot_reason = "next_state provided"
+        if os.environ.get("RL_Q_LOG_BOOTSTRAP", "1").strip().lower() not in ("0", "false", "no"):
+            print(
+                f"[Q-Learning] Q-update bootstrap: "
+                f"discounted_future={'yes' if max_next_q is not None else 'no'} "
+                f"(reason={_boot_reason}"
+                + (
+                    f", gamma={self.discount_factor:.4f}, max_Q(s')={max_next_q:.4f}, "
+                    f"gamma*max_Q(s')={self.discount_factor * max_next_q:.4f}"
+                    if max_next_q is not None
+                    else ""
+                )
+                + ")"
+            )
+
         # Update Q-table
         q_delta = abs(new_q - current_q)
         self.q_table[state_idx + (action_idx,)] = new_q
@@ -674,12 +711,15 @@ class QLearningProtocolSelector:
             "q_table": self.q_table,
             "comm_t_low": self.comm_t_low,
             "comm_t_high": self.comm_t_high,
+            "resource_load_threshold": self.resource_load_threshold,
+            "battery_soc_threshold": self.battery_soc_threshold,
             "epsilon": self.epsilon,
             "episode_count": self.episode_count,
             "total_rewards": self.total_rewards,
             "protocol_usage": dict(self.protocol_usage),
             "protocol_success": dict(self.protocol_success),
             "protocol_failures": dict(self.protocol_failures),
+            "data_network_scenario": self.data_network_scenario,
         }
         if disk is None or not overlay:
             return self_data
@@ -704,16 +744,25 @@ class QLearningProtocolSelector:
         tr_self = self.total_rewards or []
         total_rewards_merged = list(tr_self) if self.episode_count >= disk_ep else list(tr_disk)
 
+        dns_self = self.data_network_scenario
+        dns_disk = disk.get("data_network_scenario") if isinstance(disk, dict) else None
+        merged_dns = dns_self if dns_self is not None else dns_disk
+
         return {
             "q_table": merged_q,
             "comm_t_low": float(disk.get("comm_t_low", self.comm_t_low)),
             "comm_t_high": float(disk.get("comm_t_high", self.comm_t_high)),
+            "resource_load_threshold": float(
+                disk.get("resource_load_threshold", self.resource_load_threshold)
+            ),
+            "battery_soc_threshold": float(disk.get("battery_soc_threshold", self.battery_soc_threshold)),
             "epsilon": self.epsilon if self.episode_count >= disk_ep else disk.get("epsilon", self.epsilon),
             "episode_count": ep_merged,
             "total_rewards": total_rewards_merged,
             "protocol_usage": _sum_maps(disk.get("protocol_usage"), self.protocol_usage),
             "protocol_success": _sum_maps(disk.get("protocol_success"), self.protocol_success),
             "protocol_failures": _sum_maps(disk.get("protocol_failures"), self.protocol_failures),
+            "data_network_scenario": merged_dns,
         }
 
     def _atomic_pickle_dump(self, path: str, data: Dict) -> None:
@@ -763,12 +812,15 @@ class QLearningProtocolSelector:
                     "q_table": self.q_table,
                     "comm_t_low": self.comm_t_low,
                     "comm_t_high": self.comm_t_high,
+                    "resource_load_threshold": self.resource_load_threshold,
+                    "battery_soc_threshold": self.battery_soc_threshold,
                     "epsilon": self.epsilon,
                     "episode_count": self.episode_count,
                     "total_rewards": self.total_rewards,
                     "protocol_usage": self.protocol_usage,
                     "protocol_success": self.protocol_success,
                     "protocol_failures": self.protocol_failures,
+                    "data_network_scenario": self.data_network_scenario,
                 }
                 self._atomic_pickle_dump(self.save_path, data)
                 print(f"[Q-Learning] Saved Q-table to {self.save_path}")
@@ -797,17 +849,31 @@ class QLearningProtocolSelector:
                 return False
             self.comm_t_low = float(data.get('comm_t_low', self.comm_t_low))
             self.comm_t_high = float(data.get('comm_t_high', self.comm_t_high))
+            self.resource_load_threshold = float(
+                data.get('resource_load_threshold', self.resource_load_threshold)
+            )
+            self.battery_soc_threshold = float(
+                data.get('battery_soc_threshold', self.battery_soc_threshold)
+            )
             self.epsilon = data.get('epsilon', self.epsilon)
             self.episode_count = data.get('episode_count', 0)
             self.total_rewards = data.get('total_rewards', [])
             self.protocol_usage = data.get('protocol_usage', self.protocol_usage)
             self.protocol_success = data.get('protocol_success', self.protocol_success)
             self.protocol_failures = data.get('protocol_failures', self.protocol_failures)
+            self.data_network_scenario = data.get("data_network_scenario")
+            if self.data_network_scenario is not None:
+                self.data_network_scenario = str(self.data_network_scenario).strip().lower() or None
             print(f"[Q-Learning] Loaded Q-table from {path} (past experience)")
             print(
                 f"[Q-Learning] Episodes: {self.episode_count}, Epsilon: {self.epsilon:.4f}, "
                 f"shape={tuple(self.q_table.shape)}"
             )
+            if self.data_network_scenario:
+                print(
+                    f"[Q-Learning] data_network_scenario (metadata, not RL state): "
+                    f"{self.data_network_scenario!r}"
+                )
             return True
         except Exception as e:
             print(f"[Q-Learning] Error loading Q-table from {path}: {e}")
@@ -963,10 +1029,9 @@ class QLearningProtocolSelector:
         """
         RL agent convergence (when USE_QL_CONVERGENCE is enabled):
 
-        1. Epsilon is below the exploitation cap (default strictly below 0.1).
-        2. The last N protocol selections are identical (same action index),
-           where N is `patience` if provided, else ``RL_CONVERGENCE_SAME_PROTOCOL_STREAK``
-           (default 5).
+        The last N protocol selections are identical (same action index), where N
+        is `patience` if provided, else ``RL_CONVERGENCE_SAME_PROTOCOL_STREAK``
+        (default 5).
 
         The ``threshold`` argument is kept for call-site compatibility; Q-delta
         convergence is no longer used.
@@ -977,9 +1042,6 @@ class QLearningProtocolSelector:
             if patience is not None
             else int(os.getenv("RL_CONVERGENCE_SAME_PROTOCOL_STREAK", "5"))
         )
-        epsilon_cap = float(os.getenv("RL_CONVERGENCE_EPSILON_CAP", "0.1"))
-        if self.epsilon >= epsilon_cap:
-            return False
         if len(self.action_history) < streak:
             return False
         tail = self.action_history[-streak:]
@@ -1022,7 +1084,7 @@ class QLearningProtocolSelector:
         self.reward_history = []
         self._q_deltas = []
         self._last_reward_breakdown = {}
-        
+        self.data_network_scenario = None
         # Delete saved Q-table file if it exists
         if os.path.exists(self.save_path):
             try:
@@ -1067,6 +1129,8 @@ class EnvironmentStateManager:
         self.comm_t_low = 30.0
         self.comm_t_high = 90.0
         self.battery_soc_threshold = 0.35  # SoC >= threshold -> battery_level "high"
+        # Mean CPU+memory load (0–100): values <= threshold -> resource "high" (headroom); else "low"
+        self.resource_load_threshold = 30.0
         
         # Resource monitoring
         self.cpu_usage_history = []
@@ -1078,6 +1142,8 @@ class EnvironmentStateManager:
         self.last_energy_j = 0.0  # Joules used in the last round
         # Last psutil net_io snapshot for delta-rate bandwidth (avoids cumulative saturation)
         self._net_io_prev: Optional[Tuple[int, int, float]] = None
+        # Mirrors Q-table metadata; not used in discrete Q-state (comm/resource/battery).
+        self.data_network_scenario: Optional[str] = None
 
     def comm_time_to_level(self, t: float) -> str:
         """Map wall-clock communication time (seconds) to a discrete comm bucket."""
@@ -1094,18 +1160,73 @@ class EnvironmentStateManager:
         s = max(0.0, min(1.0, s))
         return "high" if s >= self.battery_soc_threshold else "low"
 
-    def update_comm_level_from_time(self, communication_time: float) -> None:
-        """Set ``current_state['comm_level']`` from measured communication time."""
-        self.current_state["comm_level"] = self.comm_time_to_level(communication_time)
+    def update_comm_level_from_time(
+        self,
+        communication_time: float,
+        comm_t_low: Optional[float] = None,
+        comm_t_high: Optional[float] = None,
+    ) -> None:
+        """Set ``current_state['comm_level']`` from measured communication time.
+
+        When ``comm_t_low`` / ``comm_t_high`` are omitted, uses ``self.comm_t_low`` /
+        ``self.comm_t_high`` (typically aligned with the uplink selector). Pass explicit
+        thresholds when mapping **downlink** wall times using the downlink agent's bounds.
+        """
+        lo = float(self.comm_t_low if comm_t_low is None else comm_t_low)
+        hi = float(self.comm_t_high if comm_t_high is None else comm_t_high)
+        t = float(communication_time)
+        if t <= lo:
+            self.current_state["comm_level"] = "low"
+        elif t <= hi:
+            self.current_state["comm_level"] = "mid"
+        else:
+            self.current_state["comm_level"] = "high"
 
     def sync_battery_level_from_soc(self, soc: Optional[float] = None) -> None:
         """Refresh ``current_state['battery_level']`` from SoC."""
         self.current_state["battery_level"] = self.battery_soc_to_level(soc)
 
     def sync_comm_thresholds_from_selector(self, selector: "QLearningProtocolSelector") -> None:
-        """Keep env comm thresholds aligned with the selector (single source of truth)."""
+        """Keep env comm + resource/battery thresholds aligned with the uplink selector."""
         self.comm_t_low = float(selector.comm_t_low)
         self.comm_t_high = float(selector.comm_t_high)
+        self.resource_load_threshold = float(selector.resource_load_threshold)
+        self.battery_soc_threshold = float(selector.battery_soc_threshold)
+
+    def resource_level_for_threshold(
+        self, cpu_percent: float, memory_percent: float, threshold: float
+    ) -> str:
+        """``high`` = headroom (mean load <= threshold), ``low`` = stressed."""
+        avg_usage = (float(cpu_percent) + float(memory_percent)) / 2.0
+        return "high" if avg_usage <= float(threshold) else "low"
+
+    def battery_level_for_threshold(self, soc: float, threshold: float) -> str:
+        s = max(0.0, min(1.0, float(soc)))
+        return "high" if s >= float(threshold) else "low"
+
+    def state_for_rl_selector(
+        self,
+        selector: "QLearningProtocolSelector",
+        comm_time: float,
+        cpu_percent: float,
+        memory_percent: float,
+    ) -> Dict[str, str]:
+        """Discrete state for uplink vs downlink Q-agent (each selector carries its own thresholds)."""
+        comm = selector.comm_time_to_level(float(comm_time))
+        res = self.resource_level_for_threshold(
+            cpu_percent, memory_percent, selector.resource_load_threshold
+        )
+        batt = self.battery_level_for_threshold(self.battery_soc, selector.battery_soc_threshold)
+        return {"comm_level": comm, "resource": res, "battery_level": batt}
+
+    def neutral_rl_state_before_boundaries(self) -> Dict[str, str]:
+        """Discrete tuple for ε-random protocol picks during Phase 1 only.
+
+        Not derived from measured comm / load / battery. After all collection rounds,
+        :func:`compute_state_boundaries_from_minmax` derives thresholds from the stored
+        samples (min–max span); then :func:`state_for_rl_selector` is used with real cuts.
+        """
+        return {"comm_level": "mid", "resource": "high", "battery_level": "high"}
 
     def update_battery(self, soc: float, last_energy_j: float) -> None:
         """Update battery state of charge [0,1] and last-round energy in Joules."""
@@ -1117,9 +1238,29 @@ class EnvironmentStateManager:
         """Legacy: no longer part of Q-table state (optional logging only)."""
         _ = condition
 
-    def update_network_scenario(self, scenario: Optional[str]) -> None:
-        """Legacy: network scenario is not an RL state axis (optional logging only)."""
-        _ = scenario
+    def update_network_scenario(
+        self,
+        scenario: Optional[str],
+        *,
+        rl_uplink: Optional["QLearningProtocolSelector"] = None,
+        rl_downlink: Optional["QLearningProtocolSelector"] = None,
+    ) -> None:
+        """Store scenario tag for inference/logging; optional sync to RL agents for pickle persistence.
+
+        ``comm_level`` / ``resource`` / ``battery_level`` remain the only RL state axes.
+        """
+        if scenario is None or (isinstance(scenario, str) and not str(scenario).strip()):
+            self.data_network_scenario = None
+        else:
+            self.data_network_scenario = str(scenario).strip().lower()
+        if rl_uplink is not None:
+            rl_uplink.set_data_network_scenario(self.data_network_scenario)
+        if rl_downlink is not None:
+            rl_downlink.set_data_network_scenario(self.data_network_scenario)
+
+    def get_data_network_scenario(self) -> Optional[str]:
+        """Scenario tag last set via :meth:`update_network_scenario` (env mirror of selector metadata)."""
+        return self.data_network_scenario
 
     def update_resource_level(self, level: str):
         """Update resource availability: 'high' or 'low'."""
@@ -1167,15 +1308,16 @@ class EnvironmentStateManager:
             Resource level string
         """
         avg_usage = (cpu_percent + memory_percent) / 2.0
-        
-        if avg_usage < 30:
-            return 'high'
-        else:
-            return 'low'
+        thr = float(getattr(self, "resource_load_threshold", 30.0))
+        if avg_usage <= thr:
+            return "high"
+        return "low"
     
     def get_current_state(self) -> Dict:
-        """Get current environment state"""
-        return self.current_state.copy()
+        """Discrete RL state plus optional ``data_network_scenario`` (ignored by Q-state indexing)."""
+        out = self.current_state.copy()
+        out["data_network_scenario"] = self.data_network_scenario
+        return out
     
     def get_resource_consumption(
         self,
@@ -1251,16 +1393,144 @@ class EnvironmentStateManager:
             }
 
 
+def compute_comm_terciles_from_samples(comm_times: List[float]) -> Optional[Tuple[float, float]]:
+    """Upper edges of low/mid comm buckets from min–max range (33% / 66% of span)."""
+    if not comm_times:
+        return None
+    ct = [float(x) for x in comm_times]
+    cmin, cmax = min(ct), max(ct)
+    cspan = max(cmax - cmin, 1e-9)
+    return (float(cmin + 0.33 * cspan), float(cmin + 0.66 * cspan))
+
+
+def _load_or_soc_split_threshold(samples: List[float]) -> float:
+    """Two-state split at min + 33% of observed range (same rule as comm/resource/battery)."""
+    if not samples:
+        return 30.0
+    vs = [float(x) for x in samples]
+    vmin, vmax = min(vs), max(vs)
+    span = max(vmax - vmin, 1e-9)
+    return float(vmin + 0.33 * span)
+
+
+def compute_state_boundaries_from_minmax(
+    uplink_comm_times: List[float],
+    resource_loads_uplink: List[float],
+    battery_socs_uplink: List[float],
+    downlink_comm_times: Optional[List[float]] = None,
+    resource_loads_downlink: Optional[List[float]] = None,
+    battery_socs_downlink: Optional[List[float]] = None,
+) -> Optional[Dict[str, float]]:
+    """
+    Run **after** all Phase-1 rounds: uses **min/max** of the collected samples (per series),
+    then derives cut points (comm: 33%/66% along the span; resource/battery: split at min+33% of span).
+
+    Separate uplink vs downlink for comm, resource, and battery where samples exist.
+    """
+    if not uplink_comm_times or not resource_loads_uplink or not battery_socs_uplink:
+        return None
+    uc = compute_comm_terciles_from_samples(uplink_comm_times)
+    if uc is None:
+        return None
+    comm_t_low, comm_t_high = uc
+    dl = downlink_comm_times if downlink_comm_times else []
+    dc = compute_comm_terciles_from_samples(dl) if len(dl) >= 1 else None
+    if dc is not None:
+        comm_t_low_dl, comm_t_high_dl = dc
+    else:
+        comm_t_low_dl, comm_t_high_dl = comm_t_low, comm_t_high
+
+    r_ul = _load_or_soc_split_threshold(resource_loads_uplink)
+    b_ul = _load_or_soc_split_threshold(battery_socs_uplink)
+    rdl = resource_loads_downlink if resource_loads_downlink else []
+    bdl = battery_socs_downlink if battery_socs_downlink else []
+    r_dl = _load_or_soc_split_threshold(rdl) if len(rdl) >= 1 else r_ul
+    b_dl = _load_or_soc_split_threshold(bdl) if len(bdl) >= 1 else b_ul
+
+    return {
+        "comm_t_low": float(comm_t_low),
+        "comm_t_high": float(comm_t_high),
+        "comm_t_low_dl": float(comm_t_low_dl),
+        "comm_t_high_dl": float(comm_t_high_dl),
+        "resource_load_threshold_ul": float(r_ul),
+        "resource_load_threshold_dl": float(r_dl),
+        "battery_soc_threshold_ul": float(b_ul),
+        "battery_soc_threshold_dl": float(b_dl),
+    }
+
+
+def apply_state_boundaries_to_rl_selectors(
+    uplink: QLearningProtocolSelector,
+    downlink: QLearningProtocolSelector,
+    env_manager: EnvironmentStateManager,
+    bounds: Dict[str, float],
+) -> None:
+    uplink.comm_t_low = float(bounds["comm_t_low"])
+    uplink.comm_t_high = float(bounds["comm_t_high"])
+    uplink.resource_load_threshold = float(bounds["resource_load_threshold_ul"])
+    uplink.battery_soc_threshold = float(bounds["battery_soc_threshold_ul"])
+    downlink.comm_t_low = float(bounds.get("comm_t_low_dl", bounds["comm_t_low"]))
+    downlink.comm_t_high = float(bounds.get("comm_t_high_dl", bounds["comm_t_high"]))
+    downlink.resource_load_threshold = float(bounds["resource_load_threshold_dl"])
+    downlink.battery_soc_threshold = float(bounds["battery_soc_threshold_dl"])
+    # Env mirrors uplink agent (shared logging / legacy paths)
+    env_manager.comm_t_low = float(bounds["comm_t_low"])
+    env_manager.comm_t_high = float(bounds["comm_t_high"])
+    env_manager.resource_load_threshold = float(bounds["resource_load_threshold_ul"])
+    env_manager.battery_soc_threshold = float(bounds["battery_soc_threshold_ul"])
+
+
+def finalize_rl_boundary_collection_and_start_training(
+    uplink: QLearningProtocolSelector,
+    downlink: QLearningProtocolSelector,
+    env_manager: EnvironmentStateManager,
+    uplink_comm_times: List[float],
+    resource_loads_uplink: List[float],
+    battery_socs_uplink: List[float],
+    client_id: int = 0,
+    downlink_comm_times: Optional[List[float]] = None,
+    resource_loads_downlink: Optional[List[float]] = None,
+    battery_socs_downlink: Optional[List[float]] = None,
+) -> bool:
+    """
+    Phase 2: compute boundaries from collected samples, apply to env + both selectors,
+    then reset Q-tables and epsilon for Phase 3 (RL training with decay).
+    """
+    bounds = compute_state_boundaries_from_minmax(
+        uplink_comm_times,
+        resource_loads_uplink,
+        battery_socs_uplink,
+        downlink_comm_times=downlink_comm_times,
+        resource_loads_downlink=resource_loads_downlink,
+        battery_socs_downlink=battery_socs_downlink,
+    )
+    if bounds is None:
+        print("[Q-Learning] Boundary collection: no samples; keeping default thresholds.")
+    else:
+        apply_state_boundaries_to_rl_selectors(uplink, downlink, env_manager, bounds)
+        print(
+            "[Q-Learning] Phase 2 (boundaries from data): "
+            f"uplink comm: {bounds['comm_t_low']:.4f}s, {bounds['comm_t_high']:.4f}s; "
+            f"downlink comm: {bounds['comm_t_low_dl']:.4f}s, {bounds['comm_t_high_dl']:.4f}s; "
+            f"resource thr % (ul/dl): {bounds['resource_load_threshold_ul']:.2f}, {bounds['resource_load_threshold_dl']:.2f}; "
+            f"SoC thr (ul/dl): {bounds['battery_soc_threshold_ul']:.4f}, {bounds['battery_soc_threshold_dl']:.4f}"
+        )
+    uplink.begin_fresh_training(experiment_id=f"client{client_id}_uplink_rl_train")
+    downlink.begin_fresh_training(experiment_id=f"client{client_id}_downlink_rl_train")
+    return bounds is not None
+
+
 def collect_comm_resource_battery_stats(
     selector: QLearningProtocolSelector,
     env_manager: EnvironmentStateManager,
     n_rounds: int = 20,
 ) -> Tuple[List[float], List[str], List[float]]:
     """
-    Run n_rounds with epsilon=1.0 (pure exploration) to collect
-    communication_time, resource metrics, and battery SoC samples.
-    This is ONLY for determining bucket thresholds; it should not
-    perform any Q-learning updates.
+    **Offline / test helper only**: synthetic random walk (not real FL rounds).
+    For production, the unified client collects metrics during actual FL rounds; see
+    ``finalize_rl_boundary_collection_and_start_training``.
+
+    Runs n_rounds with epsilon=1.0 (pure exploration) without Q-learning updates.
     """
     old_eps = selector.epsilon
     selector.epsilon = 1.0

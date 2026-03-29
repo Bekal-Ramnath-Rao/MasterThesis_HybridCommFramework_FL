@@ -857,6 +857,8 @@ class NativeExperimentRunner:
                 env["USE_QL_CONVERGENCE"] = "true" if self.use_ql_convergence else "false"
                 if self.use_ql_convergence:
                     env["USE_RL_EXPLORATION"] = "true"
+                    env.setdefault("RL_BOUNDARY_PIPELINE", "true")
+                    env.setdefault("RL_PHASE0_ROUNDS", "20")
                 else:
                     env["USE_RL_EXPLORATION"] = "false" if self.rl_inference_only else "true"
                 env["USE_COMMUNICATION_MODEL_REWARD"] = "true" if self.use_communication_model_reward else "false"

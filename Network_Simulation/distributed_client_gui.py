@@ -1070,7 +1070,9 @@ class DistributedClientGUI(QMainWindow):
                     "-e", "USE_QL_CONVERGENCE=true",
                     "-e", "USE_RL_EXPLORATION=true",
                     "-e", "Q_CONVERGENCE_THRESHOLD=0.01",
-                    "-e", "Q_CONVERGENCE_PATIENCE=5"
+                    "-e", "Q_CONVERGENCE_PATIENCE=5",
+                    "-e", "RL_BOUNDARY_PIPELINE=true",
+                    "-e", "RL_PHASE0_ROUNDS=20",
                 ])
             else:
                 cmd.extend([

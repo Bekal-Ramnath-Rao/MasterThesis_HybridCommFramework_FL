@@ -73,22 +73,43 @@ def _prepare_q_learning_dataframe_for_excel(df):
     return out
 
 
-def _ensure_q_learning_columns(db_path):
-    """Migrate older q_learning_log DBs: add 3D RL state columns if missing."""
+def _ensure_q_learning_schema(db_path):
+    """Create or migrate q_learning_log to the slim schema (same as client logger)."""
     if not os.path.isfile(db_path):
         return
     try:
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        c.execute("PRAGMA table_info(q_learning_log)")
-        cols = {row[1] for row in c.fetchall()}
-        for col, typ in (("state_comm_level", "TEXT"), ("state_battery_level", "TEXT")):
-            if col not in cols:
-                c.execute(f"ALTER TABLE q_learning_log ADD COLUMN {col} {typ}")
-        conn.commit()
-        conn.close()
+        import importlib.util
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        mod_path = os.path.join(root, "scripts", "utilities", "q_learning_logger.py")
+        spec = importlib.util.spec_from_file_location("q_learning_logger", mod_path)
+        if spec is None or spec.loader is None:
+            return
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.init_db(db_path)
     except Exception:
         pass
+
+
+# Slim q_learning_log columns (matches scripts/utilities/q_learning_logger.py)
+_QL_SELECT_SQL = """
+    SELECT id, timestamp, round_num, episode,
+           COALESCE(link_direction, 'uplink') AS link_direction,
+           state_comm_level,
+           state_resource,
+           COALESCE(NULLIF(TRIM(state_battery_level), ''), '') AS state_battery_level,
+           action, reward, q_delta, epsilon,
+           avg_reward_last_100, converged,
+           metric_communication_time,
+           metric_success,
+           metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage,
+           metric_battery_level, metric_energy_usage,
+           reward_base, reward_communication_time, reward_resource_penalty, reward_battery_penalty, reward_total
+    FROM q_learning_log
+    ORDER BY round_num ASC,
+             CASE WHEN COALESCE(link_direction,'uplink') = 'uplink' THEN 0 ELSE 1 END ASC,
+             id ASC
+"""
 
 
 def _shared_data_dir():
@@ -160,18 +181,16 @@ class QLearningLogsTab(QWidget):
         layout.addWidget(stats_group)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(30)
+        self.table.setColumnCount(26)
         self.table.setHorizontalHeaderLabels([
             "ID", "Timestamp", "Round", "Episode", "Direction",
             "Comm level", "Resource", "Battery (RL)",
             "Action", "Reward", "Q Delta", "Epsilon", "Avg R(100)", "Converged",
-            "Comm Time", "R_comm",
-            "Conv Time", "R_conv",
-            "Success", "R_base",
-            "CPU", "Memory", "Bandwidth", "R_resource",
-            "Battery", "Energy", "R_battery",
-            "T_calc", "R_tcalc",
-            "R_total"
+            "Comm Time", "Success",
+            "CPU", "Memory", "Bandwidth",
+            "Battery", "Energy",
+            "R_base", "R_comm", "R_resource", "R_battery",
+            "R_total",
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.setAlternatingRowColors(True)
@@ -210,29 +229,10 @@ class QLearningLogsTab(QWidget):
             self.converged_label.setText("Converged: No")
             return
         try:
-            _ensure_q_learning_columns(db_path)
+            _ensure_q_learning_schema(db_path)
             conn = sqlite3.connect(db_path)
             cur = conn.cursor()
-            cur.execute("""
-                SELECT id, timestamp, round_num, episode,
-                       COALESCE(link_direction, 'uplink') AS link_direction,
-                       COALESCE(NULLIF(TRIM(state_comm_level), ''), state_network) AS state_comm_level,
-                       state_resource,
-                       COALESCE(NULLIF(TRIM(state_battery_level), ''), '') AS state_battery_level,
-                       action, reward, q_delta, epsilon,
-                       avg_reward_last_100, converged,
-                       metric_communication_time, reward_communication_time,
-                       metric_convergence_time, reward_convergence_time,
-                       metric_success, reward_base,
-                       metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage, reward_resource_penalty,
-                       metric_battery_level, metric_energy_usage, reward_battery_penalty,
-                       metric_t_calc, reward_t_calc_penalty,
-                       reward_total
-                FROM q_learning_log
-                ORDER BY round_num ASC,
-                         CASE WHEN COALESCE(link_direction,'uplink') = 'uplink' THEN 0 ELSE 1 END ASC,
-                         id ASC
-            """)
+            cur.execute(_QL_SELECT_SQL)
             rows = cur.fetchall()
             conn.close()
         except Exception as e:
@@ -320,29 +320,9 @@ class QLearningLogsTab(QWidget):
             if not os.path.exists(db_path):
                 continue
             try:
-                _ensure_q_learning_columns(db_path)
+                _ensure_q_learning_schema(db_path)
                 conn = sqlite3.connect(db_path)
-                df = pd.read_sql_query(
-                    """SELECT id, timestamp, round_num, episode,
-                       COALESCE(link_direction, 'uplink') AS link_direction,
-                       COALESCE(NULLIF(TRIM(state_comm_level), ''), state_network) AS state_comm_level,
-                       state_resource,
-                       COALESCE(NULLIF(TRIM(state_battery_level), ''), '') AS state_battery_level,
-                       action, reward, q_delta, epsilon,
-                       avg_reward_last_100, converged,
-                       metric_communication_time, reward_communication_time,
-                       metric_convergence_time, reward_convergence_time,
-                       metric_success, reward_base,
-                       metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage, reward_resource_penalty,
-                       metric_battery_level, metric_energy_usage, reward_battery_penalty,
-                       metric_t_calc, reward_t_calc_penalty,
-                       reward_total
-                       FROM q_learning_log
-                       ORDER BY round_num ASC,
-                                CASE WHEN COALESCE(link_direction,'uplink') = 'uplink' THEN 0 ELSE 1 END ASC,
-                                id ASC""",
-                    conn
-                )
+                df = pd.read_sql_query(_QL_SELECT_SQL, conn)
                 conn.close()
                 sheets[f"Client {i}"] = _prepare_q_learning_dataframe_for_excel(df)
             except Exception as e:
@@ -414,29 +394,9 @@ class QLearningLogsTab(QWidget):
                     if not os.path.exists(db_path):
                         continue
                     try:
-                        _ensure_q_learning_columns(db_path)
+                        _ensure_q_learning_schema(db_path)
                         conn = sqlite3.connect(db_path)
-                        df = pd.read_sql_query(
-                            """SELECT id, timestamp, round_num, episode,
-                               COALESCE(link_direction, 'uplink') AS link_direction,
-                               COALESCE(NULLIF(TRIM(state_comm_level), ''), state_network) AS state_comm_level,
-                               state_resource,
-                               COALESCE(NULLIF(TRIM(state_battery_level), ''), '') AS state_battery_level,
-                               action, reward, q_delta, epsilon,
-                               avg_reward_last_100, converged,
-                               metric_communication_time, reward_communication_time,
-                               metric_convergence_time, reward_convergence_time,
-                               metric_success, reward_base,
-                               metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage, reward_resource_penalty,
-                               metric_battery_level, metric_energy_usage, reward_battery_penalty,
-                               metric_t_calc, reward_t_calc_penalty,
-                               reward_total
-                               FROM q_learning_log
-                               ORDER BY round_num ASC,
-                                        CASE WHEN COALESCE(link_direction,'uplink') = 'uplink' THEN 0 ELSE 1 END ASC,
-                                        id ASC""",
-                            conn
-                        )
+                        df = pd.read_sql_query(_QL_SELECT_SQL, conn)
                         conn.close()
                         if len(df) > 0:
                             sheets[f"Client {i}"] = _prepare_q_learning_dataframe_for_excel(df)
