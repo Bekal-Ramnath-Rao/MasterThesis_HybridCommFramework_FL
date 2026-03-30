@@ -8,7 +8,7 @@ ops); client-side model training uses GPU separately.
 
 Actions: MQTT, AMQP, gRPC, QUIC, DDS
 Rewards (success, max 30): base 10, communication ≤10, resource ≥-5, battery ≥-5
-Environment (Q-table state): communication-time bucket, resource availability, battery SoC bucket
+Environment (Q-table state): network scenario (coarse), communication-time bucket, resource availability, battery SoC bucket
 """
 
 import numpy as np
@@ -105,6 +105,24 @@ def _bandwidth_norm_from_mbps(mbps: float) -> float:
     return float(m / (m + k))
 
 
+def normalize_coarse_network_scenario(name: Optional[str]) -> str:
+    """
+    Map arbitrary simulator / GUI labels onto ``QLearningProtocolSelector.NETWORK_SCENARIO_LEVELS``.
+
+    Used as the first axis of the Q-table so the same table can be trained under different
+    network regimes; each scenario slice is updated independently.
+    """
+    n = (name or "").strip().lower()
+    if n in ("excellent", "good"):
+        return "excellent"
+    if n in ("moderate", "congested_light", "dynamic"):
+        return "moderate"
+    if n in ("poor", "very_poor", "satellite", "congested_moderate", "congested_heavy"):
+        return "poor"
+    # Unknown label: default to moderate so indexing stays valid
+    return "moderate"
+
+
 def _safe_scenario_filename_tag(scenario: Optional[str]) -> str:
     """Filesystem-safe fragment for archive filenames."""
     s = (scenario or "unknown").strip().lower()
@@ -123,7 +141,8 @@ class QLearningProtocolSelector:
     # Protocol actions
     PROTOCOLS = ['mqtt', 'amqp', 'grpc', 'http3', 'dds']
     
-    # Q-table state: communication time bucket, resource availability, battery SoC bucket
+    # Q-table state axis 0: coarse network regime (same physical table, separate learned slices)
+    NETWORK_SCENARIO_LEVELS = ["excellent", "moderate", "poor"]
     COMM_LEVELS = ["low", "mid", "high"]  # wall-clock comm time: low=fast, high=slow
     RESOURCE_LEVELS = ["high", "low"]  # high = plenty of CPU/memory; low = heavily loaded
     BATTERY_LEVELS = ["high", "low"]  # high SoC vs low SoC
@@ -171,17 +190,10 @@ class QLearningProtocolSelector:
         # SoC in [0,1]: >= threshold → battery "high"; separate per uplink/downlink agent
         self.battery_soc_threshold = 0.35
 
-        # Training/inference metadata only: not used in Q-state indexing (comm/resource/battery).
+        # Training/inference metadata (raw label); Q-state uses ``normalize_coarse_network_scenario``.
         self.data_network_scenario: Optional[str] = None
 
-        self.q_table = np.zeros(
-            (
-                len(self.COMM_LEVELS),
-                len(self.RESOURCE_LEVELS),
-                len(self.BATTERY_LEVELS),
-                len(self.PROTOCOLS),
-            )
-        )
+        self.q_table = np.zeros(self._full_q_shape())
         
         # Statistics tracking
         self.episode_count = 0
@@ -205,6 +217,20 @@ class QLearningProtocolSelector:
         # Last reward breakdown (exact values for dashboard/logging)
         self._last_reward_breakdown = {}
 
+        # Last N actions per scenario slice (for per-scenario convergence)
+        self._action_history_by_scenario: Dict[int, List[int]] = {
+            i: [] for i in range(len(self.NETWORK_SCENARIO_LEVELS))
+        }
+
+    def _full_q_shape(self) -> Tuple[int, ...]:
+        return (
+            len(self.NETWORK_SCENARIO_LEVELS),
+            len(self.COMM_LEVELS),
+            len(self.RESOURCE_LEVELS),
+            len(self.BATTERY_LEVELS),
+            len(self.PROTOCOLS),
+        )
+
     def comm_time_to_level(self, t: float) -> str:
         """Map communication time (seconds) to a discrete bucket; thresholds are tunable after data collection."""
         t = float(t)
@@ -215,26 +241,35 @@ class QLearningProtocolSelector:
         return "high"
 
     def set_data_network_scenario(self, scenario: Optional[str]) -> None:
-        """Persisted with the Q-table; for inference/logging only — not part of RL state."""
+        """Persist raw label with the Q-table; discrete Q-axis uses ``normalize_coarse_network_scenario``."""
         if scenario is None or (isinstance(scenario, str) and not str(scenario).strip()):
             self.data_network_scenario = None
         else:
             self.data_network_scenario = str(scenario).strip().lower()
 
     def get_data_network_scenario(self) -> Optional[str]:
-        """Scenario tag stored with this agent (same Q-table file); not used in ``get_state_index``."""
+        """Raw scenario tag stored with this agent (same Q-table file)."""
         return self.data_network_scenario
 
     def ensure_scenario(self, scenario_name: Optional[str]) -> None:
-        """Backward compatibility: no scenario axis on the Q-table; store tag for pickle + inference."""
+        """Backward compatibility: store tag for pickle + logging."""
         self.set_data_network_scenario(scenario_name)
 
-    def get_state_index(self, state: Dict) -> Tuple[int, int, int]:
+    def get_state_index(self, state: Dict) -> Tuple[int, int, int, int]:
         """
         Convert state dictionary to indices for Q-table.
 
-        Expected keys: comm_level, resource, battery_level (each a string label).
+        Expected keys: network_scenario (or data_network_scenario), comm_level, resource, battery_level.
         """
+        raw_scenario = state.get("network_scenario") or state.get("data_network_scenario")
+        scen_label = normalize_coarse_network_scenario(
+            raw_scenario if isinstance(raw_scenario, str) else str(raw_scenario or "")
+        )
+        try:
+            s_idx = self.NETWORK_SCENARIO_LEVELS.index(scen_label)
+        except ValueError:
+            s_idx = self.NETWORK_SCENARIO_LEVELS.index("moderate")
+
         comm = state.get("comm_level", "mid")
         if comm not in self.COMM_LEVELS:
             comm = "mid"
@@ -269,18 +304,20 @@ class QLearningProtocolSelector:
             "rl_q_learning_selector.py:get_state_index",
             "state_to_q_indices",
             {
+                "network_scenario": scen_label,
                 "comm_level": comm,
                 "resource": res,
                 "battery_level": batt,
-                "idx": [int(c_idx), int(r_idx), int(b_idx)],
+                "idx": [int(s_idx), int(c_idx), int(r_idx), int(b_idx)],
             },
             hypothesis_id="H5",
         )
-        return (c_idx, r_idx, b_idx)
+        return (s_idx, c_idx, r_idx, b_idx)
 
-    def _state_tuple_to_dict(self, state_idx: Tuple[int, int, int]) -> Dict[str, str]:
-        c_idx, r_idx, b_idx = state_idx
+    def _state_tuple_to_dict(self, state_idx: Tuple[int, int, int, int]) -> Dict[str, str]:
+        s_idx, c_idx, r_idx, b_idx = state_idx
         return {
+            "network_scenario": self.NETWORK_SCENARIO_LEVELS[s_idx],
             "comm_level": self.COMM_LEVELS[c_idx],
             "resource": self.RESOURCE_LEVELS[r_idx],
             "battery_level": self.BATTERY_LEVELS[b_idx],
@@ -332,15 +369,24 @@ class QLearningProtocolSelector:
         # Store for learning
         self.state_history.append(state_idx)
         self.action_history.append(action_idx)
-        
+        s_idx = int(state_idx[0])
+        ah = self._action_history_by_scenario.setdefault(s_idx, [])
+        ah.append(int(action_idx))
+        if len(ah) > 50:
+            del ah[:-50]
+
         return protocol
 
     def pop_last_selection(self) -> bool:
         """Remove the most recent (state, action) pair from learning history (e.g. after replacing an unavailable action)."""
         if not self.state_history or not self.action_history:
             return False
+        last_s = int(self.state_history[-1][0])
         self.state_history.pop()
         action_idx = self.action_history.pop()
+        ah = self._action_history_by_scenario.get(last_s)
+        if ah:
+            ah.pop()
         protocol = self.PROTOCOLS[action_idx]
         self.protocol_usage[protocol] = max(0, int(self.protocol_usage.get(protocol, 0)) - 1)
         return True
@@ -358,6 +404,11 @@ class QLearningProtocolSelector:
         self.protocol_usage[p] = int(self.protocol_usage.get(p, 0)) + 1
         self.state_history.append(state_idx)
         self.action_history.append(action_idx)
+        s_idx = int(state_idx[0])
+        ah = self._action_history_by_scenario.setdefault(s_idx, [])
+        ah.append(int(action_idx))
+        if len(ah) > 50:
+            del ah[:-50]
         return p
     
     def calculate_reward(
@@ -586,7 +637,7 @@ class QLearningProtocolSelector:
 
         Args:
             experiment_id: Unique identifier for this experiment (prevents duplicate resets)
-            scenario: Ignored (legacy); Q-table no longer has a scenario axis.
+            scenario: Ignored (legacy); archive naming only.
         """
         _ = scenario
         old_epsilon = self.epsilon
@@ -653,6 +704,9 @@ class QLearningProtocolSelector:
         self.reward_history = []
         self._q_deltas = []
         self._last_reward_breakdown = {}
+        self._action_history_by_scenario = {
+            i: [] for i in range(len(self.NETWORK_SCENARIO_LEVELS))
+        }
 
         print(
             f"[Q-Learning] Fresh training: Q-table zeroed, epsilon {old_epsilon:.4f} → 1.0"
@@ -697,7 +751,8 @@ class QLearningProtocolSelector:
             print(f"[Q-Learning] Warning: could not read Q-table for merge at {path}: {e}")
             return None
 
-    def _tail_shape(self) -> Tuple[int, int, int, int]:
+    def _tail_shape_legacy_4d(self) -> Tuple[int, int, int, int]:
+        """Pre–network-scenario Q-table shape (comm × resource × battery × protocol)."""
         return (
             len(self.COMM_LEVELS),
             len(self.RESOURCE_LEVELS),
@@ -709,6 +764,7 @@ class QLearningProtocolSelector:
         """Merge on-disk Q-table with this process (element-wise max) when overlay merge is active."""
         self_data = {
             "q_table": self.q_table,
+            "network_scenario_levels": list(self.NETWORK_SCENARIO_LEVELS),
             "comm_t_low": self.comm_t_low,
             "comm_t_high": self.comm_t_high,
             "resource_load_threshold": self.resource_load_threshold,
@@ -725,12 +781,19 @@ class QLearningProtocolSelector:
             return self_data
 
         dq = disk.get("q_table")
-        tail = self._tail_shape()
-        if dq is None or dq.ndim != 4 or tuple(dq.shape) != tail:
+        full_shape = self._full_q_shape()
+        if dq is None:
+            print("[Q-Learning] Merge skipped: disk Q-table missing; writing this process only")
+            return self_data
+        if dq.ndim == 5 and tuple(dq.shape) == full_shape:
+            merged_q = np.maximum(np.asarray(dq, dtype=float), np.asarray(self.q_table, dtype=float))
+        elif dq.ndim == 4 and tuple(dq.shape) == self._tail_shape_legacy_4d():
+            # Expand legacy disk slice to 5D by broadcasting, then merge
+            dq5 = np.stack([np.asarray(dq, dtype=float)] * len(self.NETWORK_SCENARIO_LEVELS), axis=0)
+            merged_q = np.maximum(dq5, np.asarray(self.q_table, dtype=float))
+        else:
             print("[Q-Learning] Merge skipped: disk Q-table shape mismatch; writing this process only")
             return self_data
-
-        merged_q = np.maximum(np.asarray(dq, dtype=float), np.asarray(self.q_table, dtype=float))
 
         def _sum_maps(a: Dict, b: Dict) -> Dict:
             out = {k: int(v) for k, v in (a or {}).items()}
@@ -750,6 +813,7 @@ class QLearningProtocolSelector:
 
         return {
             "q_table": merged_q,
+            "network_scenario_levels": list(self.NETWORK_SCENARIO_LEVELS),
             "comm_t_low": float(disk.get("comm_t_low", self.comm_t_low)),
             "comm_t_high": float(disk.get("comm_t_high", self.comm_t_high)),
             "resource_load_threshold": float(
@@ -810,6 +874,7 @@ class QLearningProtocolSelector:
             else:
                 data = {
                     "q_table": self.q_table,
+                    "network_scenario_levels": list(self.NETWORK_SCENARIO_LEVELS),
                     "comm_t_low": self.comm_t_low,
                     "comm_t_high": self.comm_t_high,
                     "resource_load_threshold": self.resource_load_threshold,
@@ -835,16 +900,27 @@ class QLearningProtocolSelector:
             with open(path, 'rb') as f:
                 data = pickle.load(f)
             loaded_q_table = data.get('q_table')
-            tail_shape = self._tail_shape()
+            full_shape = self._full_q_shape()
+            legacy_shape = self._tail_shape_legacy_4d()
             if loaded_q_table is None:
                 return False
-            if loaded_q_table.ndim == 4 and tuple(loaded_q_table.shape) == tail_shape:
+            if loaded_q_table.ndim == 5 and tuple(loaded_q_table.shape) == full_shape:
                 self.q_table = np.asarray(loaded_q_table, dtype=float)
+            elif loaded_q_table.ndim == 4 and tuple(loaded_q_table.shape) == legacy_shape:
+                # Legacy: one table for all scenarios — replicate across scenario axis
+                q4 = np.asarray(loaded_q_table, dtype=float)
+                self.q_table = np.stack(
+                    [q4] * len(self.NETWORK_SCENARIO_LEVELS), axis=0
+                )
+                print(
+                    f"[Q-Learning] Loaded legacy 4D Q-table from {path}; "
+                    f"broadcast to {len(self.NETWORK_SCENARIO_LEVELS)} network scenarios"
+                )
             else:
                 print(
                     f"[Q-Learning] Q-table shape mismatch at {path}: "
-                    f"expected {tail_shape}, got {getattr(loaded_q_table, 'shape', None)} "
-                    "(legacy 5D scenario pickles are not auto-migrated)"
+                    f"expected {full_shape} or legacy {legacy_shape}, "
+                    f"got {getattr(loaded_q_table, 'shape', None)}"
                 )
                 return False
             self.comm_t_low = float(data.get('comm_t_low', self.comm_t_low))
@@ -881,6 +957,14 @@ class QLearningProtocolSelector:
 
     def load_q_table(self):
         """Load Q-table from disk: try initial_load_path (past experience) first, then save_path."""
+        # Env: skip all disk loads (zeros, default epsilon). Client may set RL_FRESH_Q_TABLE when starting a new study.
+        _fresh = os.getenv("RL_FRESH_Q_TABLE", "").strip().lower() in ("1", "true", "yes", "y")
+        if _fresh:
+            print(
+                "[Q-Learning] RL_FRESH_Q_TABLE: not loading initial_load_path or save_path; "
+                "starting from an empty Q-table"
+            )
+            return
         # Try optional pretrained / past-experience path first
         if self.initial_load_path and self._try_load_from_path(self.initial_load_path):
             # region agent log
@@ -1025,16 +1109,18 @@ class QLearningProtocolSelector:
         self,
         threshold: Optional[float] = None,
         patience: Optional[int] = None,
+        state: Optional[Dict] = None,
     ) -> bool:
         """
         RL agent convergence (when USE_QL_CONVERGENCE is enabled):
 
-        The last N protocol selections are identical (same action index), where N
-        is `patience` if provided, else ``RL_CONVERGENCE_SAME_PROTOCOL_STREAK``
-        (default 5).
+        By default (``RL_CONVERGENCE_PER_SCENARIO`` true): last N selections **for the
+        active network-scenario slice** are identical. Set env ``RL_CONVERGENCE_PER_SCENARIO=0``
+        to use the global action tail (legacy).
 
-        The ``threshold`` argument is kept for call-site compatibility; Q-delta
-        convergence is no longer used.
+        ``state``: optional state dict; if provided, scenario is taken from
+        ``network_scenario`` / ``data_network_scenario`` keys. Otherwise the last
+        ``state_history`` entry is used (inference: current scenario).
         """
         _ = threshold  # legacy parameter; Q-delta criterion removed
         streak = (
@@ -1042,9 +1128,26 @@ class QLearningProtocolSelector:
             if patience is not None
             else int(os.getenv("RL_CONVERGENCE_SAME_PROTOCOL_STREAK", "5"))
         )
-        if len(self.action_history) < streak:
+        per_s = os.getenv("RL_CONVERGENCE_PER_SCENARIO", "true").strip().lower() in (
+            "1", "true", "yes", "y",
+        )
+        if not per_s:
+            if len(self.action_history) < streak:
+                return False
+            tail = self.action_history[-streak:]
+            first = tail[0]
+            return all(a == first for a in tail)
+
+        if state is not None:
+            s_idx = int(self.get_state_index(state)[0])
+        elif self.state_history:
+            s_idx = int(self.state_history[-1][0])
+        else:
             return False
-        tail = self.action_history[-streak:]
+        hist = self._action_history_by_scenario.get(s_idx, [])
+        if len(hist) < streak:
+            return False
+        tail = hist[-streak:]
         first = tail[0]
         return all(a == first for a in tail)
 
@@ -1059,14 +1162,7 @@ class QLearningProtocolSelector:
         This clears all learned knowledge and starts fresh.
         Useful when new protocols are added (e.g., HTTP/3) or starting new training.
         """
-        self.q_table = np.zeros(
-            (
-                len(self.COMM_LEVELS),
-                len(self.RESOURCE_LEVELS),
-                len(self.BATTERY_LEVELS),
-                len(self.PROTOCOLS),
-            )
-        )
+        self.q_table = np.zeros(self._full_q_shape())
         
         # Reset epsilon to initial value
         self.epsilon = 1.0
@@ -1085,6 +1181,9 @@ class QLearningProtocolSelector:
         self._q_deltas = []
         self._last_reward_breakdown = {}
         self.data_network_scenario = None
+        self._action_history_by_scenario = {
+            i: [] for i in range(len(self.NETWORK_SCENARIO_LEVELS))
+        }
         # Delete saved Q-table file if it exists
         if os.path.exists(self.save_path):
             try:
@@ -1217,7 +1316,13 @@ class EnvironmentStateManager:
             cpu_percent, memory_percent, selector.resource_load_threshold
         )
         batt = self.battery_level_for_threshold(self.battery_soc, selector.battery_soc_threshold)
-        return {"comm_level": comm, "resource": res, "battery_level": batt}
+        ns = normalize_coarse_network_scenario(self.data_network_scenario)
+        return {
+            "network_scenario": ns,
+            "comm_level": comm,
+            "resource": res,
+            "battery_level": batt,
+        }
 
     def neutral_rl_state_before_boundaries(self) -> Dict[str, str]:
         """Discrete tuple for ε-random protocol picks during Phase 1 only.
@@ -1226,7 +1331,13 @@ class EnvironmentStateManager:
         :func:`compute_state_boundaries_from_minmax` derives thresholds from the stored
         samples (min–max span); then :func:`state_for_rl_selector` is used with real cuts.
         """
-        return {"comm_level": "mid", "resource": "high", "battery_level": "high"}
+        ns = normalize_coarse_network_scenario(self.data_network_scenario)
+        return {
+            "network_scenario": ns,
+            "comm_level": "mid",
+            "resource": "high",
+            "battery_level": "high",
+        }
 
     def update_battery(self, soc: float, last_energy_j: float) -> None:
         """Update battery state of charge [0,1] and last-round energy in Joules."""
@@ -1247,7 +1358,7 @@ class EnvironmentStateManager:
     ) -> None:
         """Store scenario tag for inference/logging; optional sync to RL agents for pickle persistence.
 
-        ``comm_level`` / ``resource`` / ``battery_level`` remain the only RL state axes.
+        Coarse scenario maps to the first Q-table axis (with comm/resource/battery).
         """
         if scenario is None or (isinstance(scenario, str) and not str(scenario).strip()):
             self.data_network_scenario = None
@@ -1314,8 +1425,10 @@ class EnvironmentStateManager:
         return "low"
     
     def get_current_state(self) -> Dict:
-        """Discrete RL state plus optional ``data_network_scenario`` (ignored by Q-state indexing)."""
+        """Discrete RL state including ``network_scenario`` (coarse) for the Q-table."""
         out = self.current_state.copy()
+        ns = normalize_coarse_network_scenario(self.data_network_scenario)
+        out["network_scenario"] = ns
         out["data_network_scenario"] = self.data_network_scenario
         return out
     
@@ -1565,6 +1678,9 @@ def collect_comm_resource_battery_stats(
     selector.state_history.clear()
     selector.action_history.clear()
     selector.reward_history.clear()
+    selector._action_history_by_scenario = {
+        i: [] for i in range(len(selector.NETWORK_SCENARIO_LEVELS))
+    }
 
     return comm_times, resource_levels, battery_socs
 

@@ -330,11 +330,13 @@ try:
         QLearningProtocolSelector,
         EnvironmentStateManager,
         finalize_rl_boundary_collection_and_start_training,
+        normalize_coarse_network_scenario,
     )
 except ImportError:
     QLearningProtocolSelector = None
     EnvironmentStateManager = None
     finalize_rl_boundary_collection_and_start_training = None
+    normalize_coarse_network_scenario = None
 
 # Suppress TensorFlow warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -402,7 +404,9 @@ else:
     USE_RL_EXPLORATION = USE_QL_CONVERGENCE
 Q_CONVERGENCE_THRESHOLD = float(os.getenv("Q_CONVERGENCE_THRESHOLD", "0.01"))
 Q_CONVERGENCE_PATIENCE = int(os.getenv("Q_CONVERGENCE_PATIENCE", "5"))
-# Phase 1 — data collection: real FL rounds with epsilon=1, no Q-updates (0 = skip → train immediately)
+# Phase 1 — data collection: one sample per FL evaluation round with epsilon=1, no Q-updates (0 = skip → train immediately).
+# The federated job length is NUM_ROUNDS (server). Phase 1 needs at least RL_PHASE0_ROUNDS FL rounds to finish
+# collecting samples and run boundary computation; add more rounds for Phase 3 Q-learning after that.
 RL_PHASE0_ROUNDS = int(os.getenv("RL_PHASE0_ROUNDS", "20"))
 # When true (default), unified RL training runs: collect → compute boundaries → Q-learning training
 RL_BOUNDARY_PIPELINE = os.getenv("RL_BOUNDARY_PIPELINE", "true").lower() in ("1", "true", "yes")
@@ -413,8 +417,40 @@ _T_CALC_IMPORT_WARNED = False
 _T_CALC_IPERF_MISSING_WARNED = False
 
 
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "y")
+
+
+# Skip loading any on-disk Q-table (zeros + default epsilon). Overrides shared_data / PRETRAINED discovery.
+RL_FRESH_Q_TABLE = _env_truthy("RL_FRESH_Q_TABLE")
+# Optional explicit pickle paths for inference or a chosen checkpoint (highest priority if set and file exists).
+_RL_Q_TABLE_UPLINK_FILE = (os.getenv("RL_Q_TABLE_UPLINK_PATH") or os.getenv("RL_Q_TABLE_UPLINK") or "").strip()
+_RL_Q_TABLE_DOWNLINK_FILE = (os.getenv("RL_Q_TABLE_DOWNLINK_PATH") or os.getenv("RL_Q_TABLE_DOWNLINK") or "").strip()
+
+_num_rounds_env = os.getenv("NUM_ROUNDS", "").strip()
+if (
+    _num_rounds_env
+    and RL_BOUNDARY_PIPELINE
+    and RL_PHASE0_ROUNDS > 0
+    and not RL_FRESH_Q_TABLE
+):
+    try:
+        _nr = int(_num_rounds_env)
+        if _nr < RL_PHASE0_ROUNDS:
+            print(
+                f"[RL] Warning: NUM_ROUNDS={_nr} < RL_PHASE0_ROUNDS={RL_PHASE0_ROUNDS}. "
+                f"Phase 1 (boundary data collection) will not complete before FL stops; "
+                f"raise NUM_ROUNDS to at least {RL_PHASE0_ROUNDS} (plus rounds for Phase 3), "
+                f"or lower RL_PHASE0_ROUNDS."
+            )
+    except ValueError:
+        pass
+
+
 def _coarse_network_bucket_for_scenario(name: str) -> str:
     """Map NetworkSimulator-style scenario names onto the three RL ``network`` buckets (for logs/metrics)."""
+    if normalize_coarse_network_scenario is not None:
+        return normalize_coarse_network_scenario(name)
     n = (name or "").strip().lower()
     if n in ("excellent", "good"):
         return "excellent"
@@ -587,14 +623,29 @@ class UnifiedFLClient_Emotion:
             else:
                 save_path_uplink = f"q_table_emotion_uplink_client_{client_id}.pkl"
             initial_load_path_uplink = None
-            if os.path.exists("/shared_data"):
-                # Prefer new uplink-specific table; fall back to old shared table for backwards compat
-                for _ul_cand in ("/shared_data/q_table_emotion_uplink_trained.pkl",
-                                 "/shared_data/q_table_emotion_trained.pkl"):
-                    if os.path.exists(_ul_cand):
-                        initial_load_path_uplink = _ul_cand
-                        break
-            if initial_load_path_uplink is None:
+            if RL_FRESH_Q_TABLE:
+                initial_load_path_uplink = None
+            elif _RL_Q_TABLE_UPLINK_FILE:
+                if os.path.isfile(_RL_Q_TABLE_UPLINK_FILE):
+                    initial_load_path_uplink = _RL_Q_TABLE_UPLINK_FILE
+                    print(
+                        f"[Client {client_id}] RL: loading uplink Q-table from RL_Q_TABLE_UPLINK_PATH="
+                        f"{_RL_Q_TABLE_UPLINK_FILE!r}"
+                    )
+                else:
+                    print(
+                        f"[Client {client_id}] RL: RL_Q_TABLE_UPLINK_PATH file not found "
+                        f"({_RL_Q_TABLE_UPLINK_FILE!r}); falling back to shared/pretrained discovery"
+                    )
+            if initial_load_path_uplink is None and not RL_FRESH_Q_TABLE:
+                if os.path.exists("/shared_data"):
+                    # Prefer new uplink-specific table; fall back to old shared table for backwards compat
+                    for _ul_cand in ("/shared_data/q_table_emotion_uplink_trained.pkl",
+                                     "/shared_data/q_table_emotion_trained.pkl"):
+                        if os.path.exists(_ul_cand):
+                            initial_load_path_uplink = _ul_cand
+                            break
+            if initial_load_path_uplink is None and not RL_FRESH_Q_TABLE:
                 pretrained_dir = os.getenv("PRETRAINED_Q_TABLE_DIR")
                 if pretrained_dir:
                     for candidate in (
@@ -618,9 +669,24 @@ class UnifiedFLClient_Emotion:
             else:
                 save_path_downlink = f"q_table_emotion_downlink_client_{client_id}.pkl"
             initial_load_path_downlink = None
-            if os.path.exists("/shared_data") and os.path.exists("/shared_data/q_table_emotion_downlink_trained.pkl"):
-                initial_load_path_downlink = "/shared_data/q_table_emotion_downlink_trained.pkl"
-            if initial_load_path_downlink is None:
+            if RL_FRESH_Q_TABLE:
+                initial_load_path_downlink = None
+            elif _RL_Q_TABLE_DOWNLINK_FILE:
+                if os.path.isfile(_RL_Q_TABLE_DOWNLINK_FILE):
+                    initial_load_path_downlink = _RL_Q_TABLE_DOWNLINK_FILE
+                    print(
+                        f"[Client {client_id}] RL: loading downlink Q-table from RL_Q_TABLE_DOWNLINK_PATH="
+                        f"{_RL_Q_TABLE_DOWNLINK_FILE!r}"
+                    )
+                else:
+                    print(
+                        f"[Client {client_id}] RL: RL_Q_TABLE_DOWNLINK_PATH file not found "
+                        f"({_RL_Q_TABLE_DOWNLINK_FILE!r}); falling back to shared/pretrained discovery"
+                    )
+            if initial_load_path_downlink is None and not RL_FRESH_Q_TABLE:
+                if os.path.exists("/shared_data") and os.path.exists("/shared_data/q_table_emotion_downlink_trained.pkl"):
+                    initial_load_path_downlink = "/shared_data/q_table_emotion_downlink_trained.pkl"
+            if initial_load_path_downlink is None and not RL_FRESH_Q_TABLE:
                 pretrained_dir = os.getenv("PRETRAINED_Q_TABLE_DIR")
                 if pretrained_dir:
                     for candidate in (
@@ -2010,6 +2076,7 @@ class UnifiedFLClient_Emotion:
             q_converged = self.rl_selector_downlink.check_q_converged(
                 threshold=Q_CONVERGENCE_THRESHOLD,
                 patience=Q_CONVERGENCE_PATIENCE,
+                state=downlink_state,
             )
 
             print(f"[Downlink RL] Client {self.client_id} | round={round_num} | protocol={protocol.upper()} | "
@@ -2407,6 +2474,12 @@ class UnifiedFLClient_Emotion:
                 latency_ms, bandwidth_mbps
             )
             self.env_manager.update_network_condition(condition)
+            if USE_RL_SELECTION and self.env_manager and getattr(self, "rl_selector_uplink", None):
+                self.env_manager.update_network_scenario(
+                    condition,
+                    rl_uplink=self.rl_selector_uplink,
+                    rl_downlink=self.rl_selector_downlink,
+                )
 
             # Update mobility based on variability of recent latency samples.
             # Higher jitter -> higher inferred mobility level.
@@ -3164,11 +3237,13 @@ class UnifiedFLClient_Emotion:
                         q_uplink_converged = self.rl_selector_uplink.check_q_converged(
                             threshold=Q_CONVERGENCE_THRESHOLD,
                             patience=Q_CONVERGENCE_PATIENCE,
+                            state=self._last_uplink_rl_state,
                         )
                         q_downlink_converged = (
                             self.rl_selector_downlink.check_q_converged(
                                 threshold=Q_CONVERGENCE_THRESHOLD,
                                 patience=Q_CONVERGENCE_PATIENCE,
+                                state=self._last_downlink_rl_state,
                             )
                             if self.rl_selector_downlink is not None
                             else True
