@@ -229,7 +229,8 @@ class DistributedClientGUI(QMainWindow):
         # Port Configuration (Read-only info)
         info_label = QLabel(
             "Broker ports: Docker-mapped MQTT 31883 / AMQP 35672, or host/macvlan MQTT 1883 / AMQP 5672. "
-            "Also: gRPC 50051 | QUIC 4433 | HTTP/3 4434 | DDS domain 0. Use Test Connection to detect."
+            "Unified FL also needs TCP gRPC 50051 on the server host (initial model is pulled over gRPC, not MQTT). "
+            "QUIC 4433 | HTTP/3 4434 | DDS domain 0. Test Connection checks MQTT + gRPC."
         )
         info_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
         layout.addWidget(info_label, 1, 0, 1, 3)
@@ -1017,15 +1018,55 @@ class DistributedClientGUI(QMainWindow):
                     self.log_text.append(
                         f"   Client will use MQTT {mqtt_p}, AMQP {amqp_p}.\n"
                     )
-                    self.connection_status.setText("● Connected")
-                    self.connection_status.setStyleSheet("font-size: 12px; color: #28a745;")
-                    QMessageBox.information(
-                        self,
-                        "Success",
-                        f"Reachable MQTT at {server_ip}:{mqtt_p}.\n"
-                        f"Using AMQP port {amqp_p}.\n({desc})",
+                    grpc_ok = False
+                    grpc_port = 50051
+                    try:
+                        grpc_chk = subprocess.run(
+                            ["timeout", "3", "bash", "-c", f"nc -zv {server_ip} {grpc_port}"],
+                            capture_output=True,
+                            text=True,
+                            timeout=5,
+                        )
+                        grpc_ok = grpc_chk.returncode == 0
+                    except Exception as e:
+                        self.log_text.append(f"⚠️ Could not verify gRPC port: {e}\n")
+                    if grpc_ok:
+                        self.log_text.append(
+                            f"✅ gRPC port {grpc_port} reachable (required for unified initial model).\n"
+                        )
+                    else:
+                        self.log_text.append(
+                            f"❌ gRPC port {grpc_port} NOT reachable from this PC.\n"
+                            f"   Unified clients download the first global model over gRPC; MQTT registration alone is not enough.\n"
+                            f"   Open TCP {grpc_port} on the server firewall and ensure Docker maps "
+                            f"\"{grpc_port}:{grpc_port}\" for the unified server.\n"
+                        )
+                    self.connection_status.setText("● Connected" if grpc_ok else "● Partial")
+                    self.connection_status.setStyleSheet(
+                        "font-size: 12px; color: #28a745;"
+                        if grpc_ok
+                        else "font-size: 12px; color: #e67e22;"
                     )
-                    self.statusBar().showMessage("Connection successful")
+                    if grpc_ok:
+                        QMessageBox.information(
+                            self,
+                            "Success",
+                            f"Reachable MQTT at {server_ip}:{mqtt_p}.\n"
+                            f"Using AMQP port {amqp_p}.\n"
+                            f"gRPC port {grpc_port} is reachable.\n({desc})",
+                        )
+                    else:
+                        QMessageBox.warning(
+                            self,
+                            "MQTT OK — gRPC blocked",
+                            f"MQTT broker is reachable at {server_ip}:{mqtt_p}, but TCP port {grpc_port} (gRPC) is not.\n\n"
+                            f"The unified emotion client loads the initial global model over gRPC, not over MQTT.\n"
+                            f"Allow {grpc_port}/tcp on the server firewall and confirm the unified compose publishes "
+                            f"{grpc_port}:{grpc_port}.",
+                        )
+                    self.statusBar().showMessage(
+                        "Connection successful" if grpc_ok else "MQTT OK; fix gRPC port for initial model"
+                    )
                     return
 
             self.log_text.append(
@@ -1050,7 +1091,75 @@ class DistributedClientGUI(QMainWindow):
             self.log_text.append(f"❌ Connection test error: {str(e)}\n")
             QMessageBox.critical(self, "Error", f"Connection test failed: {str(e)}")
             self.statusBar().showMessage("Connection test error")
-    
+
+    def _resolve_docker_container_name_conflict(self, container_name):
+        """Free the Docker name for `docker run --name` by removing a leftover container.
+
+        Docker errors with "already in use" if a previous run left a container with the
+        same name (e.g. GUI closed without Stop, or crash). Exited containers are
+        removed automatically; a running container prompts before `docker rm -f`.
+        """
+        try:
+            r = subprocess.run(
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    "{{.State.Status}}",
+                    container_name,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except Exception as e:
+            self.log_text.append(f"⚠️ Could not check existing container: {e}\n")
+            QMessageBox.warning(
+                self,
+                "Docker check failed",
+                f"Could not check whether container '{container_name}' exists:\n{e}",
+            )
+            return False
+
+        if r.returncode != 0:
+            return True
+
+        status = (r.stdout or "").strip().lower()
+        if status == "running":
+            reply = QMessageBox.question(
+                self,
+                "Container already running",
+                f"A container named '{container_name}' is already running.\n\n"
+                "Stop and remove it so a new client can start?\n\n"
+                "If this session already started that client, use Stop Client first.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.No:
+                return False
+        else:
+            self.log_text.append(
+                f"Removing existing container '{container_name}' (state: {status}).\n"
+            )
+
+        rm = subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if rm.returncode != 0:
+            err = (rm.stderr or rm.stdout or "").strip()
+            self.log_text.append(f"❌ Could not remove container: {err}\n")
+            QMessageBox.critical(
+                self,
+                "Docker error",
+                f"Could not remove container '{container_name}':\n{err}",
+            )
+            return False
+        self.log_text.append(f"✅ Cleared old container '{container_name}'.\n")
+        return True
+
     def start_client(self):
         """Start the distributed client container"""
         server_ip = self.server_ip.text().strip()
@@ -1299,6 +1408,9 @@ class DistributedClientGUI(QMainWindow):
         # Add image
         cmd.append(image_name)
         
+        if not self._resolve_docker_container_name_conflict(container_name):
+            return
+
         self.log_text.append(f"\n🚀 Starting client container...\n")
         self.log_text.append(f"Command: {' '.join(cmd)}\n\n")
         

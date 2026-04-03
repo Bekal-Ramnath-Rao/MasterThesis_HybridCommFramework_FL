@@ -1520,18 +1520,19 @@ class UnifiedFLClient_Emotion:
                 self.grpc_stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
                 
                 print(f"[gRPC] Listener started for client {self.client_id}")
-                
+                _unavail_log_t0 = [0.0]  # throttle "available=False" logs
+
                 # Polling loop
                 while True:
+                    # Control plane: keep separate from GetGlobalModel so a CheckTrainingStatus failure
+                    # still allows pulling the initial model in the same second.
                     try:
-                        # Poll control-plane status first (gRPC-only signaling in unified RL mode)
                         status_request = federated_learning_pb2.StatusRequest(client_id=self.client_id)
                         status = self.grpc_stub.CheckTrainingStatus(status_request)
 
                         if getattr(status, 'has_protocol_query', False):
                             self._handle_grpc_protocol_query(status.protocol_query)
-                        
-                        # Only act on signals if we haven't already acted on them for this round
+
                         if status.should_train and self.is_active and status.current_round != self.last_grpc_train_signal_round:
                             self.last_grpc_train_signal_round = status.current_round
                             self.handle_start_training(
@@ -1541,12 +1542,29 @@ class UnifiedFLClient_Emotion:
                         if status.should_evaluate and self.is_active and status.current_round != self.last_grpc_eval_signal_round:
                             self.last_grpc_eval_signal_round = status.current_round
                             self.handle_start_evaluation(json.dumps({'round': status.current_round}).encode())
+                    except grpc.RpcError as e:
+                        print(
+                            f"[gRPC] Client {self.client_id} CheckTrainingStatus RpcError (will retry): "
+                            f"{e.code()} - {e.details()}"
+                        )
+                    except Exception as e:
+                        print(f"[gRPC] Client {self.client_id} CheckTrainingStatus error: {e}")
 
-                        # Poll for global model (chunked when > 4 MB)
+                    try:
+                        # Data plane: global model (chunked when > 4 MB)
                         req = federated_learning_pb2.ModelRequest(client_id=self.client_id, round=0, chunk_index=0)
                         first = self.grpc_stub.GetGlobalModel(req)
                         if not first.available or not first.weights:
                             response = first
+                            if self.model is None and (not first.available or not first.weights):
+                                now = time.time()
+                                if now - _unavail_log_t0[0] >= 12.0:
+                                    _unavail_log_t0[0] = now
+                                    wlen = len(first.weights) if first.weights else 0
+                                    print(
+                                        f"[gRPC] Client {self.client_id} still waiting for global model: "
+                                        f"available={first.available}, weights_bytes={wlen}, round={first.round}"
+                                    )
                         else:
                             total_chunks = getattr(first, 'total_chunks', 1) or 1
                             if total_chunks <= 1:
@@ -1568,10 +1586,6 @@ class UnifiedFLClient_Emotion:
                                     total_chunks=1,
                                     server_sent_unix=float(getattr(first, 'server_sent_unix', 0.0) or 0.0),
                                 )
-                        # Accept model if:
-                        # 1. We don't have a model yet (first round) and server has one, OR
-                        # 2. Newer round than last received, OR
-                        # 3. Same round but we're waiting for aggregated model (after sending update)
                         accept = response.available and (
                             (self.model is None) or
                             (response.round > self.last_global_round) or
@@ -1579,14 +1593,15 @@ class UnifiedFLClient_Emotion:
                         )
                         if accept:
                             self.on_grpc_global_model(response)
-                            
+
                     except grpc.RpcError as e:
-                        # Log so we can see message size / deadline / connection issues
                         if self.model is None:
                             print(f"[gRPC] Client {self.client_id} GetGlobalModel RpcError (will retry): {e.code()} - {e.details()}")
                     except Exception as e:
-                        print(f"[gRPC] Listener poll error: {e}")
-                    
+                        print(f"[gRPC] Client {self.client_id} GetGlobalModel / apply error: {e}")
+                        import traceback
+                        traceback.print_exc()
+
                     time.sleep(1)  # Poll every second
                     
             except Exception as e:
