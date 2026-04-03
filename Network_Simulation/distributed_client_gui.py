@@ -10,6 +10,7 @@ import json
 import subprocess
 import threading
 import glob
+import random
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
@@ -40,6 +41,9 @@ CONGESTION_PRESETS = {
     "moderate": {"latency": 25, "jitter": 10, "packet_loss": 0.5, "bandwidth_factor": 0.70},
     "heavy": {"latency": 50, "jitter": 20, "packet_loss": 1.0, "bandwidth_factor": 0.50},
 }
+
+# Matches run_network_experiments.py / experiment_gui "Dynamic" scenario
+DYNAMIC_BASE_SCENARIOS = ["excellent", "moderate", "poor", "congested_light"]
 
 
 class ClientMonitor(QThread):
@@ -86,6 +90,9 @@ class DistributedClientGUI(QMainWindow):
         # Set by "Test Connection" (or defaults): must match server compose (31883/35672 vs 1883/5672)
         self.remote_mqtt_port = 31883
         self.remote_amqp_port = 35672
+        self._dynamic_network_timer = QTimer(self)
+        self._dynamic_network_timer.timeout.connect(self._on_dynamic_network_tick)
+        self._last_dynamic_base = None
         self.init_ui()
         
     def init_ui(self):
@@ -336,23 +343,43 @@ class DistributedClientGUI(QMainWindow):
             "Disable this to train or run RL without reward influence from the communication model."
         )
         layout.addWidget(self.communication_model_reward_enabled, 5, 0, 1, 4)
+
+        self.mount_shared_data = QCheckBox(
+            "Mount project shared_data for RL Q-tables (same as experiment Docker compose)"
+        )
+        self.mount_shared_data.setChecked(True)
+        self.mount_shared_data.setStyleSheet("padding: 5px; font-size: 12px;")
+        self.mount_shared_data.setToolTip(
+            "Binds <project>/shared_data → /shared_data so uplink/downlink Q-table .pkl files load and save "
+            "like local clients. On another PC: sync or copy this folder from the experiment machine to share tables."
+        )
+        layout.addWidget(self.mount_shared_data, 6, 0, 1, 4)
+
+        self.reset_epsilon_on_start = QCheckBox("Reset epsilon to 1.0 (fresh RL exploration)")
+        self.reset_epsilon_on_start.setChecked(True)
+        self.reset_epsilon_on_start.setStyleSheet("padding: 5px; font-size: 12px;")
+        self.reset_epsilon_on_start.setToolTip(
+            "Matches the main experiment GUI (Reset Epsilon). Uncheck to resume epsilon/Q progress from saved tables "
+            "(equivalent to --no-reset-epsilon on the orchestrator)."
+        )
+        layout.addWidget(self.reset_epsilon_on_start, 7, 0, 1, 4)
         
         # Termination mode + round cap (must match experiment GUI for fixed-rounds runs)
-        layout.addWidget(QLabel("Termination mode:"), 6, 0)
+        layout.addWidget(QLabel("Termination mode:"), 8, 0)
         self.termination_mode_combo = QComboBox()
         self.termination_mode_combo.addItem("End on client convergence (may stop early)", "client_convergence")
         self.termination_mode_combo.addItem("End on fixed rounds (run selected rounds)", "fixed_rounds")
         self.termination_mode_combo.setCurrentIndex(0)  # Preserve existing behavior
         self.termination_mode_combo.setStyleSheet("padding: 5px; font-size: 12px;")
-        layout.addWidget(self.termination_mode_combo, 6, 1, 1, 3)
+        layout.addWidget(self.termination_mode_combo, 8, 1, 1, 3)
         
-        layout.addWidget(QLabel("NUM_ROUNDS:"), 7, 0)
+        layout.addWidget(QLabel("NUM_ROUNDS:"), 9, 0)
         self.rounds_spinbox = QSpinBox()
         self.rounds_spinbox.setRange(1, 1000)
         self.rounds_spinbox.setValue(10)
         self.rounds_spinbox.setStyleSheet("padding: 5px; font-size: 12px;")
         self.rounds_spinbox.setToolTip("Round cap to keep in sync with the main experiment GUI.")
-        layout.addWidget(self.rounds_spinbox, 7, 1)
+        layout.addWidget(self.rounds_spinbox, 9, 1)
         
         # Update state when protocol mode changes
         self.protocol_mode.currentIndexChanged.connect(self.update_ql_convergence_visibility)
@@ -361,6 +388,7 @@ class DistributedClientGUI(QMainWindow):
         self.rl_mode_training.toggled.connect(self.update_ql_convergence_visibility)
         self.rl_mode_inference.toggled.connect(self.update_ql_convergence_visibility)
         self.update_ql_convergence_visibility()
+        self.update_rl_shared_data_visibility()
         self.update_dds_impl_visibility()
         self.update_data_shard_visibility_for_use_case()
         
@@ -392,11 +420,39 @@ class DistributedClientGUI(QMainWindow):
         self.network_scenario.addItem("Light Congestion", "congested_light")
         self.network_scenario.addItem("Moderate Congestion", "congested_moderate")
         self.network_scenario.addItem("Heavy Congestion", "congested_heavy")
+        self.network_scenario.addItem(
+            "Dynamic (Random Excellent/Moderate/Poor/Light Congestion)", "dynamic"
+        )
         self.network_scenario.setStyleSheet("padding: 8px; font-size: 12px;")
         self.network_scenario.currentIndexChanged.connect(self.apply_selected_network_preset)
         preset_row.addWidget(self.network_scenario)
         preset_row.addStretch()
         scenario_layout.addLayout(preset_row)
+
+        self.dynamic_settings_widget = QWidget()
+        ds_layout = QHBoxLayout(self.dynamic_settings_widget)
+        ds_layout.setContentsMargins(0, 4, 0, 0)
+        ds_layout.addWidget(QLabel("Dynamic: re-randomize every"))
+        self.dynamic_interval_sec = QSpinBox()
+        self.dynamic_interval_sec.setRange(5, 600)
+        self.dynamic_interval_sec.setValue(45)
+        self.dynamic_interval_sec.setSuffix(" s")
+        self.dynamic_interval_sec.setToolTip(
+            "While the client runs, tc/netem is redrawn from "
+            "Excellent / Moderate / Poor / Light Congestion on this interval (aligned with main experiment GUI)."
+        )
+        self.dynamic_interval_sec.valueChanged.connect(self._on_dynamic_interval_changed)
+        ds_layout.addWidget(self.dynamic_interval_sec)
+        self.btn_dynamic_randomize = QPushButton("Randomize scenario now")
+        self.btn_dynamic_randomize.setToolTip(
+            "Immediately pick a new random base scenario and apply tc (same pool as Dynamic preset)."
+        )
+        self.btn_dynamic_randomize.clicked.connect(self.on_randomize_dynamic_now)
+        self.btn_dynamic_randomize.setEnabled(False)
+        ds_layout.addWidget(self.btn_dynamic_randomize)
+        ds_layout.addStretch()
+        self.dynamic_settings_widget.setVisible(False)
+        scenario_layout.addWidget(self.dynamic_settings_widget)
 
         self.network_preview = QLabel("No network simulation")
         self.network_preview.setStyleSheet("""
@@ -718,6 +774,30 @@ class DistributedClientGUI(QMainWindow):
         self.ql_convergence_enabled.setChecked(training_selected)
         self.ql_convergence_enabled.setEnabled(False)
         self.communication_model_reward_enabled.setEnabled(is_rl_unified)
+        self.update_rl_shared_data_visibility()
+
+    def update_rl_shared_data_visibility(self):
+        """Show shared_data mount + epsilon reset only for RL-unified (matches experiment GUI scope)."""
+        if not hasattr(self, "mount_shared_data"):
+            return
+        is_rl_unified = self.protocol_mode.currentData() == "rl_unified"
+        training_selected = is_rl_unified and self.rl_mode_training.isChecked()
+        self.mount_shared_data.setVisible(is_rl_unified)
+        self.reset_epsilon_on_start.setVisible(training_selected)
+
+    def _sync_reset_epsilon_flag_for_distributed(self, shared_data_path):
+        """If resuming epsilon, remove reset_epsilon_flag.txt so a copied shared_data tree does not force reset."""
+        if not self.is_rl_training_mode() or self.reset_epsilon_on_start.isChecked():
+            return
+        flag_path = os.path.join(shared_data_path, "reset_epsilon_flag.txt")
+        try:
+            if os.path.isfile(flag_path):
+                os.remove(flag_path)
+                self.log_text.append(
+                    "Removed reset_epsilon_flag.txt (resume epsilon; matches orchestrator --no-reset-epsilon).\n"
+                )
+        except OSError as e:
+            self.log_text.append(f"⚠️ Could not remove reset_epsilon_flag.txt: {e}\n")
     
     def update_dds_impl_visibility(self):
         """Enable DDS implementation selector only when DDS protocol is selected"""
@@ -827,7 +907,13 @@ class DistributedClientGUI(QMainWindow):
     def update_network_preview(self):
         """Update network scenario preview"""
         profile = self.get_effective_network_profile()
-        scenario_name = self.network_scenario.currentText()
+        data = self.network_scenario.currentData()
+        if data == "dynamic" and self._last_dynamic_base:
+            scenario_name = (
+                f"Dynamic — current draw: {self._last_dynamic_base}"
+            )
+        else:
+            scenario_name = self.network_scenario.currentText()
         preview = (
             f"📊 {scenario_name}\n"
             f"Latency: {profile['latency']} ms | "
@@ -839,9 +925,35 @@ class DistributedClientGUI(QMainWindow):
             preview += f"\nCongestion: {self.congestion_level.currentText()}"
         self.network_preview.setText(preview)
 
+    def apply_random_dynamic_base(self):
+        """Pick a random base from DYNAMIC_BASE_SCENARIOS and sync sliders (matches main experiment dynamic)."""
+        base = random.choice(DYNAMIC_BASE_SCENARIOS)
+        self._last_dynamic_base = base
+        preset = NETWORK_SCENARIO_PRESETS[base]
+        for slider in (self.latency_slider, self.bandwidth_slider, self.jitter_slider, self.packet_loss_slider):
+            slider.blockSignals(True)
+        self.latency_slider.setValue(int(preset["latency"]))
+        self.bandwidth_slider.setValue(int(preset["bandwidth"]))
+        self.jitter_slider.setValue(int(preset["jitter"]))
+        self.packet_loss_slider.setValue(int(round(preset["packet_loss"] * 10)))
+        for slider in (self.latency_slider, self.bandwidth_slider, self.jitter_slider, self.packet_loss_slider):
+            slider.blockSignals(False)
+        self.latency_label.setText(f"{self.latency_slider.value()} ms")
+        self.bandwidth_label.setText(f"{self.bandwidth_slider.value()} Mbps")
+        self.jitter_label.setText(f"{self.jitter_slider.value()} ms")
+        self.packet_loss_label.setText(f"{self.packet_loss_slider.value() / 10.0:.1f} %")
+        self.update_network_preview()
+
     def apply_selected_network_preset(self):
         """Apply the selected preset values to the manual network controls"""
-        preset = NETWORK_SCENARIO_PRESETS.get(self.network_scenario.currentData(), NETWORK_SCENARIO_PRESETS["none"])
+        data = self.network_scenario.currentData()
+        if data == "dynamic":
+            self.apply_random_dynamic_base()
+            self.dynamic_settings_widget.setVisible(True)
+            return
+        self._last_dynamic_base = None
+        self.dynamic_settings_widget.setVisible(False)
+        preset = NETWORK_SCENARIO_PRESETS.get(data, NETWORK_SCENARIO_PRESETS["none"])
         for slider in (self.latency_slider, self.bandwidth_slider, self.jitter_slider, self.packet_loss_slider):
             slider.blockSignals(True)
         self.latency_slider.setValue(int(preset["latency"]))
@@ -958,9 +1070,21 @@ class DistributedClientGUI(QMainWindow):
         is_unified = (protocol == "rl_unified")
         
         # Confirm
-        reply = QMessageBox.question(
-            self,
-            "Start Client",
+        net_line = f"Network: {network_scenario}"
+        if network_scenario == "dynamic":
+            net_line += f" (re-randomize every {self.dynamic_interval_sec.value()}s)"
+        net_line += "\n"
+        rl_shared_lines = ""
+        if is_unified:
+            rl_shared_lines = (
+                f"RL shared_data mount: {'Yes' if self.mount_shared_data.isChecked() else 'No'} "
+                f"(Q-tables like experiment Docker)\n"
+            )
+            if self.is_rl_training_mode():
+                rl_shared_lines += (
+                    f"Reset epsilon: {'Yes' if self.reset_epsilon_on_start.isChecked() else 'No (resume)'}\n"
+                )
+        confirm_msg = (
             f"Ready to start client with:\n\n"
             f"Client ID: {client_id}\n"
             f"Total Clients: {total_clients}\n"
@@ -970,16 +1094,22 @@ class DistributedClientGUI(QMainWindow):
             f"Protocol: {protocol}\n"
             f"RL Mode: {'Training' if self.is_rl_training_mode() else 'Inference'}\n"
             f"DDS Implementation: {self.dds_impl.currentText() if protocol == 'dds' else 'N/A'}\n"
-            f"Network: {network_scenario}\n"
+            f"{net_line}"
             f"Rounds: {self.rounds_spinbox.value()}\n"
             f"Termination: {self.termination_mode_combo.currentText()}\n"
             f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
             f"Q-Learning Convergence: {'Enabled' if self.is_rl_training_mode() else 'Disabled'}\n"
             f"Communication Model Reward: {'Enabled' if is_unified and self.communication_model_reward_enabled.isChecked() else 'Disabled'}\n"
+            f"{rl_shared_lines}"
             f"Quantization: {'Enabled' if self.quantization_enabled.isChecked() else 'Disabled'}\n"
             f"Compression: {'Enabled' if self.compression_enabled.isChecked() else 'Disabled'}\n"
             f"Pruning: {'Enabled' if self.pruning_enabled.isChecked() else 'Disabled'}\n\n"
-            f"Continue?",
+            f"Continue?"
+        )
+        reply = QMessageBox.question(
+            self,
+            "Start Client",
+            confirm_msg,
             QMessageBox.Yes | QMessageBox.No
         )
         
@@ -1039,6 +1169,17 @@ class DistributedClientGUI(QMainWindow):
         except Exception as e:
             self.log_text.append(f"⚠️ Could not check image: {str(e)}\n")
         
+        shared_data_path = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "shared_data")
+        )
+        if is_unified and self.mount_shared_data.isChecked():
+            try:
+                os.makedirs(shared_data_path, exist_ok=True)
+            except OSError as e:
+                QMessageBox.critical(self, "shared_data", f"Cannot create shared_data directory:\n{e}")
+                return
+            self._sync_reset_epsilon_flag_for_distributed(shared_data_path)
+        
         # Base command
         cmd = [
             "docker", "run", "-d",
@@ -1048,6 +1189,8 @@ class DistributedClientGUI(QMainWindow):
             "-e", f"CLIENT_ID={client_id}",
             "-e", f"NUM_CLIENTS={total_clients}",
         ]
+        if is_unified and self.mount_shared_data.isChecked():
+            cmd.extend(["-v", f"{shared_data_path}:/shared_data"])
         ds_val = self.data_shard_combo.currentData()
         if ds_val is not None and str(use_case).lower() in ("emotion", "mentalstate"):
             cmd.extend(["-e", f"DATASET_CLIENT_ID={int(ds_val)}"])
@@ -1099,11 +1242,13 @@ class DistributedClientGUI(QMainWindow):
                     "-e", "Q_CONVERGENCE_PATIENCE=5",
                     "-e", "RL_BOUNDARY_PIPELINE=true",
                     "-e", "RL_PHASE0_ROUNDS=20",
+                    "-e", f"RESET_EPSILON={'true' if self.reset_epsilon_on_start.isChecked() else 'false'}",
                 ])
             else:
                 cmd.extend([
                     "-e", "USE_QL_CONVERGENCE=false",
                     "-e", "USE_RL_EXPLORATION=false",
+                    "-e", "RESET_EPSILON=false",
                 ])
         else:
             cmd.extend([
@@ -1158,10 +1303,14 @@ class DistributedClientGUI(QMainWindow):
                 # Apply network conditions if specified
                 if network_scenario != "none":
                     self.apply_network_conditions(container_name, network_scenario)
+                if network_scenario == "dynamic":
+                    self._dynamic_network_timer.start(self.dynamic_interval_sec.value() * 1000)
                 
                 # Update UI
+                self.network_scenario.setEnabled(False)
                 self.start_btn.setEnabled(False)
                 self.stop_btn.setEnabled(True)
+                self._refresh_dynamic_randomize_btn()
                 self.status_label.setText(f"Status: Running (Client {client_id})")
                 self.status_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #28a745;")
                 self.statusBar().showMessage(f"Client {client_id} running")
@@ -1188,36 +1337,40 @@ class DistributedClientGUI(QMainWindow):
             f"Resolved profile -> latency={cond['latency']}ms, bandwidth={cond['bandwidth']}mbit, "
             f"jitter={cond['jitter']}ms, loss={cond['packet_loss']:.1f}%\n"
         )
-        
+        self._apply_tc_profile(container_name, cond)
+
+    def _apply_tc_profile(self, container_name, cond):
+        """Apply tc/netem profile inside the client container (eth0)."""
         try:
-            # Build tc commands to apply inside container
             setup_cmds = [
                 "tc qdisc del dev eth0 root || true",
                 "tc qdisc add dev eth0 root handle 1: htb default 12",
                 f"tc class add dev eth0 parent 1: classid 1:12 htb rate {cond['bandwidth']}mbit",
             ]
-            
+
             netem_params = [f"delay {cond['latency']}ms"]
             if cond["jitter"] > 0:
                 netem_params.append(f"{cond['jitter']}ms")
             if cond["packet_loss"] > 0:
                 netem_params.append(f"loss {cond['packet_loss']:.1f}%")
-            
-            setup_cmds.append(f"tc qdisc add dev eth0 parent 1:12 handle 10: netem {' '.join(netem_params)}")
-            
+
+            setup_cmds.append(
+                f"tc qdisc add dev eth0 parent 1:12 handle 10: netem {' '.join(netem_params)}"
+            )
+
             for tc_cmd in setup_cmds:
                 result = subprocess.run(
                     ["docker", "exec", container_name, "bash", "-c", tc_cmd],
                     capture_output=True,
                     text=True,
-                    timeout=10
+                    timeout=10,
                 )
-                
+
                 if result.returncode != 0:
                     self.log_text.append(f"⚠️ Warning applying network condition: {result.stderr}\n")
-            
-            self.log_text.append(f"✅ Network conditions applied successfully\n")
-            
+
+            self.log_text.append("✅ Network conditions applied successfully\n")
+
         except Exception as e:
             self.log_text.append(f"⚠️ Error applying network conditions: {str(e)}\n")
     
@@ -1227,6 +1380,41 @@ class DistributedClientGUI(QMainWindow):
         self.client_monitor.log_update.connect(self.update_logs)
         self.client_monitor.start()
     
+    def _on_dynamic_interval_changed(self, _value):
+        if self._dynamic_network_timer.isActive():
+            self._dynamic_network_timer.start(self.dynamic_interval_sec.value() * 1000)
+
+    def _on_dynamic_network_tick(self):
+        if not self.client_container:
+            self._dynamic_network_timer.stop()
+            return
+        if self.network_scenario.currentData() != "dynamic":
+            self._dynamic_network_timer.stop()
+            return
+        self.apply_random_dynamic_base()
+        cond = self.get_effective_network_profile()
+        self.log_text.append(
+            f"\n🌐 [DYNAMIC] Switched to {self._last_dynamic_base}: "
+            f"lat={cond['latency']}ms, bw={cond['bandwidth']}Mbps, "
+            f"jitter={cond['jitter']}ms, loss={cond['packet_loss']:.1f}%\n"
+        )
+        self._apply_tc_profile(self.client_container, cond)
+
+    def on_randomize_dynamic_now(self):
+        if not self.client_container:
+            return
+        if self.network_scenario.currentData() != "dynamic":
+            return
+        self.apply_random_dynamic_base()
+        cond = self.get_effective_network_profile()
+        self.log_text.append(f"\n🌐 [DYNAMIC] Manual randomize → {self._last_dynamic_base}\n")
+        self._apply_tc_profile(self.client_container, cond)
+
+    def _refresh_dynamic_randomize_btn(self):
+        running = self.client_container is not None
+        dyn = self.network_scenario.currentData() == "dynamic"
+        self.btn_dynamic_randomize.setEnabled(running and dyn)
+
     def stop_client(self):
         """Stop the client container"""
         if not self.client_container:
@@ -1243,6 +1431,7 @@ class DistributedClientGUI(QMainWindow):
             return
         
         try:
+            self._dynamic_network_timer.stop()
             # Stop monitoring
             if self.client_monitor:
                 self.client_monitor.stop()
@@ -1262,6 +1451,8 @@ class DistributedClientGUI(QMainWindow):
             self.status_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #6c757d;")
             self.statusBar().showMessage("Client stopped")
             self.client_container = None
+            self.network_scenario.setEnabled(True)
+            self._refresh_dynamic_randomize_btn()
             
         except Exception as e:
             self.log_text.append(f"❌ Error stopping client: {str(e)}\n")
