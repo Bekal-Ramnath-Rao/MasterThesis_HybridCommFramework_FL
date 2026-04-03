@@ -373,6 +373,18 @@ class ExperimentRunner:
             return local
         return max(local, int(self.min_clients))
 
+    def _compose_project_name(self) -> str:
+        """
+        Stable Docker Compose project name. Runtime-patched compose files live under /tmp; without an
+        explicit -p, Compose would use the /tmp directory name (e.g. fl_runtime_compose) and try to
+        recreate containers that already exist with fixed container_name from the Docker/ stack.
+        """
+        return self.docker_dir.name.lower()
+
+    def _docker_compose_base(self, compose_file: str) -> List[str]:
+        """``docker compose -p <project> -f <file>`` prefix for all compose invocations."""
+        return ["docker", "compose", "-p", self._compose_project_name(), "-f", compose_file]
+
     def _compose_requires_runtime_patch(self) -> bool:
         """Whether compose files should be patched at runtime to expose pruning env vars."""
         return bool(getattr(self, "use_pruning", False))
@@ -688,7 +700,7 @@ class ExperimentRunner:
                     f"fl-server-unified-{uc}",
                     f"fl-client-unified-{uc}-1",
                 ]
-                compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"] + services_single_client
+                compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_single_client
             else:
                 # Unified compose defines two client services; a bare `up -d` starts both and ignores
                 # --local-clients. Start only brokers + server + the first N client services (N=1 or 2).
@@ -706,7 +718,7 @@ class ExperimentRunner:
                 ]
                 for i in range(1, num_local + 1):
                     services_multi.append(f"fl-client-unified-{uc}-{i}")
-                compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"] + services_multi
+                compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_multi
             
             if self.use_ql_convergence:
                 _n_loc, _n_tot = 1, 1
@@ -754,7 +766,7 @@ class ExperimentRunner:
             sim = NetworkSimulator(verbose=True)
             if not sim.ensure_macvlan_network():
                 raise RuntimeError("Failed to create macvlan network for host_macvlan mode")
-        compose_cmd_base = ["docker", "compose", "-f", compose_file]
+        compose_cmd_base = self._docker_compose_base(compose_file)
         
         services = self.service_patterns[self.use_case][protocol]
         
@@ -862,7 +874,7 @@ class ExperimentRunner:
         
         print(f"\nStopping containers for {protocol.upper()} protocol...")
         
-        cmd = ["docker", "compose", "-f", compose_file, "down"]
+        cmd = self._docker_compose_base(compose_file) + ["down"]
         
         self.run_command(cmd, check=False)
         
