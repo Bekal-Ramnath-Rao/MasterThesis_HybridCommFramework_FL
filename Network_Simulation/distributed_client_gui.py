@@ -94,7 +94,31 @@ class DistributedClientGUI(QMainWindow):
         self._dynamic_network_timer.timeout.connect(self._on_dynamic_network_tick)
         self._last_dynamic_base = None
         self.init_ui()
-        
+
+    def _docker_client_entrypoint(self, use_case, protocol, is_unified):
+        """
+        argv for `docker run ... IMAGE <command>`. The Client Dockerfile CMD defaults to
+        FL_Client_MQTT.py; compose files override per protocol. Distributed `docker run`
+        must pass the same override or every protocol incorrectly runs MQTT (→ MQTT_PORT e.g. 31883).
+        """
+        uc = str(use_case).lower().replace(" ", "")
+        folder = {
+            "emotion": "Emotion_Recognition",
+            "mentalstate": "MentalState_Recognition",
+            "temperature": "Temperature_Regulation",
+        }.get(uc, "Emotion_Recognition")
+        if is_unified:
+            return ["python3", f"Client/{folder}/FL_Client_Unified.py"]
+        script = {
+            "mqtt": "FL_Client_MQTT.py",
+            "amqp": "FL_Client_AMQP.py",
+            "grpc": "FL_Client_gRPC.py",
+            "quic": "FL_Client_QUIC.py",
+            "http3": "FL_Client_HTTP3.py",
+            "dds": "FL_Client_DDS.py",
+        }.get(protocol, "FL_Client_MQTT.py")
+        return ["python", "-u", f"Client/{folder}/{script}"]
+
     def init_ui(self):
         """Initialize the user interface"""
         self.setWindowTitle("🌐 Distributed FL Client Dashboard")
@@ -1405,9 +1429,10 @@ class DistributedClientGUI(QMainWindow):
         if self.gpu_enabled.isChecked():
             cmd.extend(["--gpus", "all"])
         
-        # Add image
+        # Add image and entrypoint (must match compose `command`; Dockerfile default is MQTT-only)
         cmd.append(image_name)
-        
+        cmd.extend(self._docker_client_entrypoint(use_case, protocol, is_unified))
+
         if not self._resolve_docker_container_name_conflict(container_name):
             return
 
