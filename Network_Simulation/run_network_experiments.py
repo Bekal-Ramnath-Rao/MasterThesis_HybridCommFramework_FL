@@ -74,6 +74,7 @@ class ExperimentRunner:
         use_ql_convergence: bool = False,
         rl_inference_only: bool = False,
         local_clients: int = 2,
+        min_clients: Optional[int] = None,
         use_communication_model_reward: bool = True,
         reset_epsilon: bool = True,
         dataset_client_map: Optional[Dict[int, int]] = None,
@@ -94,12 +95,15 @@ class ExperimentRunner:
         self.reset_epsilon = reset_epsilon
         # Number of client containers started from this runner on the central machine
         self.local_clients = max(1, int(local_clients or 1))
+        # Total participants the server should wait for (local + remote); None => same as local_clients
+        self.min_clients = int(min_clients) if min_clients is not None else None
         # quantization_params expected to be a dict of simple string values
         self.quantization_params = quantization_params or {}
         # pruning_params expected to be a dict of simple string values
         self.pruning_params = pruning_params or {}
         self._runtime_compose_files: Dict[str, str] = {}
         self._runtime_compose_files_stop: Dict[str, str] = {}
+        self._runtime_compose_files_num_clients: Dict[str, str] = {}
         self.dataset_client_map: Dict[int, int] = dict(dataset_client_map or {})
         self._runtime_compose_files_dataset: Dict[tuple, str] = {}
         
@@ -362,6 +366,13 @@ class ExperimentRunner:
             and s in running
         ]
 
+    def _total_expected_federation_clients(self) -> int:
+        """Clients the server waits for (local + remote). At least the number started on this host."""
+        local = self.local_clients
+        if self.min_clients is None:
+            return local
+        return max(local, int(self.min_clients))
+
     def _compose_requires_runtime_patch(self) -> bool:
         """Whether compose files should be patched at runtime to expose pruning env vars."""
         return bool(getattr(self, "use_pruning", False))
@@ -450,6 +461,7 @@ class ExperimentRunner:
         if self._compose_requires_runtime_patch():
             patched_path = self._patch_compose_pruning_env(patched_path)
         patched_path = self._patch_compose_stop_env(patched_path)
+        patched_path = self._patch_compose_num_clients_substitution(patched_path)
         return self._patch_compose_dataset_env(patched_path)
 
     def _patch_compose_dataset_env(self, compose_file: str) -> str:
@@ -572,7 +584,51 @@ class ExperimentRunner:
         self._runtime_compose_files_stop[compose_file] = str(patched_path)
         print(f"[INFO] Using runtime patched compose file (STOP env): {patched_path}")
         return str(patched_path)
-    
+
+    def _patch_compose_num_clients_substitution(self, compose_file: str) -> str:
+        """Replace hardcoded NUM_CLIENTS=N with compose substitution so host env can set federation size."""
+        if compose_file in self._runtime_compose_files_num_clients:
+            return self._runtime_compose_files_num_clients[compose_file]
+
+        src_path = Path(compose_file)
+        if not src_path.exists():
+            return compose_file
+
+        try:
+            original = src_path.read_text(encoding="utf-8")
+        except Exception:
+            return compose_file
+
+        if "NUM_CLIENTS=${NUM_CLIENTS" in original:
+            self._runtime_compose_files_num_clients[compose_file] = compose_file
+            return compose_file
+
+        lines = original.splitlines()
+        changed = False
+        new_lines: List[str] = []
+        num_re = re.compile(r"^(\s*)-\s*NUM_CLIENTS=\d+\s*$")
+        for line in lines:
+            m = num_re.match(line)
+            if m:
+                indent = m.group(1)
+                new_lines.append(f"{indent}- NUM_CLIENTS=${{NUM_CLIENTS:-2}}")
+                changed = True
+            else:
+                new_lines.append(line)
+
+        if not changed:
+            self._runtime_compose_files_num_clients[compose_file] = compose_file
+            return compose_file
+
+        patched = "\n".join(new_lines) + ("\n" if original.endswith("\n") else "")
+        tmp_dir = Path(tempfile.gettempdir()) / "fl_runtime_compose"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        patched_path = tmp_dir / f"{src_path.stem}.runtime-numclients{src_path.suffix}"
+        self._write_runtime_compose_patch(patched_path, patched)
+        self._runtime_compose_files_num_clients[compose_file] = str(patched_path)
+        print(f"[INFO] Using runtime patched compose file (NUM_CLIENTS env): {patched_path}")
+        return str(patched_path)
+
     def start_containers(self, protocol: str, scenario: str = "excellent", congestion_level: str = "none"):
         """Start Docker containers for a specific protocol with staged startup"""
         
@@ -639,8 +695,9 @@ class ExperimentRunner:
                 uc = self.use_case
                 max_unified_clients = 2
                 num_local = max(1, min(int(self.local_clients), max_unified_clients))
-                os.environ["MIN_CLIENTS"] = str(num_local)
-                os.environ["NUM_CLIENTS"] = str(num_local)
+                total_fed = self._total_expected_federation_clients()
+                os.environ["MIN_CLIENTS"] = str(total_fed)
+                os.environ["NUM_CLIENTS"] = str(total_fed)
                 os.environ["MAX_CLIENTS"] = "100"
                 services_multi = [
                     "mqtt-broker-unified",
@@ -651,7 +708,15 @@ class ExperimentRunner:
                     services_multi.append(f"fl-client-unified-{uc}-{i}")
                 compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"] + services_multi
             
-            print(f"Starting unified FL system for {self.use_case}...")
+            if self.use_ql_convergence:
+                _n_loc, _n_tot = 1, 1
+            else:
+                _n_loc = num_local
+                _n_tot = self._total_expected_federation_clients()
+            print(
+                f"Starting unified FL system for {self.use_case}... "
+                f"(local client containers: {_n_loc}; server expects total participants: {_n_tot})"
+            )
             result = self.run_command(compose_cmd, check=False)
             
             if result.returncode != 0:
@@ -673,7 +738,14 @@ class ExperimentRunner:
         
         # Regular protocol handling (existing code)
         compose_file = self._get_runtime_compose_file(self.compose_files[self.use_case])
-        
+        total_fed = self._total_expected_federation_clients()
+        os.environ["MIN_CLIENTS"] = str(total_fed)
+        os.environ["NUM_CLIENTS"] = str(total_fed)
+        print(
+            f"[INFO] Federation size for Docker compose (MIN_CLIENTS/NUM_CLIENTS): {total_fed} "
+            f"(local client containers this host: {self.local_clients})"
+        )
+
         # host_macvlan: ensure fl-macvlan network exists before up
         if self.network_mode == "host_macvlan":
             import sys
@@ -1942,6 +2014,16 @@ def main():
         help="Number of client containers to start from this runner on the central machine (default: 2).",
     )
     parser.add_argument(
+        "--min-clients",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Total participants the FL server waits for (local + remote). "
+            "Defaults to --local-clients when omitted. Set to match experiment GUI 'Min Clients (server)'."
+        ),
+    )
+    parser.add_argument(
         "--dds-impl",
         choices=["cyclonedds", "fastdds"],
         default="cyclonedds",
@@ -2018,6 +2100,7 @@ def main():
         use_ql_convergence=args.use_ql_convergence,
         rl_inference_only=getattr(args, "rl_inference_only", False),
         local_clients=args.local_clients,
+        min_clients=args.min_clients,
         use_communication_model_reward=not args.disable_communication_model_reward,
         reset_epsilon=not args.no_reset_epsilon,  # Default True (reset), --no-reset-epsilon makes it False
         dataset_client_map=dataset_client_map,

@@ -2692,6 +2692,8 @@ class FLExperimentGUI(QMainWindow):
             cmd_parts.extend(["--network-mode", mode])
             # Number of client containers started from this GUI on the central machine
             cmd_parts.extend(["--local-clients", str(self.gui_clients.value())])
+            # Total federation size (local + remote); server MIN_CLIENTS / NUM_CLIENTS in Docker runner
+            cmd_parts.extend(["--min-clients", str(self.min_clients.value())])
         
         # Baseline mode flag (Docker-only at the moment)
         if not self.exec_mode_native.isChecked():

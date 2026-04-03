@@ -1065,6 +1065,15 @@ class DistributedClientGUI(QMainWindow):
         if not server_ip:
             QMessageBox.warning(self, "Error", "Please enter server IP address!")
             return
+        if client_id > total_clients:
+            QMessageBox.warning(
+                self,
+                "Invalid client count",
+                f"Client ID ({client_id}) cannot be greater than Total Expected Clients ({total_clients}).\n"
+                "Raise Total Expected Clients to match the main experiment (local + remote), "
+                "and ensure it matches Min Clients (server) on the experiment machine.",
+            )
+            return
 
         # Determine if using unified or single protocol
         is_unified = (protocol == "rl_unified")
@@ -1188,6 +1197,7 @@ class DistributedClientGUI(QMainWindow):
             "--cap-add", "NET_ADMIN",  # For network simulation
             "-e", f"CLIENT_ID={client_id}",
             "-e", f"NUM_CLIENTS={total_clients}",
+            "-e", f"MIN_CLIENTS={total_clients}",
         ]
         if is_unified and self.mount_shared_data.isChecked():
             cmd.extend(["-v", f"{shared_data_path}:/shared_data"])
