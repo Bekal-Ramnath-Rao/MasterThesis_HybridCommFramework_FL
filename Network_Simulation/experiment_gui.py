@@ -854,16 +854,17 @@ class FLExperimentGUI(QMainWindow):
         self.min_clients.setToolTip("Minimum number of clients required by the FL server before training can start.")
         training_layout.addWidget(self.min_clients, 1, 3)
 
-        # Number of clients started from this GUI (Docker-based runs only; native uses Min Clients)
+        # Local client count: Docker (--local-clients) and native (--num-clients).
         training_layout.addWidget(QLabel("Clients from this GUI:"), 2, 0)
         self.gui_clients = QSpinBox()
         self.gui_clients.setRange(1, 2)
         self.gui_clients.setValue(2)
         self.gui_clients.setStyleSheet("padding: 5px;")
         self.gui_clients.setToolTip(
-            "Number of client containers to start on this machine when running Docker-based experiments.\n"
-            "The FL server will still wait for the configured minimum clients (e.g., 2). "
-            "You can start the remaining clients from other PCs using the Distributed Client GUI."
+            "How many client processes/containers to start on this machine.\n"
+            "Docker: passed as --local-clients (including RL-unified: only this many unified client services start).\n"
+            "Native mode: same value is used as --num-clients.\n"
+            "For Docker, Min Clients (server) should usually match the total clients you expect (local + remote)."
         )
         training_layout.addWidget(self.gui_clients, 2, 1)
 
@@ -2662,9 +2663,10 @@ class FLExperimentGUI(QMainWindow):
             if scenarios:
                 cmd_parts.extend(["--scenarios"] + scenarios)
             
-            # Rounds and client count (native: all clients run on this machine)
+            # Rounds and client count (native: all clients run on this machine).
+            # Use "Clients from this GUI" so it matches Docker --local-clients behavior (Min Clients is server wait for Docker).
             cmd_parts.extend(["--rounds", str(self.rounds_spinbox.value())])
-            cmd_parts.extend(["--num-clients", str(self.min_clients.value())])
+            cmd_parts.extend(["--num-clients", str(self.gui_clients.value())])
             # Pruning (native mode)
             if self.pruning_enabled.isChecked():
                 cmd_parts.append("--use-pruning")

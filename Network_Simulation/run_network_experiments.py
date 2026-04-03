@@ -634,7 +634,22 @@ class ExperimentRunner:
                 ]
                 compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"] + services_single_client
             else:
-                compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"]
+                # Unified compose defines two client services; a bare `up -d` starts both and ignores
+                # --local-clients. Start only brokers + server + the first N client services (N=1 or 2).
+                uc = self.use_case
+                max_unified_clients = 2
+                num_local = max(1, min(int(self.local_clients), max_unified_clients))
+                os.environ["MIN_CLIENTS"] = str(num_local)
+                os.environ["NUM_CLIENTS"] = str(num_local)
+                os.environ["MAX_CLIENTS"] = "100"
+                services_multi = [
+                    "mqtt-broker-unified",
+                    "amqp-broker-unified",
+                    f"fl-server-unified-{uc}",
+                ]
+                for i in range(1, num_local + 1):
+                    services_multi.append(f"fl-client-unified-{uc}-{i}")
+                compose_cmd = ["docker", "compose", "-f", compose_file, "up", "-d"] + services_multi
             
             print(f"Starting unified FL system for {self.use_case}...")
             result = self.run_command(compose_cmd, check=False)

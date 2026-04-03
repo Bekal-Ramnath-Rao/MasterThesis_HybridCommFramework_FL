@@ -83,6 +83,9 @@ class DistributedClientGUI(QMainWindow):
         super().__init__()
         self.client_monitor = None
         self.client_container = None
+        # Set by "Test Connection" (or defaults): must match server compose (31883/35672 vs 1883/5672)
+        self.remote_mqtt_port = 31883
+        self.remote_amqp_port = 35672
         self.init_ui()
         
     def init_ui(self):
@@ -218,7 +221,8 @@ class DistributedClientGUI(QMainWindow):
         
         # Port Configuration (Read-only info)
         info_label = QLabel(
-            "Remote ports: MQTT(31883) | AMQP(35672) | gRPC(50051) | QUIC(4433) | HTTP/3(4434) | DDS(Domain 0)"
+            "Broker ports: Docker-mapped MQTT 31883 / AMQP 35672, or host/macvlan MQTT 1883 / AMQP 5672. "
+            "Also: gRPC 50051 | QUIC 4433 | HTTP/3 4434 | DDS domain 0. Use Test Connection to detect."
         )
         info_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
         layout.addWidget(info_label, 1, 0, 1, 3)
@@ -869,7 +873,7 @@ class DistributedClientGUI(QMainWindow):
         return profile
     
     def test_connection(self):
-        """Test connection to server"""
+        """Test connection to server (try Docker-mapped ports first, then standard broker ports)."""
         server_ip = self.server_ip.text().strip()
         
         if not server_ip:
@@ -879,35 +883,57 @@ class DistributedClientGUI(QMainWindow):
         self.log_text.append(f"\n🔍 Testing connection to {server_ip}...\n")
         self.statusBar().showMessage("Testing connection...")
         
-        # Test MQTT port
+        # Order: gpu-isolated non-unified (31883/35672), then host-network / macvlan (1883/5672)
+        candidates = [
+            (31883, 35672, "Docker port maps (e.g. *-gpu-isolated.yml)"),
+            (1883, 5672, "Host or macvlan (brokers on standard ports)"),
+        ]
         try:
-            result = subprocess.run(
-                ["timeout", "3", "bash", "-c", f"nc -zv {server_ip} 31883"],
-                capture_output=True,
-                text=True,
-                timeout=5
+            for mqtt_p, amqp_p, desc in candidates:
+                result = subprocess.run(
+                    ["timeout", "3", "bash", "-c", f"nc -zv {server_ip} {mqtt_p}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    self.remote_mqtt_port = mqtt_p
+                    self.remote_amqp_port = amqp_p
+                    self.log_text.append(
+                        f"✅ MQTT reachable at {server_ip}:{mqtt_p} — {desc}\n"
+                    )
+                    self.log_text.append(
+                        f"   Client will use MQTT {mqtt_p}, AMQP {amqp_p}.\n"
+                    )
+                    self.connection_status.setText("● Connected")
+                    self.connection_status.setStyleSheet("font-size: 12px; color: #28a745;")
+                    QMessageBox.information(
+                        self,
+                        "Success",
+                        f"Reachable MQTT at {server_ip}:{mqtt_p}.\n"
+                        f"Using AMQP port {amqp_p}.\n({desc})",
+                    )
+                    self.statusBar().showMessage("Connection successful")
+                    return
+
+            self.log_text.append(
+                f"❌ No MQTT on {server_ip}:31883 or :1883 (is the experiment running?)\n"
             )
-            
-            if result.returncode == 0:
-                self.log_text.append(f"✅ MQTT broker reachable at {server_ip}:31883\n")
-                self.connection_status.setText("● Connected")
-                self.connection_status.setStyleSheet("font-size: 12px; color: #28a745;")
-                QMessageBox.information(self, "Success", f"Successfully connected to server at {server_ip}!")
-                self.statusBar().showMessage("Connection successful")
-            else:
-                self.log_text.append(f"❌ Cannot reach MQTT broker at {server_ip}:31883\n")
-                self.connection_status.setText("● Disconnected")
-                self.connection_status.setStyleSheet("font-size: 12px; color: #dc3545;")
-                QMessageBox.warning(self, "Connection Failed", 
-                                   f"Cannot reach server at {server_ip}!\n\n"
-                                   f"Please check:\n"
-                                   f"• Server IP is correct\n"
-                                   f"• Server is running\n"
-                                   f"• Network connectivity\n"
-                                   f"• Firewall settings\n"
-                                   f"• MQTT broker listening on port 31883")
-                self.statusBar().showMessage("Connection failed")
-                
+            self.connection_status.setText("● Disconnected")
+            self.connection_status.setStyleSheet("font-size: 12px; color: #dc3545;")
+            QMessageBox.warning(
+                self,
+                "Connection Failed",
+                f"Cannot reach MQTT at {server_ip} on ports 31883 or 1883.\n\n"
+                "Check:\n"
+                "• Correct server IP (e.g. eno2 address)\n"
+                "• Experiment started; brokers are up (docker ps)\n"
+                "• Firewall allows those TCP ports from your PC\n"
+                "• Unified default bridge compose does not publish MQTT to the host — "
+                "use host / macvlan mode or non-unified gpu-isolated, or add port mappings.",
+            )
+            self.statusBar().showMessage("Connection failed")
+
         except Exception as e:
             self.log_text.append(f"❌ Connection test error: {str(e)}\n")
             QMessageBox.critical(self, "Error", f"Connection test failed: {str(e)}")
@@ -1029,10 +1055,10 @@ class DistributedClientGUI(QMainWindow):
             "-e", f"NUM_ROUNDS={self.rounds_spinbox.value()}",
             "-e", f"NODE_TYPE=client",
             "-e", f"MQTT_BROKER={server_ip}",
-            "-e", "MQTT_PORT=31883",  # External port for MQTT broker
+            "-e", f"MQTT_PORT={self.remote_mqtt_port}",
             "-e", f"AMQP_HOST={server_ip}",
             "-e", f"AMQP_BROKER={server_ip}",
-            "-e", "AMQP_PORT=35672",  # External port for RabbitMQ broker
+            "-e", f"AMQP_PORT={self.remote_amqp_port}",
             "-e", "AMQP_USER=guest",
             "-e", "AMQP_PASSWORD=guest",
             "-e", f"GRPC_HOST={server_ip}",
