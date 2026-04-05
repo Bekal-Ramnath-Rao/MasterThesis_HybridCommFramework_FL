@@ -300,7 +300,8 @@ services:
     cap_add:
       - NET_ADMIN
     ports:
-      - "50051:50051"
+      # gRPC: HTTP/2 over TCP — explicit /tcp (default); required for remote clients
+      - "50051:50051/tcp"
     networks:
       - emotion_network
     container_name: fl-server-grpc-emotion

@@ -236,7 +236,7 @@ services:
     cap_add:
       - NET_ADMIN
     ports:
-      - "50051:50051"
+      - "50051:50051/tcp"  # gRPC (HTTP/2); required for remote clients
     environment:
       - GRPC_PORT=50051
       - NUM_CLIENTS=2

@@ -255,8 +255,8 @@ class DistributedClientGUI(QMainWindow):
         info_label = QLabel(
             "Broker ports: Docker-mapped MQTT 31883 / AMQP 35672, or host/macvlan MQTT 1883 / AMQP 5672. "
             "Unified FL also needs TCP gRPC 50051 on the server host (initial model is pulled over gRPC, not MQTT). "
-            "QUIC 4433 | HTTP/3 4434 (UDP) | DDS domain 0. "
-            "Test Connection: MQTT + gRPC for broker-based modes; QUIC/HTTP3 probe UDP; DDS uses ICMP ping (no MQTT)."
+            "Standalone gRPC uses TCP 50051 only (no MQTT). QUIC 4433 | HTTP/3 4434 (UDP) | DDS domain 0. "
+            "Test Connection: gRPC-only → TCP 50051; MQTT modes → MQTT + gRPC; QUIC/HTTP3 → UDP; DDS → ping."
         )
         info_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
         layout.addWidget(info_label, 1, 0, 1, 3)
@@ -1172,6 +1172,69 @@ class DistributedClientGUI(QMainWindow):
         )
         self.statusBar().showMessage(f"{name}: fix UDP {port} mapping / firewall")
 
+    def _tcp_port_probe(self, host: str, port: int) -> bool:
+        """Best-effort TCP reachability (gRPC, broker checks)."""
+        try:
+            r = subprocess.run(
+                ["timeout", "6", "nc", "-z", "-v", "-w", "3", host, str(port)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return r.returncode == 0
+        except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+            return False
+
+    def _test_connection_grpc_only(self, server_ip: str):
+        """Standalone gRPC uses HTTP/2 over TCP 50051; no MQTT broker."""
+        grpc_port = 50051
+        self.log_text.append(
+            f"\n🔍 gRPC-only: testing TCP/{grpc_port} to {server_ip} (not MQTT)...\n"
+        )
+        self.statusBar().showMessage(f"Testing gRPC TCP {grpc_port}...")
+        ping_ok = self._ping_server_host(server_ip)
+        if ping_ok:
+            self.log_text.append(f"✅ ICMP ping to {server_ip} succeeded.\n")
+        else:
+            self.log_text.append(
+                f"⚠️ ICMP ping to {server_ip} failed or unavailable (gRPC may still work).\n"
+            )
+
+        tcp_ok = self._tcp_port_probe(server_ip, grpc_port)
+        if tcp_ok:
+            self.log_text.append(
+                f"✅ TCP port {grpc_port} open (`nc -z`). gRPC server is reachable from this PC.\n"
+            )
+            self.connection_status.setText("● Reachable (gRPC)")
+            self.connection_status.setStyleSheet("font-size: 12px; color: #28a745;")
+            QMessageBox.information(
+                self,
+                "gRPC — TCP OK",
+                f"Host {server_ip}: TCP port {grpc_port} is reachable.\n\n"
+                f"Standalone gRPC does not use MQTT. Ensure the FL gRPC server container is up and "
+                f"Docker publishes \"{grpc_port}:{grpc_port}\" (TCP) on the host.",
+            )
+            self.statusBar().showMessage(f"gRPC: TCP {grpc_port} OK")
+            return
+
+        self.log_text.append(
+            f"❌ TCP {grpc_port} to {server_ip} not reachable from this PC.\n"
+            f"   Open {grpc_port}/tcp on the server firewall (e.g. sudo ufw allow {grpc_port}/tcp) and "
+            f"ensure Docker maps host port {grpc_port} to the gRPC server.\n"
+        )
+        self.connection_status.setText("● gRPC blocked")
+        self.connection_status.setStyleSheet("font-size: 12px; color: #dc3545;")
+        QMessageBox.warning(
+            self,
+            "gRPC — TCP failed",
+            f"Could not connect to TCP/{grpc_port} on {server_ip}.\n\n"
+            f"• Firewall on the server: allow {grpc_port}/tcp (e.g. ufw allow {grpc_port}/tcp).\n"
+            f"• Docker: fl-server-grpc-* must publish \"{grpc_port}:{grpc_port}\" or \"{grpc_port}:{grpc_port}/tcp\".\n"
+            f"• NAT/router: forward TCP {grpc_port} to the server host if needed.\n\n"
+            f"This mode does not use MQTT — ignore MQTT broker checks.",
+        )
+        self.statusBar().showMessage(f"gRPC: open TCP {grpc_port} / firewall")
+
     def test_connection(self):
         """Test connection to server (try Docker-mapped ports first, then standard broker ports)."""
         server_ip = self.server_ip.text().strip()
@@ -1189,6 +1252,9 @@ class DistributedClientGUI(QMainWindow):
             return
         if protocol == "quic":
             self._test_connection_quic_http3(server_ip, "quic")
+            return
+        if protocol == "grpc":
+            self._test_connection_grpc_only(server_ip)
             return
         
         self.log_text.append(f"\n🔍 Testing connection to {server_ip}...\n")
@@ -1219,13 +1285,7 @@ class DistributedClientGUI(QMainWindow):
                     grpc_ok = False
                     grpc_port = 50051
                     try:
-                        grpc_chk = subprocess.run(
-                            ["timeout", "3", "bash", "-c", f"nc -zv {server_ip} {grpc_port}"],
-                            capture_output=True,
-                            text=True,
-                            timeout=5,
-                        )
-                        grpc_ok = grpc_chk.returncode == 0
+                        grpc_ok = self._tcp_port_probe(server_ip, grpc_port)
                     except Exception as e:
                         self.log_text.append(f"⚠️ Could not verify gRPC port: {e}\n")
                     if grpc_ok:

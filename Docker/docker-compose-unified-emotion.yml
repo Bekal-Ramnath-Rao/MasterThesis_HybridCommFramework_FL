@@ -70,7 +70,7 @@ services:
     ports:
       - "4433:4433/udp"  # QUIC
       - "4434:4434/udp"  # HTTP/3 (QUIC)
-      - "50051:50051"    # gRPC
+      - "50051:50051/tcp"  # gRPC (HTTP/2)
     depends_on:
       - mqtt-broker-unified
       - amqp-broker-unified
