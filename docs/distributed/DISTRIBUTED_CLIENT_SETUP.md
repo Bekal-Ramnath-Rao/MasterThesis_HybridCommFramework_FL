@@ -174,7 +174,9 @@ The **distributed client GUI** mounts this file into the client container when y
 
 On a **host** (no Docker): `source config/dds_distributed_env.sh` before starting `FL_Server_DDS.py` / `FL_Client_DDS.py`.
 
-**Docker:** peer IPs (e.g. `129.69.x.x`) are **not** bound as `NetworkInterfaceAddress` automatically—inside a **bridge** container that IP does not exist on any interface and Cyclone will error. Leave **`DDS_NETWORK_INTERFACE` unset** (Cyclone picks an interface), use **`docker run --network host`**, macvlan, or set **`DDS_NETWORK_INTERFACE=eth0`** (real interface name in that container).
+**Docker bridge:** `DDS_PEER_*` are the **logical** LAN addresses (for humans and for **remote** peers). On the **same** Compose network, Cyclone must use **Docker DNS** names in `<Peer>` so traffic goes to the right container. Set **`DDS_SPDP_SERVER`**, **`DDS_SPDP_CLIENT1`**, **`DDS_SPDP_CLIENT2`** (see `config/dds_distributed_unicast.py`); `Docker/docker-compose-emotion.yml` defaults them to `fl-server-dds-emotion`, `fl-client-dds-emotion-1`, and the remote host IP for client 2. Publish UDP **7412/7414/7416** (SPDP) on the host for **remote** machines. Alternatively use **`network_mode: host`** for DDS containers.
+
+**NetworkInterfaceAddress:** peer IPs are **not** auto-bound inside bridge containers. Leave **`DDS_NETWORK_INTERFACE` unset** unless you pin a real interface name, or use **`docker run --network host`**.
 
 Optional: Allow **UDP** between all three hosts (SPDP ports follow `7410 + 2 * ParticipantIndex` on domain 0, plus the usual RTPS range). The **Connection** tab in `distributed_client_gui.py` can fill these three fields for remote containers; the main server container must export the same values.
 

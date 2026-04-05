@@ -6,7 +6,7 @@ This directory contains configuration files for various components of the system
 
 ### CycloneDDS Configuration Files
 - `cyclonedds-multicast-lan.xml` - **Multicast SPDP discovery** on a real LAN (distributed clients on other PCs). Use with matching firewall rules; set the same `CYCLONEDDS_URI` on server and clients (see `docs/distributed/DISTRIBUTED_CLIENT_SETUP.md`).
-- `dds_distributed_unicast.py` - **Runtime static unicast peers** when `DDS_PEER_SERVER`, `DDS_PEER_CLIENT1`, and `DDS_PEER_CLIENT2` are set (no `CYCLONEDDS_URI`); used by Emotion `FL_Server_DDS.py` / `FL_Client_DDS.py` for cross-subnet or no-multicast LANs.
+- `dds_distributed_unicast.py` - **Runtime static unicast peers** when `DDS_PEER_SERVER`, `DDS_PEER_CLIENT1`, and `DDS_PEER_CLIENT2` are set (no `CYCLONEDDS_URI`); optional **`DDS_SPDP_SERVER` / `DDS_SPDP_CLIENT1` / `DDS_SPDP_CLIENT2`** override the `<Peer>` hostnames (use Docker service names on a bridge network; see `Docker/docker-compose-emotion.yml`).
 - `dds_distributed_env.sh` - **Host shell exports** for the same three peers (defaults: server and client1 `129.69.102.245`, client2 `129.69.102.173`). `source config/dds_distributed_env.sh` before running DDS on bare metal. Docker images set the same via `ENV` in `Server/Dockerfile` and `Client/Dockerfile`.
 - `cyclonedds-unicast.xml` - CycloneDDS unicast configuration (general)
 - `cyclonedds-emotion.xml` - CycloneDDS configuration for emotion recognition

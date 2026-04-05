@@ -627,6 +627,9 @@ services:
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-dds-emotion}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-dds-emotion-1}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
       - PROTOCOL=DDS
       - USE_CASE=emotion
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
@@ -651,6 +654,8 @@ services:
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
     command: bash -c "sleep 10 && python -u Server/Emotion_Recognition/FL_Server_DDS.py"
+    ports:
+      - "7412:7412/udp"
     # Server does not need GPU resources - only aggregates models
 
   fl-client-dds-emotion-1:
@@ -661,6 +666,9 @@ services:
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-dds-emotion}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-dds-emotion-1}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
       - CLIENT_ID=1
       - NUM_CLIENTS=2
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -688,6 +696,8 @@ services:
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
+    ports:
+      - "7414:7414/udp"
     deploy:
       resources:
         reservations:
@@ -704,6 +714,9 @@ services:
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-dds-emotion}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-dds-emotion-1}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
       - CLIENT_ID=2
       - NUM_CLIENTS=2
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -731,6 +744,8 @@ services:
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
+    ports:
+      - "7416:7416/udp"
     deploy:
       resources:
         reservations:

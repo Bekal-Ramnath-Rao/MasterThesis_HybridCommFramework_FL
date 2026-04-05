@@ -519,9 +519,9 @@ services:
   # DDS Protocol Setup (Emotion Recognition)
   # ============================================================================
   
-  # DDS FL Server (Emotion Recognition) — static unicast peers from image ENV (override as needed).
-  # For single-host bridge networking, prefer CYCLONEDDS_URI=file:///app/config/cyclonedds-multicast-lan.xml
-  # or unset DDS_PEER_* via env file if you need multicast-only discovery.
+  # DDS FL Server (Emotion Recognition) — static unicast: DDS_PEER_* are logical LAN IPs; on this
+  # bridge network use DDS_SPDP_* so Cyclone peers use Docker DNS (see config/dds_distributed_unicast.py).
+  # Publish UDP SPDP ports so a remote client (another machine) can reach this host.
   fl-server-dds-emotion:
     build:
       context: ..
@@ -533,6 +533,9 @@ services:
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-dds-emotion}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-dds-emotion-1}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
       - DDS_DOMAIN_ID=0
       - NUM_CLIENTS=2
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
@@ -545,6 +548,8 @@ services:
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Server/Emotion_Recognition/FL_Server_DDS.py
+    ports:
+      - "7412:7412/udp"
     networks:
       - fl-dds-network
     volumes:
@@ -565,6 +570,9 @@ services:
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-dds-emotion}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-dds-emotion-1}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
       - DDS_DOMAIN_ID=0
       - CLIENT_ID=1
       - NUM_CLIENTS=2
@@ -577,6 +585,8 @@ services:
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
+    ports:
+      - "7414:7414/udp"
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
@@ -597,6 +607,9 @@ services:
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-dds-emotion}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-dds-emotion-1}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
       - DDS_DOMAIN_ID=0
       - CLIENT_ID=2
       - NUM_CLIENTS=2
@@ -606,6 +619,8 @@ services:
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
+    ports:
+      - "7416:7416/udp"
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
     networks:
