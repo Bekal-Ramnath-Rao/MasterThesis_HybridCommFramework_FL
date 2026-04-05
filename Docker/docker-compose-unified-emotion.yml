@@ -69,7 +69,7 @@ services:
       - fl-network
     ports:
       - "4433:4433/udp"  # QUIC
-      - "4434:4434"      # HTTP/3
+      - "4434:4434/udp"  # HTTP/3 (QUIC)
       - "50051:50051"    # gRPC
     depends_on:
       - mqtt-broker-unified

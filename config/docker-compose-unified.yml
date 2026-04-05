@@ -71,7 +71,7 @@ services:
     ports:
       - "50051:50051"  # gRPC
       - "4433:4433"    # QUIC
-      - "4434:4434"    # HTTP/3
+      - "4434:4434/udp"  # HTTP/3 (QUIC)
     volumes:
       - ./shared_data:/shared_data
       - ./results:/app/results

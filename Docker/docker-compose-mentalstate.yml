@@ -340,7 +340,7 @@ services:
     cap_add:
       - NET_ADMIN
     ports:
-      - "4434:4434"
+      - "4434:4434/udp"
     environment:
       - HTTP3_HOST=0.0.0.0
       - HTTP3_PORT=4434

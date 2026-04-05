@@ -527,7 +527,8 @@ services:
     cap_add:
       - NET_ADMIN
     ports:
-      - "4434:4434"
+      # HTTP/3 is QUIC over UDP — TCP mapping alone does not expose the server to remote hosts
+      - "4434:4434/udp"
     volumes:
       - ../certs:/app/certs:ro
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results

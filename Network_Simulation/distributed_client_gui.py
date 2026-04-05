@@ -255,8 +255,8 @@ class DistributedClientGUI(QMainWindow):
         info_label = QLabel(
             "Broker ports: Docker-mapped MQTT 31883 / AMQP 35672, or host/macvlan MQTT 1883 / AMQP 5672. "
             "Unified FL also needs TCP gRPC 50051 on the server host (initial model is pulled over gRPC, not MQTT). "
-            "QUIC 4433 | HTTP/3 4434 | DDS domain 0. "
-            "Test Connection: MQTT + gRPC for broker-based modes; for DDS-only it uses ICMP ping (no MQTT broker needed)."
+            "QUIC 4433 | HTTP/3 4434 (UDP) | DDS domain 0. "
+            "Test Connection: MQTT + gRPC for broker-based modes; QUIC/HTTP3 probe UDP; DDS uses ICMP ping (no MQTT)."
         )
         info_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
         layout.addWidget(info_label, 1, 0, 1, 3)
@@ -1108,6 +1108,70 @@ class DistributedClientGUI(QMainWindow):
         )
         self.statusBar().showMessage("DDS: install ping to test reachability")
 
+    def _udp_port_probe(self, host: str, port: int) -> bool:
+        """Best-effort UDP reachability (QUIC/HTTP3). May be inconclusive if ICMP/nc differ."""
+        try:
+            r = subprocess.run(
+                ["timeout", "6", "nc", "-u", "-z", "-v", "-w", "3", host, str(port)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            return r.returncode == 0
+        except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+            return False
+
+    def _test_connection_quic_http3(self, server_ip: str, protocol: str):
+        """QUIC and HTTP/3 use UDP; do not test MQTT."""
+        port = 4433 if protocol == "quic" else 4434
+        name = "QUIC" if protocol == "quic" else "HTTP/3"
+        self.log_text.append(
+            f"\n🔍 {name}: testing UDP/{port} to {server_ip} (not MQTT)...\n"
+        )
+        self.statusBar().showMessage(f"Testing {name} UDP {port}...")
+        ping_ok = self._ping_server_host(server_ip)
+        if ping_ok:
+            self.log_text.append(f"✅ ICMP ping to {server_ip} succeeded.\n")
+        else:
+            self.log_text.append(
+                f"⚠️ ICMP ping to {server_ip} failed or unavailable (UDP may still work).\n"
+            )
+
+        udp_ok = self._udp_port_probe(server_ip, port)
+        if udp_ok:
+            self.log_text.append(
+                f"✅ UDP port {port} probe succeeded (`nc -u -z`). {name} is likely reachable.\n"
+            )
+            self.connection_status.setText("● Reachable (UDP)")
+            self.connection_status.setStyleSheet("font-size: 12px; color: #28a745;")
+            QMessageBox.information(
+                self,
+                f"{name} — UDP OK",
+                f"Host {server_ip}: UDP port {port} responded to a probe.\n\n"
+                f"{name} uses QUIC over UDP (not TCP/MQTT). Ensure the server publishes "
+                f"\"{port}:{port}/udp\" in Docker and that firewalls allow UDP/{port}.",
+            )
+            self.statusBar().showMessage(f"{name}: UDP {port} OK")
+            return
+
+        self.log_text.append(
+            f"❌ UDP probe to {server_ip}:{port} did not succeed.\n"
+            f"   Common causes: Docker mapped TCP only (use \"{port}:{port}/udp\"), "
+            f"or host firewall blocking UDP/{port}.\n"
+        )
+        self.connection_status.setText("● UDP blocked / inconclusive")
+        self.connection_status.setStyleSheet("font-size: 12px; color: #e67e22;")
+        QMessageBox.warning(
+            self,
+            f"{name} — UDP not verified",
+            f"Could not confirm UDP/{port} to {server_ip} (QUIC/HTTP3).\n\n"
+            f"• Docker: map UDP explicitly, e.g. \"{port}:{port}/udp\" for the HTTP/3 server.\n"
+            f"• Firewall: allow UDP/{port} from this machine to the server.\n"
+            f"• `nc` may be missing; install netcat-openbsd.\n\n"
+            f"This mode does not use MQTT — ignore MQTT broker checks.",
+        )
+        self.statusBar().showMessage(f"{name}: fix UDP {port} mapping / firewall")
+
     def test_connection(self):
         """Test connection to server (try Docker-mapped ports first, then standard broker ports)."""
         server_ip = self.server_ip.text().strip()
@@ -1119,6 +1183,12 @@ class DistributedClientGUI(QMainWindow):
         protocol = self.protocol_mode.currentData() or self.protocol_mode.currentText()
         if protocol == "dds":
             self._test_connection_dds_only(server_ip)
+            return
+        if protocol == "http3":
+            self._test_connection_quic_http3(server_ip, "http3")
+            return
+        if protocol == "quic":
+            self._test_connection_quic_http3(server_ip, "quic")
             return
         
         self.log_text.append(f"\n🔍 Testing connection to {server_ip}...\n")

@@ -524,7 +524,7 @@ services:
     cap_add:
       - NET_ADMIN
     ports:
-      - "4434:4434"
+      - "4434:4434/udp"
     volumes:
       - ../certs:/app/certs:ro
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results

@@ -420,7 +420,7 @@ services:
     cap_add:
       - NET_ADMIN
     ports:
-      - "4434:4434"
+      - "4434:4434/udp"
     volumes:
       - ../certs:/app/certs:ro
       - ../Server/Temperature_Regulation/results:/app/Server/Temperature_Regulation/results
