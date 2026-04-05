@@ -11,14 +11,14 @@
   The experiment server must use the same file (or equivalent AllowMulticast=true
   and no unicast-only peer list); compose files that set AllowMulticast=false
   with Docker-only peers will not discover remote machines.
+
+  Keep General minimal: avoid deprecated NetworkInterfaceAddress and elements
+  only valid in newer CycloneDDS (see project cyclonedds-emotion.xml style).
 -->
 <CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
     <Domain id="any">
         <General>
             <AllowMulticast>true</AllowMulticast>
-            <NetworkInterfaceAddress>auto</NetworkInterfaceAddress>
-            <!-- Avoid host-only SHM paths when mixing containers and remote peers -->
-            <EnableSharedMemory>false</EnableSharedMemory>
         </General>
         <Internal>
             <HeartbeatInterval>500ms</HeartbeatInterval>
