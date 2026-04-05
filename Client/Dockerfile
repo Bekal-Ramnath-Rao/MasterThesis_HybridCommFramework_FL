@@ -45,6 +45,8 @@ RUN cd Protocols && \
 
 COPY scripts/utilities/packet_logger.py ./
 COPY scripts/utilities/q_learning_logger.py ./
+# DDS: LAN multicast profile (aligned with Server image and distributed_client_gui)
+COPY config/cyclonedds-multicast-lan.xml /app/config/cyclonedds-multicast-lan.xml
 # Copy the Client directory
 COPY Client/ ./Client/
 # T_calc / R_tcalc in Q-learning rewards (communication_model, scenario tables)

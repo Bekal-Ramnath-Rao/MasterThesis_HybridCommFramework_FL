@@ -43,6 +43,9 @@ RUN cd Protocols && \
     python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. federated_learning.proto && \
     cd ..
 
+# DDS: same multicast LAN profile as remote distributed clients (must match for discovery)
+COPY config/cyclonedds-multicast-lan.xml /app/config/cyclonedds-multicast-lan.xml
+
 # Copy the Server directory and scripts (DDS discovery server)
 COPY scripts/utilities/packet_logger.py ./
 COPY scripts/utilities/experiment_results_path.py ./

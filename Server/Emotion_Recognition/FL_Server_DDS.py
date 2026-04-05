@@ -10,8 +10,26 @@ import json
 from pathlib import Path
 
 # Set CycloneDDS config before any cyclonedds import (native lib may read at load time)
-if not os.environ.get("CYCLONEDDS_URI") and os.path.exists("/app/config/cyclonedds-emotion-server.xml"):
-    os.environ["CYCLONEDDS_URI"] = "file:///app/config/cyclonedds-emotion-server.xml"
+def _emotion_config_dir():
+    if os.path.exists("/app"):
+        return "/app/config"
+    # Server/Emotion_Recognition/FL_Server_DDS.py -> repo/config
+    return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "config"))
+
+
+def _ensure_server_cyclonedds_uri():
+    """Prefer LAN multicast (distributed clients); else legacy emotion-server (localhost peers)."""
+    if os.environ.get("CYCLONEDDS_URI"):
+        return
+    base = _emotion_config_dir()
+    for name in ("cyclonedds-multicast-lan.xml", "cyclonedds-emotion-server.xml"):
+        p = os.path.join(base, name)
+        if os.path.isfile(p):
+            os.environ["CYCLONEDDS_URI"] = "file://" + os.path.abspath(p)
+            return
+
+
+_ensure_server_cyclonedds_uri()
 
 # Project root and utilities (for experiment_results path)
 if os.path.exists("/app"):
@@ -353,11 +371,9 @@ class FederatedLearningServer:
     def setup_dds(self):
         """Initialize DDS participant, topics, readers, and writers"""
         # Ensure CycloneDDS uses discovery server config (must be set before participant creation)
+        _ensure_server_cyclonedds_uri()
         uri = os.environ.get("CYCLONEDDS_URI")
-        if not uri and os.path.exists("/app/config/cyclonedds-emotion-server.xml"):
-            uri = "file:///app/config/cyclonedds-emotion-server.xml"
-            os.environ["CYCLONEDDS_URI"] = uri
-        print(f"[DDS] CYCLONEDDS_URI={uri or os.environ.get('CYCLONEDDS_URI', '(not set)')}")
+        print(f"[DDS] CYCLONEDDS_URI={uri or '(not set)'}")
         print(f"Setting up DDS on domain {DDS_DOMAIN_ID}...")
         
         # Create domain participant

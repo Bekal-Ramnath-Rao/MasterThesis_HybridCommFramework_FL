@@ -162,6 +162,8 @@ export CYCLONEDDS_URI=file://$PWD/config/cyclonedds-multicast-lan.xml
 
 The **distributed client GUI** mounts this file into the client container when you choose **DDS** or **RL-Unified** (`CYCLONEDDS_URI=file:///app/config/cyclonedds-multicast-lan.xml`). On the **main experiment machine**, set the **same** `CYCLONEDDS_URI` on the FL server container (volume-mount the same XML), or remote clients will never complete discovery with a server that still uses unicast-only compose configs.
 
+**Emotion DDS images:** Rebuild the server and client Docker images after updating the repo so `/app/config/cyclonedds-multicast-lan.xml` is **inside** the image. `FL_Server_DDS.py` (Emotion) and `FL_Client_DDS.py` now prefer that file automatically when `CYCLONEDDS_URI` is unset. If the server used default CycloneDDS (no XML) while the remote client used multicast-lan, **participant discovery could succeed on one host but fail between PCs**; aligning both sides fixes that class of mismatch.
+
 **Wi‑Fi:** disable **AP / client isolation** if present; otherwise multicast between stations may fail.
 
 ### Server Firewall Rules (Ubuntu/Linux)
