@@ -519,9 +519,9 @@ services:
   # DDS Protocol Setup (Emotion Recognition)
   # ============================================================================
   
-  # DDS FL Server (Emotion Recognition) — static unicast: DDS_PEER_* are logical LAN IPs; on this
-  # bridge network use DDS_SPDP_* so Cyclone peers use Docker DNS (see config/dds_distributed_unicast.py).
-  # Publish UDP SPDP ports so a remote client (another machine) can reach this host.
+  # DDS FL Server — network_mode: host so Cyclone RTPS uses the full UDP port range on 129.69.102.245.
+  # Docker bridge + publishing only 7412/7414 often breaks a remote client 2 (other PC): user traffic
+  # uses additional UDP ports. Remote client 2: docker run --network host on the other machine.
   fl-server-dds-emotion:
     build:
       context: ..
@@ -529,12 +529,13 @@ services:
     container_name: fl-server-dds-emotion
     cap_add:
       - NET_ADMIN
+    network_mode: host
     environment:
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-dds-emotion}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-dds-emotion-1}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
       - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
       - DDS_DOMAIN_ID=0
       - NUM_CLIENTS=2
@@ -548,10 +549,6 @@ services:
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Server/Emotion_Recognition/FL_Server_DDS.py
-    ports:
-      - "7412:7412/udp"
-    networks:
-      - fl-dds-network
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
@@ -566,12 +563,13 @@ services:
       - NET_ADMIN
     depends_on:
       - fl-server-dds-emotion
+    network_mode: host
     environment:
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-dds-emotion}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-dds-emotion-1}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
       - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
       - DDS_DOMAIN_ID=0
       - CLIENT_ID=1
@@ -585,12 +583,8 @@ services:
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
-    ports:
-      - "7414:7414/udp"
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-    networks:
-      - fl-dds-network
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # DDS FL Client 2 (Emotion Recognition)
@@ -603,12 +597,13 @@ services:
       - NET_ADMIN
     depends_on:
       - fl-server-dds-emotion
+    network_mode: host
     environment:
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-dds-emotion}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-dds-emotion-1}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
       - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
       - DDS_DOMAIN_ID=0
       - CLIENT_ID=2
@@ -619,12 +614,8 @@ services:
       - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
       - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
     command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
-    ports:
-      - "7416:7416/udp"
     volumes:
       - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
-    networks:
-      - fl-dds-network
     # GPU reservations moved to overlay file Docker/docker-compose-emotion.gpu.yml
 
   # ============================================================================

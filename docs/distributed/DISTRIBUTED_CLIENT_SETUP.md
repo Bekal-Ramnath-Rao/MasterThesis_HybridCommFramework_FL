@@ -178,7 +178,9 @@ On a **host** (no Docker): `source config/dds_distributed_env.sh` before startin
 
 **NetworkInterfaceAddress:** peer IPs are **not** auto-bound inside bridge containers. Leave **`DDS_NETWORK_INTERFACE` unset** unless you pin a real interface name, or use **`docker run --network host`**.
 
-**Multi-NIC (e.g. Ethernet + Wi‑Fi):** On the client 2 PC, **`129.69.102.173` on `enp68s0` is correct** for reaching `129.69.102.245` on the lab LAN. If DDS still fails, Cyclone may have bound to Wi‑Fi (`wlp69s0`). The code now auto-sets **`NetworkInterfaceAddress`** from **`ip route get <DDS_PEER_SERVER>`** (Linux), or set **`DDS_NETWORK_INTERFACE=enp68s0`** manually. Ensure the **server host firewall** allows UDP from `129.69.102.173` to published ports **7412** and **7414**.
+**Multi-NIC (e.g. Ethernet + Wi‑Fi):** On the client 2 PC, **`129.69.102.173` on `enp68s0` is correct** for reaching `129.69.102.245` on the lab LAN. If DDS still fails, Cyclone may have bound to Wi‑Fi (`wlp69s0`). The code now auto-sets **`NetworkInterfaceAddress`** from **`ip route get <DDS_PEER_SERVER>`** (Linux), or set **`DDS_NETWORK_INTERFACE=enp68s0`** manually.
+
+**Docker on the server (129.69.102.245):** `Docker/docker-compose-emotion.yml` runs **`fl-server-dds-emotion`**, **`fl-client-dds-emotion-1`**, and **`fl-client-dds-emotion-2`** with **`network_mode: host`** so Cyclone can use the full UDP port range on the host. Publishing only SPDP ports **7412/7414** to bridge containers is often **not enough** for RTPS user traffic, which is why a **remote** client 2 could not complete discovery while client 1 on the same host worked. Recreate the stack after pulling this change.
 
 Optional: Allow **UDP** between all three hosts (SPDP ports follow `7410 + 2 * ParticipantIndex` on domain 0, plus the usual RTPS range). The **Connection** tab in `distributed_client_gui.py` can fill these three fields for remote containers; the main server container must export the same values.
 
