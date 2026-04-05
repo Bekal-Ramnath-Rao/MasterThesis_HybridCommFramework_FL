@@ -5,6 +5,7 @@ This directory contains configuration files for various components of the system
 ## Files
 
 ### CycloneDDS Configuration Files
+- `cyclonedds-multicast-lan.xml` - **Multicast SPDP discovery** on a real LAN (distributed clients on other PCs). Use with matching firewall rules; set the same `CYCLONEDDS_URI` on server and clients (see `docs/distributed/DISTRIBUTED_CLIENT_SETUP.md`).
 - `cyclonedds-unicast.xml` - CycloneDDS unicast configuration (general)
 - `cyclonedds-emotion.xml` - CycloneDDS configuration for emotion recognition
 - `cyclonedds-mentalstate.xml` - CycloneDDS configuration for mental state recognition

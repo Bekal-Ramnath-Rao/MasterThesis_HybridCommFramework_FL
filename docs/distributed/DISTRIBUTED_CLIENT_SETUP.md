@@ -148,9 +148,25 @@ Ensure the following ports are accessible from remote PCs to the server:
 | AMQP     | 5672  | RabbitMQ              |
 | gRPC     | 50051 | gRPC Communication    |
 | QUIC     | 4433  | QUIC Protocol         |
-| DDS      | N/A   | Auto-discovery        |
+| DDS      | UDP 7400–7500 | CycloneDDS RTPS (participant + user traffic) |
+
+### DDS (CycloneDDS) on a LAN: multicast + firewall
+
+DDS does **not** use the “Server IP” field for discovery; it uses **UDP** and, by default, **multicast** for participant discovery (SPDP) on the same broadcast domain. For remote PCs to join, **both** the experiment server and the remote client must use a config that **allows multicast** and does **not** rely on Docker-only hostnames or `127.0.0.1` static peers.
+
+**Recommended:** use `config/cyclonedds-multicast-lan.xml` on both sides:
+
+```bash
+export CYCLONEDDS_URI=file://$PWD/config/cyclonedds-multicast-lan.xml
+```
+
+The **distributed client GUI** mounts this file into the client container when you choose **DDS** or **RL-Unified** (`CYCLONEDDS_URI=file:///app/config/cyclonedds-multicast-lan.xml`). On the **main experiment machine**, set the **same** `CYCLONEDDS_URI` on the FL server container (volume-mount the same XML), or remote clients will never complete discovery with a server that still uses unicast-only compose configs.
+
+**Wi‑Fi:** disable **AP / client isolation** if present; otherwise multicast between stations may fail.
 
 ### Server Firewall Rules (Ubuntu/Linux)
+
+Replace `192.168.1.0/24` with your LAN subnet (server and clients must be allowed to exchange **UDP** on the DDS port range).
 
 ```bash
 # Allow MQTT
@@ -165,9 +181,12 @@ sudo ufw allow 50051/tcp
 # Allow QUIC
 sudo ufw allow 4433/udp
 
-# For DDS multicast (if needed)
+# DDS (CycloneDDS): allow RTPS traffic from your LAN (server and remote clients)
 sudo ufw allow from 192.168.1.0/24 to any port 7400:7500 proto udp
+sudo ufw allow out to 192.168.1.0/24 port 7400:7500 proto udp
 ```
+
+On **remote client** machines, apply the same UDP rules so responses and discovery traffic are not blocked. If you use a restrictive outbound policy, allow UDP 7400–7500 to the server host as well.
 
 ### Testing Connectivity
 

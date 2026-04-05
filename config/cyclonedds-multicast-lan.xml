@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  CycloneDDS: multicast SPDP discovery on a LAN (no static peers).
+
+  Use for distributed FL when server and clients run on different hosts on the
+  same broadcast domain. Pair with firewall rules allowing UDP 7400–7500 between hosts.
+
+  Set: CYCLONEDDS_URI=file:///path/to/cyclonedds-multicast-lan.xml
+  (distributed_client_gui mounts this at /app/config/cyclonedds-multicast-lan.xml)
+
+  The experiment server must use the same file (or equivalent AllowMulticast=true
+  and no unicast-only peer list); compose files that set AllowMulticast=false
+  with Docker-only peers will not discover remote machines.
+-->
+<CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+    <Domain id="any">
+        <General>
+            <AllowMulticast>true</AllowMulticast>
+            <NetworkInterfaceAddress>auto</NetworkInterfaceAddress>
+            <!-- Avoid host-only SHM paths when mixing containers and remote peers -->
+            <EnableSharedMemory>false</EnableSharedMemory>
+        </General>
+        <Internal>
+            <HeartbeatInterval>500ms</HeartbeatInterval>
+        </Internal>
+        <Tracing>
+            <Verbosity>warning</Verbosity>
+            <OutputFile>stderr</OutputFile>
+        </Tracing>
+    </Domain>
+</CycloneDDS>

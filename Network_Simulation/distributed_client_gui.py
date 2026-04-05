@@ -1356,7 +1356,30 @@ class DistributedClientGUI(QMainWindow):
             "-e", "HTTP3_PORT=4434",
             "-e", "DDS_DOMAIN_ID=0",
         ])
-        
+
+        # DDS on a remote PC: use multicast SPDP on the LAN (same config must be used on the server).
+        # Mount cyclonedds-multicast-lan.xml; do not rely on compose-only unicast/127.0.0.1 peers.
+        if protocol == "dds" or is_unified:
+            _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            _mc_xml = os.path.join(_repo_root, "config", "cyclonedds-multicast-lan.xml")
+            if os.path.isfile(_mc_xml):
+                cmd.extend(
+                    [
+                        "-v",
+                        f"{_mc_xml}:/app/config/cyclonedds-multicast-lan.xml:ro",
+                        "-e",
+                        "CYCLONEDDS_URI=file:///app/config/cyclonedds-multicast-lan.xml",
+                    ]
+                )
+                self.log_text.append(
+                    "DDS: CYCLONEDDS_URI=cyclonedds-multicast-lan.xml (multicast LAN). "
+                    "Ensure the experiment server uses the same URI and UDP 7400–7500 is allowed.\n"
+                )
+            else:
+                self.log_text.append(
+                    f"⚠️ DDS multicast config not found ({_mc_xml}); remote DDS discovery may fail.\n"
+                )
+
         termination_mode = self.termination_mode_combo.currentData() or self.termination_mode_combo.currentText()
         stop_on_client_convergence = "false" if termination_mode == "fixed_rounds" else "true"
         cmd.extend(["-e", f"STOP_ON_CLIENT_CONVERGENCE={stop_on_client_convergence}"])
