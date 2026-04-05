@@ -190,6 +190,8 @@ On **remote client** machines, apply the same UDP rules so responses and discove
 
 ### Testing Connectivity
 
+**Distributed Client GUI — “Test Connection”:** For **DDS-only** protocol mode, the GUI does **not** check MQTT (no broker is required). It uses **ICMP ping** to verify the server host is reachable. For MQTT-based modes, it checks MQTT (and gRPC for unified) as before.
+
 From remote PC, test each port:
 
 ```bash

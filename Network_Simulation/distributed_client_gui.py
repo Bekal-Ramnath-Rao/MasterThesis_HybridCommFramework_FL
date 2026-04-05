@@ -11,6 +11,7 @@ import subprocess
 import threading
 import glob
 import random
+import shutil
 from datetime import datetime
 
 from PyQt5.QtWidgets import (
@@ -254,7 +255,8 @@ class DistributedClientGUI(QMainWindow):
         info_label = QLabel(
             "Broker ports: Docker-mapped MQTT 31883 / AMQP 35672, or host/macvlan MQTT 1883 / AMQP 5672. "
             "Unified FL also needs TCP gRPC 50051 on the server host (initial model is pulled over gRPC, not MQTT). "
-            "QUIC 4433 | HTTP/3 4434 | DDS domain 0. Test Connection checks MQTT + gRPC."
+            "QUIC 4433 | HTTP/3 4434 | DDS domain 0. "
+            "Test Connection: MQTT + gRPC for broker-based modes; for DDS-only it uses ICMP ping (no MQTT broker needed)."
         )
         info_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
         layout.addWidget(info_label, 1, 0, 1, 3)
@@ -1009,12 +1011,92 @@ class DistributedClientGUI(QMainWindow):
             profile["bandwidth"] = max(1, int(profile["bandwidth"] * congestion["bandwidth_factor"]))
         return profile
     
+    def _ping_server_host(self, server_ip: str):
+        """Return True if ICMP ping succeeds, False if it fails, None if ping is unavailable."""
+        if not shutil.which("ping"):
+            return None
+        try:
+            if sys.platform == "win32":
+                cmd = ["ping", "-n", "1", "-w", "3000", server_ip]
+            elif sys.platform == "darwin":
+                # macOS: -W is milliseconds per reply
+                cmd = ["ping", "-c", "1", "-W", "2000", server_ip]
+            else:
+                # Linux (iputils): -W is seconds
+                cmd = ["ping", "-c", "1", "-W", "3", server_ip]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            return r.returncode == 0
+        except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+            return False
+
+    def _test_connection_dds_only(self, server_ip: str):
+        """DDS-only experiments do not run MQTT; verify host reachability (ping) and remind about UDP."""
+        self.log_text.append(
+            f"\n🔍 DDS-only: skipping MQTT (broker not required). "
+            f"Checking host reachability to {server_ip} (ICMP ping)...\n"
+        )
+        self.statusBar().showMessage("Testing host reachability (DDS)...")
+        ok = self._ping_server_host(server_ip)
+        if ok is True:
+            self.log_text.append(
+                f"✅ Host {server_ip} answered ping. DDS uses UDP multicast/7400–7500; "
+                f"ensure the same CYCLONEDDS_URI and firewall rules as in the docs.\n"
+            )
+            self.connection_status.setText("● Reachable (ping)")
+            self.connection_status.setStyleSheet("font-size: 12px; color: #28a745;")
+            QMessageBox.information(
+                self,
+                "Host reachable (DDS)",
+                f"Ping to {server_ip} succeeded.\n\n"
+                "DDS does not use MQTT; no broker is required for this mode.\n"
+                "Discovery uses UDP (multicast on the LAN); allow UDP 7400–7500 between hosts if needed.",
+            )
+            self.statusBar().showMessage("DDS: host reachable")
+            return
+        if ok is False:
+            self.log_text.append(
+                f"❌ Ping to {server_ip} failed (ICMP blocked or host down).\n"
+                f"   You can still start the client if the IP is correct and UDP 7400–7500 is allowed.\n"
+            )
+            self.connection_status.setText("● Ping failed")
+            self.connection_status.setStyleSheet("font-size: 12px; color: #e67e22;")
+            QMessageBox.warning(
+                self,
+                "Ping failed (DDS)",
+                f"No ICMP reply from {server_ip}.\n\n"
+                "Many networks block ping; DDS may still work if:\n"
+                "• The server IP is correct\n"
+                "• UDP 7400–7500 is allowed (firewall)\n"
+                "• Multicast is allowed on the LAN (see cyclonedds-multicast-lan.xml)\n\n"
+                "You can start the client anyway.",
+            )
+            self.statusBar().showMessage("DDS: ping failed — check IP/firewall")
+            return
+        # ok is None — ping not installed
+        self.log_text.append(
+            "⚠️ `ping` not found; cannot verify host. Start the client if the server IP is correct.\n"
+        )
+        self.connection_status.setText("● Not verified")
+        self.connection_status.setStyleSheet("font-size: 12px; color: #e67e22;")
+        QMessageBox.information(
+            self,
+            "DDS — no ping",
+            "The `ping` command was not found; host reachability was not tested.\n\n"
+            "DDS does not require MQTT. Ensure the server IP is correct and UDP 7400–7500 is allowed.",
+        )
+        self.statusBar().showMessage("DDS: install ping to test reachability")
+
     def test_connection(self):
         """Test connection to server (try Docker-mapped ports first, then standard broker ports)."""
         server_ip = self.server_ip.text().strip()
         
         if not server_ip:
             QMessageBox.warning(self, "Error", "Please enter server IP address!")
+            return
+
+        protocol = self.protocol_mode.currentData() or self.protocol_mode.currentText()
+        if protocol == "dds":
+            self._test_connection_dds_only(server_ip)
             return
         
         self.log_text.append(f"\n🔍 Testing connection to {server_ip}...\n")
