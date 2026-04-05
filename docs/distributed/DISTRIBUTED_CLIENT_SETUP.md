@@ -174,7 +174,7 @@ The **distributed client GUI** mounts this file into the client container when y
 
 On a **host** (no Docker): `source config/dds_distributed_env.sh` before starting `FL_Server_DDS.py` / `FL_Client_DDS.py`.
 
-`dds_distributed_unicast.py` sets **NetworkInterfaceAddress** per role (server → `DDS_PEER_SERVER`, client 1 → `DDS_PEER_CLIENT1`, client 2 → `DDS_PEER_CLIENT2`) so Cyclone does not advertise `docker0` or loopback. Override with **`DDS_NETWORK_INTERFACE`** if needed.
+**Docker:** peer IPs (e.g. `129.69.x.x`) are **not** bound as `NetworkInterfaceAddress` automatically—inside a **bridge** container that IP does not exist on any interface and Cyclone will error. Leave **`DDS_NETWORK_INTERFACE` unset** (Cyclone picks an interface), use **`docker run --network host`**, macvlan, or set **`DDS_NETWORK_INTERFACE=eth0`** (real interface name in that container).
 
 Optional: Allow **UDP** between all three hosts (SPDP ports follow `7410 + 2 * ParticipantIndex` on domain 0, plus the usual RTPS range). The **Connection** tab in `distributed_client_gui.py` can fill these three fields for remote containers; the main server container must export the same values.
 

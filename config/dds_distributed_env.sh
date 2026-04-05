@@ -12,5 +12,7 @@ export DDS_PEER_SERVER=129.69.102.245
 export DDS_PEER_CLIENT1=129.69.102.245
 export DDS_PEER_CLIENT2=129.69.102.173
 
-# Optional bind/interface for CycloneDDS (uncomment if needed):
+# Optional: real interface *name* in this process (not the host LAN IP). Needed only if
+# Cyclone picks the wrong NIC. In Docker bridge, do not set the peer IP here—it is not a
+# local interface address. Use e.g. eth0, or use docker --network host for DDS.
 # export DDS_NETWORK_INTERFACE=eth0
