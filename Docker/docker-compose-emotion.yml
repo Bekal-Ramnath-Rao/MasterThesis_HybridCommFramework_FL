@@ -519,7 +519,9 @@ services:
   # DDS Protocol Setup (Emotion Recognition)
   # ============================================================================
   
-  # DDS FL Server (Emotion Recognition) - no CYCLONEDDS_URI to match unified (default config)
+  # DDS FL Server (Emotion Recognition) — static unicast peers from image ENV (override as needed).
+  # For single-host bridge networking, prefer CYCLONEDDS_URI=file:///app/config/cyclonedds-multicast-lan.xml
+  # or unset DDS_PEER_* via env file if you need multicast-only discovery.
   fl-server-dds-emotion:
     build:
       context: ..
@@ -528,6 +530,9 @@ services:
     cap_add:
       - NET_ADMIN
     environment:
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
       - DDS_DOMAIN_ID=0
       - NUM_CLIENTS=2
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
@@ -557,6 +562,9 @@ services:
     depends_on:
       - fl-server-dds-emotion
     environment:
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
       - DDS_DOMAIN_ID=0
       - CLIENT_ID=1
       - NUM_CLIENTS=2
@@ -586,6 +594,9 @@ services:
     depends_on:
       - fl-server-dds-emotion
     environment:
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
       - DDS_DOMAIN_ID=0
       - CLIENT_ID=2
       - NUM_CLIENTS=2

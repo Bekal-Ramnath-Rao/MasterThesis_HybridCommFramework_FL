@@ -45,8 +45,10 @@ RUN cd Protocols && \
 
 COPY scripts/utilities/packet_logger.py ./
 COPY scripts/utilities/q_learning_logger.py ./
-# DDS: LAN multicast profile (aligned with Server image and distributed_client_gui)
+# DDS: LAN multicast + runtime static unicast generator (DDS_PEER_*)
 COPY config/cyclonedds-multicast-lan.xml /app/config/cyclonedds-multicast-lan.xml
+COPY config/dds_distributed_unicast.py /app/config/dds_distributed_unicast.py
+COPY config/dds_distributed_env.sh /app/config/dds_distributed_env.sh
 # Copy the Client directory
 COPY Client/ ./Client/
 # T_calc / R_tcalc in Q-learning rewards (communication_model, scenario tables)
@@ -64,6 +66,10 @@ ENV AMQP_HOST=rabbitmq
 ENV GRPC_HOST=fl-server
 ENV QUIC_HOST=fl-server
 ENV DDS_DOMAIN_ID=0
+# Emotion DDS static unicast (same three on server + both clients; override at runtime if needed)
+ENV DDS_PEER_SERVER=129.69.102.245
+ENV DDS_PEER_CLIENT1=129.69.102.245
+ENV DDS_PEER_CLIENT2=129.69.102.173
 
 # Default command - can be overridden in docker-compose
 CMD ["python", "-u", "Client/Emotion_Recognition/FL_Client_MQTT.py"]

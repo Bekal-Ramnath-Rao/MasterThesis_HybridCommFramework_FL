@@ -231,8 +231,8 @@ class DistributedClientGUI(QMainWindow):
         
         # Server IP
         layout.addWidget(QLabel("Server IP Address:"), 0, 0)
-        self.server_ip = QLineEdit("192.168.1.100")
-        self.server_ip.setPlaceholderText("e.g., 192.168.1.100")
+        self.server_ip = QLineEdit("129.69.102.245")
+        self.server_ip.setPlaceholderText("e.g., 129.69.102.245")
         self.server_ip.setStyleSheet("padding: 8px; font-size: 12px;")
         layout.addWidget(self.server_ip, 0, 1)
         
@@ -260,6 +260,28 @@ class DistributedClientGUI(QMainWindow):
         )
         info_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
         layout.addWidget(info_label, 1, 0, 1, 3)
+
+        dds_help = QLabel(
+            "DDS static unicast (optional): set all three if multicast discovery fails across subnets/routers. "
+            "Must match the FL server and both client hosts (see config/dds_distributed_unicast.py)."
+        )
+        dds_help.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
+        layout.addWidget(dds_help, 2, 0, 1, 3)
+        layout.addWidget(QLabel("DDS peer — server host:"), 3, 0)
+        self.dds_peer_server = QLineEdit("129.69.102.245")
+        self.dds_peer_server.setPlaceholderText("empty = use multicast LAN XML")
+        self.dds_peer_server.setStyleSheet("padding: 8px; font-size: 12px;")
+        layout.addWidget(self.dds_peer_server, 3, 1, 1, 2)
+        layout.addWidget(QLabel("DDS peer — client 1 host:"), 4, 0)
+        self.dds_peer_client1 = QLineEdit("129.69.102.245")
+        self.dds_peer_client1.setPlaceholderText("machine running CLIENT_ID=1")
+        self.dds_peer_client1.setStyleSheet("padding: 8px; font-size: 12px;")
+        layout.addWidget(self.dds_peer_client1, 4, 1, 1, 2)
+        layout.addWidget(QLabel("DDS peer — client 2 host:"), 5, 0)
+        self.dds_peer_client2 = QLineEdit("129.69.102.173")
+        self.dds_peer_client2.setPlaceholderText("machine running CLIENT_ID=2")
+        self.dds_peer_client2.setStyleSheet("padding: 8px; font-size: 12px;")
+        layout.addWidget(self.dds_peer_client2, 5, 1, 1, 2)
         
         group.setLayout(layout)
         return group
@@ -1439,12 +1461,33 @@ class DistributedClientGUI(QMainWindow):
             "-e", "DDS_DOMAIN_ID=0",
         ])
 
-        # DDS on a remote PC: use multicast SPDP on the LAN (same config must be used on the server).
-        # Mount cyclonedds-multicast-lan.xml; do not rely on compose-only unicast/127.0.0.1 peers.
+        # DDS on a remote PC: multicast LAN, or static unicast peers (DDS_PEER_*) if all three set.
         if protocol == "dds" or is_unified:
             _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             _mc_xml = os.path.join(_repo_root, "config", "cyclonedds-multicast-lan.xml")
-            if os.path.isfile(_mc_xml):
+            ps = getattr(self, "dds_peer_server", None)
+            p1 = getattr(self, "dds_peer_client1", None)
+            p2 = getattr(self, "dds_peer_client2", None)
+            ps_t = ps.text().strip() if ps else ""
+            p1_t = p1.text().strip() if p1 else ""
+            p2_t = p2.text().strip() if p2 else ""
+            if ps_t and p1_t and p2_t:
+                cmd.extend(
+                    [
+                        "-e",
+                        f"DDS_PEER_SERVER={ps_t}",
+                        "-e",
+                        f"DDS_PEER_CLIENT1={p1_t}",
+                        "-e",
+                        f"DDS_PEER_CLIENT2={p2_t}",
+                    ]
+                )
+                self.log_text.append(
+                    "DDS: static unicast peers (DDS_PEER_SERVER / CLIENT1 / CLIENT2). "
+                    "CYCLONEDDS_URI is generated at runtime; open UDP between hosts (~7400–7500 + SPDP ports). "
+                    "The main experiment server must set the same three DDS_PEER_* variables (no CYCLONEDDS_URI).\n"
+                )
+            elif os.path.isfile(_mc_xml):
                 cmd.extend(
                     [
                         "-v",

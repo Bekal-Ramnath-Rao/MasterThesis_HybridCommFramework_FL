@@ -166,6 +166,16 @@ The **distributed client GUI** mounts this file into the client container when y
 
 **Wi‑Fi:** disable **AP / client isolation** if present; otherwise multicast between stations may fail.
 
+**Cross-subnet / no multicast:** set the same three variables on the **server** and **both** Emotion DDS clients, and **do not** set `CYCLONEDDS_URI` (the process generates a temp CycloneDDS XML from `config/dds_distributed_unicast.py`). Defaults for this project are baked into `Server/Dockerfile`, `Client/Dockerfile`, `Docker/docker-compose-emotion.yml`, and `config/dds_distributed_env.sh`:
+
+- `DDS_PEER_SERVER=129.69.102.245` — FL server host
+- `DDS_PEER_CLIENT1=129.69.102.245` — host running `CLIENT_ID=1` (same machine as server in the lab setup)
+- `DDS_PEER_CLIENT2=129.69.102.173` — host running `CLIENT_ID=2`
+
+On a **host** (no Docker): `source config/dds_distributed_env.sh` before starting `FL_Server_DDS.py` / `FL_Client_DDS.py`.
+
+Optional: `DDS_NETWORK_INTERFACE` (bind/interface for CycloneDDS). Allow **UDP** between all three hosts (SPDP ports follow `7410 + 2 * ParticipantIndex` on domain 0, plus the usual RTPS range). The **Connection** tab in `distributed_client_gui.py` can fill these three fields for remote containers; the main server container must export the same values.
+
 ### Server Firewall Rules (Ubuntu/Linux)
 
 Replace `192.168.1.0/24` with your LAN subnet (server and clients must be allowed to exchange **UDP** on the DDS port range).

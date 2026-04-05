@@ -624,6 +624,9 @@ services:
       context: ..
       dockerfile: Server/Dockerfile
     environment:
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
       - PROTOCOL=DDS
       - USE_CASE=emotion
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
@@ -655,6 +658,9 @@ services:
       context: ..
       dockerfile: Client/Dockerfile
     environment:
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
       - CLIENT_ID=1
       - NUM_CLIENTS=2
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -695,6 +701,9 @@ services:
       context: ..
       dockerfile: Client/Dockerfile
     environment:
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
       - CLIENT_ID=2
       - NUM_CLIENTS=2
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}

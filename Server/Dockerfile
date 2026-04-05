@@ -43,8 +43,10 @@ RUN cd Protocols && \
     python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. federated_learning.proto && \
     cd ..
 
-# DDS: same multicast LAN profile as remote distributed clients (must match for discovery)
+# DDS: multicast LAN + runtime static unicast generator (DDS_PEER_*)
 COPY config/cyclonedds-multicast-lan.xml /app/config/cyclonedds-multicast-lan.xml
+COPY config/dds_distributed_unicast.py /app/config/dds_distributed_unicast.py
+COPY config/dds_distributed_env.sh /app/config/dds_distributed_env.sh
 
 # Copy the Server directory and scripts (DDS discovery server)
 COPY scripts/utilities/packet_logger.py ./
@@ -64,6 +66,10 @@ RUN mkdir -p /app/Server/results \
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV TF_CPP_MIN_LOG_LEVEL=3
+# Emotion DDS static unicast (same three on server + both clients; override at runtime if needed)
+ENV DDS_PEER_SERVER=129.69.102.245
+ENV DDS_PEER_CLIENT1=129.69.102.245
+ENV DDS_PEER_CLIENT2=129.69.102.173
 
 # Expose ports for different protocols
 # MQTT: 1883

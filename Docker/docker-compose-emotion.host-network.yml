@@ -611,6 +611,9 @@ services:
 
   # ============================================================================
   # DDS Protocol Services (Discovery at 127.0.0.1:7410; server 7412, client1 7414, client2 7416)
+  # For multi-machine static unicast (129.69.102.x lab), use docker run --network host with
+  # DDS_PEER_* from config/dds_distributed_env.sh / Server+Client Dockerfiles — do not use this
+  # localhost discovery block.
   # ============================================================================
   fl-server-dds-emotion:
     build:

@@ -17,9 +17,25 @@ def _emotion_config_dir():
     return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "config"))
 
 
+def _try_distributed_unicast_server():
+    """Static SPDP peers (DDS_PEER_*); see config/dds_distributed_unicast.py."""
+    base = _emotion_config_dir()
+    helper = os.path.join(base, "dds_distributed_unicast.py")
+    if not os.path.isfile(helper):
+        return False
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("dds_distributed_unicast", helper)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.try_apply_server_uri()
+
+
 def _ensure_server_cyclonedds_uri():
-    """Prefer LAN multicast (distributed clients); else legacy emotion-server (localhost peers)."""
+    """Explicit CYCLONEDDS_URI; else static unicast (DDS_PEER_*); else LAN multicast; else localhost peers."""
     if os.environ.get("CYCLONEDDS_URI"):
+        return
+    if _try_distributed_unicast_server():
         return
     base = _emotion_config_dir()
     for name in ("cyclonedds-multicast-lan.xml", "cyclonedds-emotion-server.xml"):
