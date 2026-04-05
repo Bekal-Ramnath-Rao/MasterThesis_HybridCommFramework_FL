@@ -2203,6 +2203,21 @@ class UnifiedFLClient_Emotion:
             return
         data = json.loads(payload.decode())
         round_num = data['round']
+        # Server current_round can run ahead of local state when gRPC polls CheckTrainingStatus
+        # before MQTT (or another thread) has applied handle_start_training for the same round.
+        if round_num < self.current_round:
+            print(
+                f"Client {self.client_id} ignoring stale evaluation signal for round {round_num} "
+                f"(current: {self.current_round})"
+            )
+            return
+        if round_num > self.current_round:
+            self.pending_start_evaluation_round = round_num
+            print(
+                f"Client {self.client_id} deferring evaluation for round {round_num} "
+                f"until local round catches up (current: {self.current_round})"
+            )
+            return
         if round_num == self.current_round:
             if self.waiting_for_aggregated_model or self.last_global_round < round_num:
                 self.pending_start_evaluation_round = round_num
@@ -2218,8 +2233,6 @@ class UnifiedFLClient_Emotion:
             print(f"Client {self.client_id} starting evaluation for round {round_num}...")
             self.evaluate_model(evaluation_round_num=round_num)
             print(f"Client {self.client_id} evaluation completed for round {round_num}.")
-        else:
-            print(f"Client {self.client_id} skipping evaluation signal for round {round_num} (current: {self.current_round})")
     
     def handle_training_complete(self):
         """Handle training completion signal from server"""

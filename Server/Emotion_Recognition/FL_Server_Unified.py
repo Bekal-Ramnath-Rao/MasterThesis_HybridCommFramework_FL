@@ -311,6 +311,8 @@ class UnifiedFederatedLearningServer:
         self.grpc_model_ready = {}  # Maps client_id -> model_ready_for_round (int)
         # (client_id, round) -> server wall time when gRPC downlink transfer started (chunk 0)
         self.grpc_downlink_sent_unix = {}
+        # Dedup noisy GetGlobalModel chunk-0 logs (clients poll ~1 Hz per listener thread)
+        self._grpc_chunk0_log_keys = set()
         
         # Training configuration
         self.training_config = {"batch_size": 32, "local_epochs": 20}
@@ -2563,7 +2565,14 @@ if GRPC_AVAILABLE:
                 if chunk_index == 0:
                     server_sent_unix = time.time()
                     self.server.grpc_downlink_sent_unix[sent_key] = server_sent_unix
-                    print(f"[gRPC] Client {client_id}: Sending global model (round {round_to_serve}, {total_size/1024:.2f} KB in {total_chunks} chunks)")
+                    _log_key = (int(client_id), int(round_to_serve), int(total_chunks))
+                    if _log_key not in self.server._grpc_chunk0_log_keys:
+                        self.server._grpc_chunk0_log_keys.add(_log_key)
+                        print(
+                            f"[gRPC] Client {client_id}: Sending global model "
+                            f"(round {round_to_serve}, {total_size/1024:.2f} KB in {total_chunks} chunks) "
+                            f"(further chunk-0 polls are silent until a new round/model size)"
+                        )
                 else:
                     server_sent_unix = float(self.server.grpc_downlink_sent_unix.get(sent_key, 0.0))
                     if server_sent_unix <= 0.0:
