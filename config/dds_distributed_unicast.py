@@ -21,11 +21,15 @@ Use Docker Compose service names for server/client1 when they share a bridge net
 Remote machines keep defaults from DDS_PEER_* (LAN IPs).
 
 Optional:
-  DDS_NETWORK_INTERFACE — only when you need to pin Cyclone to one NIC (e.g. eth0, enp3s0).
-  Do NOT set this to a host LAN IP (e.g. 129.x) inside a normal Docker bridge container:
-  that address is not assigned to any interface there and Cyclone will fail with
-  "does not match an available interface". For multi-host DDS use docker --network host,
-  macvlan, or leave DDS_NETWORK_INTERFACE unset and let Cyclone choose.
+  DDS_NETWORK_INTERFACE — pin Cyclone to an interface name (e.g. enp68s0) or IPv4 on that NIC.
+  On multi-NIC hosts (Wi‑Fi + Ethernet), "auto" may pick the wrong interface; set this explicitly
+  or rely on auto-detection below.
+
+  DDS_AUTO_NETWORK_INTERFACE — default "1": on Linux, set NetworkInterfaceAddress from
+  `ip -4 route get` to DDS_PEER_SERVER (clients) or to a remote peer (server). Set "0" to disable.
+
+  Do NOT set DDS_NETWORK_INTERFACE to a LAN IP inside a normal Docker bridge container unless
+  that IP exists in the container's network namespace.
 
 Open UDP between all three hosts for the ports Cyclone uses (typically ~7400–7500 and
 per-participant SPDP ports above).
@@ -36,6 +40,7 @@ Do not set CYCLONEDDS_URI when using this mode; it is set automatically to a tem
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 
 
@@ -106,6 +111,64 @@ def _peers_from_env() -> tuple[str, str, str] | None:
     return (s, c1, c2)
 
 
+def _auto_iface_enabled() -> bool:
+    return os.environ.get("DDS_AUTO_NETWORK_INTERFACE", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _iface_for_route_to(dst: str) -> str | None:
+    """Linux: return egress interface for IPv4 route to dst (skip loopback)."""
+    if not dst or not str(dst).strip():
+        return None
+    try:
+        out = subprocess.check_output(
+            ["ip", "-4", "route", "get", dst.strip()],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return None
+    parts = out.split()
+    if "dev" not in parts:
+        return None
+    i = parts.index("dev")
+    if i + 1 >= len(parts):
+        return None
+    iface = parts[i + 1]
+    if iface == "lo":
+        return None
+    return iface
+
+
+def _bind_iface_server(s: str, c1: str, c2: str) -> str | None:
+    explicit = os.environ.get("DDS_NETWORK_INTERFACE", "").strip()
+    if explicit:
+        return explicit
+    if not _auto_iface_enabled():
+        return None
+    # Prefer route toward a peer on another host (reveals LAN-facing NIC)
+    for dst in (c2, c1):
+        if dst and dst != s:
+            hit = _iface_for_route_to(dst)
+            if hit:
+                return hit
+    return None
+
+
+def _bind_iface_client(s: str, _c1: str, _c2: str, _cid: int) -> str | None:
+    explicit = os.environ.get("DDS_NETWORK_INTERFACE", "").strip()
+    if explicit:
+        return explicit
+    if not _auto_iface_enabled():
+        return None
+    return _iface_for_route_to(s)
+
+
 def _spdp_host_for_participant(pi: int, s: str, c1: str, c2: str) -> str:
     """Host part of <Peer> for the given remote participant index (1=server, 2=client1, 3=client2)."""
     if pi == 1:
@@ -130,7 +193,7 @@ def try_apply_server_uri() -> bool:
         _peer(_spdp_host_for_participant(2, s, c1, c2), 2),
         _peer(_spdp_host_for_participant(3, s, c1, c2), 3),
     ]
-    bind = os.environ.get("DDS_NETWORK_INTERFACE", "").strip() or None
+    bind = _bind_iface_server(s, c1, c2)
     xml = _document(1, peers, bind)
     _write_uri(xml)
     extra = f" NetworkInterfaceAddress={bind}" if bind else " (interface: auto)"
@@ -173,7 +236,7 @@ def try_apply_client_uri() -> bool:
             "falling back to CYCLONEDDS_URI / multicast."
         )
         return False
-    bind = os.environ.get("DDS_NETWORK_INTERFACE", "").strip() or None
+    bind = _bind_iface_client(s, c1, c2, cid)
     xml = _document(pi, peers, bind)
     _write_uri(xml)
     extra = f" NetworkInterfaceAddress={bind}" if bind else " (interface: auto)"

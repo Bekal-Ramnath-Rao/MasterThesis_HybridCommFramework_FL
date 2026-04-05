@@ -1634,13 +1634,45 @@ class DistributedClientGUI(QMainWindow):
         )
         self._apply_tc_profile(container_name, cond)
 
-    def _apply_tc_profile(self, container_name, cond):
-        """Apply tc/netem profile inside the client container (eth0)."""
+    def _tc_netdev_for_container(self, container_name: str) -> str:
+        """Interface to shape (host-network containers often have enp*, not eth0)."""
+        server_ip = self.server_ip.text().strip()
+        if not server_ip:
+            return "eth0"
         try:
+            r = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    container_name,
+                    "bash",
+                    "-c",
+                    f"ip -4 route get {server_ip} 2>/dev/null",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=6,
+            )
+            if r.returncode == 0 and "dev" in r.stdout:
+                parts = r.stdout.split()
+                i = parts.index("dev")
+                if i + 1 < len(parts):
+                    dev = parts[i + 1]
+                    if dev != "lo":
+                        return dev
+        except (subprocess.SubprocessError, FileNotFoundError, ValueError, IndexError):
+            pass
+        return "eth0"
+
+    def _apply_tc_profile(self, container_name, cond):
+        """Apply tc/netem profile inside the client container (detect iface toward server IP)."""
+        try:
+            dev = self._tc_netdev_for_container(container_name)
+            self.log_text.append(f"  tc netdev: {dev} (route toward server {self.server_ip.text().strip()})\n")
             setup_cmds = [
-                "tc qdisc del dev eth0 root || true",
-                "tc qdisc add dev eth0 root handle 1: htb default 12",
-                f"tc class add dev eth0 parent 1: classid 1:12 htb rate {cond['bandwidth']}mbit",
+                f"tc qdisc del dev {dev} root || true",
+                f"tc qdisc add dev {dev} root handle 1: htb default 12",
+                f"tc class add dev {dev} parent 1: classid 1:12 htb rate {cond['bandwidth']}mbit",
             ]
 
             netem_params = [f"delay {cond['latency']}ms"]
@@ -1650,7 +1682,7 @@ class DistributedClientGUI(QMainWindow):
                 netem_params.append(f"loss {cond['packet_loss']:.1f}%")
 
             setup_cmds.append(
-                f"tc qdisc add dev eth0 parent 1:12 handle 10: netem {' '.join(netem_params)}"
+                f"tc qdisc add dev {dev} parent 1:12 handle 10: netem {' '.join(netem_params)}"
             )
 
             for tc_cmd in setup_cmds:
