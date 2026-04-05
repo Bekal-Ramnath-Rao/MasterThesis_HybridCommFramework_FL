@@ -70,7 +70,7 @@ services:
       - USE_QUANTIZATION=false
     ports:
       - "50051:50051/tcp"  # gRPC (HTTP/2 over TCP)
-      - "4433:4433"    # QUIC
+      - "4433:4433/udp"  # QUIC
       - "4434:4434/udp"  # HTTP/3 (QUIC)
     volumes:
       - ./shared_data:/shared_data

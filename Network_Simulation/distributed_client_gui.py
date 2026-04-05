@@ -256,7 +256,8 @@ class DistributedClientGUI(QMainWindow):
             "Broker ports: Docker-mapped MQTT 31883 / AMQP 35672, or host/macvlan MQTT 1883 / AMQP 5672. "
             "Unified FL also needs TCP gRPC 50051 on the server host (initial model is pulled over gRPC, not MQTT). "
             "Standalone gRPC uses TCP 50051 only (no MQTT). QUIC 4433 | HTTP/3 4434 (UDP) | DDS domain 0. "
-            "Test Connection: gRPC-only → TCP 50051; MQTT modes → MQTT + gRPC; QUIC/HTTP3 → UDP; DDS → ping."
+            "Test Connection: RL-Unified → MQTT+AMQP TCP, gRPC TCP, QUIC/HTTP3 UDP; gRPC-only → TCP 50051; "
+            "MQTT modes → MQTT + gRPC; QUIC/HTTP3 → UDP; DDS → ping."
         )
         info_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
         layout.addWidget(info_label, 1, 0, 1, 3)
@@ -1235,6 +1236,138 @@ class DistributedClientGUI(QMainWindow):
         )
         self.statusBar().showMessage(f"gRPC: open TCP {grpc_port} / firewall")
 
+    def _test_connection_unified(self, server_ip: str):
+        """RL-Unified needs MQTT, AMQP, gRPC (TCP), QUIC & HTTP/3 (UDP). DDS is separate (UDP multicast/unicast)."""
+        self.log_text.append(
+            f"\n🔍 RL-Unified: checking {server_ip} — MQTT, AMQP, gRPC, QUIC, HTTP/3 "
+            f"(DDS uses UDP discovery; see log note)...\n"
+        )
+        self.statusBar().showMessage("Testing RL-Unified endpoints…")
+
+        ping_ok = self._ping_server_host(server_ip)
+        if ping_ok is True:
+            self.log_text.append(f"✅ ICMP ping to {server_ip} succeeded.\n")
+        elif ping_ok is False:
+            self.log_text.append(
+                f"⚠️ ICMP ping to {server_ip} failed or blocked (brokers may still be reachable).\n"
+            )
+        else:
+            self.log_text.append("⚠️ `ping` not installed; skipping host ICMP check.\n")
+
+        candidates = [
+            (31883, 35672, "Docker-mapped (e.g. docker-compose-unified-emotion.yml)"),
+            (1883, 5672, "Standard broker ports (e.g. macvlan / host / config compose)"),
+        ]
+
+        mqtt_p = amqp_p = None
+        desc = ""
+        for mp, ap, d in candidates:
+            if self._tcp_port_probe(server_ip, mp):
+                mqtt_p, amqp_p, desc = mp, ap, d
+                self.remote_mqtt_port = mp
+                self.remote_amqp_port = ap
+                break
+
+        if mqtt_p is None:
+            self.log_text.append(
+                f"❌ MQTT not reachable on {server_ip}:31883 or :1883.\n"
+                f"   Start brokers + unified stack; open firewall TCP 31883/1883 from this PC.\n"
+            )
+            self.connection_status.setText("● Disconnected")
+            self.connection_status.setStyleSheet("font-size: 12px; color: #dc3545;")
+            QMessageBox.warning(
+                self,
+                "RL-Unified — MQTT",
+                f"Cannot reach MQTT on {server_ip} (tried TCP 31883 and 1883).\n\n"
+                f"Remote RL-Unified clients need the MQTT broker published on the host.\n"
+                f"Check server IP, docker compose port maps, and firewall.",
+            )
+            self.statusBar().showMessage("RL-Unified: MQTT failed")
+            return
+
+        self.log_text.append(f"✅ MQTT TCP {mqtt_p} — {desc}\n")
+        mqtt_ok = True
+
+        amqp_ok = self._tcp_port_probe(server_ip, amqp_p)
+        self.log_text.append(
+            f"{'✅' if amqp_ok else '❌'} AMQP TCP {amqp_p} ({'RabbitMQ' if amqp_ok else 'not reachable from this PC'})\n"
+        )
+
+        grpc_port = 50051
+        grpc_ok = self._tcp_port_probe(server_ip, grpc_port)
+        self.log_text.append(
+            f"{'✅' if grpc_ok else '❌'} gRPC TCP {grpc_port} "
+            f"({'unified server / initial model' if grpc_ok else 'required for initial global model'})\n"
+        )
+
+        quic_ok = self._udp_port_probe(server_ip, 4433)
+        http3_ok = self._udp_port_probe(server_ip, 4434)
+        self.log_text.append(
+            f"{'✅' if quic_ok else '❌'} QUIC UDP 4433 ({'OK' if quic_ok else 'allow UDP / Docker 4433:4433/udp'})\n"
+        )
+        self.log_text.append(
+            f"{'✅' if http3_ok else '❌'} HTTP/3 UDP 4434 ({'OK' if http3_ok else 'allow UDP / Docker 4434:4434/udp'})\n"
+        )
+
+        self.log_text.append(
+            "ℹ️ DDS: CycloneDDS uses UDP (multicast LAN or static DDS_PEER_*); no single TCP port check. "
+            "Ensure same CYCLONEDDS_URI / peers as the server if you use DDS selection.\n"
+        )
+
+        transport_ok = mqtt_ok and amqp_ok and grpc_ok and quic_ok and http3_ok
+        core_ok = mqtt_ok and grpc_ok
+
+        if transport_ok:
+            self.connection_status.setText("● Reachable (full)")
+            self.connection_status.setStyleSheet("font-size: 12px; color: #28a745;")
+            QMessageBox.information(
+                self,
+                "RL-Unified — all probes OK",
+                f"Server {server_ip}:\n"
+                f"• MQTT TCP {mqtt_p} ✓\n"
+                f"• AMQP TCP {amqp_p} ✓\n"
+                f"• gRPC TCP {grpc_port} ✓\n"
+                f"• QUIC UDP 4433 ✓\n"
+                f"• HTTP/3 UDP 4434 ✓\n\n"
+                f"DDS is not TCP-probed; use matching multicast/unicast config with the server.",
+            )
+            self.statusBar().showMessage("RL-Unified: all endpoints OK")
+            return
+
+        if not core_ok:
+            self.connection_status.setText("● Blocked (MQTT/gRPC)")
+            self.connection_status.setStyleSheet("font-size: 12px; color: #dc3545;")
+            fail = []
+            if not grpc_ok:
+                fail.append(f"gRPC TCP {grpc_port} (required for initial model)")
+            QMessageBox.warning(
+                self,
+                "RL-Unified — critical failure",
+                f"MQTT or gRPC is not reachable on {server_ip}.\n\n"
+                f"Unified clients need MQTT for control and gRPC TCP {grpc_port} for the first global model.\n\n"
+                + ("\n".join(fail) if fail else "Open firewall and confirm Docker publishes these ports."),
+            )
+            self.statusBar().showMessage("RL-Unified: fix MQTT/gRPC")
+            return
+
+        # Core OK but some optional transports missing
+        self.connection_status.setText("● Partial")
+        self.connection_status.setStyleSheet("font-size: 12px; color: #e67e22;")
+        parts = []
+        if not amqp_ok:
+            parts.append(f"AMQP TCP {amqp_p} — RL cannot use AMQP until open.")
+        if not quic_ok:
+            parts.append("QUIC UDP 4433 — map 4433:4433/udp, firewall UDP/4433.")
+        if not http3_ok:
+            parts.append("HTTP/3 UDP 4434 — map 4434:4434/udp, firewall UDP/4434.")
+        msg = (
+            f"Server {server_ip}: MQTT and gRPC are OK; some other transports failed:\n\n"
+            + "\n".join(parts)
+            + "\n\nRL can still run, but protocol selection will skip unreachable transports."
+        )
+        QMessageBox.warning(self, "RL-Unified — partial", msg)
+        self.statusBar().showMessage("RL-Unified: partial — open AMQP/QUIC/HTTP3 if needed")
+
     def test_connection(self):
         """Test connection to server (try Docker-mapped ports first, then standard broker ports)."""
         server_ip = self.server_ip.text().strip()
@@ -1256,6 +1389,9 @@ class DistributedClientGUI(QMainWindow):
         if protocol == "grpc":
             self._test_connection_grpc_only(server_ip)
             return
+        if protocol == "rl_unified":
+            self._test_connection_unified(server_ip)
+            return
         
         self.log_text.append(f"\n🔍 Testing connection to {server_ip}...\n")
         self.statusBar().showMessage("Testing connection...")
@@ -1267,13 +1403,7 @@ class DistributedClientGUI(QMainWindow):
         ]
         try:
             for mqtt_p, amqp_p, desc in candidates:
-                result = subprocess.run(
-                    ["timeout", "3", "bash", "-c", f"nc -zv {server_ip} {mqtt_p}"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if result.returncode == 0:
+                if self._tcp_port_probe(server_ip, mqtt_p):
                     self.remote_mqtt_port = mqtt_p
                     self.remote_amqp_port = amqp_p
                     self.log_text.append(
