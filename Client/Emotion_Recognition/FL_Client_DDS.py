@@ -477,9 +477,17 @@ class FederatedLearningClient:
 
         print(f"Client {self.client_id} DDS setup complete (Reliable QoS; model_update 10 min blocking for large uploads)")
         
-        # Wait for DDS endpoint discovery before sending
-        print(f"Client {self.client_id} waiting for endpoint discovery...")
-        time.sleep(2.0)
+        # Wait for DDS endpoint discovery before sending (static unicast SPDP is slower than multicast)
+        _peers_set = all(
+            (
+                os.environ.get("DDS_PEER_SERVER", "").strip(),
+                os.environ.get("DDS_PEER_CLIENT1", "").strip(),
+                os.environ.get("DDS_PEER_CLIENT2", "").strip(),
+            )
+        )
+        _disc = float(os.environ.get("DDS_DISCOVERY_WAIT_S", "5" if _peers_set else "2"))
+        print(f"Client {self.client_id} waiting for endpoint discovery ({_disc}s)...")
+        time.sleep(_disc)
         
         # Register with server (send multiple times for reliability)
         registration = ClientRegistration(
@@ -544,7 +552,14 @@ class FederatedLearningClient:
     
     def get_training_config(self):
         """Get training configuration from server"""
-        timeout = 10
+        _peers_set = all(
+            (
+                os.environ.get("DDS_PEER_SERVER", "").strip(),
+                os.environ.get("DDS_PEER_CLIENT1", "").strip(),
+                os.environ.get("DDS_PEER_CLIENT2", "").strip(),
+            )
+        )
+        timeout = float(os.environ.get("DDS_CONFIG_WAIT_S", "45" if _peers_set else "10"))
         start_time = time.time()
         
         while time.time() - start_time < timeout:

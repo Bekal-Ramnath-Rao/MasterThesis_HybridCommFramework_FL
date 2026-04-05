@@ -11,7 +11,13 @@ Participant indices match config/cyclonedds-emotion-server.xml and client1/2:
 SPDP unicast port for domain 0 (CycloneDDS 0.10.x): 7410 + 2 * ParticipantIndex
 
 Optional:
-  DDS_NETWORK_INTERFACE — e.g. eth0 or 192.168.1.10 (passed to NetworkInterfaceAddress)
+  DDS_NETWORK_INTERFACE — overrides the automatic binding below (e.g. eth0).
+
+If DDS_NETWORK_INTERFACE is unset, each process binds/advertises on the LAN IP that matches
+its role (fixes discovery when "auto" picks docker0 or loopback):
+  server  → DDS_PEER_SERVER
+  client1 → DDS_PEER_CLIENT1
+  client2 → DDS_PEER_CLIENT2
 
 Open UDP between all three hosts for the ports Cyclone uses (typically ~7400–7500 and
 per-participant SPDP ports above).
@@ -36,8 +42,9 @@ def _peer(host: str, participant_index: int) -> str:
     return f"{h}:{spdp_port_domain0(participant_index)}"
 
 
-def _general_xml() -> str:
-    iface = os.environ.get("DDS_NETWORK_INTERFACE", "").strip()
+def _general_xml(network_iface: str | None) -> str:
+    """network_iface: explicit bind address (IPv4, hostname, or interface name)."""
+    iface = (network_iface or "").strip() or os.environ.get("DDS_NETWORK_INTERFACE", "").strip()
     if iface:
         return f"""        <General>
             <AllowMulticast>false</AllowMulticast>
@@ -48,12 +55,12 @@ def _general_xml() -> str:
         </General>"""
 
 
-def _document(participant_index: int, peer_addrs: list[str]) -> str:
+def _document(participant_index: int, peer_addrs: list[str], network_iface: str | None = None) -> str:
     lines = "\n".join(f'                <Peer address="{a}"/>' for a in peer_addrs)
     return f"""<?xml version="1.0" encoding="UTF-8" ?>
 <CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
     <Domain id="any">
-{_general_xml()}
+{_general_xml(network_iface)}
         <Discovery>
             <ParticipantIndex>{participant_index}</ParticipantIndex>
             <Peers>
@@ -101,11 +108,13 @@ def try_apply_server_uri() -> bool:
     s, c1, c2 = t
     # Other participants: client1 (PI=2), client2 (PI=3)
     peers = [_peer(c1, 2), _peer(c2, 3)]
-    xml = _document(1, peers)
+    bind = os.environ.get("DDS_NETWORK_INTERFACE", "").strip() or s
+    xml = _document(1, peers, bind)
     _write_uri(xml)
     print(
         "[DDS] Static unicast peers (server): "
         f"DDS_PEER_SERVER={s} DDS_PEER_CLIENT1={c1} DDS_PEER_CLIENT2={c2} "
+        f"NetworkInterfaceAddress={bind} "
         f"-> CYCLONEDDS_URI={os.environ['CYCLONEDDS_URI']}"
     )
     return True
@@ -135,11 +144,13 @@ def try_apply_client_uri() -> bool:
             "falling back to CYCLONEDDS_URI / multicast."
         )
         return False
-    xml = _document(pi, peers)
+    bind = os.environ.get("DDS_NETWORK_INTERFACE", "").strip() or (c1 if cid == 1 else c2)
+    xml = _document(pi, peers, bind)
     _write_uri(xml)
     print(
         f"[DDS] Static unicast peers (client {cid}): "
         f"DDS_PEER_SERVER={s} DDS_PEER_CLIENT1={c1} DDS_PEER_CLIENT2={c2} "
+        f"NetworkInterfaceAddress={bind} "
         f"-> CYCLONEDDS_URI={os.environ['CYCLONEDDS_URI']}"
     )
     return True

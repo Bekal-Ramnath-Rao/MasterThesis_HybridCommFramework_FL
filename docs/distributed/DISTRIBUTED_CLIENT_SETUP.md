@@ -174,7 +174,9 @@ The **distributed client GUI** mounts this file into the client container when y
 
 On a **host** (no Docker): `source config/dds_distributed_env.sh` before starting `FL_Server_DDS.py` / `FL_Client_DDS.py`.
 
-Optional: `DDS_NETWORK_INTERFACE` (bind/interface for CycloneDDS). Allow **UDP** between all three hosts (SPDP ports follow `7410 + 2 * ParticipantIndex` on domain 0, plus the usual RTPS range). The **Connection** tab in `distributed_client_gui.py` can fill these three fields for remote containers; the main server container must export the same values.
+`dds_distributed_unicast.py` sets **NetworkInterfaceAddress** per role (server → `DDS_PEER_SERVER`, client 1 → `DDS_PEER_CLIENT1`, client 2 → `DDS_PEER_CLIENT2`) so Cyclone does not advertise `docker0` or loopback. Override with **`DDS_NETWORK_INTERFACE`** if needed.
+
+Optional: Allow **UDP** between all three hosts (SPDP ports follow `7410 + 2 * ParticipantIndex` on domain 0, plus the usual RTPS range). The **Connection** tab in `distributed_client_gui.py` can fill these three fields for remote containers; the main server container must export the same values.
 
 ### Server Firewall Rules (Ubuntu/Linux)
 

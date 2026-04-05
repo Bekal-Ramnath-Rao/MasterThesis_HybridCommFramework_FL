@@ -484,16 +484,24 @@ class FederatedLearningServer:
         time.sleep(5.0)
         print("DDS endpoints ready\n")
         
-        # Publish initial training config
+        # Publish initial training config (re-published until training starts so late joiners receive it)
         config = TrainingConfig(
             batch_size=self.training_config['batch_size'],
             local_epochs=self.training_config['local_epochs']
         )
+        self._training_config_msg = config
+        self._last_config_republish = time.time()
         self.writers['config'].write(config)
         
         try:
             while not self.training_complete:
                 try:
+                    # Re-publish config while waiting for all clients (TransientLocal + late discovery)
+                    if not self.training_started:
+                        now = time.time()
+                        if now - self._last_config_republish >= 2.0:
+                            self.writers['config'].write(self._training_config_msg)
+                            self._last_config_republish = now
                     # Publish current status
                     try:
                         self.publish_status()
