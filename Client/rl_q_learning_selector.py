@@ -343,8 +343,15 @@ class QLearningProtocolSelector:
             explored = True
         else:
             # Exploit: best known action (uses learned Q-table)
-            # When training=False, this always uses the learned Q-table for inference
-            action_idx = np.argmax(self.q_table[state_idx])
+            # When training=False, this always uses the learned Q-table for inference.
+            # Break ties at random — np.argmax always picks index 0 on all-zero rows, which
+            # incorrectly forces MQTT (protocol index 0) whenever that state was never updated.
+            qrow = self.q_table[state_idx]
+            max_q = float(np.max(qrow))
+            tie = np.flatnonzero(np.isclose(qrow, max_q, rtol=1e-9, atol=1e-12))
+            if tie.size == 0:
+                tie = np.array([0], dtype=np.intp)
+            action_idx = int(np.random.choice(tie))
             explored = False
         
         # region agent log
@@ -1066,7 +1073,12 @@ class QLearningProtocolSelector:
             Best protocol name
         """
         state_idx = self.get_state_index(state)
-        action_idx = np.argmax(self.q_table[state_idx])
+        qrow = self.q_table[state_idx]
+        max_q = float(np.max(qrow))
+        tie = np.flatnonzero(np.isclose(qrow, max_q, rtol=1e-9, atol=1e-12))
+        if tie.size == 0:
+            tie = np.array([0], dtype=np.intp)
+        action_idx = int(np.random.choice(tie))
         return self.PROTOCOLS[action_idx]
     
     def get_last_q_delta(self) -> float:

@@ -461,6 +461,25 @@ def _coarse_network_bucket_for_scenario(name: str) -> str:
     return "moderate"
 
 
+def _effective_rl_network_scenario_label_from_env() -> Optional[str]:
+    """
+    Explicit experiment/simulator label for Q-table ``network_scenario`` indexing.
+
+    When set, used for **both** training and inference so greedy selection reads the same
+    Q slices that were updated during training (avoids inference-only ``measure_network_condition``
+    classifying broker RTT as one bucket while training used ``RL_REWARD_SCENARIO``).
+    Priority: RL_REWARD_SCENARIO, then RL_STATE_NETWORK_SCENARIO, NETWORK_SCENARIO, SIMULATOR_SCENARIO.
+    """
+    rs = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
+    if rs:
+        return rs
+    for key in ("RL_STATE_NETWORK_SCENARIO", "NETWORK_SCENARIO", "SIMULATOR_SCENARIO"):
+        v = os.environ.get(key, "").strip().lower()
+        if v:
+            return v
+    return None
+
+
 # Energy / battery model constants (tunable)
 k_tx = 1e-8
 k_rx = 1e-8
@@ -1897,26 +1916,7 @@ class UnifiedFLClient_Emotion:
             import psutil
             cpu = psutil.cpu_percent(interval=0.1)
             memory = psutil.virtual_memory().percent
-            if USE_QL_CONVERGENCE:
-                reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
-                if reward_scenario:
-                    self.env_manager.update_network_scenario(
-                        reward_scenario,
-                        rl_uplink=self.rl_selector_uplink,
-                        rl_downlink=self.rl_selector_downlink,
-                    )
-                    self.env_manager.update_network_condition(
-                        _coarse_network_bucket_for_scenario(reward_scenario)
-                    )
-                else:
-                    self.env_manager.update_network_scenario(
-                        None,
-                        rl_uplink=self.rl_selector_uplink,
-                        rl_downlink=self.rl_selector_downlink,
-                    )
-                    self.measure_network_condition()
-            else:
-                self.measure_network_condition()
+            self._apply_rl_network_scenario_for_selector_state()
             t_dl = float(getattr(self, "_last_downlink_comm_wall_s", 0.0) or 0.0)
             if t_dl <= 0.0:
                 rm = self.round_metrics or {}
@@ -2321,26 +2321,7 @@ class UnifiedFLClient_Emotion:
                     import psutil
                     cpu = psutil.cpu_percent(interval=0.1)
                     memory = psutil.virtual_memory().percent
-                    if USE_QL_CONVERGENCE:
-                        reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
-                        if reward_scenario:
-                            self.env_manager.update_network_scenario(
-                                reward_scenario,
-                                rl_uplink=self.rl_selector_uplink,
-                                rl_downlink=self.rl_selector_downlink,
-                            )
-                            self.env_manager.update_network_condition(
-                                _coarse_network_bucket_for_scenario(reward_scenario)
-                            )
-                        else:
-                            self.env_manager.update_network_scenario(
-                                None,
-                                rl_uplink=self.rl_selector_uplink,
-                                rl_downlink=self.rl_selector_downlink,
-                            )
-                            self.measure_network_condition()
-                    else:
-                        self.measure_network_condition()
+                    self._apply_rl_network_scenario_for_selector_state()
                     t_dl = float(getattr(self, "_last_downlink_comm_wall_s", 0.0) or 0.0)
                     if t_dl <= 0.0:
                         rm = self.round_metrics or {}
@@ -2545,6 +2526,34 @@ class UnifiedFLClient_Emotion:
         except Exception as e:
             print(f"[Network] Failed to measure network condition: {e}")
 
+    def _apply_rl_network_scenario_for_selector_state(self) -> None:
+        """
+        Set ``data_network_scenario`` for Q-learning state (first axis: excellent/moderate/poor).
+
+        If an explicit label is set in the environment, use it whenever training **or** inference
+        runs so ``argmax`` Q selection matches the slices populated during learning.
+        """
+        if not self.env_manager:
+            return
+        eff = _effective_rl_network_scenario_label_from_env()
+        if eff:
+            self.env_manager.update_network_scenario(
+                eff,
+                rl_uplink=self.rl_selector_uplink,
+                rl_downlink=self.rl_selector_downlink,
+            )
+            self.env_manager.update_network_condition(
+                _coarse_network_bucket_for_scenario(eff)
+            )
+            return
+        if USE_QL_CONVERGENCE:
+            self.env_manager.update_network_scenario(
+                None,
+                rl_uplink=self.rl_selector_uplink,
+                rl_downlink=self.rl_selector_downlink,
+            )
+        self.measure_network_condition()
+
     def _shared_data_dir(self):
         """Resolve shared_data path (Docker: /shared_data; native: project shared_data)."""
         if os.path.exists("/shared_data"):
@@ -2732,28 +2741,9 @@ class UnifiedFLClient_Emotion:
                     cpu = psutil.cpu_percent(interval=0.1)
                     memory = psutil.virtual_memory().percent
 
-                    # When USE_QL_CONVERGENCE: use RL_REWARD_SCENARIO for state if set (train in target scenario).
-                    # Otherwise use actual measured network so we learn/select for real conditions.
-                    if USE_QL_CONVERGENCE:
-                        reward_scenario = os.environ.get("RL_REWARD_SCENARIO", "").strip().lower()
-                        if reward_scenario:
-                            self.env_manager.update_network_scenario(
-                                reward_scenario,
-                                rl_uplink=self.rl_selector_uplink,
-                                rl_downlink=self.rl_selector_downlink,
-                            )
-                            self.env_manager.update_network_condition(
-                                _coarse_network_bucket_for_scenario(reward_scenario)
-                            )
-                        else:
-                            self.env_manager.update_network_scenario(
-                                None,
-                                rl_uplink=self.rl_selector_uplink,
-                                rl_downlink=self.rl_selector_downlink,
-                            )
-                            self.measure_network_condition()
-                    else:
-                        self.measure_network_condition()
+                    # Explicit RL_REWARD_SCENARIO / NETWORK_SCENARIO (see _effective_rl_network_scenario_label_from_env)
+                    # applies to **inference** as well as training so Q-state matches learned slices.
+                    self._apply_rl_network_scenario_for_selector_state()
 
                     rm = self.round_metrics or {}
                     t_comm = float(
