@@ -3064,8 +3064,13 @@ class UnifiedFLClient_Emotion:
         
         num_samples = self.validation_generator.n
         
-        # Select protocol based on RL (store state for Q-learning log — uplink thresholds)
-        protocol = self.select_protocol()
+        # Use the same transport as the model upload for this round. train_local_model() already
+        # called select_protocol() once and registered (state, action) for the uplink; calling
+        # select_protocol() again would append a second pair while update_q_value() only trains
+        # the last entry — pairing round rewards with the wrong action (e.g. HTTP/3 for metrics
+        # while the slow uplink used another stack).
+        protocol = (self._last_update_protocol or self.selected_protocol or "mqtt")
+        self.selected_protocol = protocol
         if self.env_manager is not None:
             self._last_rl_state = (
                 getattr(self, "_last_uplink_rl_state", None) or self.env_manager.get_current_state()

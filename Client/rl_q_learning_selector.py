@@ -144,7 +144,8 @@ class QLearningProtocolSelector:
     # Q-table state axis 0: coarse network regime (same physical table, separate learned slices)
     NETWORK_SCENARIO_LEVELS = ["excellent", "moderate", "poor"]
     COMM_LEVELS = ["low", "mid", "high"]  # wall-clock comm time: low=fast, high=slow
-    RESOURCE_LEVELS = ["high", "low"]  # high = plenty of CPU/memory; low = heavily loaded
+    # Resource is *availability/headroom* (inverse of load): high = low CPU+memory stress.
+    RESOURCE_LEVELS = ["high", "low"]  # high = plenty of CPU/memory headroom; low = stressed
     BATTERY_LEVELS = ["high", "low"]  # high SoC vs low SoC
     
     def __init__(
@@ -1386,7 +1387,7 @@ class EnvironmentStateManager:
         return self.data_network_scenario
 
     def update_resource_level(self, level: str):
-        """Update resource availability: 'high' or 'low'."""
+        """Update resource availability: ``high`` = headroom (low load), ``low`` = stressed."""
         if level in QLearningProtocolSelector.RESOURCE_LEVELS:
             self.current_state["resource"] = level
 
