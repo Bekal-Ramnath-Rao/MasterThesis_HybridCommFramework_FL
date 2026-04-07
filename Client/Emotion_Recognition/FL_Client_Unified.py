@@ -2083,6 +2083,7 @@ class UnifiedFLClient_Emotion:
                 done=False if next_state is not None else True,
             )
             q_delta = self.rl_selector_downlink.get_last_q_delta()
+            q_value = self.rl_selector_downlink.get_last_q_value()
             avg_reward = (
                 float(np.mean(self.rl_selector_downlink.total_rewards[-100:]))
                 if self.rl_selector_downlink.total_rewards else 0.0
@@ -2111,6 +2112,7 @@ class UnifiedFLClient_Emotion:
                     reward=reward,
                     q_delta=q_delta,
                     epsilon=self.rl_selector_downlink.epsilon,
+                    q_value=q_value,
                     avg_reward_last_100=avg_reward,
                     converged=q_converged,
                     metric_communication_time=reward_details.get('communication_time'),
@@ -3254,6 +3256,7 @@ class UnifiedFLClient_Emotion:
                             done=False if next_state is not None else True,
                         )
                         q_delta = self.rl_selector_uplink.get_last_q_delta()
+                        q_value = self.rl_selector_uplink.get_last_q_value()
                         avg_reward = (np.mean(self.rl_selector_uplink.total_rewards[-100:])
                                      if self.rl_selector_uplink.total_rewards else 0.0)
                         self.rl_selector_uplink.end_episode()
@@ -3291,6 +3294,7 @@ class UnifiedFLClient_Emotion:
                                 reward=reward,
                                 q_delta=q_delta,
                                 epsilon=self.rl_selector_uplink.epsilon,
+                                q_value=q_value,
                                 avg_reward_last_100=float(avg_reward),
                                 converged=(
                                     q_both_converged

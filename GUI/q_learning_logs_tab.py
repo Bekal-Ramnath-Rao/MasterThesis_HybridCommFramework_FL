@@ -98,7 +98,7 @@ _QL_SELECT_SQL = """
            state_comm_level,
            state_resource,
            COALESCE(NULLIF(TRIM(state_battery_level), ''), '') AS state_battery_level,
-           action, reward, q_delta, epsilon,
+           action, reward, q_delta, q_value, epsilon,
            avg_reward_last_100, converged,
            metric_communication_time,
            metric_success,
@@ -181,11 +181,11 @@ class QLearningLogsTab(QWidget):
         layout.addWidget(stats_group)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(26)
+        self.table.setColumnCount(27)
         self.table.setHorizontalHeaderLabels([
             "ID", "Timestamp", "Round", "Episode", "Direction",
             "Comm level", "Resource", "Battery (RL)",
-            "Action", "Reward", "Q Delta", "Epsilon", "Avg R(100)", "Converged",
+            "Action", "Reward", "Q Delta", "Q Value", "Epsilon", "Avg R(100)", "Converged",
             "Comm Time", "Success",
             "CPU", "Memory", "Bandwidth",
             "Battery", "Energy",
@@ -241,7 +241,7 @@ class QLearningLogsTab(QWidget):
         self.table.setRowCount(0)
         # Column indices (0-based): 3D RL state = comm, resource, battery
         DIR_COL = 4
-        CONVERGED_COL = 13
+        CONVERGED_COL = 14
         REWARD_COL = 9
         for r in rows:
             self.table.insertRow(self.table.rowCount())

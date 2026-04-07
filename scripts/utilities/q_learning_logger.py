@@ -65,6 +65,7 @@ def _create_slim_table(c: sqlite3.Cursor) -> None:
             action TEXT NOT NULL,
             reward REAL NOT NULL,
             q_delta REAL,
+            q_value REAL,
             epsilon REAL NOT NULL,
             avg_reward_last_100 REAL,
             converged INTEGER DEFAULT 0,
@@ -121,6 +122,7 @@ def _migrate_legacy_to_slim(conn: sqlite3.Connection) -> None:
             action TEXT NOT NULL,
             reward REAL NOT NULL,
             q_delta REAL,
+            q_value REAL,
             epsilon REAL NOT NULL,
             avg_reward_last_100 REAL,
             converged INTEGER DEFAULT 0,
@@ -156,7 +158,7 @@ def _migrate_legacy_to_slim(conn: sqlite3.Connection) -> None:
         INSERT INTO q_learning_log_new (
             client_id, timestamp, link_direction, round_num, episode,
             state_comm_level, state_resource, state_battery_level,
-            action, reward, q_delta, epsilon, avg_reward_last_100, converged,
+            action, reward, q_delta, q_value, epsilon, avg_reward_last_100, converged,
             metric_communication_time, metric_success,
             metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage,
             metric_battery_level, metric_energy_usage,
@@ -169,7 +171,7 @@ def _migrate_legacy_to_slim(conn: sqlite3.Connection) -> None:
             {sel_comm},
             COALESCE(state_resource, ''),
             COALESCE(state_battery_level, ''),
-            action, reward, q_delta, epsilon, avg_reward_last_100, converged,
+            action, reward, q_delta, NULL, epsilon, avg_reward_last_100, converged,
             metric_communication_time, metric_success,
             metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage,
             metric_battery_level, metric_energy_usage,
@@ -197,6 +199,9 @@ def init_db(db_path: Optional[str] = None):
             cols = _table_columns(conn, "q_learning_log")
             if "metric_t_calc" in cols or "state_network" in cols or "state_comm_level" not in cols:
                 _migrate_legacy_to_slim(conn)
+                cols = _table_columns(conn, "q_learning_log")
+            if "q_value" not in cols:
+                c.execute("ALTER TABLE q_learning_log ADD COLUMN q_value REAL")
         conn.commit()
     finally:
         conn.close()
@@ -213,6 +218,7 @@ def log_q_step(
     reward: float,
     q_delta: float,
     epsilon: float,
+    q_value: Optional[float] = None,
     avg_reward_last_100: float = None,
     converged: bool = False,
     metric_communication_time: float = None,
@@ -240,12 +246,12 @@ def log_q_step(
             INSERT INTO q_learning_log (
                 client_id, timestamp, link_direction, round_num, episode,
                 state_comm_level, state_resource, state_battery_level,
-                action, reward, q_delta, epsilon, avg_reward_last_100, converged,
+                action, reward, q_delta, q_value, epsilon, avg_reward_last_100, converged,
                 metric_communication_time, metric_success,
                 metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage,
                 metric_battery_level, metric_energy_usage,
                 reward_base, reward_communication_time, reward_resource_penalty, reward_battery_penalty, reward_total
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 client_id,
@@ -259,6 +265,7 @@ def log_q_step(
                 action,
                 reward,
                 q_delta if q_delta is not None else 0.0,
+                q_value,
                 epsilon,
                 avg_reward_last_100 if avg_reward_last_100 is not None else 0.0,
                 1 if converged else 0,
@@ -292,6 +299,7 @@ def log_q_step(
                 reward,
                 q_delta,
                 epsilon,
+                q_value=q_value,
                 avg_reward_last_100=avg_reward_last_100,
                 converged=converged,
                 metric_communication_time=metric_communication_time,

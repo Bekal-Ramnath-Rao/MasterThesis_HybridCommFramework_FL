@@ -214,6 +214,7 @@ class QLearningProtocolSelector:
         # Q-value convergence tracking (for "end on Q convergence" mode)
         self._q_deltas = []  # abs(new_q - current_q) per update
         self._q_delta_window = 50  # keep last N deltas
+        self._last_q_value = 0.0  # Q(s,a) after last update (for logging)
 
         # Last reward breakdown (exact values for dashboard/logging)
         self._last_reward_breakdown = {}
@@ -602,6 +603,7 @@ class QLearningProtocolSelector:
         # Update Q-table
         q_delta = abs(new_q - current_q)
         self.q_table[state_idx + (action_idx,)] = new_q
+        self._last_q_value = float(new_q)
 
         # region agent log
         _agent_debug_log(
@@ -711,6 +713,7 @@ class QLearningProtocolSelector:
         self.action_history = []
         self.reward_history = []
         self._q_deltas = []
+        self._last_q_value = 0.0
         self._last_reward_breakdown = {}
         self._action_history_by_scenario = {
             i: [] for i in range(len(self.NETWORK_SCENARIO_LEVELS))
@@ -1086,10 +1089,14 @@ class QLearningProtocolSelector:
         """Return the last Q-update delta (for logging)."""
         return self._q_deltas[-1] if self._q_deltas else 0.0
 
+    def get_last_q_value(self) -> float:
+        """Return Q(s,a) after the last update (for logging)."""
+        return float(self._last_q_value)
+
     def get_last_q_data(self) -> Dict:
         """
         Return a dict of last Q-learning step data (for logging/display).
-        Keys: q_delta, epsilon, episode_count, avg_reward_last_100, last_state, last_action, last_reward.
+        Keys: q_delta, q_value, epsilon, episode_count, avg_reward_last_100, last_state, last_action, last_reward.
         """
         avg_reward = (
             float(np.mean(self.total_rewards[-100:]))
@@ -1103,6 +1110,7 @@ class QLearningProtocolSelector:
         )
         data = {
             'q_delta': self.get_last_q_delta(),
+            'q_value': self.get_last_q_value(),
             'epsilon': self.epsilon,
             'episode_count': self.episode_count,
             'avg_reward_last_100': avg_reward,
@@ -1192,6 +1200,7 @@ class QLearningProtocolSelector:
         self.action_history = []
         self.reward_history = []
         self._q_deltas = []
+        self._last_q_value = 0.0
         self._last_reward_breakdown = {}
         self.data_network_scenario = None
         self._action_history_by_scenario = {
