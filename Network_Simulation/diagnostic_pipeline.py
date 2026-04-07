@@ -813,6 +813,10 @@ def run_pipeline(
     # Phase 2: Apply tc at ingress and egress of clients only. Then Round 2 runs: Server → Global model → Client; Client → Local model → Server.
     # T_actual = recv_end_ts − send_start_ts for round index 2 (second round, client send to server receive).
     print(f"[Phase 2] Applying tc at client ingress and egress: {scenario}. Round 2 will run with tc...")
+    if scenario == "dynamic":
+        from network_simulator import reset_dynamic_base_scenario_draw
+
+        reset_dynamic_base_scenario_draw()
     use_gaussian = os.environ.get("USE_GAUSSIAN_DELAY", "1").strip().lower() in ("1", "true", "yes")
     sigma_factor = float(os.environ.get("GAUSSIAN_SIGMA_FACTOR", "0.05"))
     use_extra_jitter = os.environ.get("USE_EXTRA_JITTER", "0").strip().lower() in ("1", "true", "yes")

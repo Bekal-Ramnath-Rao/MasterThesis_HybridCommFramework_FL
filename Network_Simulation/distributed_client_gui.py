@@ -10,7 +10,6 @@ import json
 import subprocess
 import threading
 import glob
-import random
 import shutil
 from datetime import datetime
 
@@ -43,8 +42,7 @@ CONGESTION_PRESETS = {
     "heavy": {"latency": 50, "jitter": 20, "packet_loss": 1.0, "bandwidth_factor": 0.50},
 }
 
-# Matches run_network_experiments.py / experiment_gui "Dynamic" scenario
-DYNAMIC_BASE_SCENARIOS = ["excellent", "moderate", "poor", "congested_light"]
+# Dynamic preset pool / draw logic: network_simulator.draw_dynamic_base_scenario()
 
 
 class ClientMonitor(QThread):
@@ -471,7 +469,7 @@ class DistributedClientGUI(QMainWindow):
         self.network_scenario.addItem("Moderate Congestion", "congested_moderate")
         self.network_scenario.addItem("Heavy Congestion", "congested_heavy")
         self.network_scenario.addItem(
-            "Dynamic (Random Excellent/Moderate/Poor/Light Congestion)", "dynamic"
+            "Dynamic (Excellent/Good/Moderate/Poor/Light Congestion, shuffle-bag)", "dynamic"
         )
         self.network_scenario.setStyleSheet("padding: 8px; font-size: 12px;")
         self.network_scenario.currentIndexChanged.connect(self.apply_selected_network_preset)
@@ -488,14 +486,14 @@ class DistributedClientGUI(QMainWindow):
         self.dynamic_interval_sec.setValue(45)
         self.dynamic_interval_sec.setSuffix(" s")
         self.dynamic_interval_sec.setToolTip(
-            "While the client runs, tc/netem is redrawn from "
-            "Excellent / Moderate / Poor / Light Congestion on this interval (aligned with main experiment GUI)."
+            "While the client runs, tc/netem is redrawn from the dynamic pool "
+            "(excellent, good, moderate, poor, congested_light; shuffle-bag by default) on this interval."
         )
         self.dynamic_interval_sec.valueChanged.connect(self._on_dynamic_interval_changed)
         ds_layout.addWidget(self.dynamic_interval_sec)
         self.btn_dynamic_randomize = QPushButton("Randomize scenario now")
         self.btn_dynamic_randomize.setToolTip(
-            "Immediately pick a new random base scenario and apply tc (same pool as Dynamic preset)."
+            "Draw the next base scenario (same pool and DYNAMIC_BASE_MODE as run_network_experiments) and apply tc."
         )
         self.btn_dynamic_randomize.clicked.connect(self.on_randomize_dynamic_now)
         self.btn_dynamic_randomize.setEnabled(False)
@@ -976,8 +974,13 @@ class DistributedClientGUI(QMainWindow):
         self.network_preview.setText(preview)
 
     def apply_random_dynamic_base(self):
-        """Pick a random base from DYNAMIC_BASE_SCENARIOS and sync sliders (matches main experiment dynamic)."""
-        base = random.choice(DYNAMIC_BASE_SCENARIOS)
+        """Draw next dynamic base via network_simulator (shuffle-bag default; matches run_network_experiments)."""
+        _ns_dir = os.path.dirname(os.path.abspath(__file__))
+        if _ns_dir not in sys.path:
+            sys.path.insert(0, _ns_dir)
+        from network_simulator import draw_dynamic_base_scenario
+
+        base = draw_dynamic_base_scenario()
         self._last_dynamic_base = base
         preset = NETWORK_SCENARIO_PRESETS[base]
         for slider in (self.latency_slider, self.bandwidth_slider, self.jitter_slider, self.packet_loss_slider):
@@ -998,6 +1001,12 @@ class DistributedClientGUI(QMainWindow):
         """Apply the selected preset values to the manual network controls"""
         data = self.network_scenario.currentData()
         if data == "dynamic":
+            _ns_dir = os.path.dirname(os.path.abspath(__file__))
+            if _ns_dir not in sys.path:
+                sys.path.insert(0, _ns_dir)
+            from network_simulator import reset_dynamic_base_scenario_draw
+
+            reset_dynamic_base_scenario_draw()
             self.apply_random_dynamic_base()
             self.dynamic_settings_widget.setVisible(True)
             return

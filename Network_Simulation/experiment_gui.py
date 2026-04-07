@@ -750,7 +750,7 @@ class FLExperimentGUI(QMainWindow):
             ("Moderate Congestion", "congested_moderate", False),
             ("Heavy Congestion", "congested_heavy", False),
             # Dynamic: randomly alternates between Excellent / Moderate / Poor / Light Congestion
-            ("Dynamic (Random Excellent/Moderate/Poor/Light Congestion)", "dynamic", False),
+            ("Dynamic (Excellent/Good/Moderate/Poor/Light Congestion, shuffle-bag)", "dynamic", False),
         ])
         layout.addWidget(scenario_group)
         self.scenario_checkboxes = scenario_group.findChildren(QCheckBox)

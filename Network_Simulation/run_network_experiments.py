@@ -17,7 +17,6 @@ from typing import List, Dict, Optional
 import argparse
 from pathlib import Path
 import tempfile
-import random
 
 # Set UTF-8 encoding for Windows console
 if sys.platform == 'win32':
@@ -203,7 +202,7 @@ class ExperimentRunner:
             "congested_light",
             "congested_moderate",
             "congested_heavy",
-            # Dynamic: per-round random choice between a subset of scenarios
+            # Dynamic: draw_dynamic_base_scenario() (shuffle-bag by default)
             "dynamic",
         ]
         
@@ -888,7 +887,11 @@ class ExperimentRunner:
         parent_dir = str(Path(__file__).parent.parent)
         if parent_dir not in sys.path:
             sys.path.insert(0, parent_dir)
-        from network_simulator import NetworkSimulator
+        from network_simulator import (
+            NetworkSimulator,
+            draw_dynamic_base_scenario,
+            reset_dynamic_base_scenario_draw,
+        )
 
         print(f"\n{'='*70}")
         print(f"Applying network scenario: {scenario.upper()}")
@@ -896,12 +899,11 @@ class ExperimentRunner:
         
         sim = NetworkSimulator(verbose=True)
 
-        # For the special "dynamic" scenario, we do not apply a fixed profile
-        # here. Instead, we pick a base scenario at apply-time so that the
-        # network can change over time and between experiments.
-        dynamic_bases = ["excellent", "moderate", "poor", "congested_light"]
+        # Dynamic: pick base via draw_dynamic_base_scenario() (shuffle-bag by default so
+        # excellent/good/moderate are not starved in short runs). Reset bag at experiment start.
         if scenario == "dynamic":
-            base_scenario = random.choice(dynamic_bases)
+            reset_dynamic_base_scenario_draw()
+            base_scenario = draw_dynamic_base_scenario()
             print(f"[DYNAMIC] Initial dynamic base scenario selected: {base_scenario}")
         else:
             base_scenario = scenario
@@ -1042,19 +1044,19 @@ class ExperimentRunner:
                             if str(script_dir) not in sys.path:
                                 sys.path.insert(0, str(script_dir))
                             try:
-                                from network_simulator import NetworkSimulator, build_delay_models
+                                from network_simulator import (
+                                    NetworkSimulator,
+                                    build_delay_models,
+                                    draw_dynamic_base_scenario,
+                                )
                                 sim = NetworkSimulator(verbose=False)
                                 sigma_factor = float(os.environ.get("GAUSSIAN_SIGMA_FACTOR", "0.05"))
                                 use_extra_jitter = os.environ.get("USE_EXTRA_JITTER", "0").strip().lower() in ("1", "true", "yes")
                                 models = build_delay_models(sim.NETWORK_SCENARIOS, sigma_factor=sigma_factor)
 
-                                # For dynamic scenario, pick a fresh base scenario
-                                # every time we resample, to mimic a time-varying
-                                # network that switches between the four options
-                                # before client->server send.
+                                # Dynamic: next base from same shuffle-bag / mode as initial apply (see draw_dynamic_base_scenario).
                                 if scenario == "dynamic":
-                                    dynamic_bases = ["excellent", "moderate", "poor", "congested_light"]
-                                    base_scenario = random.choice(dynamic_bases)
+                                    base_scenario = draw_dynamic_base_scenario()
                                     print(f"  [DYNAMIC] Per-round base scenario (client->server send): {base_scenario}")
                                 else:
                                     base_scenario = scenario

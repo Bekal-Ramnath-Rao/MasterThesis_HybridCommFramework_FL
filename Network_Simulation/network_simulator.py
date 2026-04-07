@@ -29,6 +29,20 @@ MACVLAN_NETWORK_NAME = "fl-macvlan"
 MACVLAN_SUBNET = os.environ.get("FL_MACVLAN_SUBNET", "192.168.254.0/24")
 MACVLAN_GATEWAY = os.environ.get("FL_MACVLAN_GATEWAY", "192.168.254.1")
 
+# --- Dynamic scenario: shuffle-bag state (see draw_dynamic_base_scenario) ---
+_dynamic_draw_bag: list[str] = []
+
+# Default pool for ``scenario == "dynamic"``: covers excellent / good / moderate / poor
+# plus light congestion. Shuffle mode ensures each appears before any repeats (short runs
+# are not dominated by one outcome). Override with env DYNAMIC_BASE_SCENARIOS=comma,separated.
+DEFAULT_DYNAMIC_BASE_SCENARIOS = (
+    "excellent",
+    "good",
+    "moderate",
+    "poor",
+    "congested_light",
+)
+
 
 class NetworkSimulator:
     """Simulates various network conditions on Docker containers using tc (traffic control)"""
@@ -103,11 +117,10 @@ class NetworkSimulator:
             "bandwidth": "2mbit",
             "loss": "6%"
         },
-        # Dynamic scenario: randomly selects one of these base scenarios
-        # at each application (e.g., per FL round) so that the effective
-        # network alternates between excellent / moderate / poor / congested_light.
+        # Dynamic scenario: base profile is chosen via draw_dynamic_base_scenario()
+        # (shuffle-bag by default; see DYNAMIC_BASE_MODE).
         "dynamic": {
-            "name": "Dynamic Network (Random Excellent/Moderate/Poor/Congested-Light)",
+            "name": "Dynamic Network (Excellent/Good/Moderate/Poor/Congested-Light)",
             # Latency/jitter values here are placeholders and are not used
             # when Gaussian sampling + per-round resampling is enabled.
             # Bandwidth/loss will be taken from the randomly chosen base scenario.
@@ -153,11 +166,10 @@ class NetworkSimulator:
         if scenario_name not in cls.NETWORK_SCENARIOS:
             raise KeyError(f"Unknown scenario: {scenario_name}")
 
-        # Special handling for "dynamic": randomly pick one of the base
-        # scenarios and return sampled conditions for that scenario.
+        # Special handling for "dynamic": pick base via draw_dynamic_base_scenario()
+        # (shuffle-bag default so excellent/moderate/good are not starved in short runs).
         if scenario_name == "dynamic":
-            dynamic_bases = ["excellent", "moderate", "poor", "congested_light"]
-            chosen = random.choice(dynamic_bases)
+            chosen = draw_dynamic_base_scenario()
         else:
             chosen = scenario_name
 
@@ -816,6 +828,45 @@ class NetworkSimulator:
             print(f"  Bandwidth: {scenario.get('bandwidth', 'N/A')}")
             print(f"  Packet Loss: {scenario.get('loss', 'N/A')}")
             print()
+
+
+def _parse_dynamic_base_scenarios_from_env() -> tuple[str, ...]:
+    raw = os.environ.get("DYNAMIC_BASE_SCENARIOS", "").strip()
+    if not raw:
+        return DEFAULT_DYNAMIC_BASE_SCENARIOS
+    names = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    return tuple(names) if names else DEFAULT_DYNAMIC_BASE_SCENARIOS
+
+
+def reset_dynamic_base_scenario_draw() -> None:
+    """Clear shuffle-bag state (e.g. when starting a new experiment with scenario=dynamic)."""
+    global _dynamic_draw_bag
+    _dynamic_draw_bag = []
+
+
+def draw_dynamic_base_scenario() -> str:
+    """
+    Select a base scenario name when ``network_scenario == \"dynamic\"``.
+
+    - Default ``DYNAMIC_BASE_MODE=shuffle``: refill a shuffled copy of the pool and pop
+      one name each call so every scenario in the pool appears once before any repeats.
+    - ``DYNAMIC_BASE_MODE=uniform`` (or ``random`` / ``choice``): legacy i.i.d. ``random.choice``.
+
+    Optional ``DYNAMIC_BASE_SCENARIOS=name1,name2,...`` overrides the pool; names must exist
+    in :attr:`NetworkSimulator.NETWORK_SCENARIOS` (except ``dynamic`` itself).
+    """
+    global _dynamic_draw_bag
+    pool = _parse_dynamic_base_scenarios_from_env()
+    valid = [p for p in pool if p in NetworkSimulator.NETWORK_SCENARIOS and p != "dynamic"]
+    if not valid:
+        valid = [p for p in DEFAULT_DYNAMIC_BASE_SCENARIOS if p in NetworkSimulator.NETWORK_SCENARIOS]
+    mode = os.environ.get("DYNAMIC_BASE_MODE", "shuffle").strip().lower()
+    if mode in ("uniform", "random", "choice"):
+        return random.choice(valid)
+    if not _dynamic_draw_bag:
+        _dynamic_draw_bag = list(valid)
+        random.shuffle(_dynamic_draw_bag)
+    return _dynamic_draw_bag.pop()
 
 
 class NamespaceEndpoint:

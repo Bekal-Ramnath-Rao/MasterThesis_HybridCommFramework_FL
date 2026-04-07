@@ -8,7 +8,9 @@ ops); client-side model training uses GPU separately.
 
 Actions: MQTT, AMQP, gRPC, QUIC, DDS
 Rewards (success, max 30): base 10, communication ≤10, resource ≥-5, battery ≥-5
-Environment (Q-table state): network scenario (coarse), communication-time bucket, resource availability, battery SoC bucket
+Environment (Q-table state): network scenario (coarse), communication-time bucket, resource availability, battery SoC bucket.
+The coarse network axis prefers client-detected scenario (``EnvironmentStateManager.detected_network_scenario``)
+when ``RL_Q_USE_DETECTED_NETWORK=1`` (default); otherwise the configured label (``data_network_scenario`` / env).
 """
 
 import numpy as np
@@ -191,8 +193,10 @@ class QLearningProtocolSelector:
         # SoC in [0,1]: >= threshold → battery "high"; separate per uplink/downlink agent
         self.battery_soc_threshold = 0.35
 
-        # Training/inference metadata (raw label); Q-state uses ``normalize_coarse_network_scenario``.
+        # Configured experiment label (e.g. NETWORK_SCENARIO env); Q-index may use ``detected_network_scenario`` instead.
         self.data_network_scenario: Optional[str] = None
+        # Client-side estimate from latency/bandwidth (see FL_Client_Unified.measure_network_condition).
+        self.detected_network_scenario: Optional[str] = None
 
         self.q_table = np.zeros(self._full_q_shape())
         
@@ -243,15 +247,25 @@ class QLearningProtocolSelector:
         return "high"
 
     def set_data_network_scenario(self, scenario: Optional[str]) -> None:
-        """Persist raw label with the Q-table; discrete Q-axis uses ``normalize_coarse_network_scenario``."""
+        """Persist configured experiment label with the Q-table (metadata / reward alignment)."""
         if scenario is None or (isinstance(scenario, str) and not str(scenario).strip()):
             self.data_network_scenario = None
         else:
             self.data_network_scenario = str(scenario).strip().lower()
 
     def get_data_network_scenario(self) -> Optional[str]:
-        """Raw scenario tag stored with this agent (same Q-table file)."""
+        """Configured scenario tag (e.g. env) stored with this agent (same Q-table file)."""
         return self.data_network_scenario
+
+    def set_detected_network_scenario(self, scenario: Optional[str]) -> None:
+        """Persist client-detected scenario label (same Q-table pickle as metadata)."""
+        if scenario is None or (isinstance(scenario, str) and not str(scenario).strip()):
+            self.detected_network_scenario = None
+        else:
+            self.detected_network_scenario = str(scenario).strip().lower()
+
+    def get_detected_network_scenario(self) -> Optional[str]:
+        return self.detected_network_scenario
 
     def ensure_scenario(self, scenario_name: Optional[str]) -> None:
         """Backward compatibility: store tag for pickle + logging."""
@@ -261,9 +275,12 @@ class QLearningProtocolSelector:
         """
         Convert state dictionary to indices for Q-table.
 
-        Expected keys: network_scenario (or data_network_scenario), comm_level, resource, battery_level.
+        Expected keys: network_scenario (preferred; already coarse effective label from env manager),
+        or detected_network_scenario / data_network_scenario for partial dicts.
         """
-        raw_scenario = state.get("network_scenario") or state.get("data_network_scenario")
+        raw_scenario = state.get("network_scenario")
+        if raw_scenario is None:
+            raw_scenario = state.get("detected_network_scenario") or state.get("data_network_scenario")
         scen_label = normalize_coarse_network_scenario(
             raw_scenario if isinstance(raw_scenario, str) else str(raw_scenario or "")
         )
@@ -787,6 +804,7 @@ class QLearningProtocolSelector:
             "protocol_success": dict(self.protocol_success),
             "protocol_failures": dict(self.protocol_failures),
             "data_network_scenario": self.data_network_scenario,
+            "detected_network_scenario": self.detected_network_scenario,
         }
         if disk is None or not overlay:
             return self_data
@@ -821,6 +839,9 @@ class QLearningProtocolSelector:
         dns_self = self.data_network_scenario
         dns_disk = disk.get("data_network_scenario") if isinstance(disk, dict) else None
         merged_dns = dns_self if dns_self is not None else dns_disk
+        det_self = self.detected_network_scenario
+        det_disk = disk.get("detected_network_scenario") if isinstance(disk, dict) else None
+        merged_det = det_self if det_self is not None else det_disk
 
         return {
             "q_table": merged_q,
@@ -838,6 +859,7 @@ class QLearningProtocolSelector:
             "protocol_success": _sum_maps(disk.get("protocol_success"), self.protocol_success),
             "protocol_failures": _sum_maps(disk.get("protocol_failures"), self.protocol_failures),
             "data_network_scenario": merged_dns,
+            "detected_network_scenario": merged_det,
         }
 
     def _atomic_pickle_dump(self, path: str, data: Dict) -> None:
@@ -897,6 +919,7 @@ class QLearningProtocolSelector:
                     "protocol_success": self.protocol_success,
                     "protocol_failures": self.protocol_failures,
                     "data_network_scenario": self.data_network_scenario,
+                    "detected_network_scenario": self.detected_network_scenario,
                 }
                 self._atomic_pickle_dump(self.save_path, data)
                 print(f"[Q-Learning] Saved Q-table to {self.save_path}")
@@ -951,6 +974,9 @@ class QLearningProtocolSelector:
             self.data_network_scenario = data.get("data_network_scenario")
             if self.data_network_scenario is not None:
                 self.data_network_scenario = str(self.data_network_scenario).strip().lower() or None
+            self.detected_network_scenario = data.get("detected_network_scenario")
+            if self.detected_network_scenario is not None:
+                self.detected_network_scenario = str(self.detected_network_scenario).strip().lower() or None
             print(f"[Q-Learning] Loaded Q-table from {path} (past experience)")
             print(
                 f"[Q-Learning] Episodes: {self.episode_count}, Epsilon: {self.epsilon:.4f}, "
@@ -958,8 +984,13 @@ class QLearningProtocolSelector:
             )
             if self.data_network_scenario:
                 print(
-                    f"[Q-Learning] data_network_scenario (metadata, not RL state): "
+                    f"[Q-Learning] data_network_scenario (configured / env metadata): "
                     f"{self.data_network_scenario!r}"
+                )
+            if self.detected_network_scenario:
+                print(
+                    f"[Q-Learning] detected_network_scenario (client-measured metadata): "
+                    f"{self.detected_network_scenario!r}"
                 )
             return True
         except Exception as e:
@@ -1203,6 +1234,7 @@ class QLearningProtocolSelector:
         self._last_q_value = 0.0
         self._last_reward_breakdown = {}
         self.data_network_scenario = None
+        self.detected_network_scenario = None
         self._action_history_by_scenario = {
             i: [] for i in range(len(self.NETWORK_SCENARIO_LEVELS))
         }
@@ -1263,8 +1295,28 @@ class EnvironmentStateManager:
         self.last_energy_j = 0.0  # Joules used in the last round
         # Last psutil net_io snapshot for delta-rate bandwidth (avoids cumulative saturation)
         self._net_io_prev: Optional[Tuple[int, int, float]] = None
-        # Mirrors Q-table metadata; not used in discrete Q-state (comm/resource/battery).
+        # Configured label (e.g. NETWORK_SCENARIO); Q-index may use ``detected_network_scenario`` instead.
         self.data_network_scenario: Optional[str] = None
+        # Raw label from client latency/bandwidth classifier (excellent/moderate/poor).
+        self.detected_network_scenario: Optional[str] = None
+
+    def effective_network_scenario_for_q_state(self) -> str:
+        """
+        Coarse network label for Q-table axis 0.
+
+        When ``RL_Q_USE_DETECTED_NETWORK`` is true (default), prefer client-detected scenario
+        when available; otherwise fall back to configured ``data_network_scenario``.
+        Set ``RL_Q_USE_DETECTED_NETWORK=0`` to always use the configured label only.
+        """
+        use_det = os.environ.get("RL_Q_USE_DETECTED_NETWORK", "1").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+        )
+        if use_det and self.detected_network_scenario:
+            return normalize_coarse_network_scenario(self.detected_network_scenario)
+        return normalize_coarse_network_scenario(self.data_network_scenario)
 
     def comm_time_to_level(self, t: float) -> str:
         """Map wall-clock communication time (seconds) to a discrete comm bucket."""
@@ -1338,12 +1390,14 @@ class EnvironmentStateManager:
             cpu_percent, memory_percent, selector.resource_load_threshold
         )
         batt = self.battery_level_for_threshold(self.battery_soc, selector.battery_soc_threshold)
-        ns = normalize_coarse_network_scenario(self.data_network_scenario)
+        ns = self.effective_network_scenario_for_q_state()
         return {
             "network_scenario": ns,
             "comm_level": comm,
             "resource": res,
             "battery_level": batt,
+            "data_network_scenario": self.data_network_scenario,
+            "detected_network_scenario": self.detected_network_scenario,
         }
 
     def neutral_rl_state_before_boundaries(self) -> Dict[str, str]:
@@ -1353,12 +1407,14 @@ class EnvironmentStateManager:
         :func:`compute_state_boundaries_from_minmax` derives thresholds from the stored
         samples (min–max span); then :func:`state_for_rl_selector` is used with real cuts.
         """
-        ns = normalize_coarse_network_scenario(self.data_network_scenario)
+        ns = self.effective_network_scenario_for_q_state()
         return {
             "network_scenario": ns,
             "comm_level": "mid",
             "resource": "high",
             "battery_level": "high",
+            "data_network_scenario": self.data_network_scenario,
+            "detected_network_scenario": self.detected_network_scenario,
         }
 
     def update_battery(self, soc: float, last_energy_j: float) -> None:
@@ -1391,9 +1447,29 @@ class EnvironmentStateManager:
         if rl_downlink is not None:
             rl_downlink.set_data_network_scenario(self.data_network_scenario)
 
+    def update_detected_network_scenario(
+        self,
+        scenario: Optional[str],
+        *,
+        rl_uplink: Optional["QLearningProtocolSelector"] = None,
+        rl_downlink: Optional["QLearningProtocolSelector"] = None,
+    ) -> None:
+        """Store client-measured scenario (latency/bandwidth) and mirror to RL agents for pickle metadata."""
+        if scenario is None or (isinstance(scenario, str) and not str(scenario).strip()):
+            self.detected_network_scenario = None
+        else:
+            self.detected_network_scenario = str(scenario).strip().lower()
+        if rl_uplink is not None:
+            rl_uplink.set_detected_network_scenario(self.detected_network_scenario)
+        if rl_downlink is not None:
+            rl_downlink.set_detected_network_scenario(self.detected_network_scenario)
+
     def get_data_network_scenario(self) -> Optional[str]:
         """Scenario tag last set via :meth:`update_network_scenario` (env mirror of selector metadata)."""
         return self.data_network_scenario
+
+    def get_detected_network_scenario(self) -> Optional[str]:
+        return self.detected_network_scenario
 
     def update_resource_level(self, level: str):
         """Update resource availability: ``high`` = headroom (low load), ``low`` = stressed."""
@@ -1447,11 +1523,11 @@ class EnvironmentStateManager:
         return "low"
     
     def get_current_state(self) -> Dict:
-        """Discrete RL state including ``network_scenario`` (coarse) for the Q-table."""
+        """Discrete RL state including ``network_scenario`` (coarse, effective for Q-table) and both scenario tags."""
         out = self.current_state.copy()
-        ns = normalize_coarse_network_scenario(self.data_network_scenario)
-        out["network_scenario"] = ns
+        out["network_scenario"] = self.effective_network_scenario_for_q_state()
         out["data_network_scenario"] = self.data_network_scenario
+        out["detected_network_scenario"] = self.detected_network_scenario
         return out
     
     def get_resource_consumption(

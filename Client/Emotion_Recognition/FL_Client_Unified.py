@@ -2486,11 +2486,18 @@ class UnifiedFLClient_Emotion:
             )
             self.env_manager.update_network_condition(condition)
             if USE_RL_SELECTION and self.env_manager and getattr(self, "rl_selector_uplink", None):
-                self.env_manager.update_network_scenario(
+                self.env_manager.update_detected_network_scenario(
                     condition,
                     rl_uplink=self.rl_selector_uplink,
                     rl_downlink=self.rl_selector_downlink,
                 )
+                # Keep configured env label for metadata when set; else use measurement for both.
+                if not _effective_rl_network_scenario_label_from_env():
+                    self.env_manager.update_network_scenario(
+                        condition,
+                        rl_uplink=self.rl_selector_uplink,
+                        rl_downlink=self.rl_selector_downlink,
+                    )
 
             # Update mobility based on variability of recent latency samples.
             # Higher jitter -> higher inferred mobility level.
@@ -2530,10 +2537,9 @@ class UnifiedFLClient_Emotion:
 
     def _apply_rl_network_scenario_for_selector_state(self) -> None:
         """
-        Set ``data_network_scenario`` for Q-learning state (first axis: excellent/moderate/poor).
-
-        If an explicit label is set in the environment, use it whenever training **or** inference
-        runs so ``argmax`` Q selection matches the slices populated during learning.
+        Set configured ``data_network_scenario`` from env when provided, then refresh
+        client-detected scenario for Q-table indexing (``detected_network_scenario``;
+        see ``RL_Q_USE_DETECTED_NETWORK``).
         """
         if not self.env_manager:
             return
@@ -2547,13 +2553,13 @@ class UnifiedFLClient_Emotion:
             self.env_manager.update_network_condition(
                 _coarse_network_bucket_for_scenario(eff)
             )
-            return
-        if USE_QL_CONVERGENCE:
+        elif USE_QL_CONVERGENCE:
             self.env_manager.update_network_scenario(
                 None,
                 rl_uplink=self.rl_selector_uplink,
                 rl_downlink=self.rl_selector_downlink,
             )
+        # Always measure so Q-table can use client-detected network slice alongside configured env.
         self.measure_network_condition()
 
     def _shared_data_dir(self):
