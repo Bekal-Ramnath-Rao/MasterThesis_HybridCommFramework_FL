@@ -9,6 +9,7 @@ import json
 import pickle
 import base64
 import time
+import random
 import logging
 import numpy as np
 _xla_flags = os.environ.get("XLA_FLAGS", "").strip()
@@ -27,6 +28,13 @@ if compression_path not in sys.path:
     sys.path.insert(0, compression_path)
 
 from quantization_client import Quantization, QuantizationConfig
+
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+_utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+
 try:
     from pruning_client import ModelPruning, PruningConfig
     PRUNING_AVAILABLE = True
@@ -85,6 +93,10 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 NUM_ROUNDS = int(os.getenv("NUM_ROUNDS", "16"))
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 # MQTT Topics
 TOPIC_GLOBAL_MODEL = "fl/global_model"
@@ -137,6 +149,10 @@ class FederatedLearningClient:
             "val_split": 0.10
         }
         self.class_weights = None
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
+        self.has_converged = False
+        self.last_global_round = None
         
         # Initialize MQTT client
         self.mqtt_client = mqtt.Client(client_id=f"fl_eeg_client_{client_id}")
@@ -244,6 +260,82 @@ class FederatedLearningClient:
         ds = ds.batch(batch_size).prefetch(AUTOTUNE)
         return ds
     
+    def build_eeg_model(self, input_shape, num_classes):
+        """Build CNN+BiLSTM+MHA model for EEG classification"""
+        from tensorflow.keras import layers, Model
+        
+        def se_block(x, r=8):
+            ch = x.shape[-1]
+            s = layers.GlobalAveragePooling1D()(x)
+            s = layers.Dense(max(ch // r, 8), activation='relu')(s)
+            s = layers.Dense(ch, activation='sigmoid', dtype='float32')(s)
+            s = layers.Reshape((1, ch))(s)
+            return layers.Multiply()([x, s])
+        
+        def conv_bn_relu(x, f, k, d=1):
+            x = layers.Conv1D(f, k, padding="same", dilation_rate=d, use_bias=False)(x)
+            x = layers.BatchNormalization()(x)
+            x = layers.ReLU()(x)
+            return x
+        
+        def res_block(x, f, k, d=1):
+            sc = x
+            y = conv_bn_relu(x, f, k, d)
+            y = layers.Conv1D(f, k, padding="same", dilation_rate=d, use_bias=False)(y)
+            y = layers.BatchNormalization()(y)
+            if sc.shape[-1] != f:
+                sc = layers.Conv1D(f, 1, padding="same", use_bias=False)(sc)
+                sc = layers.BatchNormalization()(sc)
+            y = layers.Add()([y, sc])
+            y = layers.ReLU()(y)
+            y = se_block(y)
+            return y
+        
+        inp = layers.Input(shape=input_shape)
+        
+        x = conv_bn_relu(inp, 64, 7, d=1)
+        x = res_block(x, 64, 7, d=1)
+        x = layers.MaxPooling1D(2)(x)
+        
+        for d in [1, 2, 4]:
+            x = res_block(x, 128, 5, d=d)
+        
+        x = layers.Bidirectional(
+            layers.LSTM(64, return_sequences=True, dropout=0.25)
+        )(x)
+        
+        attn = layers.MultiHeadAttention(num_heads=4, key_dim=32, dropout=0.1)(x, x)
+        x = layers.Add()([x, attn])
+        x = layers.LayerNormalization()(x)
+        
+        x = layers.GlobalAveragePooling1D()(x)
+        x = layers.Dense(256, activation="relu")(x)
+        x = layers.Dropout(0.4)(x)
+        x = layers.Dense(128, activation="relu")(x)
+        x = layers.Dropout(0.35)(x)
+        out = layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
+        
+        model = Model(inp, out)
+        
+        lr_sched = tf.keras.optimizers.schedules.CosineDecayRestarts(
+            initial_learning_rate=1e-3, first_decay_steps=4,
+            t_mul=2.0, m_mul=0.8, alpha=1e-5
+        )
+        opt = tf.keras.optimizers.AdamW(
+            learning_rate=lr_sched, weight_decay=1e-4, global_clipnorm=1.0
+        )
+        
+        model.compile(
+            optimizer=opt,
+            loss=tf.keras.losses.CategoricalCrossentropy(),
+            metrics=[
+                tf.keras.metrics.CategoricalAccuracy(name="acc"),
+                tf.keras.metrics.TopKCategoricalAccuracy(k=2, name="top2")
+            ]
+        )
+        
+        return model
+    
     def serialize_weights(self, weights):
         """Serialize model weights for MQTT transmission"""
         serialized = pickle.dumps(weights)
@@ -329,67 +421,204 @@ class FederatedLearningClient:
             data = json.loads(payload.decode()) if isinstance(payload, bytes) else payload
             round_num = data.get('round', 0)
             
-            # Check for duplicate (already processed this exact model)
-            if hasattr(self, 'last_global_round') and self.last_global_round == round_num and self.model is not None:
+            if self.last_global_round == round_num and self.model is not None:
                 print(f"Client {self.client_id} ignoring duplicate global model for round {round_num}")
                 return
             
             print(f"Client {self.client_id} received global model (round {round_num})")
             
-            # Decompress/deserialize weights (priority: pruned_data -> quantized_data -> raw weights)
-            if 'pruned_data' in data and PRUNING_AVAILABLE and ModelPruning is not None:
-                compressed_bytes = base64.b64decode(data['pruned_data'].encode('utf-8'))
-                pruning_codec = self.pruner or ModelPruning(PruningConfig())
-                weights = pruning_codec.decompress_pruned_weights(compressed_bytes)
-                print(f"Client {self.client_id} decompressed pruned model")
-            elif 'quantized_data' in data:
-                # Handle quantized/compressed data
+            if 'quantized_data' in data and self.quantizer is not None:
                 compressed_data = data['quantized_data']
                 if isinstance(compressed_data, str):
-                    import base64, pickle
                     compressed_data = pickle.loads(base64.b64decode(compressed_data.encode('utf-8')))
-                if hasattr(self, 'quantization') and self.quantization is not None:
-                    weights = self.quantization.decompress(compressed_data)
-                elif hasattr(self, 'quantizer') and self.quantizer is not None:
-                    weights = self.quantizer.decompress(compressed_data)
-                else:
-                    weights = compressed_data
-                print(f"Client {self.client_id} received global model (dequantized for training)")
+                weights = self.quantizer.decompress(compressed_data)
+                if round_num > 0:
+                    print(f"Client {self.client_id}: Received quantized global model (dequantized for training)")
             else:
-                # Normal weights
-                if 'weights' in data:
-                    encoded_weights = data['weights']
-                    if isinstance(encoded_weights, str):
-                        import base64, pickle
-                        serialized = base64.b64decode(encoded_weights.encode('utf-8'))
-                        weights = pickle.loads(serialized)
-                    else:
-                        weights = encoded_weights
-                else:
-                    weights = data.get('parameters', [])
+                weights = self.deserialize_weights(data['weights'])
             
-            # Initialize model if not already done (for late-joining or first-time clients)
             if self.model is None:
                 model_config = data.get('model_config')
-                if model_config:
-                    print(f"Client {self.client_id} initializing model from received configuration...")
-                    self.model = self.build_model_from_config(model_config)
-                    print(f"Client {self.client_id} model built successfully")
-                else:
+                if not model_config:
                     print(f"Client {self.client_id} WARNING: No model_config in global model, cannot initialize!")
                     return
+                print(f"Client {self.client_id} building EEG model from server configuration...")
+                self.model = self.build_eeg_model(
+                    input_shape=tuple(model_config['input_shape']),
+                    num_classes=model_config['num_classes']
+                )
+                self.model.set_weights(weights)
+                _ = self.model(tf.zeros((1, *tuple(model_config['input_shape']))), training=False)
+                print(f"Client {self.client_id} model initialized and verified with server weights")
+                self.current_round = 0
+            else:
+                self.model.set_weights(weights)
+                print(f"Client {self.client_id} received global model for round {round_num}, ready for next local round")
             
-            # Apply received weights
-            self.model.set_weights(weights)
-            self.current_round = round_num
-            if hasattr(self, 'last_global_round'):
-                self.last_global_round = round_num
-            print(f"Client {self.client_id} updated model weights (round {round_num})")
+            self.last_global_round = round_num
             
         except Exception as e:
             print(f"\n[Client {self.client_id}] Error: {e}")
             import traceback
             traceback.print_exc()
+    
+    def handle_training_config(self, payload):
+        """Update training configuration"""
+        cfg = json.loads(payload.decode())
+        self.training_config.update(cfg)
+        print(f"Client {self.client_id} updated config: {self.training_config}")
+    
+    def handle_start_training(self, payload):
+        """Start local training when server signals"""
+        data = json.loads(payload.decode())
+        round_num = data['round']
+        max_wait = 30
+        wait_time = 0
+        while self.model is None and wait_time < max_wait:
+            print(f"Client {self.client_id} waiting for model initialization... ({wait_time}s)")
+            time.sleep(1)
+            wait_time += 1
+        if self.model is None:
+            print(f"Client {self.client_id} cannot train: model not initialized")
+            return
+        if round_num > self.current_round:
+            self.current_round = round_num
+            print(f"\nClient {self.client_id} starting training for round {round_num}...")
+            self.train_local_model()
+        else:
+            print(f"Client {self.client_id} round mismatch - received signal for round {round_num}, currently at {self.current_round}")
+    
+    def handle_start_evaluation(self, payload):
+        """Handle evaluation signal (no held-out test set for this client)"""
+        print(f"\n[Client {self.client_id}] Evaluation requested (no local test set)")
+    
+    def _update_local_convergence(self, loss: float):
+        """Track client-local convergence and disconnect when converged."""
+        if self.current_round < MIN_ROUNDS:
+            self.best_loss = min(self.best_loss, loss)
+            return
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            self.best_loss = loss
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+        if self.rounds_without_improvement >= CONVERGENCE_PATIENCE and not self.has_converged:
+            self.has_converged = True
+            print(f"Client {self.client_id} reached local convergence at round {self.current_round}")
+    
+    def train_local_model(self):
+        """Train model on local data and send updates to server"""
+        batch_size = self.training_config['batch_size']
+        epochs = self.training_config['local_epochs']
+        
+        ds_train = self.make_dataset(
+            self.x_train, self.y_train,
+            batch_size, training=True
+        )
+        
+        print(f"[Client {self.client_id}] Training for {epochs} epochs...")
+        training_start = time.time()
+        history = self.model.fit(
+            ds_train,
+            epochs=epochs,
+            verbose=2,
+            callbacks=[
+                tf.keras.callbacks.EarlyStopping(
+                    monitor="loss", patience=3,
+                    restore_best_weights=True, verbose=0
+                )
+            ]
+        )
+        training_time = time.time() - training_start
+        
+        updated_weights = self.model.get_weights()
+        
+        final_loss = float(history.history['loss'][-1]) if 'loss' in history.history else 0.0
+        final_acc = float(history.history.get('acc', [0.0])[-1])
+        self._update_local_convergence(final_loss)
+        metrics = {
+            "loss": final_loss,
+            "accuracy": final_acc
+        }
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
+            metrics["client_converged"] = 1.0
+        num_samples = int(len(self.y_train))
+        
+        if self.quantizer is not None:
+            compressed_data = self.quantizer.compress(updated_weights, data_type="weights")
+            stats = self.quantizer.get_compression_stats(updated_weights, compressed_data)
+            print(f"Client {self.client_id}: Compressed weights - "
+                  f"Ratio: {stats['compression_ratio']:.2f}x, "
+                  f"Size: {stats['compressed_size_mb']:.2f}MB")
+            serialized = base64.b64encode(pickle.dumps(compressed_data)).decode('utf-8')
+            update_message = {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "compressed_data": serialized,
+                "num_samples": num_samples,
+                "metrics": metrics
+            }
+        else:
+            update_message = {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "weights": self.serialize_weights(updated_weights),
+                "num_samples": num_samples,
+                "metrics": metrics
+            }
+        
+        delay = random.uniform(0.5, 3.0)
+        print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
+        time.sleep(delay)
+        
+        comm_start = time.time()
+        self.mqtt_client.publish(TOPIC_CLIENT_UPDATE, json.dumps(update_message))
+        uplink_comm_sec = time.time() - comm_start
+        
+        append_client_fl_metrics_record(
+            self.client_id,
+            {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "loss": float(final_loss),
+                "accuracy": float(final_acc),
+                "training_time_sec": float(training_time),
+                "pre_uplink_delay_sec": float(delay),
+                "uplink_model_comm_sec": float(uplink_comm_sec),
+                "total_fl_wall_time_sec": float(training_time + delay + uplink_comm_sec),
+                "battery_energy_joules": 0.0,
+                "battery_soc_after": 1.0,
+            },
+            use_case=use_case_from_env("mental_state"),
+            protocol="mqtt",
+        )
+        
+        print(f"Client {self.client_id} sent model update for round {self.current_round}")
+        print(f"Training metrics - Loss: {final_loss:.4f}, Accuracy: {final_acc:.4f}")
+        if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
+            print(f"Client {self.client_id} notifying server of convergence and disconnecting")
+            time.sleep(2)
+            self.mqtt_client.disconnect()
+    
+    def start(self):
+        """Connect to MQTT broker and listen for server messages"""
+        max_retries = 5
+        retry_delay = 2
+        for attempt in range(max_retries):
+            try:
+                print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
+                self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+                print(f"Successfully connected to MQTT broker!\n")
+                self.mqtt_client.loop_forever()
+                break
+            except Exception as e:
+                print(f"Connection attempt {attempt + 1}/{max_retries} failed: {e}")
+                if attempt < max_retries - 1:
+                    print(f"Retrying in {retry_delay} seconds...\n")
+                    time.sleep(retry_delay)
+                else:
+                    print(f"\nFailed to connect to MQTT broker after {max_retries} attempts.")
+                    raise
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 
 from packet_logger import log_received_packet, log_sent_packet, init_db
+from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 
 # Battery model (shared with gRPC/MQTT/Unified)
 _client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -193,6 +194,8 @@ class FederatedLearningClient:
         
         # Battery/energy model for consumption tracking (server uses for battery plot)
         self.battery_model = BatteryModel(protocol="amqp")
+        self._last_training_time_sec = 0.0
+        self._last_uplink_model_comm_sec = 0.0
         
         # AMQP connection
         self.connection = None
@@ -940,6 +943,8 @@ class FederatedLearningClient:
             bytes_sent = self._publish_update_with_chunking(update_message)
             communication_time = time.time() - comm_start
             self.battery_model.update(bytes_sent, 0, training_time, communication_time)
+            self._last_training_time_sec = training_time
+            self._last_uplink_model_comm_sec = communication_time
             if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
                 send_end_cpu = time.perf_counter()
                 O_send = send_end_cpu - send_start_cpu
@@ -992,15 +997,40 @@ class FederatedLearningClient:
             "metrics": metrics_dict
         }
         
+        _body = json.dumps(metrics_message)
+        _mt0 = time.time()
         if self.publish_with_retry(
             exchange=EXCHANGE_CLIENT_UPDATES,
             routing_key='client.metrics',
-            body=json.dumps(metrics_message),
+            body=_body,
             properties=pika.BasicProperties(delivery_mode=AMQP_DELIVERY_MODE)
         ):
+            _uplink_metrics_sec = time.time() - _mt0
+            append_client_fl_metrics_record(
+                self.client_id,
+                {
+                    "client_id": self.client_id,
+                    "round": self.current_round,
+                    "loss": float(loss),
+                    "accuracy": float(accuracy),
+                    "training_time_sec": float(self._last_training_time_sec),
+                    "uplink_model_comm_sec": float(self._last_uplink_model_comm_sec),
+                    "uplink_metrics_comm_sec": float(_uplink_metrics_sec),
+                    "total_fl_wall_time_sec": float(
+                        self._last_training_time_sec
+                        + self._last_uplink_model_comm_sec
+                        + _uplink_metrics_sec
+                    ),
+                    "battery_energy_joules": float(self.battery_model.last_energy_j),
+                    "battery_soc_after": float(self.battery_model.battery_soc),
+                    "cumulative_battery_energy_joules": float(self.battery_model.cumulative_energy_j),
+                },
+                use_case=use_case_from_env("emotion"),
+                protocol="amqp",
+            )
             print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
             log_sent_packet(
-                packet_size=len(json.dumps(metrics_message)),
+                packet_size=len(_body),
                 peer=EXCHANGE_CLIENT_UPDATES,
                 protocol="AMQP",
                 round=self.current_round,

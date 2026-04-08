@@ -91,6 +91,12 @@ if _client_dir not in sys.path:
     sys.path.insert(0, _client_dir)
 from battery_model import BatteryModel
 
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+_utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+
 # HTTP/3 Configuration
 HTTP3_HOST = os.getenv("HTTP3_HOST", "fl-server-http3-emotion")
 HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
@@ -247,6 +253,8 @@ class FederatedLearningClient:
         self.stream_id = 0
         self.model_ready = asyncio.Event()  # Event to signal model is ready
         self.battery_model = BatteryModel(protocol="http3")
+        self._last_training_time_sec = 0.0
+        self._last_uplink_model_comm_sec = 0.0
         self._global_model_chunk_buffers = {}
         
         print(f"Client {self.client_id} initialized with:")
@@ -706,6 +714,8 @@ class FederatedLearningClient:
         sent_payload_bytes = await self._send_update_with_chunking(update_message)
         communication_time = time.time() - comm_start
         self.battery_model.update(sent_payload_bytes, 0, training_time, communication_time)
+        self._last_training_time_sec = training_time
+        self._last_uplink_model_comm_sec = communication_time
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
             O_send = time.perf_counter() - send_start_cpu
             print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={sent_payload_bytes} send_start_ts={send_start_ts:.9f}")
@@ -735,13 +745,38 @@ class FederatedLearningClient:
         
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
         
-        await self.send_message({
+        _metrics_msg = {
             'type': 'metrics',
             'client_id': self.client_id,
             'round': self.current_round,
             'num_samples': self.validation_generator.n,
             'metrics': metrics_dict
-        })
+        }
+        _mt0 = time.time()
+        await self.send_message(_metrics_msg)
+        _uplink_metrics_sec = time.time() - _mt0
+        append_client_fl_metrics_record(
+            self.client_id,
+            {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "loss": float(loss),
+                "accuracy": float(accuracy),
+                "training_time_sec": float(self._last_training_time_sec),
+                "uplink_model_comm_sec": float(self._last_uplink_model_comm_sec),
+                "uplink_metrics_comm_sec": float(_uplink_metrics_sec),
+                "total_fl_wall_time_sec": float(
+                    self._last_training_time_sec
+                    + self._last_uplink_model_comm_sec
+                    + _uplink_metrics_sec
+                ),
+                "battery_energy_joules": float(self.battery_model.last_energy_j),
+                "battery_soc_after": float(self.battery_model.battery_soc),
+                "cumulative_battery_energy_joules": float(self.battery_model.cumulative_energy_j),
+            },
+            use_case=use_case_from_env("emotion"),
+            protocol="http3",
+        )
         if self.has_converged and stop_on_client_convergence():
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             await asyncio.sleep(0.5)

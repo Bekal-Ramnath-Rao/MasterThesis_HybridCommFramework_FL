@@ -317,6 +317,7 @@ if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 
 from packet_logger import init_db, log_sent_packet, log_received_packet, get_round_bytes_sent_received
+from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 try:
     from q_learning_logger import init_db as init_qlearning_db, log_q_step
 except ImportError:
@@ -3084,12 +3085,12 @@ class UnifiedFLClient_Emotion:
                 getattr(self, "_last_uplink_rl_state", None) or self.env_manager.get_current_state()
             )
         
-        round_time_sec = (
-            self.round_metrics.get('training_time', 0.0)
-            + self.round_metrics.get('uplink_model_comm_time', 0.0)
-            + self.round_metrics.get('uplink_metrics_comm_time', 0.0)
-        )
+        training_time_sec = float(self.round_metrics.get('training_time', 0.0))
+        uplink_model_comm_sec = float(self.round_metrics.get('uplink_model_comm_time', 0.0))
+        # This round's evaluation-metrics uplink is sent below; do not include stale prior-round timing.
+        round_time_sec = training_time_sec + uplink_model_comm_sec
         battery_soc = self.env_manager.battery_soc if (USE_RL_SELECTION and self.env_manager) else 1.0
+        battery_soc_before_energy = float(battery_soc)
 
         metrics_message = {
             "client_id": self.client_id,
@@ -3098,14 +3099,19 @@ class UnifiedFLClient_Emotion:
             "loss": float(loss),
             "accuracy": float(accuracy),
             "battery_soc": float(battery_soc),
+            "training_time_sec": training_time_sec,
+            "uplink_model_comm_sec": uplink_model_comm_sec,
             "round_time_sec": float(round_time_sec),
             "metrics": {
                 "loss": float(loss),
                 "accuracy": float(accuracy),
                 "battery_soc": float(battery_soc),
+                "training_time_sec": training_time_sec,
+                "uplink_model_comm_sec": uplink_model_comm_sec,
                 "round_time_sec": float(round_time_sec),
             },
         }
+        energy_j_total = 0.0
         
         metrics_comm_start = time.time()
         try:
@@ -3156,12 +3162,42 @@ class UnifiedFLClient_Emotion:
                     E_radio = alpha * E_radio_baseline
                     E_cpu = P_CPU_MAX * (cpu_util / 100.0) * t_round * beta
                     E_total = E_radio + E_cpu
+                    energy_j_total = float(E_total)
                     soc = self.env_manager.battery_soc
                     delta_soc = E_total / BATTERY_CAP_J
                     new_soc = soc - delta_soc
                     self.env_manager.update_battery(new_soc, E_total)
                 except Exception:
                     pass
+            uplink_metrics_comm_sec = float(self.round_metrics.get('uplink_metrics_comm_time', 0.0))
+            total_fl_wall_time_sec = (
+                training_time_sec
+                + uplink_model_comm_sec
+                + uplink_metrics_comm_sec
+            )
+            battery_soc_after = (
+                float(self.env_manager.battery_soc)
+                if (USE_RL_SELECTION and self.env_manager)
+                else float(battery_soc_before_energy)
+            )
+            append_client_fl_metrics_record(
+                self.client_id,
+                {
+                    "client_id": self.client_id,
+                    "round": report_round,
+                    "loss": float(loss),
+                    "accuracy": float(accuracy),
+                    "training_time_sec": training_time_sec,
+                    "uplink_model_comm_sec": uplink_model_comm_sec,
+                    "uplink_metrics_comm_sec": uplink_metrics_comm_sec,
+                    "total_fl_wall_time_sec": float(total_fl_wall_time_sec),
+                    "battery_energy_joules": float(energy_j_total),
+                    "battery_soc_before": float(battery_soc_before_energy),
+                    "battery_soc_after": float(battery_soc_after),
+                },
+                use_case=use_case_from_env("emotion"),
+                protocol=protocol,
+            )
             print(f"Client {self.client_id} sent evaluation metrics for round {report_round}")
             print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
             # RL update and optional Q-convergence end condition (battery already updated above for metrics)

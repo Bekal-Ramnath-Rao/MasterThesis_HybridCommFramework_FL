@@ -60,6 +60,7 @@ if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 
 from packet_logger import log_sent_packet, log_received_packet, init_db, get_round_bytes_sent_received
+from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 # Make TensorFlow logs less verbose
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
@@ -176,6 +177,8 @@ class FederatedLearningClient:
         # Battery/energy model (same as unified use case)
         self.battery_model = BatteryModel(protocol="mqtt")
         self._last_round_time_sec = 0.0  # training + communication time for last round
+        self._last_training_time_sec = 0.0
+        self._last_uplink_model_comm_sec = 0.0
 
         # Initialize quantization compression (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
@@ -887,6 +890,8 @@ class FederatedLearningClient:
             bytes_sent, bytes_recv, training_time, communication_time
         )
         self._last_round_time_sec = training_time + communication_time
+        self._last_training_time_sec = training_time
+        self._last_uplink_model_comm_sec = communication_time
     
     def _update_local_convergence(self, loss: float):
         """Track client-local convergence and disconnect when converged."""
@@ -933,13 +938,38 @@ class FederatedLearningClient:
             "metrics": metrics_dict
         }
         
-        self.mqtt_client.publish(TOPIC_CLIENT_METRICS, json.dumps(metrics_message))
+        _m_payload = json.dumps(metrics_message)
+        _mt0 = time.time()
+        self.mqtt_client.publish(TOPIC_CLIENT_METRICS, _m_payload)
+        _uplink_metrics_sec = time.time() - _mt0
         log_sent_packet(
-            packet_size=len(json.dumps(metrics_message)),
+            packet_size=len(_m_payload),
             peer=TOPIC_CLIENT_METRICS,  # or client_id/server_id as appropriate
             protocol="MQTT",
             round=self.current_round if hasattr(self, 'current_round') else None,
             extra_info="any additional info"
+        )
+        append_client_fl_metrics_record(
+            self.client_id,
+            {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "loss": float(loss),
+                "accuracy": float(accuracy),
+                "training_time_sec": float(self._last_training_time_sec),
+                "uplink_model_comm_sec": float(self._last_uplink_model_comm_sec),
+                "uplink_metrics_comm_sec": float(_uplink_metrics_sec),
+                "total_fl_wall_time_sec": float(
+                    self._last_training_time_sec
+                    + self._last_uplink_model_comm_sec
+                    + _uplink_metrics_sec
+                ),
+                "battery_energy_joules": float(self.battery_model.last_energy_j),
+                "battery_soc_after": float(self.battery_model.battery_soc),
+                "cumulative_battery_energy_joules": float(self.battery_model.cumulative_energy_j),
+            },
+            use_case=use_case_from_env("emotion"),
+            protocol="mqtt",
         )
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
         if self.has_converged and stop_on_client_convergence():

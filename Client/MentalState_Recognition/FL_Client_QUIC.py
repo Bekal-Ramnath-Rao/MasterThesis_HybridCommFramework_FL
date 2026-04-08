@@ -9,6 +9,7 @@ import json
 import pickle
 import base64
 import time
+import random
 import asyncio
 import logging
 import numpy as np
@@ -85,6 +86,12 @@ MODEL_INIT_TIMEOUT = float(os.getenv("MODEL_INIT_TIMEOUT", "300"))
 # Training Configuration
 AUTOTUNE = tf.data.AUTOTUNE
 SMOOTH_EPS = 0.05
+
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+_utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 
 
 class FederatedLearningClientProtocol(QuicConnectionProtocol):
@@ -546,7 +553,9 @@ class FederatedLearningClient:
                 ]
             )
         
+        training_start = time.time()
         history = await loop.run_in_executor(None, train_model)
+        training_time = time.time() - training_start
         
         # Prepare metrics
         final_loss = float(history.history['loss'][-1]) if 'loss' in history.history else 0.0
@@ -565,6 +574,10 @@ class FederatedLearningClient:
         
         print(f"[DEBUG] Client {self.client_id} sending model_update for round {self.current_round}")
         
+        delay = random.uniform(0.5, 3.0)
+        print(f"Client {self.client_id} waiting {delay:.2f} seconds before sending update...")
+        await asyncio.sleep(delay)
+        
         # Prepare weights (compress if quantization enabled)
         updated_weights = self.model.get_weights()
         if self.quantizer is not None:
@@ -578,6 +591,7 @@ class FederatedLearningClient:
             weights_key = 'weights'
         
         # Send model update to server
+        comm_start = time.time()
         await self.send_message({
             'type': 'model_update',
             'client_id': self.client_id,
@@ -586,6 +600,24 @@ class FederatedLearningClient:
             'num_samples': int(len(self.y_train)),
             'metrics': metrics_dict
         })
+        uplink_comm_sec = time.time() - comm_start
+        append_client_fl_metrics_record(
+            self.client_id,
+            {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "loss": float(final_loss),
+                "accuracy": float(final_acc),
+                "training_time_sec": float(training_time),
+                "pre_uplink_delay_sec": float(delay),
+                "uplink_model_comm_sec": float(uplink_comm_sec),
+                "total_fl_wall_time_sec": float(training_time + delay + uplink_comm_sec),
+                "battery_energy_joules": 0.0,
+                "battery_soc_after": 1.0,
+            },
+            use_case=use_case_from_env("mental_state"),
+            protocol="quic",
+        )
         if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             await asyncio.sleep(2)

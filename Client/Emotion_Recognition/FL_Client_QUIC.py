@@ -83,6 +83,12 @@ if compression_path not in sys.path:
 
 from quantization_client import Quantization, QuantizationConfig
 
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+_utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+
 # QUIC Configuration
 QUIC_HOST = os.getenv("QUIC_HOST", "fl-server-quic-emotion")
 QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
@@ -172,6 +178,8 @@ class FederatedLearningClient:
         self.protocol = None
         self.stream_id = 0
         self.model_ready = asyncio.Event()  # Event to signal model is ready
+        self._last_training_time_sec = 0.0
+        self._last_uplink_model_comm_sec = 0.0
         
         print(f"Client {self.client_id} initialized with:")
         print(f"  Training samples: {self.train_generator.n}")
@@ -460,6 +468,7 @@ class FederatedLearningClient:
         
         print(f"Training on {self.train_generator.n} samples for {epochs} epochs...")
         
+        training_start = time.time()
         # Train the model directly (synchronous call is faster, no executor overhead)
         history = self.model.fit(
             self.train_generator,
@@ -469,6 +478,7 @@ class FederatedLearningClient:
             validation_steps=val_steps,
             verbose=2
         )
+        training_time = time.time() - training_start
         
         # Get updated weights
         updated_weights = self.model.get_weights()
@@ -509,7 +519,11 @@ class FederatedLearningClient:
             msg['diagnostic_send_start_ts'] = send_start_ts
         payload = json.dumps(msg)
         # Send model update to server
+        comm_start = time.time()
         await self.send_message(msg)
+        communication_time = time.time() - comm_start
+        self._last_training_time_sec = training_time
+        self._last_uplink_model_comm_sec = communication_time
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
             O_send = time.perf_counter() - send_start_cpu
             print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={len(payload)} send_start_ts={send_start_ts:.9f}")
@@ -538,13 +552,37 @@ class FederatedLearningClient:
         
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
         
-        await self.send_message({
+        _metrics_msg = {
             'type': 'metrics',
             'client_id': self.client_id,
             'round': self.current_round,
             'num_samples': self.validation_generator.n,
             'metrics': metrics_dict
-        })
+        }
+        _mt0 = time.time()
+        await self.send_message(_metrics_msg)
+        _uplink_metrics_sec = time.time() - _mt0
+        append_client_fl_metrics_record(
+            self.client_id,
+            {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "loss": float(loss),
+                "accuracy": float(accuracy),
+                "training_time_sec": float(self._last_training_time_sec),
+                "uplink_model_comm_sec": float(self._last_uplink_model_comm_sec),
+                "uplink_metrics_comm_sec": float(_uplink_metrics_sec),
+                "total_fl_wall_time_sec": float(
+                    self._last_training_time_sec
+                    + self._last_uplink_model_comm_sec
+                    + _uplink_metrics_sec
+                ),
+                "battery_energy_joules": 0.0,
+                "battery_soc_after": 1.0,
+            },
+            use_case=use_case_from_env("emotion"),
+            protocol="quic",
+        )
         if self.has_converged and stop_on_client_convergence():
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             await asyncio.sleep(0.5)

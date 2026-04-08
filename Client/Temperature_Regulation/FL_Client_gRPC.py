@@ -65,6 +65,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'Protocol
 import federated_learning_pb2
 import federated_learning_pb2_grpc
 
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.abspath(os.path.join(_script_dir, '..', '..'))
+_utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+
 # gRPC Configuration
 GRPC_HOST = os.getenv("GRPC_HOST", "localhost")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
@@ -118,6 +125,8 @@ class FederatedLearningClient:
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.has_converged = False
+        self._last_training_time_sec = 0.0
+        self._last_uplink_model_comm_sec = 0.0
         
         # Prepare data and model
         self.prepare_data_and_model(dataframe)
@@ -416,6 +425,7 @@ class FederatedLearningClient:
         epochs = self.training_config['local_epochs']
         
         # Train the model
+        training_start = time.time()
         history = self.model.fit(
             self.x_train, self.y_train,
             epochs=epochs,
@@ -423,6 +433,7 @@ class FederatedLearningClient:
             verbose=2,
             validation_data=(self.x_test, self.y_test)
         )
+        training_time = time.time() - training_start
         
         # Get final metrics
         final_loss = history.history['loss'][-1]
@@ -454,6 +465,7 @@ class FederatedLearningClient:
         # Other protocols don't have random delays, so gRPC shouldn't either
         
         # Send model update to server
+        comm_start = time.time()
         response = self.stub.SendModelUpdate(
             federated_learning_pb2.ModelUpdate(
                 client_id=self.client_id,
@@ -468,6 +480,9 @@ class FederatedLearningClient:
                 }
             )
         )
+        communication_time = time.time() - comm_start
+        self._last_training_time_sec = training_time
+        self._last_uplink_model_comm_sec = communication_time
         
         if response.success:
             print(f"Client {self.client_id} sent model update for round {self.current_round}")
@@ -488,6 +503,7 @@ class FederatedLearningClient:
         mape = results[3]
         
         # Send metrics to server
+        _mt0 = time.time()
         response = self.stub.SendMetrics(
             federated_learning_pb2.EvaluationMetrics(
                 client_id=self.client_id,
@@ -501,8 +517,32 @@ class FederatedLearningClient:
                 }
             )
         )
+        _uplink_metrics_sec = time.time() - _mt0
         
         if response.success:
+            append_client_fl_metrics_record(
+                self.client_id,
+                {
+                    "client_id": self.client_id,
+                    "round": self.current_round,
+                    "loss": float(loss),
+                    "mse": float(mse),
+                    "mae": float(mae),
+                    "mape": float(mape),
+                    "training_time_sec": float(self._last_training_time_sec),
+                    "uplink_model_comm_sec": float(self._last_uplink_model_comm_sec),
+                    "uplink_metrics_comm_sec": float(_uplink_metrics_sec),
+                    "total_fl_wall_time_sec": float(
+                        self._last_training_time_sec
+                        + self._last_uplink_model_comm_sec
+                        + _uplink_metrics_sec
+                    ),
+                    "battery_energy_joules": 0.0,
+                    "battery_soc_after": 1.0,
+                },
+                use_case=use_case_from_env("temperature"),
+                protocol="grpc",
+            )
             print(f"Client {self.client_id} sent evaluation metrics for round {self.current_round}")
             print(f"Evaluation metrics - Loss: {loss:.4f}, MSE: {mse:.4f}, "
                   f"MAE: {mae:.4f}, MAPE: {mape:.4f}\n")

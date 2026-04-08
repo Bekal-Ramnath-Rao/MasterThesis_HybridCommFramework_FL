@@ -49,6 +49,13 @@ if compression_path not in sys.path:
 from quantization_client import Quantization, QuantizationConfig
 from pruning_client import ModelPruning, PruningConfig
 
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.abspath(os.path.join(_script_dir, '..', '..'))
+_utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+
 # Make TensorFlow logs less verbose
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
@@ -104,6 +111,8 @@ class FederatedLearningClient:
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.has_converged = False
+        self._last_training_time_sec = 0.0
+        self._last_uplink_model_comm_sec = 0.0
         
         # AMQP connection
         self.connection = None
@@ -421,6 +430,7 @@ class FederatedLearningClient:
         epochs = self.training_config['local_epochs']
         
         # Train the model
+        training_start = time.time()
         history = self.model.fit(
             self.x_train,
             self.y_train,
@@ -429,6 +439,7 @@ class FederatedLearningClient:
             validation_split=0.1,
             verbose=2
         )
+        training_time = time.time() - training_start
         
         # Get updated weights
         updated_weights = self.model.get_weights()
@@ -518,12 +529,17 @@ class FederatedLearningClient:
         # FAIR FIX: Removed random delay - this was causing unfair comparison with other protocols
         # Other protocols don't have random delays, so AMQP shouldn't either
         
+        _body = json.dumps(update_message)
+        comm_start = time.time()
         self.channel.basic_publish(
             exchange=EXCHANGE_CLIENT_UPDATES,
             routing_key='client.update',
-            body=json.dumps(update_message),
+            body=_body,
             properties=pika.BasicProperties(delivery_mode=2)
         )
+        communication_time = time.time() - comm_start
+        self._last_training_time_sec = training_time
+        self._last_uplink_model_comm_sec = communication_time
         
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
         print(f"Training metrics - Loss: {metrics['loss']:.4f}, MSE: {metrics['mse']:.4f}, "
@@ -570,11 +586,37 @@ class FederatedLearningClient:
             "metrics": metrics_dict
         }
         
+        _mb = json.dumps(metrics_message)
+        _mt0 = time.time()
         self.channel.basic_publish(
             exchange=EXCHANGE_CLIENT_UPDATES,
             routing_key='client.metrics',
-            body=json.dumps(metrics_message),
+            body=_mb,
             properties=pika.BasicProperties(delivery_mode=2)
+        )
+        _uplink_metrics_sec = time.time() - _mt0
+        append_client_fl_metrics_record(
+            self.client_id,
+            {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "loss": float(loss),
+                "mse": float(mse),
+                "mae": float(mae),
+                "mape": float(mape),
+                "training_time_sec": float(self._last_training_time_sec),
+                "uplink_model_comm_sec": float(self._last_uplink_model_comm_sec),
+                "uplink_metrics_comm_sec": float(_uplink_metrics_sec),
+                "total_fl_wall_time_sec": float(
+                    self._last_training_time_sec
+                    + self._last_uplink_model_comm_sec
+                    + _uplink_metrics_sec
+                ),
+                "battery_energy_joules": 0.0,
+                "battery_soc_after": 1.0,
+            },
+            use_case=use_case_from_env("temperature"),
+            protocol="amqp",
         )
         
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, MSE: {mse:.4f}, "

@@ -1908,6 +1908,8 @@ class UnifiedFederatedLearningServer:
             accuracy_value = float(data.get('accuracy', metrics_payload.get('accuracy', 0.0)))
             battery_soc = float(data.get('battery_soc', metrics_payload.get('battery_soc', 1.0)))
             round_time_sec = float(data.get('round_time_sec', metrics_payload.get('round_time_sec', 0.0)))
+            training_time_sec = float(data.get('training_time_sec', metrics_payload.get('training_time_sec', 0.0)))
+            uplink_model_comm_sec = float(data.get('uplink_model_comm_sec', metrics_payload.get('uplink_model_comm_sec', 0.0)))
             client_converged = float(data.get('client_converged', metrics_payload.get('client_converged', 0.0)))
             
             print(f"[{protocol.upper()}] handle_client_metrics ENTRY: client_id={client_id}, round={round_num}, current_round={self.current_round}")
@@ -1950,11 +1952,15 @@ class UnifiedFederatedLearningServer:
                 'protocol': protocol,
                 'battery_soc': battery_soc,
                 'round_time_sec': round_time_sec,
+                'training_time_sec': training_time_sec,
+                'uplink_model_comm_sec': uplink_model_comm_sec,
                 'metrics': metrics_payload or {
                     'loss': loss_value,
                     'accuracy': accuracy_value,
                     'battery_soc': battery_soc,
                     'round_time_sec': round_time_sec,
+                    'training_time_sec': training_time_sec,
+                    'uplink_model_comm_sec': uplink_model_comm_sec,
                 },
             }
             

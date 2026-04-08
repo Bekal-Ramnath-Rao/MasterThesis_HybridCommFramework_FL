@@ -8,6 +8,7 @@ import time
 import random
 import asyncio
 import os
+import sys
 import logging
 _xla_flags = os.environ.get("XLA_FLAGS", "").strip()
 if _xla_flags:
@@ -30,6 +31,13 @@ if compression_path not in os.sys.path:
 
 from quantization_client import Quantization, QuantizationConfig
 from pruning_client import ModelPruning, PruningConfig
+
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.abspath(os.path.join(_script_dir, '..', '..'))
+_utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
@@ -133,6 +141,8 @@ class FederatedLearningClient:
         self.has_converged = False
         self.protocol = None
         self.stream_id = 0
+        self._last_training_time_sec = 0.0
+        self._last_uplink_model_comm_sec = 0.0
         
         # Prepare data and model
         self.prepare_data_and_model(dataframe)
@@ -366,6 +376,7 @@ class FederatedLearningClient:
         
         # Train in a thread pool to avoid blocking
         loop = asyncio.get_event_loop()
+        training_start = time.time()
         history = await loop.run_in_executor(
             None,
             lambda: self.model.fit(
@@ -377,6 +388,7 @@ class FederatedLearningClient:
                 verbose=2
             )
         )
+        training_time = time.time() - training_start
         
         updated_weights = self.model.get_weights()
 
@@ -469,7 +481,11 @@ class FederatedLearningClient:
                 "metrics": metrics
             }
         
+        comm_start = time.time()
         await self.send_message(update_message)
+        communication_time = time.time() - comm_start
+        self._last_training_time_sec = training_time
+        self._last_uplink_model_comm_sec = communication_time
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
         print(f"Training metrics - Loss: {metrics['loss']:.4f}, MSE: {metrics['mse']:.4f}, "
               f"MAE: {metrics['mae']:.4f}, MAPE: {metrics['mape']:.4f}")
@@ -520,7 +536,32 @@ class FederatedLearningClient:
             "metrics": metrics_dict
         }
         
+        _mt0 = time.time()
         await self.send_message(metrics_message)
+        _uplink_metrics_sec = time.time() - _mt0
+        append_client_fl_metrics_record(
+            self.client_id,
+            {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "loss": float(loss),
+                "mse": float(mse),
+                "mae": float(mae),
+                "mape": float(mape),
+                "training_time_sec": float(self._last_training_time_sec),
+                "uplink_model_comm_sec": float(self._last_uplink_model_comm_sec),
+                "uplink_metrics_comm_sec": float(_uplink_metrics_sec),
+                "total_fl_wall_time_sec": float(
+                    self._last_training_time_sec
+                    + self._last_uplink_model_comm_sec
+                    + _uplink_metrics_sec
+                ),
+                "battery_energy_joules": 0.0,
+                "battery_soc_after": 1.0,
+            },
+            use_case=use_case_from_env("temperature"),
+            protocol="http3",
+        )
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, MSE: {mse:.4f}, "
               f"MAE: {mae:.4f}, MAPE: {mape:.4f}")
         if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:

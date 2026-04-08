@@ -76,6 +76,12 @@ if compression_path not in sys.path:
 
 from quantization_client import Quantization, QuantizationConfig
 
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+_utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+
 from cyclonedds.topic import Topic
 from cyclonedds.sub import DataReader
 from cyclonedds.pub import DataWriter
@@ -689,6 +695,7 @@ class FederatedLearningClient:
         
         # Train
         print(f"[Client {self.client_id}] Training for {epochs} epochs...")
+        training_start = time.time()
         history = self.model.fit(
             ds_train,
             epochs=epochs,
@@ -700,6 +707,7 @@ class FederatedLearningClient:
                 )
             ]
         )
+        training_time = time.time() - training_start
         
         # Get metrics
         final_loss = float(history.history['loss'][-1]) if 'loss' in history.history else 0.0
@@ -725,6 +733,7 @@ class FederatedLearningClient:
         time.sleep(delay)
         
         # Send model update to server using chunking
+        send_start = time.time()
         self.send_model_update_chunked(
             self.current_round,
             serialized_weights,
@@ -732,6 +741,25 @@ class FederatedLearningClient:
             final_loss,
             final_acc,
             client_converged
+        )
+        uplink_comm_sec = time.time() - send_start
+        
+        append_client_fl_metrics_record(
+            self.client_id,
+            {
+                "client_id": self.client_id,
+                "round": self.current_round,
+                "loss": float(final_loss),
+                "accuracy": float(final_acc),
+                "training_time_sec": float(training_time),
+                "pre_uplink_delay_sec": float(delay),
+                "uplink_model_comm_sec": float(uplink_comm_sec),
+                "total_fl_wall_time_sec": float(training_time + delay + uplink_comm_sec),
+                "battery_energy_joules": 0.0,
+                "battery_soc_after": 1.0,
+            },
+            use_case=use_case_from_env("mental_state"),
+            protocol="dds",
         )
         
         print(f"Client {self.client_id} sent model update for round {self.current_round}")

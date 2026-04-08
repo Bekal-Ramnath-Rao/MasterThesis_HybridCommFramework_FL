@@ -95,6 +95,12 @@ if _client_dir not in sys.path:
     sys.path.insert(0, _client_dir)
 from battery_model import BatteryModel
 
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+_utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
+if _utilities_path not in sys.path:
+    sys.path.insert(0, _utilities_path)
+from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+
 # Import generated gRPC code
 import federated_learning_pb2
 import federated_learning_pb2_grpc
@@ -136,6 +142,8 @@ class FederatedLearningClient:
         
         self.battery_model = BatteryModel(protocol="grpc")
         self._last_round_time_sec = 0.0
+        self._last_training_time_sec = 0.0
+        self._last_uplink_model_comm_sec = 0.0
         # Initialize quantization compression (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
         use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
@@ -616,6 +624,8 @@ class FederatedLearningClient:
             bytes_sent = payload_size
             self.battery_model.update(bytes_sent, 0, training_time, communication_time)
             self._last_round_time_sec = training_time + communication_time
+            self._last_training_time_sec = training_time
+            self._last_uplink_model_comm_sec = communication_time
 
             if response.success:
                 print(f"Client {self.client_id} successfully sent update for round {self.current_round}")
@@ -642,6 +652,7 @@ class FederatedLearningClient:
             client_converged = 1.0 if (stop_on_client_convergence() and self._would_converge_after_eval(loss_f)) else 0.0
             
             # Send metrics to server (include battery, round time, and convergence flag)
+            _mt0 = time.time()
             response = self.stub.SendMetrics(
                 federated_learning_pb2.Metrics(
                     client_id=self.client_id,
@@ -654,8 +665,31 @@ class FederatedLearningClient:
                     client_converged=client_converged,
                 )
             )
+            _uplink_metrics_sec = time.time() - _mt0
             
             if response.success:
+                append_client_fl_metrics_record(
+                    self.client_id,
+                    {
+                        "client_id": self.client_id,
+                        "round": self.current_round,
+                        "loss": loss_f,
+                        "accuracy": float(accuracy),
+                        "training_time_sec": float(self._last_training_time_sec),
+                        "uplink_model_comm_sec": float(self._last_uplink_model_comm_sec),
+                        "uplink_metrics_comm_sec": float(_uplink_metrics_sec),
+                        "total_fl_wall_time_sec": float(
+                            self._last_training_time_sec
+                            + self._last_uplink_model_comm_sec
+                            + _uplink_metrics_sec
+                        ),
+                        "battery_energy_joules": float(self.battery_model.last_energy_j),
+                        "battery_soc_after": float(self.battery_model.battery_soc),
+                        "cumulative_battery_energy_joules": float(self.battery_model.cumulative_energy_j),
+                    },
+                    use_case=use_case_from_env("emotion"),
+                    protocol="grpc",
+                )
                 print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
                 self._update_local_convergence(loss_f)
             

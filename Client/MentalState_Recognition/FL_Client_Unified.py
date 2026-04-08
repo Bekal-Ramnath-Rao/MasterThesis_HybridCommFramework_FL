@@ -61,6 +61,7 @@ try:
 except ImportError:
     init_qlearning_db = None
     log_q_step = None
+from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 
 # Suppress TensorFlow warnings
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -658,6 +659,28 @@ class UnifiedFLClient_MentalState:
                 print(f"[Uplink RL] Reward: {reward:.2f}, epsilon: {self.rl_selector_uplink.epsilon:.4f}")
                 # Compute and log downlink reward if a downlink selection was made this round
                 self._update_downlink_rl_after_reception(round_num=int(getattr(self, 'current_round', 0)))
+            
+            _batt_soc = (
+                float(self.env_manager.battery_soc)
+                if (USE_RL_SELECTION and self.env_manager)
+                else 1.0
+            )
+            append_client_fl_metrics_record(
+                self.client_id,
+                {
+                    "client_id": self.client_id,
+                    "round": int(getattr(self, "current_round", 0)),
+                    "loss": float(train_metrics.get("val_loss", 0.0)),
+                    "accuracy": float(train_metrics.get("val_accuracy", 0.0)),
+                    "training_time_sec": float(train_metrics.get("training_time", 0.0)),
+                    "total_fl_wall_time_sec": float(round_time),
+                    "uplink_model_comm_sec": float(self.round_metrics.get("communication_time", 0.0)),
+                    "battery_energy_joules": 0.0,
+                    "battery_soc_after": _batt_soc,
+                },
+                use_case=use_case_from_env("mental_state"),
+                protocol=str(protocol),
+            )
             
             return {
                 'protocol': protocol,
