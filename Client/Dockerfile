@@ -45,6 +45,7 @@ RUN cd Protocols && \
 
 COPY scripts/utilities/packet_logger.py ./
 COPY scripts/utilities/q_learning_logger.py ./
+COPY scripts/utilities/client_fl_metrics_log.py ./
 # DDS: LAN multicast + runtime static unicast generator (DDS_PEER_*)
 COPY config/cyclonedds-multicast-lan.xml /app/config/cyclonedds-multicast-lan.xml
 COPY config/dds_distributed_unicast.py /app/config/dds_distributed_unicast.py
