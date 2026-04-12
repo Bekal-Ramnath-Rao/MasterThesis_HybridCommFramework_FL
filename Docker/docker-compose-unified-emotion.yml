@@ -60,6 +60,11 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+      # DDS (Cyclone): static unicast with DDS_PEER_* must use Docker DNS for peers on this bridge.
+      # LAN IPs (e.g. 129.x) point at the host, not the client container — SPDP to :7414 would miss client1.
+      # Override DDS_SPDP_CLIENT1 only if you know what you are doing. Remote client2 still uses DDS_PEER_CLIENT2.
+      - DDS_DOMAIN_ID=0
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-unified-emotion-1}
     volumes:
       - ../Server/Emotion_Recognition:/app/Server/Emotion_Recognition
       - ../experiment_results:/app/results
@@ -71,6 +76,7 @@ services:
       - "4433:4433/udp"  # QUIC
       - "4434:4434/udp"  # HTTP/3 (QUIC)
       - "50051:50051/tcp"  # gRPC (HTTP/2)
+      - "7412:7412/udp"  # CycloneDDS SPDP (participant index 1 = server); open on firewall for remote peers
     depends_on:
       - mqtt-broker-unified
       - amqp-broker-unified
@@ -126,6 +132,8 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+      - DDS_DOMAIN_ID=0
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-unified-emotion}
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
       - ../Network_Simulation:/app/Network_Simulation:ro
@@ -134,6 +142,8 @@ services:
       - ../certs:/app/certs:ro
     networks:
       - fl-network
+    ports:
+      - "7414:7414/udp"  # CycloneDDS SPDP (participant index 2 = client 1); map host IP for remote peer discovery
     depends_on:
       - fl-server-unified-emotion
       - mqtt-broker-unified
@@ -186,6 +196,10 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+      # Same-host unified stack: use Docker DNS for server + client1. Remote deployments: set DDS_SPDP_* to LAN IPs.
+      - DDS_DOMAIN_ID=0
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-unified-emotion}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-unified-emotion-1}
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
       - ../Network_Simulation:/app/Network_Simulation:ro
@@ -194,6 +208,8 @@ services:
       - ../certs:/app/certs:ro
     networks:
       - fl-network
+    ports:
+      - "7416:7416/udp"  # CycloneDDS SPDP (participant index 3 = client 2)
     depends_on:
       - fl-server-unified-emotion
       - mqtt-broker-unified
