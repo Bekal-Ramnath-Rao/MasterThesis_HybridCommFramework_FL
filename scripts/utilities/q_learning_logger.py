@@ -2,14 +2,14 @@
 Q-Learning Logger - Persist Q-learning steps for FL clients (Docker and local).
 Similar to packet_logger: shared_data in Docker, scripts/utilities locally.
 
-Schema keeps only columns that are populated by the unified clients (no empty
-convergence / T_calc / legacy state columns).
+Schema matches unified clients: RL state (comm, resource, battery), coarse
+network scenario fields used for Q-table indexing, metrics, and reward breakdown.
 """
 
 import sqlite3
 from datetime import datetime
 import os
-from typing import Optional
+from typing import Any, Dict, Optional
 
 
 def get_db_path():
@@ -49,6 +49,32 @@ def get_db_path():
 DB_PATH = get_db_path()
 
 
+def rl_state_network_kwargs(state: Optional[Dict[str, Any]]) -> Dict[str, Optional[str]]:
+    """
+    Map ``EnvironmentStateManager.get_current_state()`` (or downlink snapshot dict)
+    into ``log_q_step`` keyword args for network-scenario columns.
+    """
+    if not state:
+        return {
+            "state_network_scenario": None,
+            "state_data_network_scenario": None,
+            "state_detected_network_scenario": None,
+        }
+
+    def _s(key: str) -> Optional[str]:
+        v = state.get(key)
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s if s else None
+
+    return {
+        "state_network_scenario": _s("network_scenario"),
+        "state_data_network_scenario": _s("data_network_scenario"),
+        "state_detected_network_scenario": _s("detected_network_scenario"),
+    }
+
+
 def _create_slim_table(c: sqlite3.Cursor) -> None:
     c.execute(
         """
@@ -62,6 +88,9 @@ def _create_slim_table(c: sqlite3.Cursor) -> None:
             state_comm_level TEXT,
             state_resource TEXT,
             state_battery_level TEXT,
+            state_network_scenario TEXT,
+            state_data_network_scenario TEXT,
+            state_detected_network_scenario TEXT,
             action TEXT NOT NULL,
             reward REAL NOT NULL,
             q_delta REAL,
@@ -119,6 +148,9 @@ def _migrate_legacy_to_slim(conn: sqlite3.Connection) -> None:
             state_comm_level TEXT,
             state_resource TEXT,
             state_battery_level TEXT,
+            state_network_scenario TEXT,
+            state_data_network_scenario TEXT,
+            state_detected_network_scenario TEXT,
             action TEXT NOT NULL,
             reward REAL NOT NULL,
             q_delta REAL,
@@ -158,6 +190,7 @@ def _migrate_legacy_to_slim(conn: sqlite3.Connection) -> None:
         INSERT INTO q_learning_log_new (
             client_id, timestamp, link_direction, round_num, episode,
             state_comm_level, state_resource, state_battery_level,
+            state_network_scenario, state_data_network_scenario, state_detected_network_scenario,
             action, reward, q_delta, q_value, epsilon, avg_reward_last_100, converged,
             metric_communication_time, metric_success,
             metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage,
@@ -171,6 +204,7 @@ def _migrate_legacy_to_slim(conn: sqlite3.Connection) -> None:
             {sel_comm},
             COALESCE(state_resource, ''),
             COALESCE(state_battery_level, ''),
+            '', '', '',
             action, reward, q_delta, NULL, epsilon, avg_reward_last_100, converged,
             metric_communication_time, metric_success,
             metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage,
@@ -202,6 +236,15 @@ def init_db(db_path: Optional[str] = None):
                 cols = _table_columns(conn, "q_learning_log")
             if "q_value" not in cols:
                 c.execute("ALTER TABLE q_learning_log ADD COLUMN q_value REAL")
+            cols = _table_columns(conn, "q_learning_log")
+            for col_sql in (
+                ("state_network_scenario", "TEXT"),
+                ("state_data_network_scenario", "TEXT"),
+                ("state_detected_network_scenario", "TEXT"),
+            ):
+                if col_sql[0] not in cols:
+                    c.execute(f"ALTER TABLE q_learning_log ADD COLUMN {col_sql[0]} {col_sql[1]}")
+                cols = _table_columns(conn, "q_learning_log")
         conn.commit()
     finally:
         conn.close()
@@ -234,6 +277,9 @@ def log_q_step(
     reward_battery_penalty: float = None,
     reward_total: float = None,
     link_direction: str = "uplink",
+    state_network_scenario: Optional[str] = None,
+    state_data_network_scenario: Optional[str] = None,
+    state_detected_network_scenario: Optional[str] = None,
 ):
     """Log one Q-learning step."""
     effective_reward_total = reward_total if reward_total is not None else reward
@@ -246,12 +292,13 @@ def log_q_step(
             INSERT INTO q_learning_log (
                 client_id, timestamp, link_direction, round_num, episode,
                 state_comm_level, state_resource, state_battery_level,
+                state_network_scenario, state_data_network_scenario, state_detected_network_scenario,
                 action, reward, q_delta, q_value, epsilon, avg_reward_last_100, converged,
                 metric_communication_time, metric_success,
                 metric_cpu_usage, metric_memory_usage, metric_bandwidth_usage,
                 metric_battery_level, metric_energy_usage,
                 reward_base, reward_communication_time, reward_resource_penalty, reward_battery_penalty, reward_total
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 client_id,
@@ -262,6 +309,9 @@ def log_q_step(
                 state_comm_level or "",
                 state_resource or "",
                 state_battery_level or "",
+                state_network_scenario or "",
+                state_data_network_scenario or "",
+                state_detected_network_scenario or "",
                 action,
                 reward,
                 q_delta if q_delta is not None else 0.0,
@@ -315,6 +365,9 @@ def log_q_step(
                 reward_battery_penalty=reward_battery_penalty,
                 reward_total=reward_total,
                 link_direction=link_direction,
+                state_network_scenario=state_network_scenario,
+                state_data_network_scenario=state_data_network_scenario,
+                state_detected_network_scenario=state_detected_network_scenario,
             )
         else:
             print(f"[QLearningLogger] Error: {e}")

@@ -2002,6 +2002,8 @@ class UnifiedFLClient_Emotion:
         """
         if not USE_RL_SELECTION or self.rl_selector_downlink is None or self.env_manager is None:
             return
+        if not USE_RL_EXPLORATION:
+            return
         if self._downlink_select_time is not None and self._last_downlink_rl_state is not None:
             return
         try:
@@ -2011,7 +2013,7 @@ class UnifiedFLClient_Emotion:
             proto = self._downlink_protocol_from_delivery_source(source)
             if proto not in self.rl_selector_downlink.PROTOCOLS:
                 proto = "grpc"
-            self.rl_selector_downlink.register_selection(state, proto)
+            self.rl_selector_downlink.register_selection(state, proto, record_learning=USE_RL_EXPLORATION)
             self._last_downlink_rl_state = state
             self._downlink_select_time = receive_started_at
             self.selected_downlink_protocol = proto
@@ -2059,6 +2061,10 @@ class UnifiedFLClient_Emotion:
         self._downlink_select_time = None
 
         self._last_downlink_comm_wall_s = float(comm_time)
+
+        if not USE_RL_EXPLORATION:
+            self._last_downlink_rl_state = None
+            return
 
         if getattr(self, "_rl_boundary_collection_phase", False):
             import psutil
@@ -2384,7 +2390,9 @@ class UnifiedFLClient_Emotion:
                     training_mode = USE_RL_EXPLORATION
                     if getattr(self, "_rl_boundary_collection_phase", False):
                         self.rl_selector_downlink.epsilon = 1.0
-                    selected = self.rl_selector_downlink.select_protocol(state, training=training_mode)
+                    selected = self.rl_selector_downlink.select_protocol(
+                        state, training=training_mode, record_learning=USE_RL_EXPLORATION
+                    )
                 # Store downlink state and selection time so reward can be computed after model arrives
                 self._last_downlink_rl_state = state
                 self._downlink_select_time = time.time()
@@ -2418,7 +2426,7 @@ class UnifiedFLClient_Emotion:
                 and self.rl_selector_downlink is not None
                 and self.rl_selector_downlink.pop_last_selection()
             ):
-                self.rl_selector_downlink.register_selection(state, 'grpc')
+                self.rl_selector_downlink.register_selection(state, 'grpc', record_learning=USE_RL_EXPLORATION)
                 self._last_downlink_rl_state = state
                 self._downlink_select_time = time.time()
             else:
@@ -2814,7 +2822,9 @@ class UnifiedFLClient_Emotion:
                     training_mode = USE_RL_EXPLORATION
                     if getattr(self, "_rl_boundary_collection_phase", False):
                         self.rl_selector_uplink.epsilon = 1.0
-                    protocol = self.rl_selector_uplink.select_protocol(state, training=training_mode)
+                    protocol = self.rl_selector_uplink.select_protocol(
+                        state, training=training_mode, record_learning=USE_RL_EXPLORATION
+                    )
                 
                 print(f"\n[Uplink RL Protocol Selection]")
                 print(f"  CPU: {cpu:.1f}%, Memory: {memory:.1f}%")
@@ -3244,7 +3254,8 @@ class UnifiedFLClient_Emotion:
             print(f"Client {self.client_id} sent evaluation metrics for round {report_round}")
             print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
             # RL update and optional Q-convergence end condition (battery already updated above for metrics)
-            # When RL is enabled: always update Q and log to DB (so GUI shows data and agent learns).
+            # When USE_RL_EXPLORATION: update Q, log, epsilon decay (training). When inference-only
+            # (USE_RL_EXPLORATION=false): greedy protocol only; Q-table unchanged.
             # Only the *stopping* condition differs: USE_QL_CONVERGENCE -> stop when Q converges; else stop on loss.
             # Uses the dedicated UPLINK Q-learning agent.
             if USE_RL_SELECTION and self.rl_selector_uplink and self.env_manager:
@@ -3318,7 +3329,7 @@ class UnifiedFLClient_Emotion:
                             )
                         skip_uplink_training = True
 
-                    if not skip_uplink_training:
+                    if not skip_uplink_training and USE_RL_EXPLORATION:
                         reward = self.rl_selector_uplink.calculate_reward(
                             communication_time=comm_time_for_reward,
                             success=self.round_metrics['success'],
