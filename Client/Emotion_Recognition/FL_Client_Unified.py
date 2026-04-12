@@ -79,6 +79,45 @@ except ImportError:
     H3Event = None
     StreamReset = None
 
+# Set CycloneDDS config before any cyclonedds import (native lib may read at load time);
+# same logic as FL_Client_DDS.py for DDS_PEER_* static unicast across hosts.
+def _emotion_config_dir():
+    if os.path.exists("/app"):
+        return "/app/config"
+    return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "config"))
+
+
+def _try_distributed_unicast_client():
+    base = _emotion_config_dir()
+    helper = os.path.join(base, "dds_distributed_unicast.py")
+    if not os.path.isfile(helper):
+        return False
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("dds_distributed_unicast", helper)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.try_apply_client_uri()
+
+
+def _ensure_client_cyclonedds_uri():
+    if os.environ.get("CYCLONEDDS_URI"):
+        return
+    if _try_distributed_unicast_client():
+        return
+    base = _emotion_config_dir()
+    mc = os.path.join(base, "cyclonedds-multicast-lan.xml")
+    if os.path.isfile(mc):
+        os.environ["CYCLONEDDS_URI"] = "file://" + os.path.abspath(mc)
+        return
+    _cid = os.environ.get("CLIENT_ID", "1")
+    _path = os.path.join(base, f"cyclonedds-emotion-client{_cid}.xml")
+    if os.path.isfile(_path):
+        os.environ["CYCLONEDDS_URI"] = "file://" + os.path.abspath(_path)
+
+
+_ensure_client_cyclonedds_uri()
+
 try:
     from cyclonedds.domain import DomainParticipant
     from cyclonedds.topic import Topic
@@ -319,10 +358,13 @@ if _utilities_path not in sys.path:
 from packet_logger import init_db, log_sent_packet, log_received_packet, get_round_bytes_sent_received
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 try:
-    from q_learning_logger import init_db as init_qlearning_db, log_q_step
+    from q_learning_logger import init_db as init_qlearning_db, log_q_step, rl_state_network_kwargs
 except ImportError:
     init_qlearning_db = None
     log_q_step = None
+
+    def rl_state_network_kwargs(_state=None):
+        return {}
 
 # Import custom modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -2109,6 +2151,7 @@ class UnifiedFLClient_Emotion:
                     state_comm_level=downlink_state.get('comm_level', ''),
                     state_resource=downlink_state.get('resource', ''),
                     state_battery_level=downlink_state.get('battery_level', ''),
+                    **rl_state_network_kwargs(downlink_state),
                     action=protocol,
                     reward=reward,
                     q_delta=q_delta,
@@ -3332,6 +3375,7 @@ class UnifiedFLClient_Emotion:
                                 state_comm_level=st.get('comm_level', ''),
                                 state_resource=st.get('resource', ''),
                                 state_battery_level=st.get('battery_level', ''),
+                                **rl_state_network_kwargs(st),
                                 action=self._last_update_protocol or self.selected_protocol or 'mqtt',
                                 reward=reward,
                                 q_delta=q_delta,

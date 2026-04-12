@@ -57,10 +57,13 @@ _utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 try:
-    from q_learning_logger import init_db as init_qlearning_db, log_q_step
+    from q_learning_logger import init_db as init_qlearning_db, log_q_step, rl_state_network_kwargs
 except ImportError:
     init_qlearning_db = None
     log_q_step = None
+
+    def rl_state_network_kwargs(_state=None):
+        return {}
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 
 # Suppress TensorFlow warnings
@@ -354,6 +357,7 @@ class UnifiedFLClient_MentalState:
                     state_comm_level=downlink_state.get('comm_level', ''),
                     state_resource=downlink_state.get('resource', ''),
                     state_battery_level=downlink_state.get('battery_level', ''),
+                    **rl_state_network_kwargs(downlink_state),
                     action=protocol,
                     reward=reward,
                     q_delta=q_delta,
@@ -635,6 +639,7 @@ class UnifiedFLClient_MentalState:
                         state_comm_level=st.get('comm_level', ''),
                         state_resource=st.get('resource', ''),
                         state_battery_level=st.get('battery_level', ''),
+                        **rl_state_network_kwargs(st),
                         action=protocol,
                         reward=reward,
                         q_delta=q_delta,

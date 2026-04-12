@@ -93,6 +93,42 @@ except Exception as e:
     QUIC_AVAILABLE = False
     print(f"Warning: aioquic not available, QUIC disabled (Unexpected error: {type(e).__name__}: {e})")
 
+# Set CycloneDDS config before any cyclonedds import (native lib may read at load time);
+# same logic as FL_Server_DDS.py for DDS_PEER_* static unicast across hosts.
+def _emotion_config_dir():
+    if os.path.exists("/app"):
+        return "/app/config"
+    return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "config"))
+
+
+def _try_distributed_unicast_server():
+    base = _emotion_config_dir()
+    helper = os.path.join(base, "dds_distributed_unicast.py")
+    if not os.path.isfile(helper):
+        return False
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("dds_distributed_unicast", helper)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.try_apply_server_uri()
+
+
+def _ensure_server_cyclonedds_uri():
+    if os.environ.get("CYCLONEDDS_URI"):
+        return
+    if _try_distributed_unicast_server():
+        return
+    base = _emotion_config_dir()
+    for name in ("cyclonedds-multicast-lan.xml", "cyclonedds-emotion-server.xml"):
+        p = os.path.join(base, name)
+        if os.path.isfile(p):
+            os.environ["CYCLONEDDS_URI"] = "file://" + os.path.abspath(p)
+            return
+
+
+_ensure_server_cyclonedds_uri()
+
 try:
     from cyclonedds.domain import DomainParticipant  # DDS
     from cyclonedds.topic import Topic

@@ -254,8 +254,8 @@ class DistributedClientGUI(QMainWindow):
             "Broker ports: Docker-mapped MQTT 31883 / AMQP 35672, or host/macvlan MQTT 1883 / AMQP 5672. "
             "Unified FL also needs TCP gRPC 50051 on the server host (initial model is pulled over gRPC, not MQTT). "
             "Standalone gRPC uses TCP 50051 only (no MQTT). QUIC 4433 | HTTP/3 4434 (UDP) | DDS domain 0. "
-            "Test Connection: RL-Unified → MQTT+AMQP TCP, gRPC TCP, QUIC/HTTP3 UDP; gRPC-only → TCP 50051; "
-            "MQTT modes → MQTT + gRPC; QUIC/HTTP3 → UDP; DDS → ping."
+            "Test Connection: RL-Unified → MQTT+AMQP TCP, gRPC TCP, QUIC/HTTP3 UDP, DDS (UDP SPDP 7412 + peer fields); "
+            "gRPC-only → TCP 50051; MQTT modes → MQTT + gRPC; QUIC/HTTP3 → UDP; DDS-only → ping + SPDP."
         )
         info_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
         layout.addWidget(info_label, 1, 0, 1, 3)
@@ -1065,7 +1065,13 @@ class DistributedClientGUI(QMainWindow):
         """DDS-only experiments do not run MQTT; verify host reachability (ping) and remind about UDP."""
         self.log_text.append(
             f"\n🔍 DDS-only: skipping MQTT (broker not required). "
-            f"Checking host reachability to {server_ip} (ICMP ping)...\n"
+            f"Checking {server_ip} — SPDP UDP + ICMP ping...\n"
+        )
+        spdp_srv_port = self._cyclone_spdp_port_domain0(1)
+        dds_spdp_ok = self._udp_port_probe(server_ip, spdp_srv_port)
+        self.log_text.append(
+            f"{'✅' if dds_spdp_ok else 'ℹ️'} DDS SPDP UDP {spdp_srv_port} on {server_ip} "
+            f"({'reply — Cyclone may be listening' if dds_spdp_ok else 'no reply — normal if server DDS not running; allow UDP ~7400–7500'})\n"
         )
         self.statusBar().showMessage("Testing host reachability (DDS)...")
         ok = self._ping_server_host(server_ip)
@@ -1079,9 +1085,10 @@ class DistributedClientGUI(QMainWindow):
             QMessageBox.information(
                 self,
                 "Host reachable (DDS)",
-                f"Ping to {server_ip} succeeded.\n\n"
+                f"Ping to {server_ip} succeeded.\n"
+                f"SPDP UDP {spdp_srv_port}: {'open (best-effort)' if dds_spdp_ok else 'no nc reply (optional)'}\n\n"
                 "DDS does not use MQTT; no broker is required for this mode.\n"
-                "Discovery uses UDP (multicast on the LAN); allow UDP 7400–7500 between hosts if needed.",
+                "Discovery uses UDP (multicast on the LAN or static DDS_PEER_*); allow UDP 7400–7500 between hosts if needed.",
             )
             self.statusBar().showMessage("DDS: host reachable")
             return
@@ -1130,6 +1137,11 @@ class DistributedClientGUI(QMainWindow):
             return r.returncode == 0
         except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
             return False
+
+    @staticmethod
+    def _cyclone_spdp_port_domain0(participant_index: int) -> int:
+        """CycloneDDS domain 0 SPDP port: 7410 + 2 * ParticipantIndex (config/dds_distributed_unicast.py)."""
+        return 7410 + 2 * int(participant_index)
 
     def _test_connection_quic_http3(self, server_ip: str, protocol: str):
         """QUIC and HTTP/3 use UDP; do not test MQTT."""
@@ -1248,8 +1260,8 @@ class DistributedClientGUI(QMainWindow):
     def _test_connection_unified(self, server_ip: str):
         """RL-Unified needs MQTT, AMQP, gRPC (TCP), QUIC & HTTP/3 (UDP). DDS is separate (UDP multicast/unicast)."""
         self.log_text.append(
-            f"\n🔍 RL-Unified: checking {server_ip} — MQTT, AMQP, gRPC, QUIC, HTTP/3 "
-            f"(DDS uses UDP discovery; see log note)...\n"
+            f"\n🔍 RL-Unified: checking {server_ip} — MQTT, AMQP, gRPC, QUIC, HTTP/3, "
+            f"DDS (UDP SPDP / peers; not a TCP port like the others)...\n"
         )
         self.statusBar().showMessage("Testing RL-Unified endpoints…")
 
@@ -1318,10 +1330,28 @@ class DistributedClientGUI(QMainWindow):
             f"{'✅' if http3_ok else '❌'} HTTP/3 UDP 4434 ({'OK' if http3_ok else 'allow UDP / Docker 4434:4434/udp'})\n"
         )
 
-        self.log_text.append(
-            "ℹ️ DDS: CycloneDDS uses UDP (multicast LAN or static DDS_PEER_*); no single TCP port check. "
-            "Ensure same CYCLONEDDS_URI / peers as the server if you use DDS selection.\n"
+        # DDS: not TCP — probe optional SPDP UDP on server (participant index 1 → port 7412) + UI peer fields
+        spdp_srv_port = self._cyclone_spdp_port_domain0(1)
+        dds_spdp_ok = self._udp_port_probe(server_ip, spdp_srv_port)
+        ps = getattr(self, "dds_peer_server", None)
+        p1 = getattr(self, "dds_peer_client1", None)
+        p2 = getattr(self, "dds_peer_client2", None)
+        peers_filled = bool(
+            ps and p1 and p2
+            and ps.text().strip() and p1.text().strip() and p2.text().strip()
         )
+        self.log_text.append(
+            f"{'✅' if dds_spdp_ok else 'ℹ️'} DDS SPDP UDP {spdp_srv_port} on {server_ip} "
+            f"({'reply — Cyclone may be listening on server' if dds_spdp_ok else 'no reply — normal if unified server has no DDS participant yet; allow UDP ~7400–7500 + SPDP'})\n"
+        )
+        if peers_filled:
+            self.log_text.append(
+                "✅ DDS_PEER_*: all three peer fields set (static unicast; must match the experiment server).\n"
+            )
+        else:
+            self.log_text.append(
+                "ℹ️ DDS: set all three DDS peer fields for cross-host static unicast, or rely on multicast LAN XML.\n"
+            )
 
         transport_ok = mqtt_ok and amqp_ok and grpc_ok and quic_ok and http3_ok
         core_ok = mqtt_ok and grpc_ok
@@ -1337,8 +1367,11 @@ class DistributedClientGUI(QMainWindow):
                 f"• AMQP TCP {amqp_p} ✓\n"
                 f"• gRPC TCP {grpc_port} ✓\n"
                 f"• QUIC UDP 4433 ✓\n"
-                f"• HTTP/3 UDP 4434 ✓\n\n"
-                f"DDS is not TCP-probed; use matching multicast/unicast config with the server.",
+                f"• HTTP/3 UDP 4434 ✓\n"
+                f"• DDS: UDP discovery (not TCP); SPDP probe {spdp_srv_port} "
+                f"{'✓' if dds_spdp_ok else '— (optional)'}, peers in UI "
+                f"{'✓' if peers_filled else '— fill for static unicast'}\n\n"
+                f"DDS cannot use the same check as MQTT/gRPC; match DDS_PEER_* / CYCLONEDDS_URI with the server.",
             )
             self.statusBar().showMessage("RL-Unified: all endpoints OK")
             return
