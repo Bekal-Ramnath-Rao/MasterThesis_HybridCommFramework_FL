@@ -1769,14 +1769,32 @@ class UnifiedFederatedLearningServer:
                     r = getattr(self, "_dds_update_chunk_reader", None)
                     if r is None:
                         return
-                    st = r.get_subscription_matched_status()
-                    print(
-                        f"[DDS] ModelUpdateChunk reader matched publications: {st.current_count} "
-                        f"(0 after clients start usually means UDP/locators: same-bridge containers "
-                        f"often need DDS_DISABLE_EXTERNAL_ADVERTISE=1 on the server)"
-                    )
+                    n_matched = None
+                    # cyclonedds-python versions differ: some DataReaders lack get_subscription_matched_status.
+                    try:
+                        pubs = r.get_matched_publications()
+                        n_matched = len(pubs) if pubs is not None else 0
+                    except Exception:
+                        pass
+                    if n_matched is None:
+                        try:
+                            st = r.get_subscription_matched_status()
+                            n_matched = int(getattr(st, "current_count", 0))
+                        except AttributeError:
+                            n_matched = None
+                    if n_matched is not None:
+                        print(
+                            f"[DDS] ModelUpdateChunk reader matched publications: {n_matched} "
+                            f"(0 after clients start usually means UDP/locators: same-bridge containers "
+                            f"often need DDS_DISABLE_EXTERNAL_ADVERTISE=1 on the server)"
+                        )
+                    else:
+                        print(
+                            "[DDS] ModelUpdateChunk reader: cannot query matched writers "
+                            "(upgrade cyclonedds or ignore; DDS uplink may still work)"
+                        )
                 except Exception as ex:
-                    print(f"[DDS] ModelUpdateChunk match diagnostic skipped: {ex}")
+                    print(f"[DDS] ModelUpdateChunk match diagnostic failed: {ex}")
 
             threading.Thread(target=_dds_chunk_match_diagnostic, daemon=True).start()
             
