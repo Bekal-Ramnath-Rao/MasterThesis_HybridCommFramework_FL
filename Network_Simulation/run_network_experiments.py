@@ -92,8 +92,8 @@ class ExperimentRunner:
         self.rl_inference_only = bool(rl_inference_only)
         self.use_communication_model_reward = use_communication_model_reward
         self.reset_epsilon = reset_epsilon
-        # Number of client containers started from this runner on the central machine
-        self.local_clients = max(1, int(local_clients or 1))
+        # Number of client containers started from this runner on the central machine (0 = server/brokers only).
+        self.local_clients = max(0, int(local_clients))
         # Total participants the server should wait for (local + remote); None => same as local_clients
         self.min_clients = int(min_clients) if min_clients is not None else None
         # quantization_params expected to be a dict of simple string values
@@ -670,10 +670,21 @@ class ExperimentRunner:
                 # Emotion unified client: collect→boundaries→RL training (override via env if needed)
                 os.environ.setdefault("RL_BOUNDARY_PIPELINE", "true")
                 os.environ.setdefault("RL_PHASE0_ROUNDS", "20")
-                # RL training: only one client runs; server waits for 1 client; run until Q converges and exit
-                os.environ["MIN_CLIENTS"] = "1"
-                os.environ["NUM_CLIENTS"] = "1"
-                print("RL training mode: starting only 1 client (converge and exit)")
+                if int(self.local_clients) <= 0:
+                    # Server/brokers only: federation size from --min-clients (same as non-QL unified).
+                    total_fed = self._total_expected_federation_clients()
+                    os.environ["MIN_CLIENTS"] = str(total_fed)
+                    os.environ["NUM_CLIENTS"] = str(total_fed)
+                    os.environ["MAX_CLIENTS"] = "100"
+                    print(
+                        "RL training mode: no local client containers; "
+                        "server uses federation MIN_CLIENTS/NUM_CLIENTS until remote clients attach."
+                    )
+                else:
+                    # RL training: one local client; server waits for 1 client; run until Q converges and exit
+                    os.environ["MIN_CLIENTS"] = "1"
+                    os.environ["NUM_CLIENTS"] = "1"
+                    print("RL training mode: starting only 1 client (converge and exit)")
             else:
                 os.environ["USE_QL_CONVERGENCE"] = "false"
                 # Multi-client FL: explore (train Q) unless explicit inference-only from GUI/CLI.
@@ -693,19 +704,27 @@ class ExperimentRunner:
             # When QL convergence: start only brokers + server + first client (single client for training)
             if self.use_ql_convergence:
                 uc = self.use_case  # emotion, mentalstate, temperature
-                services_single_client = [
-                    "mqtt-broker-unified",
-                    "amqp-broker-unified",
-                    f"fl-server-unified-{uc}",
-                    f"fl-client-unified-{uc}-1",
-                ]
-                compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_single_client
+                if int(self.local_clients) <= 0:
+                    services_ql = [
+                        "mqtt-broker-unified",
+                        "amqp-broker-unified",
+                        f"fl-server-unified-{uc}",
+                    ]
+                    compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_ql
+                else:
+                    services_single_client = [
+                        "mqtt-broker-unified",
+                        "amqp-broker-unified",
+                        f"fl-server-unified-{uc}",
+                        f"fl-client-unified-{uc}-1",
+                    ]
+                    compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_single_client
             else:
                 # Unified compose defines two client services; a bare `up -d` starts both and ignores
                 # --local-clients. Start only brokers + server + the first N client services (N=1 or 2).
                 uc = self.use_case
                 max_unified_clients = 2
-                num_local = max(1, min(int(self.local_clients), max_unified_clients))
+                num_local = max(0, min(int(self.local_clients), max_unified_clients))
                 total_fed = self._total_expected_federation_clients()
                 os.environ["MIN_CLIENTS"] = str(total_fed)
                 os.environ["NUM_CLIENTS"] = str(total_fed)
@@ -720,7 +739,8 @@ class ExperimentRunner:
                 compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_multi
             
             if self.use_ql_convergence:
-                _n_loc, _n_tot = 1, 1
+                _n_loc = 0 if int(self.local_clients) <= 0 else 1
+                _n_tot = self._total_expected_federation_clients()
             else:
                 _n_loc = num_local
                 _n_tot = self._total_expected_federation_clients()
@@ -739,7 +759,10 @@ class ExperimentRunner:
             print("  ✓ MQTT Broker")
             print("  ✓ AMQP Broker")
             print("  ✓ Unified FL Server")
-            print("  ✓ Unified FL Clients")
+            if _n_loc > 0:
+                print("  ✓ Unified FL Clients")
+            else:
+                print("  — Unified FL Clients: none started locally (server-only mode)")
             
             # Wait for services to initialize
             print("\nWaiting for services to initialize (15 seconds)...")
@@ -835,20 +858,23 @@ class ExperimentRunner:
         # Stage 4: Start clients
         if clients:
             # Respect configured number of local clients to start on this machine.
-            num_local = max(1, min(self.local_clients, len(clients)))
+            num_local = max(0, min(self.local_clients, len(clients)))
             clients_to_start = clients[:num_local]
-            stage_num = "[Stage 4/4]" if (broker and self.enable_congestion and congestion_level != "none") else "[Stage 3/4]"
-            print(f"\n{stage_num} Starting clients ({num_local} local): {', '.join(clients_to_start)}")
-            cmd_clients = compose_cmd_base + ["up", "-d"] + clients_to_start
-            result = self.run_command(cmd_clients, check=False)
-            if result.returncode != 0:
-                print(f"[ERROR] Failed to start clients")
-                print(f"[ERROR] stdout: {result.stdout}")
-                print(f"[ERROR] stderr: {result.stderr}")
-                return False
-            
-            print(f"Waiting 5 seconds for clients to connect...")
-            time.sleep(5)
+            if clients_to_start:
+                stage_num = "[Stage 4/4]" if (broker and self.enable_congestion and congestion_level != "none") else "[Stage 3/4]"
+                print(f"\n{stage_num} Starting clients ({num_local} local): {', '.join(clients_to_start)}")
+                cmd_clients = compose_cmd_base + ["up", "-d"] + clients_to_start
+                result = self.run_command(cmd_clients, check=False)
+                if result.returncode != 0:
+                    print(f"[ERROR] Failed to start clients")
+                    print(f"[ERROR] stdout: {result.stdout}")
+                    print(f"[ERROR] stderr: {result.stderr}")
+                    return False
+
+                print(f"Waiting 5 seconds for clients to connect...")
+                time.sleep(5)
+            else:
+                print("\n[Stage 4/4] Skipping local clients (0 requested; server-only mode).")
         
         print(f"\n[OK] All containers started successfully with staged delays")
         return True
@@ -2025,7 +2051,7 @@ def main():
         "--local-clients",
         type=int,
         default=2,
-        help="Number of client containers to start from this runner on the central machine (default: 2).",
+        help="Number of client containers to start from this runner on the central machine (default: 2). Use 0 for server/brokers only.",
     )
     parser.add_argument(
         "--min-clients",

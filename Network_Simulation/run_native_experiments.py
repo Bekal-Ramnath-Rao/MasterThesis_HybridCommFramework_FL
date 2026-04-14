@@ -199,12 +199,15 @@ class NativeExperimentRunner:
         use_communication_model_reward: bool = True,
         reset_epsilon: bool = True,
         dataset_client_map: Optional[Dict[int, int]] = None,
+        server_min_clients: Optional[int] = None,
     ) -> None:
         self.use_case = use_case
         self.protocol = protocol
         self.scenario = scenario
         self.num_rounds = num_rounds
         self.num_clients = num_clients
+        # When set (e.g. from experiment GUI), federation floor for MIN_CLIENTS can exceed local num_clients (server-only + remote).
+        self.server_min_clients = server_min_clients
         self.downstream_scenario = downstream_scenario or scenario
         self.upstream_scenario = upstream_scenario or scenario
         self.enable_gpu = enable_gpu
@@ -677,6 +680,31 @@ class NativeExperimentRunner:
                         if localhost_ok:
                             print("  → Add NODE_IP_ADDRESS=0.0.0.0 to /etc/rabbitmq/rabbitmq-env.conf and restart RabbitMQ.")
 
+    def _federation_min_for_server(self) -> int:
+        if self.protocol == "rl_unified" and self.use_ql_convergence and self.num_clients > 0:
+            return 1
+        if self.num_clients == 0:
+            if self.server_min_clients is None:
+                print(
+                    "[WARNING] --num-clients 0 but --min-clients not set; "
+                    "using MIN_CLIENTS=1 for the server process."
+                )
+                return 1
+            return max(0, int(self.server_min_clients))
+        if self.server_min_clients is not None:
+            return max(self.num_clients, int(self.server_min_clients))
+        return self.num_clients
+
+    def _federation_max_for_server(self) -> int:
+        if self.protocol == "rl_unified" and self.use_ql_convergence and self.num_clients > 0:
+            return 1
+        fmin = self._federation_min_for_server()
+        if self.num_clients == 0:
+            return 100
+        if self.server_min_clients is not None and int(self.server_min_clients) > self.num_clients:
+            return 100
+        return max(fmin, self.num_clients)
+
     def _netns_exec_args(self, ns_name: str, executable: str, script: str) -> tuple:
         """
         Build command list to run a script inside a network namespace.
@@ -705,17 +733,10 @@ class NativeExperimentRunner:
             env["NUM_ROUNDS"] = str(effective_num_rounds)
         else:
             env.pop("NUM_ROUNDS", None)
-        if self.protocol == "rl_unified":
-            if self.use_ql_convergence:
-                # RL training: run with a single client until the learned table converges.
-                env["MIN_CLIENTS"] = "1"
-                env["MAX_CLIENTS"] = "1"
-            else:
-                env["MIN_CLIENTS"] = str(self.num_clients)
-                env["MAX_CLIENTS"] = str(self.num_clients)
-        else:
-            env["MIN_CLIENTS"] = str(self.num_clients)
-            env["MAX_CLIENTS"] = str(self.num_clients)
+        fmin = self._federation_min_for_server()
+        fmax = self._federation_max_for_server()
+        env["MIN_CLIENTS"] = str(fmin)
+        env["MAX_CLIENTS"] = str(fmax)
         # Match Docker defaults for convergence behaviour unless explicitly overridden
         env.setdefault("CONVERGENCE_THRESHOLD", "0.001")
         env.setdefault("CONVERGENCE_PATIENCE", "2")
@@ -1257,7 +1278,17 @@ def parse_args() -> argparse.Namespace:
         "-n",
         type=int,
         default=2,
-        help="Number of FL clients to start.",
+        help="Number of FL clients to start on this machine (0 = server only; use --min-clients for expected federation size).",
+    )
+    parser.add_argument(
+        "--min-clients",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Participants the server waits for before training (local + remote). "
+            "Defaults to matching --num-clients when omitted. Recommended when --num-clients is 0."
+        ),
     )
     parser.add_argument(
         "--enable-gpu",
@@ -1371,8 +1402,15 @@ def main() -> None:
     for protocol in protocols:
         for scenario in scenarios:
             run_num_clients = args.num_clients
-            if protocol == "rl_unified" and args.use_ql_convergence and run_num_clients != 1:
-                print(f"[INFO] RL unified: forcing num_clients=1 for training (was {run_num_clients}) for protocol={protocol}, scenario={scenario}.")
+            if (
+                protocol == "rl_unified"
+                and args.use_ql_convergence
+                and run_num_clients not in (0, 1)
+            ):
+                print(
+                    f"[INFO] RL unified: forcing num_clients=1 for training (was {run_num_clients}) "
+                    f"for protocol={protocol}, scenario={scenario}."
+                )
                 run_num_clients = 1
 
             print(
@@ -1402,6 +1440,7 @@ def main() -> None:
                 use_communication_model_reward=not getattr(args, "disable_communication_model_reward", False),
                 reset_epsilon=not getattr(args, "no_reset_epsilon", False),  # Default True (reset), --no-reset-epsilon makes it False
                 dataset_client_map=native_dataset_map,
+                server_min_clients=getattr(args, "min_clients", None),
             )
             _install_signal_handlers(runner)
             code = runner.run()
