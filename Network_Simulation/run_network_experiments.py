@@ -218,7 +218,7 @@ class ExperimentRunner:
                 "temperature": str(docker_dir / "docker-compose-temperature.host-network.yml")
             }
             self.unified_compose_files = {
-                "emotion": str(docker_dir / "docker-compose-unified-emotion.host-network.yml"),
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.host-network.yml"),
                 "temperature": str(docker_dir / "docker-compose-unified-temperature.host-network.yml")
             }
@@ -248,7 +248,7 @@ class ExperimentRunner:
                 "temperature": str(docker_dir / "docker-compose-temperature.gpu-isolated.yml")
             }
             self.unified_compose_files = {
-                "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.bridge.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.yml"),
                 "temperature": str(docker_dir / "docker-compose-unified-temperature.yml")
             }
@@ -263,7 +263,7 @@ class ExperimentRunner:
                 "temperature": str(docker_dir / "docker-compose-temperature.yml")
             }
             self.unified_compose_files = {
-                "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.bridge.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.yml"),
                 "temperature": str(docker_dir / "docker-compose-unified-temperature.yml")
             }

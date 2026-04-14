@@ -1,4 +1,5 @@
-# Unified Emotion FL with network_mode: host (high-performance)
+# Same stack as docker-compose-unified-emotion.yml (default unified compose is host-network).
+# Kept for scripts that pass this path explicitly; prefer docker-compose-unified-emotion.yml for new use.
 # Brokers bind 1883, 5672 on host; server 50051, 4433, 4434. Clients use 127.0.0.1.
 
 services:

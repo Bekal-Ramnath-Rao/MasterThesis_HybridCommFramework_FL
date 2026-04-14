@@ -1768,6 +1768,13 @@ class UnifiedFederatedLearningServer:
             threading.Thread(target=_dds_chunk_match_diagnostic, daemon=True).start()
             
             print(f"[DDS] Server started on domain {DDS_DOMAIN_ID}")
+            if os.path.exists("/.dockerenv"):
+                print(
+                    "[DDS] Running in Docker: if clients log DDS sends but this server never prints "
+                    "'[DDS] Chunked model update', use network_mode:host for unified FL "
+                    "(default Docker/docker-compose-unified-emotion.yml). Bridge layout: "
+                    "docker-compose-unified-emotion.bridge.yml rarely supports DDS without extra UDP mapping."
+                )
 
         except Exception as e:
             print(f"[DDS] Failed to start: {e}")

@@ -1,5 +1,5 @@
 # Overlay: use external macvlan network for unified FL (replaces bridge).
-# Use with: docker compose -f docker-compose-unified-emotion.yml -f fl-macvlan-overlay-unified.yml ...
+# Use with bridge unified stack: docker compose -f docker-compose-unified-emotion.bridge.yml -f fl-macvlan-overlay-unified.yml ...
 networks:
   fl-network:
     external: true

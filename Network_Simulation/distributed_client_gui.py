@@ -1276,7 +1276,7 @@ class DistributedClientGUI(QMainWindow):
             self.log_text.append("⚠️ `ping` not installed; skipping host ICMP check.\n")
 
         candidates = [
-            (31883, 35672, "Docker-mapped (e.g. docker-compose-unified-emotion.yml)"),
+            (31883, 35672, "Docker-mapped (e.g. docker-compose-unified-emotion.bridge.yml)"),
             (1883, 5672, "Standard broker ports (e.g. macvlan / host / config compose)"),
         ]
 

@@ -1,37 +1,39 @@
-# Unified Emotion FL — Docker with network_mode: host on all services.
-#
-# Matches docker-compose-emotion.yml DDS services (fl-server-dds-emotion / fl-client-dds-emotion-*):
-# Cyclone RTPS needs the host UDP port range; Docker bridge + mapping only 7412/7414 breaks DDS.
-#
-# Brokers listen on the host: MQTT 1883, AMQP 5672 (and 15672 for Rabbit UI). FL containers use
-# 127.0.0.1 for MQTT/AMQP/gRPC/QUIC/HTTP3. Ensure host ports are free or change broker configs.
-#
-# For an isolated bridge deployment (no host-wide ports; DDS may be unreliable), see
-# docker-compose-unified-emotion.bridge.yml
+# Unified Emotion FL on Docker bridge (fl-network).
+# MQTT/AMQP use mapped host ports (31883, 35672). gRPC/QUIC/HTTP3 use published ports.
+# DDS (Cyclone) often fails on this layout: RTPS user-data uses ephemeral UDP beyond mapped SPDP ports.
+# Default unified compose uses host networking; use this file only if you need bridge isolation
+# and can avoid DDS or accept DDS_DISABLE_EXTERNAL_ADVERTISE mitigations.
 
 services:
   mqtt-broker-unified:
     image: eclipse-mosquitto:latest
     container_name: mqtt-broker-unified
-    network_mode: host
+    ports:
+      - "31883:1883"
+      - "9001:9001"
     volumes:
       - ./mqtt-config:/mosquitto/config
+    networks:
+      - fl-network
     command: mosquitto -c /mosquitto/config/mosquitto.conf
 
   amqp-broker-unified:
     image: rabbitmq:3-management
     container_name: amqp-broker-unified
-    network_mode: host
+    ports:
+      - "35672:5672"
+      - "35671:15672"
     environment:
       - RABBITMQ_DEFAULT_USER=guest
       - RABBITMQ_DEFAULT_PASS=guest
+    networks:
+      - fl-network
 
   fl-server-unified-emotion:
     build:
       context: ..
       dockerfile: Server/Dockerfile
     container_name: fl-server-unified-emotion
-    network_mode: host
     environment:
       - NODE_TYPE=server
       - NUM_CLIENTS=2
@@ -40,10 +42,10 @@ services:
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
-      - MQTT_BROKER=127.0.0.1
-      - AMQP_BROKER=127.0.0.1
-      - AMQP_HOST=127.0.0.1
-      - GRPC_HOST=0.0.0.0
+      - MQTT_BROKER=mqtt-broker-unified
+      - AMQP_BROKER=amqp-broker-unified
+      - AMQP_HOST=amqp-broker-unified
+      - GRPC_HOST=fl-server-unified-emotion
       - GRPC_PORT=50051
       - QUIC_HOST=0.0.0.0
       - QUIC_PORT=4433
@@ -62,11 +64,19 @@ services:
       - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
       - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
       - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
+      - DDS_DISABLE_EXTERNAL_ADVERTISE=${DDS_DISABLE_EXTERNAL_ADVERTISE:-0}
     volumes:
       - ../Server/Emotion_Recognition:/app/Server/Emotion_Recognition
       - ../experiment_results:/app/results
       - ../certs:/app/certs:ro
       - ../shared_data:/shared_data
+    networks:
+      - fl-network
+    ports:
+      - "4433:4433/udp"
+      - "4434:4434/udp"
+      - "50051:50051/tcp"
+      - "7412:7412/udp"
     depends_on:
       - mqtt-broker-unified
       - amqp-broker-unified
@@ -86,7 +96,6 @@ services:
       context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-unified-emotion-1
-    network_mode: host
     environment:
       - NODE_TYPE=client
       - CLIENT_ID=1
@@ -105,14 +114,14 @@ services:
       - RL_QTABLE_MERGE=${RL_QTABLE_MERGE:-false}
       - RL_QTABLE_OVERLAY_SCENARIOS=${RL_QTABLE_OVERLAY_SCENARIOS:-}
       - DEFAULT_PROTOCOL=mqtt
-      - MQTT_BROKER=127.0.0.1
-      - AMQP_BROKER=127.0.0.1
-      - AMQP_HOST=127.0.0.1
-      - GRPC_HOST=127.0.0.1
+      - MQTT_BROKER=mqtt-broker-unified
+      - AMQP_BROKER=amqp-broker-unified
+      - AMQP_HOST=amqp-broker-unified
+      - GRPC_HOST=fl-server-unified-emotion
       - GRPC_PORT=50051
-      - QUIC_HOST=127.0.0.1
+      - QUIC_HOST=fl-server-unified-emotion
       - QUIC_PORT=4433
-      - HTTP3_HOST=127.0.0.1
+      - HTTP3_HOST=fl-server-unified-emotion
       - HTTP3_PORT=4434
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -130,6 +139,10 @@ services:
       - ../shared_data:/shared_data
       - ../experiment_results:/app/results
       - ../certs:/app/certs:ro
+    networks:
+      - fl-network
+    ports:
+      - "7414:7414/udp"
     depends_on:
       - fl-server-unified-emotion
       - mqtt-broker-unified
@@ -150,7 +163,6 @@ services:
       context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-unified-emotion-2
-    network_mode: host
     environment:
       - NODE_TYPE=client
       - CLIENT_ID=2
@@ -169,14 +181,14 @@ services:
       - RL_QTABLE_MERGE=${RL_QTABLE_MERGE:-false}
       - RL_QTABLE_OVERLAY_SCENARIOS=${RL_QTABLE_OVERLAY_SCENARIOS:-}
       - DEFAULT_PROTOCOL=mqtt
-      - MQTT_BROKER=127.0.0.1
-      - AMQP_BROKER=127.0.0.1
-      - AMQP_HOST=127.0.0.1
-      - GRPC_HOST=127.0.0.1
+      - MQTT_BROKER=mqtt-broker-unified
+      - AMQP_BROKER=amqp-broker-unified
+      - AMQP_HOST=amqp-broker-unified
+      - GRPC_HOST=fl-server-unified-emotion
       - GRPC_PORT=50051
-      - QUIC_HOST=127.0.0.1
+      - QUIC_HOST=fl-server-unified-emotion
       - QUIC_PORT=4433
-      - HTTP3_HOST=127.0.0.1
+      - HTTP3_HOST=fl-server-unified-emotion
       - HTTP3_PORT=4434
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -194,6 +206,10 @@ services:
       - ../shared_data:/shared_data
       - ../experiment_results:/app/results
       - ../certs:/app/certs:ro
+    networks:
+      - fl-network
+    ports:
+      - "7416:7416/udp"
     depends_on:
       - fl-server-unified-emotion
       - mqtt-broker-unified
@@ -208,3 +224,7 @@ services:
             - driver: nvidia
               device_ids: ['0']
               capabilities: [gpu]
+
+networks:
+  fl-network:
+    driver: bridge

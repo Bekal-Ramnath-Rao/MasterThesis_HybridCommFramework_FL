@@ -1,6 +1,11 @@
 """
 Static unicast SPDP peers for Emotion FL across hosts (no multicast).
 
+Deployment note: Docker/docker-compose-emotion.yml runs the DDS-only server and clients with
+network_mode: host so Cyclone can use the full UDP port range. docker-compose-unified-emotion.yml
+does the same for the unified stack. The bridge variant (docker-compose-unified-emotion.bridge.yml)
+only maps SPDP ports; RTPS user-data still uses extra ephemeral ports, so DDS is usually unreliable there.
+
 Set these environment variables (all three required) before starting server/clients:
   DDS_PEER_SERVER   — IP or hostname of the machine running FL_Server_DDS
   DDS_PEER_CLIENT1  — IP or hostname of the machine running CLIENT_ID=1
@@ -41,14 +46,14 @@ Docker bridge — two valid setups:
      service names (e.g. fl-server-unified-emotion) so SPDP targets container IPs. Do not use
      service names on a machine that is not on that Docker network (e.g. client 2 on another PC);
      those names will not resolve and DDS discovery will fail silently from the remote host.
-Alternatively use Docker/docker-compose-unified-emotion.host-network.yml for Cyclone on the host NIC.
+Alternatively use Docker/docker-compose-unified-emotion.yml (host network) for Cyclone on the host NIC.
 
 Server in Docker bridge: DDS_SERVER_ADVERTISE_AS_PEER=1 (default) sets ExternalNetworkAddress = DDS_PEER_SERVER
 so **remote** LAN peers reach user-data on a routable address. That same setting often breaks **co-located**
 containers on one Docker bridge: writers send to host_IP:ephemeral_UDP, which is not published (only SPDP
 ports like 7412/7414 are), so the server never receives ModelUpdateChunk. For server + client1 on the same
 bridge, set DDS_DISABLE_EXTERNAL_ADVERTISE=1 on the server (container-to-container locators). Remote DDS
-then needs host/macvlan networking or a different topology; see Docker/docker-compose-unified-emotion.host-network.yml.
+then needs host/macvlan networking or a different topology; see Docker/docker-compose-unified-emotion.yml.
   DDS_EXTERNAL_NETWORK_ADDRESS / DDS_EXTERNAL_NETWORK_MASK — optional explicit advertise address + mask.
 
 Do not set CYCLONEDDS_URI when using this mode; it is set automatically to a temp file.

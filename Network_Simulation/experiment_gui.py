@@ -1886,9 +1886,9 @@ class FLExperimentGUI(QMainWindow):
         )
 
     def build_docker_images_unified_emotion_host(self):
-        """Build Unified Docker images for Emotion (host network)."""
+        """Build Unified Docker images for Emotion (host network; same images as default unified yml)."""
         self._build_compose(
-            "Docker/docker-compose-unified-emotion.host-network.yml",
+            "Docker/docker-compose-unified-emotion.yml",
             "build_btn_unified_emotion_host",
             "Unified Docker images built successfully (Emotion) [Host Network]",
             "Unified Docker build failed (Emotion) [Host Network]",
