@@ -63,7 +63,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
       - DDS_DOMAIN_ID=0
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-unified-emotion-1}
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
     volumes:
       - ../Server/Emotion_Recognition:/app/Server/Emotion_Recognition
       - ../experiment_results:/app/results
@@ -130,7 +135,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
       - DDS_DOMAIN_ID=0
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-unified-emotion}
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
       - ../Network_Simulation:/app/Network_Simulation:ro
@@ -192,8 +202,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
       - DDS_DOMAIN_ID=0
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-unified-emotion}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-unified-emotion-1}
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
       - ../Network_Simulation:/app/Network_Simulation:ro

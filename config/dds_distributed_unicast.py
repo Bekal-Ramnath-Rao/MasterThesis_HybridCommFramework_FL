@@ -34,12 +34,13 @@ Optional:
 Open UDP between all three hosts for the ports Cyclone uses (typically ~7400–7500 and
 per-participant SPDP ports above).
 
-Docker bridge (e.g. docker-compose-unified-emotion.yml): DDS_PEER_* often use the host LAN IP.
-That IP is not where the client container listens for RTPS. Set DDS_SPDP_SERVER to the compose
-service name of the FL server (e.g. fl-server-unified-emotion) and DDS_SPDP_CLIENT1 to the
-service name of client 1 (e.g. fl-client-unified-emotion-1) so peers resolve to container
-addresses on the internal network. Keep DDS_PEER_CLIENT2 as the remote machine's LAN IP for
-the third participant; publish UDP 7412/7414/7416 on the respective hosts if a peer is remote.
+Docker bridge — two valid setups:
+  A) Cross-host (recommended parity with docker-compose-emotion DDS): set DDS_PEER_* and DDS_SPDP_*
+     to real LAN IPs for all three participants. Publish host UDP 7412 / 7414 / 7416 to the containers.
+  B) All containers on one bridge only: you may set DDS_SPDP_SERVER / DDS_SPDP_CLIENT1 to compose
+     service names (e.g. fl-server-unified-emotion) so SPDP targets container IPs. Do not use
+     service names on a machine that is not on that Docker network (e.g. client 2 on another PC);
+     those names will not resolve and DDS discovery will fail silently from the remote host.
 Alternatively use Docker/docker-compose-unified-emotion.host-network.yml for Cyclone on the host NIC.
 
 Do not set CYCLONEDDS_URI when using this mode; it is set automatically to a temp file.

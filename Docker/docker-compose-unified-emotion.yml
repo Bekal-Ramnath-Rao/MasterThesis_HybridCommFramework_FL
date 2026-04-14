@@ -60,11 +60,18 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
-      # DDS (Cyclone): static unicast with DDS_PEER_* must use Docker DNS for peers on this bridge.
-      # LAN IPs (e.g. 129.x) point at the host, not the client container — SPDP to :7414 would miss client1.
-      # Override DDS_SPDP_CLIENT1 only if you know what you are doing. Remote client2 still uses DDS_PEER_CLIENT2.
+      # DDS (Cyclone): DDS_PEER_* + DDS_SPDP_* must be reachable from every participant.
+      # Defaults match docker-compose-emotion.yml (LAN IPs) so a client on *another PC* can discover the server.
+      # If all containers run on one Docker bridge and you prefer internal DNS, override e.g.:
+      #   DDS_SPDP_SERVER=fl-server-unified-emotion DDS_SPDP_CLIENT1=fl-client-unified-emotion-1
+      # Publish UDP 7412/7414/7416 on the host firewall for remote peers (see FL_Server_Unified / FL_Client_DDS).
       - DDS_DOMAIN_ID=0
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-unified-emotion-1}
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
     volumes:
       - ../Server/Emotion_Recognition:/app/Server/Emotion_Recognition
       - ../experiment_results:/app/results
@@ -133,7 +140,12 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
       - DDS_DOMAIN_ID=0
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-unified-emotion}
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
       - ../Network_Simulation:/app/Network_Simulation:ro
@@ -196,10 +208,13 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
-      # Same-host unified stack: use Docker DNS for server + client1. Remote deployments: set DDS_SPDP_* to LAN IPs.
       - DDS_DOMAIN_ID=0
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-unified-emotion}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-unified-emotion-1}
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
       - ../Network_Simulation:/app/Network_Simulation:ro
