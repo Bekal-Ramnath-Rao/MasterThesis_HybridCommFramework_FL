@@ -566,6 +566,8 @@ TOPIC_TRAINING_COMPLETE = "fl/training_complete"
 
 # DDS Configuration
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
+# Large model chunk streams (distributed): allow long reliable blocking (seconds).
+DDS_CHUNK_MAX_BLOCKING_SEC = float(os.getenv("DDS_CHUNK_MAX_BLOCKING_SEC", "60.0"))
 
 # Protocol max payload sizes (unified spec: AMQP/MQTT 128KB, gRPC 4MB, HTTP/3 16KB, DDS 64KB)
 MQTT_MAX_PAYLOAD_BYTES = 128 * 1024   # 128 KB
@@ -985,9 +987,10 @@ class UnifiedFLClient_Emotion:
         self._downlink_server_sent_unix = None  # server wall time when downlink send started
         self._downlink_receive_complete_unix = None  # client wall time when model apply finished
         
-        # DDS chunk reassembly buffers (FAIR CONFIG: matching standalone)
+               # DDS chunk reassembly buffers (FAIR CONFIG: matching standalone)
         self.global_model_chunks = {}  # {chunk_id: payload}
-        self.global_model_metadata = {}  # {round, total_chunks, model_config_json}
+        self.global_model_metadata = {}  # {round, total_chunks, model_config_json, server_sent_unix}
+        self._dds_uplink_prepped = False
         
         # DDS Components
         if DDS_AVAILABLE:
@@ -995,44 +998,43 @@ class UnifiedFLClient_Emotion:
                 # Create DDS participant
                 self.dds_participant = DomainParticipant(DDS_DOMAIN_ID)
                 
-                # Reliable QoS for critical control messages (registration, config, commands)
-                reliable_qos = Qos(
-                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
-                    Policy.History.KeepLast(10),
-                    Policy.Durability.TransientLocal
-                )
-                
-                # Best effort QoS for non-critical bulk paths
+                # Best effort QoS for small / legacy DDS paths
                 best_effort_qos = Qos(
                     Policy.Reliability.BestEffort,
                     Policy.History.KeepLast(1),
                 )
 
-                # Reliable QoS for chunked model transfer to prevent dropped chunks.
+                # Reliable QoS for chunked model transfer (long blocking for WAN / large models).
+                _blk = max(1.0, min(DDS_CHUNK_MAX_BLOCKING_SEC, 600.0))
                 chunk_qos = Qos(
-                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=_blk)),
                     Policy.History.KeepLast(2048),
-                    Policy.Durability.TransientLocal
+                    Policy.Durability.TransientLocal,
                 )
                 
-                # Create topics
-                global_model_topic = Topic(self.dds_participant, "GlobalModel", GlobalModel)
-                global_model_chunk_topic = Topic(self.dds_participant, "GlobalModelChunk", GlobalModelChunk)
+                # Topics + writers only here; DataReaders are created once in start_dds_listener
+                # (avoids duplicate readers on the same topic/participant).
                 self.dds_update_topic = Topic(self.dds_participant, "ModelUpdate", ModelUpdate)
                 update_chunk_topic = Topic(self.dds_participant, "ModelUpdateChunk", ModelUpdateChunk)
                 self.dds_metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
                 
-                # Create readers (for receiving from server)
-                # Use reliable QoS for chunked model data
-                self.dds_global_model_reader = DataReader(self.dds_participant, global_model_topic, qos=best_effort_qos)
-                self.dds_global_model_chunk_reader = DataReader(self.dds_participant, global_model_chunk_topic, qos=chunk_qos)
-                
-                # Create writers (for sending to server)
-                # Use reliable QoS for chunked updates; metrics can remain best-effort
                 self.dds_update_writer = DataWriter(self.dds_participant, self.dds_update_topic, qos=best_effort_qos)
                 self.dds_update_chunk_writer = DataWriter(self.dds_participant, update_chunk_topic, qos=chunk_qos)
                 self.dds_metrics_writer = DataWriter(self.dds_participant, self.dds_metrics_topic, qos=best_effort_qos)
                 
+                self.dds_global_model_reader = None
+                self.dds_global_model_chunk_reader = None
+                self.dds_command_reader = None
+
+                _peers_set = all(
+                    os.environ.get(k, "").strip()
+                    for k in ("DDS_PEER_SERVER", "DDS_PEER_CLIENT1", "DDS_PEER_CLIENT2")
+                )
+                _disc = float(os.environ.get("DDS_DISCOVERY_WAIT_S", "5" if _peers_set else "2"))
+                if _disc > 0:
+                    print(f"[DDS] Client {client_id} post-participant discovery wait {_disc}s…")
+                    time.sleep(_disc)
+
                 print(f"[DDS] Client {client_id} initialized on domain {DDS_DOMAIN_ID} with chunking support")
             except Exception as e:
                 print(f"[DDS] Initialization failed: {e}")
@@ -1042,6 +1044,7 @@ class UnifiedFLClient_Emotion:
                 self.dds_metrics_writer = None
                 self.dds_global_model_reader = None
                 self.dds_global_model_chunk_reader = None
+                self.dds_command_reader = None
         else:
             self.dds_participant = None
             self.dds_update_writer = None
@@ -1049,6 +1052,7 @@ class UnifiedFLClient_Emotion:
             self.dds_metrics_writer = None
             self.dds_global_model_reader = None
             self.dds_global_model_chunk_reader = None
+            self.dds_command_reader = None
         
         # Initialize packet logger and Q-learning logger
         init_db()
@@ -1091,10 +1095,8 @@ class UnifiedFLClient_Emotion:
         self.amqp_listener_channel = None
         self.amqp_listener_thread = None
         
-        # DDS listener components
+        # DDS listener components (readers attached in start_dds_listener)
         self.dds_listener_thread = None
-        self.dds_global_model_reader = None
-        self.dds_command_reader = None
         
         # gRPC listener components
         self.grpc_listener_thread = None
@@ -1456,79 +1458,206 @@ class UnifiedFLClient_Emotion:
     # -------------------------------------------------------------------------
     
     def start_dds_listener(self):
-        """Start DDS reader polling thread (mirrors FL_Client_DDS.py)"""
+        """Start DDS reader polling thread (GlobalModel, GlobalModelChunk, TrainingCommand)."""
+        if self.dds_listener_thread and self.dds_listener_thread.is_alive():
+            return
+        if not DDS_AVAILABLE or not self.dds_participant:
+            return
+
         def dds_listener_loop():
             try:
-                # Create readers for GlobalModel and TrainingCommand
                 from cyclonedds.core import Qos, Policy
                 from cyclonedds.util import duration
                 from cyclonedds.topic import Topic
-                
+
                 reliable_qos = Qos(
                     Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
                     Policy.History.KeepLast(10),
-                    Policy.Durability.TransientLocal
+                    Policy.Durability.TransientLocal,
                 )
-                
+                _blk = max(1.0, min(DDS_CHUNK_MAX_BLOCKING_SEC, 600.0))
+                chunk_qos = Qos(
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=_blk)),
+                    Policy.History.KeepLast(2048),
+                    Policy.Durability.TransientLocal,
+                )
+
                 topic_global_model = Topic(self.dds_participant, "GlobalModel", GlobalModel)
+                topic_global_chunk = Topic(self.dds_participant, "GlobalModelChunk", GlobalModelChunk)
                 topic_command = Topic(self.dds_participant, "TrainingCommand", TrainingCommand)
-                
-                self.dds_global_model_reader = DataReader(self.dds_participant, topic_global_model, qos=reliable_qos)
-                self.dds_command_reader = DataReader(self.dds_participant, topic_command, qos=reliable_qos)
-                
-                print(f"[DDS] Listener started for client {self.client_id}")
-                
-                # Polling loop
+
+                self.dds_global_model_chunk_reader = DataReader(
+                    self.dds_participant, topic_global_chunk, qos=chunk_qos
+                )
+                self.dds_global_model_reader = DataReader(
+                    self.dds_participant, topic_global_model, qos=reliable_qos
+                )
+                self.dds_command_reader = DataReader(
+                    self.dds_participant, topic_command, qos=reliable_qos
+                )
+
+                print(f"[DDS] Listener started for client {self.client_id} (chunk + global + command readers)")
+
                 while True:
-                    # Check for global model
-                    for sample in self.dds_global_model_reader.take():
+                    for sample in self.dds_global_model_chunk_reader.take(100):
+                        if sample and hasattr(sample, "chunk_id"):
+                            self._ingest_dds_global_model_chunk(sample)
+                    for sample in self.dds_global_model_reader.take(20):
                         if sample:
                             self.on_dds_global_model(sample)
-                    
-                    # Check for commands
-                    for sample in self.dds_command_reader.take():
+                    for sample in self.dds_command_reader.take(20):
                         if sample:
                             self.on_dds_command(sample)
-                    
-                    time.sleep(0.1)  # Poll every 100ms
-                    
+                    time.sleep(0.05)
+
             except Exception as e:
                 print(f"[DDS] Listener error: {e}")
                 import traceback
                 traceback.print_exc()
-        
-        self.dds_listener_thread = threading.Thread(target=dds_listener_loop, daemon=True, name=f"DDS-Listener-{self.client_id}")
+
+        self.dds_listener_thread = threading.Thread(
+            target=dds_listener_loop, daemon=True, name=f"DDS-Listener-{self.client_id}"
+        )
         self.dds_listener_thread.start()
-    
-    def on_dds_global_model(self, sample):
-        """DDS callback: received global model"""
+
+    def _ingest_dds_global_model_chunk(self, sample) -> None:
+        """Reassemble GlobalModelChunk samples and apply via _apply_global_model_weights (unified path)."""
         try:
-            round_num = sample.round
-            print(f"[DDS] Client {self.client_id} received global model for round {round_num}")
-            
+            round_num = int(sample.round)
+            chunk_id = int(sample.chunk_id)
+            total_chunks = int(sample.total_chunks)
+            meta = self.global_model_metadata
+
+            need_reset = False
+            if meta and (
+                int(meta.get("round", -1)) != round_num
+                or int(meta.get("total_chunks", -1)) != total_chunks
+            ):
+                need_reset = True
+            if chunk_id == 0 and self.global_model_chunks:
+                need_reset = True
+            if need_reset:
+                self.global_model_chunks.clear()
+                self.global_model_metadata = {}
+
+            if not self.global_model_metadata:
+                self.global_model_metadata = {
+                    "round": round_num,
+                    "total_chunks": total_chunks,
+                    "model_config_json": "",
+                    "server_sent_unix": 0.0,
+                }
+
+            cfg = (getattr(sample, "model_config_json", None) or "").strip()
+            if cfg:
+                self.global_model_metadata["model_config_json"] = cfg
+            if chunk_id == 0:
+                try:
+                    self.global_model_metadata["server_sent_unix"] = float(
+                        getattr(sample, "server_sent_unix", 0.0) or 0.0
+                    )
+                except (TypeError, ValueError):
+                    self.global_model_metadata["server_sent_unix"] = 0.0
+
+            self.global_model_chunks[chunk_id] = sample.payload
+            received = len(self.global_model_chunks)
+            if received % 20 == 0 or received == total_chunks:
+                print(
+                    f"[DDS] Client {self.client_id} global model chunks {received}/{total_chunks} "
+                    f"(round {round_num})"
+                )
+
+            if received < total_chunks:
+                return
+
+            reassembled: List[int] = []
+            for i in range(total_chunks):
+                if i not in self.global_model_chunks:
+                    print(f"[DDS] Client {self.client_id} ERROR: missing global model chunk {i}")
+                    self.global_model_chunks.clear()
+                    self.global_model_metadata.clear()
+                    return
+                reassembled.extend(self.global_model_chunks[i])
+
+            self.global_model_chunks.clear()
+            meta_final = dict(self.global_model_metadata)
+            self.global_model_metadata.clear()
+
+            decoded = pickle.loads(bytes(reassembled))
+            if isinstance(decoded, dict) and "compressed_data" in decoded:
+                if self.quantizer is None:
+                    raise ValueError("Quantized global model on DDS but quantizer is not initialized")
+                weights = self.quantizer.decompress(decoded)
+                print(f"[DDS] Client {self.client_id} dequantized chunked global model (round {round_num})")
+            else:
+                weights = decoded
+
+            mc_raw = (meta_final.get("model_config_json") or "").strip()
+            model_config = json.loads(mc_raw) if mc_raw else None
+
+            self._global_model_receive_t0 = time.time()
+            log_received_packet(
+                packet_size=len(reassembled),
+                peer="server",
+                protocol="DDS",
+                round=self.current_round,
+                extra_info="global_model_chunked",
+            )
+            srv_u = meta_final.get("server_sent_unix") or 0.0
+            applied = self._apply_global_model_weights(
+                round_num=round_num,
+                weights=weights,
+                model_config=model_config,
+                source="DDS",
+                server_sent_unix=float(srv_u) if srv_u and float(srv_u) > 0 else None,
+            )
+            if applied:
+                self.waiting_for_aggregated_model = False
+        except Exception as e:
+            print(f"[DDS] Client {self.client_id} error ingesting global model chunk: {e}")
+            import traceback
+            traceback.print_exc()
+            self.global_model_chunks.clear()
+            self.global_model_metadata.clear()
+
+    def on_dds_global_model(self, sample):
+        """DDS callback: single-message GlobalModel (small payloads)."""
+        try:
+            self._global_model_receive_t0 = time.time()
+            round_num = int(sample.round)
+            print(f"[DDS] Client {self.client_id} received global model (non-chunked) for round {round_num}")
+
             log_received_packet(
                 packet_size=len(sample.weights),
                 peer="server",
                 protocol="DDS",
                 round=self.current_round,
-                extra_info="global_model"
+                extra_info="global_model",
             )
-            
-            # Deserialize weights (DDS uses sequence[int])
+
             weights_bytes = bytes(sample.weights)
-            weights = pickle.loads(weights_bytes)
-            
-            # Update model
-            if self.model and round_num > self.last_global_round:
-                self.model.set_weights(weights)
-                self.last_global_round = round_num
-                print(f"[DDS] Client {self.client_id} updated model weights for round {round_num}")
-                
+            decoded = pickle.loads(weights_bytes)
+            if isinstance(decoded, dict) and "compressed_data" in decoded:
+                if self.quantizer is None:
+                    raise ValueError("Quantized global model on DDS but quantizer is not initialized")
+                weights = self.quantizer.decompress(decoded)
+            else:
+                weights = decoded
+
+            applied = self._apply_global_model_weights(
+                round_num=round_num,
+                weights=weights,
+                model_config=None,
+                source="DDS",
+                server_sent_unix=None,
+            )
+            if applied:
+                self.waiting_for_aggregated_model = False
         except Exception as e:
             print(f"[DDS] Client {self.client_id} error handling global model: {e}")
             import traceback
             traceback.print_exc()
-    
+
     def on_dds_command(self, sample):
         """DDS callback: received training command"""
         try:
@@ -1871,10 +2000,12 @@ class UnifiedFLClient_Emotion:
         if recv_t0 is not None:
             self._global_model_receive_t0 = None
 
-        if self.model is None and source != "gRPC":
+        # gRPC is the default bootstrap in unified mode; DDS can also build the model when
+        # chunked GlobalModel includes model_config_json (standalone parity / DDS-only downlink).
+        if self.model is None and source not in ("gRPC", "DDS"):
             print(
-                f"[{source}] Client {self.client_id} ignoring non-gRPC initial global model. "
-                f"Bootstrap requires gRPC."
+                f"[{source}] Client {self.client_id} ignoring initial global model "
+                f"(bootstrap via gRPC or DDS with model_config only)."
             )
             return False
 
@@ -1888,6 +2019,13 @@ class UnifiedFLClient_Emotion:
                 return False
 
         if round_num >= self.last_global_round:
+            # Second path (e.g. gRPC + DDS) may deliver the same round twice; weights are identical.
+            if (
+                self.model is not None
+                and int(round_num) == int(self.last_global_round)
+                and not self.waiting_for_aggregated_model
+            ):
+                return True
             self.model.set_weights(weights)
             self.current_round = max(self.current_round, round_num)
             self.last_global_round = round_num
@@ -2945,6 +3083,19 @@ class UnifiedFLClient_Emotion:
         if isinstance(w, str):
             return base64.b64decode(w.encode('utf-8'))
         return pickle.dumps(w)
+
+    def _ensure_dds_uplink_discovery_wait(self) -> None:
+        """Once per process: pause so the server's ModelUpdate reader can discover this writer (distributed DDS)."""
+        if getattr(self, "_dds_uplink_prepped", False):
+            return
+        wait_s = int(os.environ.get("DDS_MODEL_UPDATE_DISCOVERY_WAIT", "8"))
+        if wait_s > 0:
+            print(
+                f"[DDS] Client {self.client_id} waiting {wait_s}s for server "
+                f"model-update reader discovery (first DDS uplink)…"
+            )
+            time.sleep(wait_s)
+        self._dds_uplink_prepped = True
     
     def send_model_update_chunked(self, round_num, serialized_weights, num_samples, loss, accuracy):
         """Send model update as chunks via DDS"""
@@ -3640,6 +3791,8 @@ class UnifiedFLClient_Emotion:
         """Send a large model update over DDS in multiple chunks."""
         if not DDS_AVAILABLE or not self.dds_update_chunk_writer:
             raise NotImplementedError("DDS chunk writer not available")
+
+        self._ensure_dds_uplink_discovery_wait()
 
         weights_bytes = self._dds_serialized_weights_bytes(message)
 
@@ -4677,6 +4830,7 @@ class UnifiedFLClient_Emotion:
             raise NotImplementedError("DDS not available - triggering fallback")
         
         try:
+            self._ensure_dds_uplink_discovery_wait()
             weights_bytes = self._dds_serialized_weights_bytes(message)
             metrics = message.get('metrics', {})
             dds_msg = ModelUpdate(
@@ -4751,69 +4905,15 @@ class UnifiedFLClient_Emotion:
             raise
     
     def check_global_model_chunks(self):
-        """Check for global model chunks from server (matching standalone DDS)"""
+        """Optional extra poll for GlobalModelChunk (listener thread is primary). Applies via _ingest_dds_global_model_chunk."""
         if not DDS_AVAILABLE or not self.dds_global_model_chunk_reader:
             return None
-        
         try:
-            # Check for chunked global model
-            chunk_samples = self.dds_global_model_chunk_reader.take()
-            
-            for sample in chunk_samples:
-                if not sample or not hasattr(sample, 'round'):
-                    continue
-                
-                round_num = sample.round
-                chunk_id = sample.chunk_id
-                total_chunks = sample.total_chunks
-                
-                # Initialize buffers if needed
-                if not self.global_model_metadata:
-                    self.global_model_metadata = {
-                        'round': round_num,
-                        'total_chunks': total_chunks,
-                        'model_config_json': sample.model_config_json if hasattr(sample, 'model_config_json') else ''
-                    }
-                
-                # Store chunk
-                self.global_model_chunks[chunk_id] = sample.payload
-                
-                chunks_received = len(self.global_model_chunks)
-                
-                # Check if all chunks received
-                if chunks_received == total_chunks:
-                    try:
-                        # Reassemble chunks in order
-                        reassembled_data = []
-                        for i in range(total_chunks):
-                            if i in self.global_model_chunks:
-                                reassembled_data.extend(self.global_model_chunks[i])
-                            else:
-                                print(f"ERROR: Missing chunk {i}")
-                                break
-                        
-                        # Only process if we have all chunks
-                        if len(reassembled_data) > 0:
-                            # Deserialize weights
-                            weights = pickle.loads(bytes(reassembled_data))
-                            
-                            # Clear buffers
-                            self.global_model_chunks.clear()
-                            self.global_model_metadata.clear()
-                            
-                            return {'weights': weights, 'round': round_num}
-                    
-                    except Exception as e:
-                        print(f"[ERROR] Client {self.client_id}: Exception during model reassembly: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        # Clear buffers on error
-                        self.global_model_chunks.clear()
-                        self.global_model_metadata.clear()
-        
+            for sample in self.dds_global_model_chunk_reader.take(50):
+                if sample and hasattr(sample, "chunk_id"):
+                    self._ingest_dds_global_model_chunk(sample)
         except Exception as e:
             print(f"Client {self.client_id} ERROR checking global model chunks: {e}")
-        
         return None
     
     def start(self):

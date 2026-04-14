@@ -206,6 +206,7 @@ QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 HTTP3_HOST = os.getenv("HTTP3_HOST", '0.0.0.0')
 HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
+DDS_CHUNK_MAX_BLOCKING_SEC = float(os.getenv("DDS_CHUNK_MAX_BLOCKING_SEC", "60.0"))
 
 # Protocol max payload sizes (unified spec)
 MQTT_MAX_PAYLOAD_BYTES = 128 * 1024   # 128 KB
@@ -1517,9 +1518,10 @@ class UnifiedFederatedLearningServer:
                 Policy.History.KeepLast(1),
             )
 
-            # Reliable QoS for chunked model transfer to prevent dropped chunks.
+            # Reliable QoS for chunked model transfer (long blocking for WAN / large models).
+            _blk = max(1.0, min(DDS_CHUNK_MAX_BLOCKING_SEC, 600.0))
             chunk_qos = Qos(
-                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=_blk)),
                 Policy.History.KeepLast(2048),
                 Policy.Durability.TransientLocal
             )
