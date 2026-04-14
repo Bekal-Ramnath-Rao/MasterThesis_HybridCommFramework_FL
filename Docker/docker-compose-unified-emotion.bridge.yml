@@ -1,8 +1,10 @@
 # Unified Emotion FL on Docker bridge (fl-network).
 # MQTT/AMQP use mapped host ports (31883, 35672). gRPC/QUIC/HTTP3 use published ports.
-# DDS (Cyclone) often fails on this layout: RTPS user-data uses ephemeral UDP beyond mapped SPDP ports.
-# Default unified compose uses host networking; use this file only if you need bridge isolation
-# and can avoid DDS or accept DDS_DISABLE_EXTERNAL_ADVERTISE mitigations.
+#
+# DDS (Cyclone): for the same working layout as fl-server-dds-emotion / fl-client-dds-emotion-*
+# (network_mode: host, full UDP range, CYCLONEDDS_URI from dds_distributed_unicast.py), use
+# Docker/docker-compose-unified-emotion.yml — not this file. Bridge + partial UDP publish breaks
+# SPDP/SEDP and RTPS user-data locators; DDS_DISABLE_EXTERNAL_ADVERTISE is only a partial mitigation.
 
 services:
   mqtt-broker-unified:
@@ -57,13 +59,14 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
-      - DDS_DOMAIN_ID=0
+      # DDS env order matches fl-server-dds-emotion (prefer docker-compose-unified-emotion.yml for DDS)
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
       - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
       - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
       - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
+      - DDS_DOMAIN_ID=0
       - DDS_DISABLE_EXTERNAL_ADVERTISE=${DDS_DISABLE_EXTERNAL_ADVERTISE:-0}
     volumes:
       - ../Server/Emotion_Recognition:/app/Server/Emotion_Recognition
@@ -126,13 +129,13 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
-      - DDS_DOMAIN_ID=0
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
       - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
       - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
       - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
+      - DDS_DOMAIN_ID=0
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
       - ../Network_Simulation:/app/Network_Simulation:ro
@@ -193,13 +196,13 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
-      - DDS_DOMAIN_ID=0
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
       - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
       - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
       - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
+      - DDS_DOMAIN_ID=0
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
       - ../Network_Simulation:/app/Network_Simulation:ro

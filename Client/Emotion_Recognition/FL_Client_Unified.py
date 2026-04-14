@@ -996,6 +996,11 @@ class UnifiedFLClient_Emotion:
         # DDS Components
         if DDS_AVAILABLE:
             try:
+                # Same as FL_Client_DDS.setup_dds: ensure static unicast XML from DDS_PEER_* before participant.
+                _ensure_client_cyclonedds_uri()
+                uri = os.environ.get("CYCLONEDDS_URI")
+                print(f"[DDS] CYCLONEDDS_URI={uri or '(not set)'}")
+                print(f"[DDS] Setting up DDS on domain {DDS_DOMAIN_ID} (client {client_id})...")
                 # Create DDS participant
                 self.dds_participant = DomainParticipant(DDS_DOMAIN_ID)
                 

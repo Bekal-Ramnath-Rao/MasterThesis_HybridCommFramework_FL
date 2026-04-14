@@ -1503,8 +1503,11 @@ class UnifiedFederatedLearningServer:
             return
         
         try:
+            # Same as FL_Server_DDS.setup_dds: refresh URI from DDS_PEER_* / temp XML before participant.
+            _ensure_server_cyclonedds_uri()
             uri = os.environ.get("CYCLONEDDS_URI")
             print(f"[DDS] CYCLONEDDS_URI={uri or '(not set)'}")
+            print(f"[DDS] Setting up DDS on domain {DDS_DOMAIN_ID}...")
             # Create DDS participant
             self.dds_participant = DomainParticipant(DDS_DOMAIN_ID)
             
