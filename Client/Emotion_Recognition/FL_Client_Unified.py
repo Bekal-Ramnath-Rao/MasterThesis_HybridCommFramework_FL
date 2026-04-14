@@ -939,6 +939,15 @@ class UnifiedFLClient_Emotion:
                 self.env_manager.update_network_condition(_coarse_network_bucket_for_scenario(_sn))
                 self.rl_selector_uplink.ensure_scenario(_sn)
                 self.rl_selector_downlink.ensure_scenario(_sn)
+
+            if os.getenv("RL_PRINT_CANONICAL_Q_VALUES", "").strip().lower() in (
+                "1", "true", "yes", "y",
+            ):
+                print(f"\n[Client {client_id}] Canonical Q-row report — uplink:")
+                self.rl_selector_uplink.print_canonical_q_values_report()
+                print(f"\n[Client {client_id}] Canonical Q-row report — downlink:")
+                self.rl_selector_downlink.print_canonical_q_values_report()
+                print()
         else:
             self.rl_selector_uplink = None
             self.rl_selector_downlink = None
