@@ -11,6 +11,10 @@ Rewards (success, max 30): base 10, communication ≤10, resource ≥-5, battery
 Environment (Q-table state): network scenario (coarse), communication-time bucket, resource availability, battery SoC bucket.
 The coarse network axis prefers client-detected scenario (``EnvironmentStateManager.detected_network_scenario``)
 when ``RL_Q_USE_DETECTED_NETWORK=1`` (default); otherwise the configured label (``data_network_scenario`` / env).
+
+Greedy selection prefers ``converged_protocol_by_scenario`` (streak-filled on every round, not only after Q-updates)
+over raw Q-argmax when ``RL_GREEDY_USE_SCENARIO_CONVERGED`` is true (default). Optional overrides:
+``RL_FORCE_CONVERGED_PROTOCOL_EXCELLENT``, ``_MODERATE``, ``_POOR`` (e.g. amqp, dds).
 """
 
 import numpy as np
@@ -449,8 +453,18 @@ class QLearningProtocolSelector:
         self._normalize_converged_protocol_map()
 
     def get_converged_protocol_for_scenario(self, scenario_label: str) -> Optional[str]:
-        """Return stored converged protocol for a coarse scenario, if any."""
+        """
+        Return the protocol to use for this coarse scenario: optional env override, then stored map.
+
+        Env (highest priority): ``RL_FORCE_CONVERGED_PROTOCOL_EXCELLENT``,
+        ``RL_FORCE_CONVERGED_PROTOCOL_MODERATE``, ``RL_FORCE_CONVERGED_PROTOCOL_POOR``
+        (values: mqtt, amqp, grpc, http3, dds).
+        """
         key = normalize_coarse_network_scenario(str(scenario_label or ""))
+        env_suffix = key.upper().replace(" ", "_")
+        forced = os.getenv(f"RL_FORCE_CONVERGED_PROTOCOL_{env_suffix}", "").strip().lower()
+        if forced and forced in self.PROTOCOLS:
+            return forced
         return self._converged_protocol_by_scenario.get(key)
 
     def inference_coarse_scenario_label(self, state: Dict) -> str:
@@ -486,7 +500,7 @@ class QLearningProtocolSelector:
             use_scenario_converged = os.getenv(
                 "RL_INFERENCE_USE_SCENARIO_CONVERGED_PROTOCOL", "true"
             ).strip().lower() in ("1", "true", "yes", "y")
-            from_map = self._converged_protocol_by_scenario.get(scen_label)
+            from_map = self.get_converged_protocol_for_scenario(scen_label)
             if use_scenario_converged:
                 proto = from_map if (from_map and from_map in self.PROTOCOLS) else None
                 if not proto:
@@ -540,18 +554,27 @@ class QLearningProtocolSelector:
             action_idx = np.random.randint(len(self.PROTOCOLS))
             explored = True
         else:
-            # Exploit: Q-row for the live discrete state from the env.
-            qrow = self.q_table[state_idx]
-            max_q = float(np.max(qrow))
-            tie = np.flatnonzero(np.isclose(qrow, max_q, rtol=1e-9, atol=1e-12))
-            if tie.size == 0:
-                tie = np.array([0], dtype=np.intp)
-            action_idx = int(np.random.choice(tie))
-            explored = False
-            if np.allclose(qrow, 0.0):
-                cp = self.get_converged_protocol_for_scenario(scen_label)
-                if cp and cp in self.PROTOCOLS:
-                    action_idx = self.PROTOCOLS.index(cp)
+            # Exploit: prefer training-time converged protocol for this scenario (matches thesis policy),
+            # then Q-row for the live discrete state. Q-argmax alone can disagree after biased updates.
+            prefer_conv = os.getenv("RL_GREEDY_USE_SCENARIO_CONVERGED", "true").strip().lower() in (
+                "1", "true", "yes", "y",
+            )
+            cp = self.get_converged_protocol_for_scenario(scen_label) if prefer_conv else None
+            if cp and cp in self.PROTOCOLS:
+                action_idx = self.PROTOCOLS.index(cp)
+                explored = False
+            else:
+                qrow = self.q_table[state_idx]
+                max_q = float(np.max(qrow))
+                tie = np.flatnonzero(np.isclose(qrow, max_q, rtol=1e-9, atol=1e-12))
+                if tie.size == 0:
+                    tie = np.array([0], dtype=np.intp)
+                action_idx = int(np.random.choice(tie))
+                explored = False
+                if np.allclose(qrow, 0.0):
+                    cp0 = self.get_converged_protocol_for_scenario(scen_label)
+                    if cp0 and cp0 in self.PROTOCOLS:
+                        action_idx = self.PROTOCOLS.index(cp0)
         
         # region agent log
         _agent_debug_log(
@@ -582,6 +605,8 @@ class QLearningProtocolSelector:
             ah.append(int(action_idx))
             if len(ah) > 50:
                 del ah[:-50]
+            # Advance streak-based converged map even when USE_RL_EXPLORATION=false (no Q-updates).
+            self.refresh_converged_protocols_from_action_history()
 
         return protocol
 
@@ -619,6 +644,7 @@ class QLearningProtocolSelector:
         ah.append(int(action_idx))
         if len(ah) > 50:
             del ah[:-50]
+        self.refresh_converged_protocols_from_action_history()
         return p
     
     def calculate_reward(
