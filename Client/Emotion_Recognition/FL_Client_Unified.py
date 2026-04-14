@@ -587,6 +587,7 @@ if DDS_AVAILABLE:
     class GlobalModel(IdlStruct):
         round: int
         weights: sequence[int]  # CycloneDDS sequence type for sequence<octet> in IDL
+        model_config_json: str = ""  # must match Server/Emotion_Recognition/FL_Server_Unified.py
     
     @dataclass
     class GlobalModelChunk(IdlStruct):

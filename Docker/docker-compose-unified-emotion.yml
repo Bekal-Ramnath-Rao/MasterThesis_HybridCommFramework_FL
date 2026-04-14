@@ -72,6 +72,9 @@ services:
       - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
       - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
       - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
+      # Set to 1 when the FL server and client 1 share one Docker bridge (fixes missing ModelUpdateChunk on server).
+      # Remote host DDS to this server: leave 0 or use Docker/docker-compose-unified-emotion.host-network.yml.
+      - DDS_DISABLE_EXTERNAL_ADVERTISE=${DDS_DISABLE_EXTERNAL_ADVERTISE:-0}
     volumes:
       - ../Server/Emotion_Recognition:/app/Server/Emotion_Recognition
       - ../experiment_results:/app/results

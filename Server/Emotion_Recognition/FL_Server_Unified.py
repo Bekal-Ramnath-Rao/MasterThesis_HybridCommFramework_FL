@@ -304,6 +304,7 @@ class UnifiedFederatedLearningServer:
         # Server state
         self.running = True
         self.training_started = False
+        self._pre_training_update_notice_shown = False
         
         # Metrics storage
         self.ACCURACY = []
@@ -1531,6 +1532,7 @@ class UnifiedFederatedLearningServer:
             update_reader = DataReader(self.dds_participant, update_topic, qos=best_effort_qos)
             update_chunk_topic = Topic(self.dds_participant, "ModelUpdateChunk", ModelUpdateChunk)
             update_chunk_reader = DataReader(self.dds_participant, update_chunk_topic, qos=chunk_qos)
+            self._dds_update_chunk_reader = update_chunk_reader
             
             # Create topics and readers for metrics
             metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
@@ -1747,6 +1749,23 @@ class UnifiedFederatedLearningServer:
             
             dds_thread = threading.Thread(target=dds_listener, daemon=True)
             dds_thread.start()
+
+            def _dds_chunk_match_diagnostic():
+                time.sleep(12.0)
+                try:
+                    r = getattr(self, "_dds_update_chunk_reader", None)
+                    if r is None:
+                        return
+                    st = r.get_subscription_matched_status()
+                    print(
+                        f"[DDS] ModelUpdateChunk reader matched publications: {st.current_count} "
+                        f"(0 after clients start usually means UDP/locators: same-bridge containers "
+                        f"often need DDS_DISABLE_EXTERNAL_ADVERTISE=1 on the server)"
+                    )
+                except Exception as ex:
+                    print(f"[DDS] ModelUpdateChunk match diagnostic skipped: {ex}")
+
+            threading.Thread(target=_dds_chunk_match_diagnostic, daemon=True).start()
             
             print(f"[DDS] Server started on domain {DDS_DOMAIN_ID}")
 
@@ -1816,11 +1835,18 @@ class UnifiedFederatedLearningServer:
                       f"({len(self.registered_clients)}/{self.num_clients})")
             
             if not self.training_started and len(self.registered_clients) >= self.min_clients:
-                self.training_started = True
                 print(f"\n[Server] All {self.num_clients} clients registered!")
                 print("[Server] Distributing initial global model...\n")
                 time.sleep(2)
-                self.distribute_initial_model()
+                try:
+                    self.distribute_initial_model()
+                except Exception as e:
+                    print(f"[Server] FATAL: distribute_initial_model() failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print("[Server] Training NOT started; fix the error and restart (or purge stale AMQP queues).")
+                    return
+                self.training_started = True
                 self.start_time = time.time()
                 print(f"[Server] Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
@@ -1859,6 +1885,14 @@ class UnifiedFederatedLearningServer:
         with self.lock:
             client_id = data['client_id']
             round_num = data['round']
+            if not self.training_started:
+                if not self._pre_training_update_notice_shown:
+                    self._pre_training_update_notice_shown = True
+                    print(
+                        f"[{protocol.upper()}] Ignoring model updates until training starts "
+                        f"(e.g. stale durable AMQP from a prior run). Purge client_*_updates queues or use a clean broker."
+                    )
+                return
             client_metrics = data.get('metrics') or {}
             if not client_metrics:
                 client_metrics = {
@@ -1986,6 +2020,8 @@ class UnifiedFederatedLearningServer:
         with self.lock:
             client_id = data['client_id']
             round_num = data['round']
+            if not self.training_started:
+                return
             metrics_payload = data.get('metrics') or {}
             loss_value = float(data.get('loss', metrics_payload.get('loss', 0.0)))
             accuracy_value = float(data.get('accuracy', metrics_payload.get('accuracy', 0.0)))
