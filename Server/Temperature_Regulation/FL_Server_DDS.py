@@ -139,6 +139,10 @@ class EvaluationMetrics(IdlStruct):
     mae: float
     mape: float
     client_converged: float = 0.0
+    battery_soc: float = 1.0
+    training_time_sec: float = 0.0
+    round_time_sec: float = 0.0
+    uplink_model_comm_sec: float = 0.0
 
 
 @dataclass
@@ -173,6 +177,8 @@ class FederatedLearningServer:
         self.MAPE = []
         self.LOSS = []
         self.ROUNDS = []
+        self.AVG_TRAINING_TIME_SEC = []
+        self.AVG_BATTERY_SOC = []
         
         # Convergence tracking
         self.best_loss = float('inf')
@@ -616,31 +622,39 @@ class FederatedLearningServer:
         samples = self.readers['metrics'].take()
         
         for sample in samples:
-            if sample:
-                print(f"Server received metrics sample: client {sample.client_id}, round {sample.round} (current: {self.current_round})")
-                
-                if sample.round == self.current_round:
-                    client_id = sample.client_id
-                    
-                    if client_id not in self.client_metrics:
-                        self.client_metrics[client_id] = {
-                            'num_samples': sample.num_samples,
-                            'metrics': {
-                                'loss': sample.loss,
-                                'mse': sample.mse,
-                                'mae': sample.mae,
-                                'mape': sample.mape
-                            }
+            if not sample:
+                continue
+            print(f"Server received metrics sample: client {sample.client_id}, round {sample.round} (current: {self.current_round})")
+            
+            if sample.round == self.current_round:
+                client_id = sample.client_id
+                if client_id not in self.active_clients:
+                    continue
+                if client_id not in self.client_metrics:
+                    self.client_metrics[client_id] = {
+                        'num_samples': sample.num_samples,
+                        'metrics': {
+                            'loss': sample.loss,
+                            'mse': sample.mse,
+                            'mae': sample.mae,
+                            'mape': sample.mape,
+                            'battery_soc': float(getattr(sample, 'battery_soc', 1.0)),
+                            'training_time_sec': float(getattr(sample, 'training_time_sec', 0.0)),
+                            'round_time_sec': float(getattr(sample, 'round_time_sec', 0.0)),
+                            'uplink_model_comm_sec': float(getattr(sample, 'uplink_model_comm_sec', 0.0)),
                         }
-                        
-                        print(f"Received metrics from client {client_id} "
-                              f"({len(self.client_metrics)}/{self.num_clients})")
-                        
-                        # If all clients sent metrics, aggregate and continue
-                    # Wait for all registered clients (dynamic)
-            if len(self.client_metrics) >= len(self.registered_clients):
-                        self.aggregate_metrics()
-                        self.continue_training()
+                    }
+                    
+                    print(f"Received metrics from client {client_id} "
+                          f"({len(self.client_metrics)}/{len(self.active_clients)})")
+        
+        if (
+            getattr(self, 'evaluation_phase', False)
+            and len(self.client_metrics) >= len(self.active_clients)
+            and len(self.active_clients) > 0
+        ):
+            self.aggregate_metrics()
+            self.continue_training()
     
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
@@ -785,7 +799,11 @@ class FederatedLearningServer:
                         'mse': sample.mse,
                         'mae': sample.mae,
                         'mape': sample.mape,
-                        'loss': sample.loss
+                        'loss': sample.loss,
+                        'battery_soc': float(getattr(sample, 'battery_soc', 1.0)),
+                        'training_time_sec': float(getattr(sample, 'training_time_sec', 0.0)),
+                        'round_time_sec': float(getattr(sample, 'round_time_sec', 0.0)),
+                        'uplink_model_comm_sec': float(getattr(sample, 'uplink_model_comm_sec', 0.0)),
                     }
                     self.client_metrics[client_id] = {
                         'metrics': metrics_dict,
@@ -823,6 +841,20 @@ class FederatedLearningServer:
         aggregated_loss = sum(metric['metrics']['loss'] * metric['num_samples']
                              for metric in self.client_metrics.values()) / total_samples
         
+        avg_training_time = (
+            sum(
+                float(metric['metrics'].get('training_time_sec', 0.0)) * metric['num_samples']
+                for metric in self.client_metrics.values()
+            )
+            / total_samples
+            if total_samples
+            else 0.0
+        )
+        socs = [float(m['metrics'].get('battery_soc', 1.0)) for m in self.client_metrics.values()]
+        avg_soc = sum(socs) / len(socs) if socs else 1.0
+        self.AVG_TRAINING_TIME_SEC.append(float(avg_training_time))
+        self.AVG_BATTERY_SOC.append(float(avg_soc))
+        
         # Store metrics
         self.MSE.append(aggregated_mse)
         self.MAE.append(aggregated_mae)
@@ -834,7 +866,9 @@ class FederatedLearningServer:
         print(f"  Loss: {aggregated_loss:.4f}")
         print(f"  MSE: {aggregated_mse:.4f}")
         print(f"  MAE: {aggregated_mae:.4f}")
-        print(f"  MAPE: {aggregated_mape:.4f}\n")
+        print(f"  MAPE: {aggregated_mape:.4f}")
+        print(f"  Avg training time (sample-weighted): {avg_training_time:.3f} s")
+        print(f"  Avg battery SoC: {avg_soc:.4f}\n")
     
     def continue_training(self):
         """Continue to next round or finish training"""
@@ -1008,12 +1042,17 @@ class FederatedLearningServer:
         """Save training results to CSV"""
         results_dir = get_experiment_results_dir("temperature", "dds")
         
+        n = len(self.ROUNDS)
+        ats = getattr(self, 'AVG_TRAINING_TIME_SEC', [])
+        absoc = getattr(self, 'AVG_BATTERY_SOC', [])
         results_df = pd.DataFrame({
             'Round': self.ROUNDS,
             'Loss': self.LOSS,
             'MSE': self.MSE,
             'MAE': self.MAE,
-            'MAPE': self.MAPE
+            'MAPE': self.MAPE,
+            'AvgTrainingTimeSec': (ats + [None] * n)[:n],
+            'AvgBatterySoC': (absoc + [None] * n)[:n],
         })
         
         # Add summary row with convergence time

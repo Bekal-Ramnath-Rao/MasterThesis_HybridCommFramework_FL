@@ -631,6 +631,9 @@ if DDS_AVAILABLE:
         accuracy: float
         client_converged: float = 0.0
         battery_soc: float = 1.0
+        training_time_sec: float = 0.0
+        round_time_sec: float = 0.0
+        uplink_model_comm_sec: float = 0.0
 
 
 class UnifiedFLClient_Emotion:
@@ -3139,6 +3142,11 @@ class UnifiedFLClient_Emotion:
             self.validation_generator,
             verbose=0
         )
+        loss_f = float(loss)
+        accuracy_f = float(accuracy)
+        client_converged = (
+            1.0 if (stop_on_client_convergence() and self._would_converge_after_eval(loss_f)) else 0.0
+        )
         
         num_samples = self.validation_generator.n
         
@@ -3165,19 +3173,21 @@ class UnifiedFLClient_Emotion:
             "client_id": self.client_id,
             "round": report_round,
             "num_samples": num_samples,
-            "loss": float(loss),
-            "accuracy": float(accuracy),
+            "loss": loss_f,
+            "accuracy": accuracy_f,
             "battery_soc": float(battery_soc),
             "training_time_sec": training_time_sec,
             "uplink_model_comm_sec": uplink_model_comm_sec,
             "round_time_sec": float(round_time_sec),
+            "client_converged": float(client_converged),
             "metrics": {
-                "loss": float(loss),
-                "accuracy": float(accuracy),
+                "loss": loss_f,
+                "accuracy": accuracy_f,
                 "battery_soc": float(battery_soc),
                 "training_time_sec": training_time_sec,
                 "uplink_model_comm_sec": uplink_model_comm_sec,
                 "round_time_sec": float(round_time_sec),
+                "client_converged": float(client_converged),
             },
         }
         energy_j_total = 0.0
@@ -3254,8 +3264,8 @@ class UnifiedFLClient_Emotion:
                 {
                     "client_id": self.client_id,
                     "round": report_round,
-                    "loss": float(loss),
-                    "accuracy": float(accuracy),
+                    "loss": loss_f,
+                    "accuracy": accuracy_f,
                     "training_time_sec": training_time_sec,
                     "uplink_model_comm_sec": uplink_model_comm_sec,
                     "uplink_metrics_comm_sec": uplink_metrics_comm_sec,
@@ -3268,7 +3278,7 @@ class UnifiedFLClient_Emotion:
                 protocol=protocol,
             )
             print(f"Client {self.client_id} sent evaluation metrics for round {report_round}")
-            print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
+            print(f"Evaluation metrics - Loss: {loss_f:.4f}, Accuracy: {accuracy_f:.4f}")
             # RL update and optional Q-convergence end condition (battery already updated above for metrics)
             # When USE_RL_EXPLORATION: update Q, log, epsilon decay (training). When false: greedy
             # protocol from Q-table / converged map (still records selection unless RL_INFERENCE_ONLY); Q unchanged.
@@ -3459,11 +3469,19 @@ class UnifiedFLClient_Emotion:
                 except Exception as rl_e:
                     print(f"[Client {self.client_id}] Uplink RL update error: {rl_e}")
             if not USE_QL_CONVERGENCE and ENABLE_LOCAL_CONVERGENCE_STOP and stop_on_client_convergence():
-                self._update_client_convergence_and_maybe_disconnect(loss)
+                self._update_client_convergence_and_maybe_disconnect(loss_f)
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending metrics: {e}")
             import traceback
             traceback.print_exc()
+
+    def _would_converge_after_eval(self, loss: float) -> bool:
+        """True if this eval loss would trigger local convergence in the same round (mirrors FL_Client_gRPC)."""
+        if self.current_round < MIN_ROUNDS or self.has_converged:
+            return False
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            return False
+        return (self.rounds_without_improvement + 1) >= CONVERGENCE_PATIENCE
 
     def _update_client_convergence_and_maybe_disconnect(self, loss: float):
         """Track local convergence and disconnect this client when converged."""
@@ -3859,6 +3877,18 @@ class UnifiedFLClient_Emotion:
                         num_samples=message['num_samples'],
                         battery_soc=float(message.get('battery_soc', message.get('metrics', {}).get('battery_soc', 1.0))),
                         round_time_sec=float(message.get('round_time_sec', message.get('metrics', {}).get('round_time_sec', 0.0))),
+                        client_converged=float(
+                            message.get('client_converged', message.get('metrics', {}).get('client_converged', 0.0))
+                        ),
+                        training_time_sec=float(
+                            message.get('training_time_sec', message.get('metrics', {}).get('training_time_sec', 0.0))
+                        ),
+                        uplink_model_comm_sec=float(
+                            message.get(
+                                'uplink_model_comm_sec',
+                                message.get('metrics', {}).get('uplink_model_comm_sec', 0.0),
+                            )
+                        ),
                     )
                 )
                 
@@ -4682,8 +4712,22 @@ class UnifiedFLClient_Emotion:
                 num_samples=message.get('num_samples', 0),
                 loss=message.get('loss', message.get('metrics', {}).get('loss', 0.0)),
                 accuracy=message.get('accuracy', message.get('metrics', {}).get('accuracy', 0.0)),
-                client_converged=float(message.get('metrics', {}).get('client_converged', 0.0)),
-                battery_soc=float(message.get('battery_soc', message.get('metrics', {}).get('battery_soc', 1.0)))
+                client_converged=float(
+                    message.get('client_converged', message.get('metrics', {}).get('client_converged', 0.0))
+                ),
+                battery_soc=float(message.get('battery_soc', message.get('metrics', {}).get('battery_soc', 1.0))),
+                training_time_sec=float(
+                    message.get('training_time_sec', message.get('metrics', {}).get('training_time_sec', 0.0))
+                ),
+                round_time_sec=float(
+                    message.get('round_time_sec', message.get('metrics', {}).get('round_time_sec', 0.0))
+                ),
+                uplink_model_comm_sec=float(
+                    message.get(
+                        'uplink_model_comm_sec',
+                        message.get('metrics', {}).get('uplink_model_comm_sec', 0.0),
+                    )
+                ),
             )
             
             # Write to DDS

@@ -87,6 +87,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.MAPE = []
         self.LOSS = []
         self.ROUNDS = []
+        self.AVG_TRAINING_TIME_SEC = []
+        self.AVG_BATTERY_SOC = []
         
         # Convergence tracking
         self.best_loss = float('inf')
@@ -449,6 +451,22 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             client_id = request.client_id
             round_num = request.round
             metrics = dict(request.metrics) if hasattr(request, 'metrics') and request.metrics else {}
+            # Scalar Metrics fields (when clients use federated_learning_pb2.Metrics)
+            for attr, key in (
+                ('loss', 'loss'),
+                ('accuracy', 'accuracy'),
+                ('battery_soc', 'battery_soc'),
+                ('training_time_sec', 'training_time_sec'),
+                ('uplink_model_comm_sec', 'uplink_model_comm_sec'),
+                ('round_time_sec', 'round_time_sec'),
+            ):
+                if hasattr(request, attr):
+                    v = getattr(request, attr, None)
+                    if v is not None and key not in metrics:
+                        try:
+                            metrics[key] = float(v)
+                        except (TypeError, ValueError):
+                            pass
             if client_id not in self.active_clients:
                 return federated_learning_pb2.MetricsResponse(
                     success=True,
@@ -564,6 +582,20 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         aggregated_loss = sum(metric['metrics']['loss'] * metric['num_samples']
                              for metric in self.client_metrics.values()) / total_samples
         
+        avg_training_time = (
+            sum(
+                float(metric['metrics'].get('training_time_sec', 0.0)) * metric['num_samples']
+                for metric in self.client_metrics.values()
+            )
+            / total_samples
+            if total_samples
+            else 0.0
+        )
+        socs = [float(m['metrics'].get('battery_soc', 1.0)) for m in self.client_metrics.values()]
+        avg_soc = sum(socs) / len(socs) if socs else 1.0
+        self.AVG_TRAINING_TIME_SEC.append(float(avg_training_time))
+        self.AVG_BATTERY_SOC.append(float(avg_soc))
+        
         # Store metrics
         self.MSE.append(aggregated_mse)
         self.MAE.append(aggregated_mae)
@@ -575,7 +607,9 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         print(f"  Loss: {aggregated_loss:.4f}")
         print(f"  MSE: {aggregated_mse:.4f}")
         print(f"  MAE: {aggregated_mae:.4f}")
-        print(f"  MAPE: {aggregated_mape:.4f}\n")
+        print(f"  MAPE: {aggregated_mape:.4f}")
+        print(f"  Avg training time (sample-weighted): {avg_training_time:.3f} s")
+        print(f"  Avg battery SoC: {avg_soc:.4f}\n")
     
     def continue_training(self):
         """Continue to next round or finish training"""
@@ -696,12 +730,17 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         """Save training results to CSV"""
         results_dir = get_experiment_results_dir("temperature", "grpc")
         
+        ats = getattr(self, 'AVG_TRAINING_TIME_SEC', [])
+        absoc = getattr(self, 'AVG_BATTERY_SOC', [])
+        n = len(self.ROUNDS)
         results_df = pd.DataFrame({
             'Round': self.ROUNDS,
             'Loss': self.LOSS,
             'MSE': self.MSE,
             'MAE': self.MAE,
-            'MAPE': self.MAPE
+            'MAPE': self.MAPE,
+            'AvgTrainingTimeSec': (ats + [None] * n)[:n],
+            'AvgBatterySoC': (absoc + [None] * n)[:n],
         })
         
         # Add summary row with convergence time

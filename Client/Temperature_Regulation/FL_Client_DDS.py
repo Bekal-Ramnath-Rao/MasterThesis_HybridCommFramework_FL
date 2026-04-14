@@ -160,6 +160,10 @@ class EvaluationMetrics(IdlStruct):
     mae: float
     mape: float
     client_converged: float = 0.0
+    battery_soc: float = 1.0
+    training_time_sec: float = 0.0
+    round_time_sec: float = 0.0
+    uplink_model_comm_sec: float = 0.0
 
 
 @dataclass
@@ -659,6 +663,8 @@ class FederatedLearningClient:
         self._update_local_convergence(float(loss))
         
         client_converged = 1.0 if (self.has_converged and STOP_ON_CLIENT_CONVERGENCE) else 0.0
+        tt = float(self._last_training_time_sec)
+        ul = float(self._last_uplink_model_comm_sec)
         metrics = EvaluationMetrics(
             client_id=self.client_id,
             round=self.current_round,
@@ -667,7 +673,11 @@ class FederatedLearningClient:
             mse=float(mse),
             mae=float(mae),
             mape=float(mape),
-            client_converged=client_converged
+            client_converged=client_converged,
+            battery_soc=1.0,
+            training_time_sec=tt,
+            round_time_sec=tt + ul,
+            uplink_model_comm_sec=ul,
         )
         
         # Write with explicit return check

@@ -663,6 +663,8 @@ class FederatedLearningClient:
                     battery_soc=float(self.battery_model.battery_soc),
                     round_time_sec=float(self._last_round_time_sec),
                     client_converged=client_converged,
+                    training_time_sec=float(self._last_training_time_sec),
+                    uplink_model_comm_sec=float(self._last_uplink_model_comm_sec),
                 )
             )
             _uplink_metrics_sec = time.time() - _mt0

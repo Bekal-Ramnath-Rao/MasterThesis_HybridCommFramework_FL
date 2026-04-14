@@ -273,6 +273,9 @@ if DDS_AVAILABLE:
         accuracy: float
         client_converged: float = 0.0
         battery_soc: float = 1.0
+        training_time_sec: float = 0.0
+        round_time_sec: float = 0.0
+        uplink_model_comm_sec: float = 0.0
 
 
 class UnifiedFederatedLearningServer:
@@ -307,6 +310,8 @@ class UnifiedFederatedLearningServer:
         self.ROUNDS = []
         self.ROUND_TIMES = []
         self.BATTERY_CONSUMPTION = []
+        self.AVG_TRAINING_TIME_SEC = []
+        self.AVG_BATTERY_SOC = []
         self.round_start_time = None
 
         # Convergence tracking
@@ -1549,18 +1554,30 @@ class UnifiedFederatedLearningServer:
                                 client_id = sample.client_id
                                 chunk_id = sample.chunk_id
                                 total_chunks = sample.total_chunks
-                                
-                                # Initialize chunk buffers if needed
+                                round_num = sample.round
+
+                                meta = self.model_update_metadata.get(client_id)
+                                buf = self.model_update_chunks.get(client_id)
+                                need_reset = False
+                                if meta is not None:
+                                    if meta.get('round') != round_num or int(meta.get('total_chunks', -1)) != int(total_chunks):
+                                        need_reset = True
+                                if chunk_id == 0 and buf:
+                                    need_reset = True
+                                if need_reset:
+                                    self.model_update_chunks.pop(client_id, None)
+                                    self.model_update_metadata.pop(client_id, None)
+
                                 if client_id not in self.model_update_chunks:
                                     self.model_update_chunks[client_id] = {}
                                     self.model_update_metadata[client_id] = {
+                                        'round': round_num,
                                         'total_chunks': total_chunks,
                                         'num_samples': sample.num_samples,
                                         'loss': sample.loss,
                                         'accuracy': sample.accuracy,
                                     }
-                                
-                                # Store chunk
+
                                 self.model_update_chunks[client_id][chunk_id] = sample.payload
                                 
                                 # Check if all chunks received for this client
@@ -1670,11 +1687,29 @@ class UnifiedFederatedLearningServer:
                                         'loss': sample.loss,
                                         'accuracy': sample.accuracy,
                                         'battery_soc': sample.battery_soc,
+                                        'training_time_sec': getattr(
+                                            sample, 'training_time_sec', 0.0
+                                        ),
+                                        'round_time_sec': getattr(
+                                            sample, 'round_time_sec', 0.0
+                                        ),
+                                        'uplink_model_comm_sec': getattr(
+                                            sample, 'uplink_model_comm_sec', 0.0
+                                        ),
                                         'metrics': {
                                             'loss': sample.loss,
                                             'accuracy': sample.accuracy,
                                             'client_converged': sample.client_converged,
                                             'battery_soc': sample.battery_soc,
+                                            'training_time_sec': getattr(
+                                                sample, 'training_time_sec', 0.0
+                                            ),
+                                            'round_time_sec': getattr(
+                                                sample, 'round_time_sec', 0.0
+                                            ),
+                                            'uplink_model_comm_sec': getattr(
+                                                sample, 'uplink_model_comm_sec', 0.0
+                                            ),
                                         }
                                     }
                                     
@@ -2328,6 +2363,17 @@ class UnifiedFederatedLearningServer:
         # Weighted average
         avg_loss = sum(m['loss'] * m['num_samples'] for m in self.client_metrics.values()) / total_samples
         avg_accuracy = sum(m['accuracy'] * m['num_samples'] for m in self.client_metrics.values()) / total_samples
+        avg_training_time = (
+            sum(
+                m.get('training_time_sec', 0.0) * m['num_samples']
+                for m in self.client_metrics.values()
+            )
+            / total_samples
+            if total_samples
+            else 0.0
+        )
+        self.AVG_TRAINING_TIME_SEC.append(float(avg_training_time))
+        self.AVG_BATTERY_SOC.append(float(avg_soc))
         
         self.ACCURACY.append(avg_accuracy)
         self.LOSS.append(avg_loss)
@@ -2336,6 +2382,8 @@ class UnifiedFederatedLearningServer:
         print(f"\nRound {self.current_round} Results:")
         print(f"  Avg Loss: {avg_loss:.4f}")
         print(f"  Avg Accuracy: {avg_accuracy:.4f}")
+        print(f"  Avg training time (sample-weighted): {avg_training_time:.3f} s")
+        print(f"  Avg battery SoC: {avg_soc:.4f}")
         print(f"  Active clients: {len(self.active_clients)}/{self.num_clients}")
         
         # Clear metrics
@@ -2386,6 +2434,8 @@ class UnifiedFederatedLearningServer:
             'loss': self.LOSS,
             'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
             'battery_consumption': getattr(self, 'BATTERY_CONSUMPTION', []),
+            'avg_training_time_sec': getattr(self, 'AVG_TRAINING_TIME_SEC', []),
+            'avg_battery_soc': getattr(self, 'AVG_BATTERY_SOC', []),
             'converged': self.converged,
             'total_time': time.time() - self.start_time,
             'convergence_time': self.convergence_time,
@@ -2752,6 +2802,8 @@ if GRPC_AVAILABLE:
                     'accuracy': request.accuracy,
                     'battery_soc': getattr(request, 'battery_soc', 1.0),
                     'round_time_sec': getattr(request, 'round_time_sec', 0.0),
+                    'training_time_sec': getattr(request, 'training_time_sec', 0.0),
+                    'uplink_model_comm_sec': getattr(request, 'uplink_model_comm_sec', 0.0),
                 }
                 
                 self.server.handle_client_metrics(data, 'grpc')

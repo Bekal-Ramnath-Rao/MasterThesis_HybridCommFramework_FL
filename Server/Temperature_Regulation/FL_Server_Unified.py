@@ -101,6 +101,10 @@ class UnifiedFederatedLearningServer:
         self.ACCURACY = []
         self.LOSS = []
         self.ROUNDS = []
+        self.ROUND_TIMES = []
+        self.AVG_TRAINING_TIME_SEC = []
+        self.AVG_BATTERY_SOC = []
+        self.round_start_time = None
         
         # Convergence tracking
         self.best_loss = float('inf')
@@ -293,12 +297,17 @@ class UnifiedFederatedLearningServer:
         """Track client evaluation metrics using standalone message routing."""
         with self.lock:
             client_id = payload['client_id']
-            self.client_metrics[client_id] = payload.get('metrics', {})
+            merged = dict(payload.get('metrics') or {})
+            for k in ('loss', 'accuracy', 'battery_soc', 'training_time_sec', 'training_time', 'round_time_sec', 'val_mae', 'val_loss'):
+                if k in payload and k not in merged:
+                    merged[k] = payload[k]
+            self.client_metrics[client_id] = merged
     
     def start_training(self):
         """Start federated learning process"""
         self.start_time = time.time()
         self.current_round = 1
+        self.round_start_time = time.time()
         for client_id in self.registered_clients.keys():
             self.grpc_model_ready[client_id] = 0
         self.broadcast_global_model()
@@ -349,16 +358,45 @@ class UnifiedFederatedLearningServer:
         
         self.global_weights = aggregated_weights
         
-        # Aggregate metrics
-        avg_accuracy = np.mean([u['metrics']['accuracy'] for u in self.client_updates.values()])
-        avg_loss = np.mean([u['metrics']['loss'] for u in self.client_updates.values()])
+        # Aggregate metrics (temperature clients use val_accuracy / val_mae proxies)
+        updates = list(self.client_updates.values())
+        avg_accuracy = np.mean([
+            float(u['metrics'].get(
+                'accuracy', u['metrics'].get('val_accuracy', 0.0)
+            ))
+            for u in updates
+        ])
+        avg_loss = np.mean([
+            float(u['metrics'].get('loss', u['metrics'].get('val_loss', 0.0)))
+            for u in updates
+        ])
+        train_times = []
+        socs = []
+        for u in updates:
+            m = u.get('metrics') or {}
+            t = m.get('training_time_sec', m.get('training_time'))
+            if t is not None:
+                try:
+                    train_times.append(float(t))
+                except (TypeError, ValueError):
+                    pass
+            try:
+                socs.append(float(m.get('battery_soc', 1.0)))
+            except (TypeError, ValueError):
+                socs.append(1.0)
+        if self.round_start_time is not None:
+            self.ROUND_TIMES.append(time.time() - self.round_start_time)
+        self.AVG_TRAINING_TIME_SEC.append(float(np.mean(train_times)) if train_times else 0.0)
+        self.AVG_BATTERY_SOC.append(float(np.mean(socs)) if socs else 1.0)
         
         self.ACCURACY.append(avg_accuracy)
         self.LOSS.append(avg_loss)
         self.ROUNDS.append(self.current_round)
         
-        print(f"Avg Accuracy: {avg_accuracy:.4f}")
+        print(f"Avg Accuracy (proxy): {avg_accuracy:.4f}")
         print(f"Avg Loss: {avg_loss:.4f}")
+        print(f"Avg training time (clients reporting): {self.AVG_TRAINING_TIME_SEC[-1]:.3f} s")
+        print(f"Avg battery SoC: {self.AVG_BATTERY_SOC[-1]:.4f}")
         
         # Check convergence
         if self.current_round >= MIN_ROUNDS:
@@ -380,6 +418,7 @@ class UnifiedFederatedLearningServer:
         # Clear for next round
         self.client_updates.clear()
         self.current_round += 1
+        self.round_start_time = time.time()
         
         if self.current_round <= self.num_rounds:
             self.broadcast_global_model()
@@ -447,6 +486,9 @@ class UnifiedFederatedLearningServer:
             'rounds': self.ROUNDS,
             'accuracy': self.ACCURACY,
             'loss': self.LOSS,
+            'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
+            'avg_training_time_sec': getattr(self, 'AVG_TRAINING_TIME_SEC', []),
+            'avg_battery_soc': getattr(self, 'AVG_BATTERY_SOC', []),
             'converged': self.converged,
             'total_time': time.time() - self.start_time,
             'convergence_time': self.convergence_time,

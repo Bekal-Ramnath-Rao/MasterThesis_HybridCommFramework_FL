@@ -83,6 +83,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.ROUNDS = []
         self.ROUND_TIMES = []
         self.BATTERY_CONSUMPTION = []
+        self.AVG_TRAINING_TIME_SEC = []
+        self.AVG_BATTERY_SOC = []
         self.round_start_time = None
 
         # Convergence tracking
@@ -454,6 +456,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 'num_samples': request.num_samples,
                 'battery_soc': float(getattr(request, 'battery_soc', 1.0)),
                 'round_time_sec': float(getattr(request, 'round_time_sec', 0.0)),
+                'training_time_sec': float(getattr(request, 'training_time_sec', 0.0)),
+                'uplink_model_comm_sec': float(getattr(request, 'uplink_model_comm_sec', 0.0)),
             }
             self.clients_evaluated.add(client_id)
             
@@ -598,6 +602,14 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         
         avg_loss = sum(m['loss'] * m['num_samples'] for m in self.client_metrics.values()) / total_samples
         avg_accuracy = sum(m['accuracy'] * m['num_samples'] for m in self.client_metrics.values()) / total_samples
+        avg_training_time = (
+            sum(m.get('training_time_sec', 0.0) * m['num_samples'] for m in self.client_metrics.values())
+            / total_samples
+            if total_samples
+            else 0.0
+        )
+        self.AVG_TRAINING_TIME_SEC.append(float(avg_training_time))
+        self.AVG_BATTERY_SOC.append(float(avg_soc))
         
         # Store metrics
         self.ROUNDS.append(self.current_round)
@@ -609,6 +621,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         print(f"{'='*70}")
         print(f"Average Loss: {avg_loss:.4f}")
         print(f"Average Accuracy: {avg_accuracy:.4f}")
+        print(f"Average training time (sample-weighted): {avg_training_time:.3f} s")
+        print(f"Average battery SoC: {avg_soc:.4f}")
         
         # Check stopping criteria
         should_stop = False
@@ -665,6 +679,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             'accuracy': self.ACCURACY,
             'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
             'battery_consumption': getattr(self, 'BATTERY_CONSUMPTION', []),
+            'avg_training_time_sec': getattr(self, 'AVG_TRAINING_TIME_SEC', []),
+            'avg_battery_soc': getattr(self, 'AVG_BATTERY_SOC', []),
             'converged': self.converged,
             'convergence_time': self.convergence_time if self.converged else None,
             'total_time': time.time() - self.start_time,

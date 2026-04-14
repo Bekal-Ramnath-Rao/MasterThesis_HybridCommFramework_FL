@@ -233,6 +233,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.ACC = []
         self.TOP2 = []
         self.ROUNDS = []
+        self.client_fl_aux_reports = []
 
         # Initialize quantization handler (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
@@ -505,10 +506,36 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 )
 
     def SendMetrics(self, request, context):
-        """Receive evaluation metrics from client (not used for server evaluation)"""
+        """Receive optional client-side FL timing / battery reports alongside global server eval."""
         with self.lock:
             client_id = request.client_id
-            print(f"Received metrics from client {client_id}")
+            metrics_map = dict(request.metrics) if hasattr(request, 'metrics') and request.metrics else {}
+            rec = {
+                'client_id': int(client_id),
+                'round': int(getattr(request, 'round', 0)),
+                'num_samples': int(getattr(request, 'num_samples', 0)),
+                'loss': float(getattr(request, 'loss', metrics_map.get('loss', 0.0)) or 0.0),
+                'accuracy': float(getattr(request, 'accuracy', metrics_map.get('accuracy', 0.0)) or 0.0),
+                'battery_soc': float(getattr(request, 'battery_soc', metrics_map.get('battery_soc', 1.0)) or 1.0),
+                'training_time_sec': float(
+                    getattr(request, 'training_time_sec', metrics_map.get('training_time_sec', 0.0)) or 0.0
+                ),
+                'uplink_model_comm_sec': float(
+                    getattr(
+                        request, 'uplink_model_comm_sec', metrics_map.get('uplink_model_comm_sec', 0.0)
+                    )
+                    or 0.0
+                ),
+                'round_time_sec': float(
+                    getattr(request, 'round_time_sec', metrics_map.get('round_time_sec', 0.0)) or 0.0
+                ),
+            }
+            self.client_fl_aux_reports.append(rec)
+            print(
+                f"Received client FL aux metrics from client {client_id} "
+                f"(training_time_sec={rec['training_time_sec']:.3f}, "
+                f"battery_soc={rec['battery_soc']:.4f})"
+            )
 
             return federated_learning_pb2.MetricsResponse(
                 success=True,
@@ -641,7 +668,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             "best_accuracy": max(self.ACC) if self.ACC else 0,
             "best_round": self.ROUNDS[np.argmax(self.ACC)] if self.ACC else 0,
             "num_clients": self.num_clients,
-            "num_rounds": self.num_rounds
+            "num_rounds": self.num_rounds,
+            "client_fl_aux_reports": getattr(self, "client_fl_aux_reports", []),
         }
 
         results_dir = get_experiment_results_dir("mental_state", "grpc")

@@ -513,7 +513,10 @@ class FederatedLearningClient:
                     'loss': float(loss),
                     'mse': float(mse),
                     'mae': float(mae),
-                    'mape': float(mape)
+                    'mape': float(mape),
+                    'training_time_sec': float(self._last_training_time_sec),
+                    'uplink_model_comm_sec': float(self._last_uplink_model_comm_sec),
+                    'battery_soc': 1.0,
                 }
             )
         )

@@ -251,6 +251,9 @@ class EvaluationMetrics(IdlStruct):
     accuracy: float
     client_converged: float = 0.0
     battery_soc: float = 1.0
+    training_time_sec: float = 0.0
+    round_time_sec: float = 0.0
+    uplink_model_comm_sec: float = 0.0
 
 
 @dataclass
@@ -865,7 +868,9 @@ class FederatedLearningClient:
         self._update_local_convergence(float(loss))
         client_converged = 1.0 if (self.has_converged and stop_on_client_convergence()) else 0.0
         
-        # Send metrics to server (include battery_soc for server battery consumption plot)
+        # Send metrics to server (battery, accuracy, local training / uplink timing for aggregation)
+        tt = float(self._last_training_time_sec)
+        ul = float(self._last_uplink_model_comm_sec)
         metrics = EvaluationMetrics(
             client_id=self.client_id,
             round=self.current_round,
@@ -874,6 +879,9 @@ class FederatedLearningClient:
             accuracy=float(accuracy),
             client_converged=client_converged,
             battery_soc=float(self.battery_model.battery_soc),
+            training_time_sec=tt,
+            round_time_sec=tt + ul,
+            uplink_model_comm_sec=ul,
         )
         
         # Write with explicit return check

@@ -77,6 +77,8 @@ message Metrics {
     double battery_soc = 6;       // optional: state of charge [0,1] for battery plot
     double round_time_sec = 7;    // optional: time for this round (training + comm)
     double client_converged = 8;  // 1.0 = client has converged locally and will disconnect; server removes from active set
+    double training_time_sec = 9; // optional: local FL training wall time (seconds)
+    double uplink_model_comm_sec = 10; // optional: time to send model update (seconds)
 }
 
 message MetricsResponse {

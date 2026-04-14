@@ -196,6 +196,9 @@ class EvaluationMetrics(IdlStruct):
     accuracy: float
     client_converged: float = 0.0
     battery_soc: float = 1.0
+    training_time_sec: float = 0.0
+    round_time_sec: float = 0.0
+    uplink_model_comm_sec: float = 0.0
 
 
 @dataclass
@@ -232,6 +235,8 @@ class FederatedLearningServer:
         self.ROUNDS = []
         self.ROUND_TIMES = []
         self.BATTERY_CONSUMPTION = []
+        self.AVG_TRAINING_TIME_SEC = []
+        self.AVG_BATTERY_SOC = []
         self.round_start_time = None
 
         # Convergence tracking
@@ -837,7 +842,9 @@ class FederatedLearningServer:
                                 'accuracy': sample.accuracy
                             },
                             'battery_soc': float(getattr(sample, 'battery_soc', 1.0)),
+                            'training_time_sec': float(getattr(sample, 'training_time_sec', 0.0)),
                             'round_time_sec': float(getattr(sample, 'round_time_sec', 0.0)),
+                            'uplink_model_comm_sec': float(getattr(sample, 'uplink_model_comm_sec', 0.0)),
                         }
                         
                         print(f"Received metrics from client {client_id} "
@@ -1018,6 +1025,9 @@ class FederatedLearningServer:
                             'metrics': metrics_dict,
                             'num_samples': sample.num_samples,
                             'battery_soc': float(getattr(sample, 'battery_soc', 1.0)),
+                            'training_time_sec': float(getattr(sample, 'training_time_sec', 0.0)),
+                            'round_time_sec': float(getattr(sample, 'round_time_sec', 0.0)),
+                            'uplink_model_comm_sec': float(getattr(sample, 'uplink_model_comm_sec', 0.0)),
                         }
                         print(f"Progress: {len(self.client_metrics)}/{len(self.active_clients)} clients")
             
@@ -1033,7 +1043,8 @@ class FederatedLearningServer:
         if getattr(self, 'round_start_time', None) is not None:
             self.ROUND_TIMES.append(time.time() - self.round_start_time)
         socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
-        self.BATTERY_CONSUMPTION.append(1.0 - (sum(socs) / len(socs) if socs else 1.0))
+        avg_soc = sum(socs) / len(socs) if socs else 1.0
+        self.BATTERY_CONSUMPTION.append(1.0 - avg_soc)
         # Calculate total samples
         total_samples = sum(metric['num_samples'] 
                           for metric in self.client_metrics.values())
@@ -1044,6 +1055,17 @@ class FederatedLearningServer:
         
         aggregated_accuracy = sum(metric['metrics']['accuracy'] * metric['num_samples']
                                  for metric in self.client_metrics.values()) / total_samples
+        avg_training_time = (
+            sum(
+                metric.get('training_time_sec', 0.0) * metric['num_samples']
+                for metric in self.client_metrics.values()
+            )
+            / total_samples
+            if total_samples
+            else 0.0
+        )
+        self.AVG_TRAINING_TIME_SEC.append(float(avg_training_time))
+        self.AVG_BATTERY_SOC.append(float(avg_soc))
         
         # Store metrics
         self.LOSS.append(aggregated_loss)
@@ -1052,7 +1074,9 @@ class FederatedLearningServer:
         
         print(f"\nRound {self.current_round} Aggregated Metrics:")
         print(f"  Loss: {aggregated_loss:.4f}")
-        print(f"  Accuracy: {aggregated_accuracy:.4f}\n")
+        print(f"  Accuracy: {aggregated_accuracy:.4f}")
+        print(f"  Avg training time (sample-weighted): {avg_training_time:.3f} s")
+        print(f"  Avg battery SoC: {avg_soc:.4f}\n")
     
     def continue_training(self):
         """Continue to next round or finish training"""
@@ -1186,6 +1210,8 @@ class FederatedLearningServer:
             'accuracy': self.ACCURACY,
             'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
             'battery_consumption': getattr(self, 'BATTERY_CONSUMPTION', []),
+            'avg_training_time_sec': getattr(self, 'AVG_TRAINING_TIME_SEC', []),
+            'avg_battery_soc': getattr(self, 'AVG_BATTERY_SOC', []),
             'summary': {
                 'total_rounds': len(self.ROUNDS),
                 'num_clients': self.num_clients,
