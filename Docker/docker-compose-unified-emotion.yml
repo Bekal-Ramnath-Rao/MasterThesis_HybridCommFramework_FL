@@ -3,8 +3,19 @@
 # Matches docker-compose-emotion.yml DDS services (fl-server-dds-emotion / fl-client-dds-emotion-*):
 # Cyclone RTPS needs the host UDP port range; Docker bridge + mapping only 7412/7414 breaks DDS.
 #
-# Brokers listen on the host: MQTT 1883, AMQP 5672 (and 15672 for Rabbit UI). FL containers use
-# 127.0.0.1 for MQTT/AMQP/gRPC/QUIC/HTTP3. Ensure host ports are free or change broker configs.
+# Brokers listen on the host: MQTT 1883, AMQP 5672 (and 15672 for Rabbit UI). Server binds gRPC/QUIC/HTTP3
+# on all interfaces; clients use UNIFIED_FL_SERVER_HOST for control/data plane (default 127.0.0.1).
+#
+# --- Second client on another PC (DDS + unified protocols) ---
+# 1) On the FL server PC: set DDS_PEER_* / DDS_SPDP_* to real LAN IPs (server, client1, client2) and
+#    start brokers + server + local client(s) as usual (docker compose up).
+# 2) On the remote PC: export the same DDS_PEER_* / DDS_SPDP_* (client2 = this machine's LAN IP),
+#    set UNIFIED_FL_SERVER_HOST to the server PC's LAN IP, open its firewall for MQTT 1883, AMQP 5672,
+#    TCP 50051, UDP 4433/4434, and DDS UDP (roughly 7400–7500 plus SPDP 7412/7414/7416 — see
+#    config/dds_distributed_unicast.py). Mount the same certs/ and Dataset; sync shared_data if you
+#    need shared Q-tables/metrics (e.g. NFS).
+# 3) Start only the remote client without pulling server/brokers from this file:
+#    docker compose -f Docker/docker-compose-unified-emotion.yml up --no-deps fl-client-unified-emotion-2
 #
 # For an isolated bridge deployment (no host-wide ports; DDS may be unreliable), see
 # docker-compose-unified-emotion.bridge.yml
@@ -105,14 +116,14 @@ services:
       - RL_QTABLE_MERGE=${RL_QTABLE_MERGE:-false}
       - RL_QTABLE_OVERLAY_SCENARIOS=${RL_QTABLE_OVERLAY_SCENARIOS:-}
       - DEFAULT_PROTOCOL=mqtt
-      - MQTT_BROKER=127.0.0.1
-      - AMQP_BROKER=127.0.0.1
-      - AMQP_HOST=127.0.0.1
-      - GRPC_HOST=127.0.0.1
+      - MQTT_BROKER=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - AMQP_BROKER=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - AMQP_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - GRPC_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
       - GRPC_PORT=50051
-      - QUIC_HOST=127.0.0.1
+      - QUIC_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
       - QUIC_PORT=4433
-      - HTTP3_HOST=127.0.0.1
+      - HTTP3_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
       - HTTP3_PORT=4434
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -169,14 +180,14 @@ services:
       - RL_QTABLE_MERGE=${RL_QTABLE_MERGE:-false}
       - RL_QTABLE_OVERLAY_SCENARIOS=${RL_QTABLE_OVERLAY_SCENARIOS:-}
       - DEFAULT_PROTOCOL=mqtt
-      - MQTT_BROKER=127.0.0.1
-      - AMQP_BROKER=127.0.0.1
-      - AMQP_HOST=127.0.0.1
-      - GRPC_HOST=127.0.0.1
+      - MQTT_BROKER=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - AMQP_BROKER=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - AMQP_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - GRPC_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
       - GRPC_PORT=50051
-      - QUIC_HOST=127.0.0.1
+      - QUIC_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
       - QUIC_PORT=4433
-      - HTTP3_HOST=127.0.0.1
+      - HTTP3_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
       - HTTP3_PORT=4434
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
