@@ -1579,7 +1579,12 @@ class UnifiedFederatedLearningServer:
                                     }
 
                                 self.model_update_chunks[client_id][chunk_id] = sample.payload
-                                
+                                if chunk_id == 0:
+                                    print(
+                                        f"[DDS] Chunked model update from client {client_id} "
+                                        f"round {round_num} ({total_chunks} chunks) — receiving…"
+                                    )
+
                                 # Check if all chunks received for this client
                                 if len(self.model_update_chunks[client_id]) == total_chunks:
                                     # Reassemble chunks in order
@@ -1903,7 +1908,12 @@ class UnifiedFederatedLearningServer:
                 }
                 weights = None
             else:
-                weights = self.deserialize_weights(data['weights'])
+                raw_w = data['weights']
+                # JSON transports (MQTT/AMQP/gRPC/…) send base64; DDS reassembly passes decoded tensors.
+                if isinstance(raw_w, str):
+                    weights = self.deserialize_weights(raw_w)
+                else:
+                    weights = raw_w
             
             # Store update (metrics are handled separately via handle_client_metrics)
             if 'compressed_data' not in data or self.quantization_handler is None:

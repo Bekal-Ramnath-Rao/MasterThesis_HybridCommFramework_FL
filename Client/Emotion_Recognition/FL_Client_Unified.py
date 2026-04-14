@@ -2936,6 +2936,15 @@ class UnifiedFLClient_Emotion:
         for i in range(0, len(data), CHUNK_SIZE):
             chunks.append(data[i:i + CHUNK_SIZE])
         return chunks
+
+    def _dds_serialized_weights_bytes(self, message: dict) -> bytes:
+        """Bytes to chunk over DDS: same pickle payload JSON transports wrap as base64 strings."""
+        if 'compressed_data' in message:
+            return base64.b64decode(message['compressed_data'].encode('utf-8'))
+        w = message['weights']
+        if isinstance(w, str):
+            return base64.b64decode(w.encode('utf-8'))
+        return pickle.dumps(w)
     
     def send_model_update_chunked(self, round_num, serialized_weights, num_samples, loss, accuracy):
         """Send model update as chunks via DDS"""
@@ -3632,10 +3641,7 @@ class UnifiedFLClient_Emotion:
         if not DDS_AVAILABLE or not self.dds_update_chunk_writer:
             raise NotImplementedError("DDS chunk writer not available")
 
-        if 'compressed_data' in message:
-            weights_bytes = base64.b64decode(message['compressed_data'].encode('utf-8'))
-        else:
-            weights_bytes = pickle.dumps(message['weights'])
+        weights_bytes = self._dds_serialized_weights_bytes(message)
 
         metrics = message.get('metrics', {})
         total_chunks = self.send_model_update_chunked(
@@ -4671,10 +4677,7 @@ class UnifiedFLClient_Emotion:
             raise NotImplementedError("DDS not available - triggering fallback")
         
         try:
-            if 'compressed_data' in message:
-                weights_bytes = base64.b64decode(message['compressed_data'].encode('utf-8'))
-            else:
-                weights_bytes = pickle.dumps(message['weights'])
+            weights_bytes = self._dds_serialized_weights_bytes(message)
             metrics = message.get('metrics', {})
             dds_msg = ModelUpdate(
                 client_id=self.client_id,
