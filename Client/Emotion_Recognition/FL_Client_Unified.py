@@ -464,6 +464,11 @@ def _env_truthy(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "y")
 
 
+# When True, select_protocol uses only frozen converged_protocol_by_scenario (inference path).
+# Default False so USE_RL_EXPLORATION=false still greedy-selects from the Q-table / converged map, not MQTT fallback.
+RL_INFERENCE_ONLY = _env_truthy("RL_INFERENCE_ONLY")
+_RL_PROTOCOL_SELECTION_RECORD_LEARNING = not RL_INFERENCE_ONLY
+
 # Skip loading any on-disk Q-table (zeros + default epsilon). Overrides shared_data / PRETRAINED discovery.
 RL_FRESH_Q_TABLE = _env_truthy("RL_FRESH_Q_TABLE")
 # Optional explicit pickle paths for inference or a chosen checkpoint (highest priority if set and file exists).
@@ -1110,6 +1115,8 @@ class UnifiedFLClient_Emotion:
         print(f"RL Protocol Selection: {'ENABLED' if USE_RL_SELECTION else 'DISABLED'}")
         if USE_RL_SELECTION:
             print(f"RL Exploration (epsilon-greedy): {'ENABLED' if USE_RL_EXPLORATION else 'DISABLED (greedy)'}")
+            if RL_INFERENCE_ONLY:
+                print("RL Inference-only (RL_INFERENCE_ONLY): protocol pick from converged map / frozen Q inference path")
             print(f"Q-Convergence Stop (USE_QL_CONVERGENCE): {'ENABLED' if USE_QL_CONVERGENCE else 'DISABLED'}")
             print(f"Communication Model in Reward: {'ENABLED' if USE_COMMUNICATION_MODEL_REWARD else 'DISABLED'}")
             if getattr(self, "_rl_boundary_collection_phase", False):
@@ -2022,7 +2029,7 @@ class UnifiedFLClient_Emotion:
             proto = self._downlink_protocol_from_delivery_source(source)
             if proto not in self.rl_selector_downlink.PROTOCOLS:
                 proto = "grpc"
-            self.rl_selector_downlink.register_selection(state, proto, record_learning=USE_RL_EXPLORATION)
+            self.rl_selector_downlink.register_selection(state, proto, record_learning=_RL_PROTOCOL_SELECTION_RECORD_LEARNING)
             self._last_downlink_rl_state = state
             self._downlink_select_time = receive_started_at
             self.selected_downlink_protocol = proto
@@ -2400,7 +2407,7 @@ class UnifiedFLClient_Emotion:
                     if getattr(self, "_rl_boundary_collection_phase", False):
                         self.rl_selector_downlink.epsilon = 1.0
                     selected = self.rl_selector_downlink.select_protocol(
-                        state, training=training_mode, record_learning=USE_RL_EXPLORATION
+                        state, training=training_mode, record_learning=_RL_PROTOCOL_SELECTION_RECORD_LEARNING
                     )
                 # Store downlink state and selection time so reward can be computed after model arrives
                 self._last_downlink_rl_state = state
@@ -2435,7 +2442,7 @@ class UnifiedFLClient_Emotion:
                 and self.rl_selector_downlink is not None
                 and self.rl_selector_downlink.pop_last_selection()
             ):
-                self.rl_selector_downlink.register_selection(state, 'grpc', record_learning=USE_RL_EXPLORATION)
+                self.rl_selector_downlink.register_selection(state, 'grpc', record_learning=_RL_PROTOCOL_SELECTION_RECORD_LEARNING)
                 self._last_downlink_rl_state = state
                 self._downlink_select_time = time.time()
             else:
@@ -2832,7 +2839,7 @@ class UnifiedFLClient_Emotion:
                     if getattr(self, "_rl_boundary_collection_phase", False):
                         self.rl_selector_uplink.epsilon = 1.0
                     protocol = self.rl_selector_uplink.select_protocol(
-                        state, training=training_mode, record_learning=USE_RL_EXPLORATION
+                        state, training=training_mode, record_learning=_RL_PROTOCOL_SELECTION_RECORD_LEARNING
                     )
                 
                 print(f"\n[Uplink RL Protocol Selection]")
@@ -3263,8 +3270,8 @@ class UnifiedFLClient_Emotion:
             print(f"Client {self.client_id} sent evaluation metrics for round {report_round}")
             print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
             # RL update and optional Q-convergence end condition (battery already updated above for metrics)
-            # When USE_RL_EXPLORATION: update Q, log, epsilon decay (training). When inference-only
-            # (USE_RL_EXPLORATION=false): greedy protocol only; Q-table unchanged.
+            # When USE_RL_EXPLORATION: update Q, log, epsilon decay (training). When false: greedy
+            # protocol from Q-table / converged map (still records selection unless RL_INFERENCE_ONLY); Q unchanged.
             # Only the *stopping* condition differs: USE_QL_CONVERGENCE -> stop when Q converges; else stop on loss.
             # Uses the dedicated UPLINK Q-learning agent.
             if USE_RL_SELECTION and self.rl_selector_uplink and self.env_manager:

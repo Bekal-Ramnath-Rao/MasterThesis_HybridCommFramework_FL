@@ -90,6 +90,14 @@ else:
     USE_RL_EXPLORATION = USE_QL_CONVERGENCE
 USE_COMMUNICATION_MODEL_REWARD = os.getenv("USE_COMMUNICATION_MODEL_REWARD", "true").lower() == "true"
 
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "y")
+
+
+RL_INFERENCE_ONLY = _env_truthy("RL_INFERENCE_ONLY")
+_RL_PROTOCOL_SELECTION_RECORD_LEARNING = not RL_INFERENCE_ONLY
+
 TOPIC_CLIENT_UPDATE = f"fl/client/{CLIENT_ID}/update"
 TOPIC_CLIENT_METRICS = f"fl/client/{CLIENT_ID}/metrics"
 GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(4 * 1024 * 1024)))
@@ -282,9 +290,9 @@ class UnifiedFLClient_Temperature:
                     self.env_manager.update_resource_level(resource_level)
                     
                     state = self.env_manager.get_current_state()
-                    # Inference: greedy + no Q-updates (USE_RL_EXPLORATION=false); training: epsilon-greedy + learning
+                    # Greedy vs explore from USE_RL_EXPLORATION; record_learning decoupled (see RL_INFERENCE_ONLY).
                     protocol = self.rl_selector_uplink.select_protocol(
-                        state, training=USE_RL_EXPLORATION, record_learning=USE_RL_EXPLORATION
+                        state, training=USE_RL_EXPLORATION, record_learning=_RL_PROTOCOL_SELECTION_RECORD_LEARNING
                     )
                 
                 print(f"\n[Uplink RL Selection] State: {state}")
@@ -408,7 +416,7 @@ class UnifiedFLClient_Temperature:
                 with tf.device('/CPU:0'):
                     state = self.env_manager.get_current_state()
                     selected = self.rl_selector_downlink.select_protocol(
-                        state, training=USE_RL_EXPLORATION, record_learning=USE_RL_EXPLORATION
+                        state, training=USE_RL_EXPLORATION, record_learning=_RL_PROTOCOL_SELECTION_RECORD_LEARNING
                     )
                 self._last_downlink_rl_state = state
                 self._downlink_select_time = time.time()

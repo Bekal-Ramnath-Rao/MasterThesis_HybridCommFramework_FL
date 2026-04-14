@@ -78,8 +78,9 @@ from quantization_client import Quantization, QuantizationConfig
 
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 _utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
-if _utilities_path not in sys.path:
-    sys.path.insert(0, _utilities_path)
+for _p in (_utilities_path, _project_root):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 
 from cyclonedds.topic import Topic

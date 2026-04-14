@@ -490,14 +490,20 @@ class QLearningProtocolSelector:
             if use_scenario_converged:
                 proto = from_map if (from_map and from_map in self.PROTOCOLS) else None
                 if not proto:
+                    policy_idx = self.policy_lookup_state_index(scen_label)
+                    row = self.q_table[policy_idx]
+                    if not np.allclose(row, 0.0):
+                        proto = self.PROTOCOLS[int(np.argmax(row))]
+                if not proto:
                     fb = os.getenv("RL_INFERENCE_FALLBACK_PROTOCOL", "mqtt").strip().lower()
                     if fb not in self.PROTOCOLS:
                         fb = "mqtt"
                     print(
-                        f"[Q-Learning] Inference: no valid converged protocol for {scen_label!r} "
+                        f"[Q-Learning] Inference: no converged map or Q signal for {scen_label!r} "
                         f"(stored map: {self._converged_protocol_by_scenario!r}); "
                         f"using RL_INFERENCE_FALLBACK_PROTOCOL={fb!r}. "
-                        f"Train or load a Q-table with converged_protocol_by_scenario for this regime."
+                        f"Train with USE_RL_EXPLORATION=true or load a pickle with "
+                        f"converged_protocol_by_scenario / non-zero Q for this regime."
                     )
                     proto = fb
                 used_from_map = bool(from_map and from_map in self.PROTOCOLS and proto == from_map)
@@ -542,6 +548,10 @@ class QLearningProtocolSelector:
                 tie = np.array([0], dtype=np.intp)
             action_idx = int(np.random.choice(tie))
             explored = False
+            if np.allclose(qrow, 0.0):
+                cp = self.get_converged_protocol_for_scenario(scen_label)
+                if cp and cp in self.PROTOCOLS:
+                    action_idx = self.PROTOCOLS.index(cp)
         
         # region agent log
         _agent_debug_log(
@@ -890,6 +900,12 @@ class QLearningProtocolSelector:
         ``scenario`` is only used as an archive filename tag (legacy API compatibility).
         """
         archive_path = self._archive_canonical_pickle(scenario)
+        clear_cp = os.getenv("RL_CLEAR_CONVERGED_MAP_ON_FRESH", "").strip().lower() in (
+            "1", "true", "yes", "y",
+        )
+        saved_cp: Dict[str, str] = (
+            {} if clear_cp else dict(self._converged_protocol_by_scenario)
+        )
         self.q_table.fill(0.0)
 
         old_epsilon = self.epsilon
@@ -912,6 +928,13 @@ class QLearningProtocolSelector:
             i: [] for i in range(len(self.NETWORK_SCENARIO_LEVELS))
         }
         self._converged_protocol_by_scenario = {}
+        if saved_cp:
+            self._converged_protocol_by_scenario.update(saved_cp)
+            self._normalize_converged_protocol_map()
+            print(
+                f"[Q-Learning] Preserved converged_protocol_by_scenario through fresh reset "
+                f"(set RL_CLEAR_CONVERGED_MAP_ON_FRESH=1 to drop): {self._converged_protocol_by_scenario!r}"
+            )
 
         print(
             f"[Q-Learning] Fresh training: Q-table zeroed, epsilon {old_epsilon:.4f} → 1.0"
