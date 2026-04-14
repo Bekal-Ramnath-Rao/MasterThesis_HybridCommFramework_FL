@@ -999,16 +999,20 @@ class UnifiedFLClient_Emotion:
                 # Create DDS participant
                 self.dds_participant = DomainParticipant(DDS_DOMAIN_ID)
                 
-                # Best effort QoS for small / legacy DDS paths
-                best_effort_qos = Qos(
-                    Policy.Reliability.BestEffort,
-                    Policy.History.KeepLast(1),
+                # Match FL_Client_DDS.setup_dds (Reliable + same chunk QoS as FL_Server_DDS).
+                reliable_qos = Qos(
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+                    Policy.History.KeepLast(10),
+                    Policy.Durability.TransientLocal,
                 )
-
-                # Reliable QoS for chunked model transfer (long blocking for WAN / large models).
-                _blk = max(1.0, min(DDS_CHUNK_MAX_BLOCKING_SEC, 600.0))
+                reliable_qos_large = Qos(
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),
+                    Policy.History.KeepLast(10),
+                    Policy.Durability.TransientLocal,
+                    Policy.ResourceLimits(max_samples=10, max_instances=10, max_samples_per_instance=10),
+                )
                 chunk_qos = Qos(
-                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=_blk)),
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
                     Policy.History.KeepLast(2048),
                     Policy.Durability.TransientLocal,
                 )
@@ -1019,9 +1023,9 @@ class UnifiedFLClient_Emotion:
                 update_chunk_topic = Topic(self.dds_participant, "ModelUpdateChunk", ModelUpdateChunk)
                 self.dds_metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
                 
-                self.dds_update_writer = DataWriter(self.dds_participant, self.dds_update_topic, qos=best_effort_qos)
+                self.dds_update_writer = DataWriter(self.dds_participant, self.dds_update_topic, qos=reliable_qos_large)
                 self.dds_update_chunk_writer = DataWriter(self.dds_participant, update_chunk_topic, qos=chunk_qos)
-                self.dds_metrics_writer = DataWriter(self.dds_participant, self.dds_metrics_topic, qos=best_effort_qos)
+                self.dds_metrics_writer = DataWriter(self.dds_participant, self.dds_metrics_topic, qos=reliable_qos)
                 
                 self.dds_global_model_reader = None
                 self.dds_global_model_chunk_reader = None
@@ -1476,9 +1480,8 @@ class UnifiedFLClient_Emotion:
                     Policy.History.KeepLast(10),
                     Policy.Durability.TransientLocal,
                 )
-                _blk = max(1.0, min(DDS_CHUNK_MAX_BLOCKING_SEC, 600.0))
                 chunk_qos = Qos(
-                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=_blk)),
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
                     Policy.History.KeepLast(2048),
                     Policy.Durability.TransientLocal,
                 )
@@ -3089,7 +3092,7 @@ class UnifiedFLClient_Emotion:
         """Once per process: pause so the server's ModelUpdate reader can discover this writer (distributed DDS)."""
         if getattr(self, "_dds_uplink_prepped", False):
             return
-        wait_s = int(os.environ.get("DDS_MODEL_UPDATE_DISCOVERY_WAIT", "8"))
+        wait_s = int(os.environ.get("DDS_MODEL_UPDATE_DISCOVERY_WAIT", "12"))
         if wait_s > 0:
             print(
                 f"[DDS] Client {self.client_id} waiting {wait_s}s for server "

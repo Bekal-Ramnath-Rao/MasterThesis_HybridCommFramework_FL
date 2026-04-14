@@ -1503,49 +1503,49 @@ class UnifiedFederatedLearningServer:
             return
         
         try:
+            uri = os.environ.get("CYCLONEDDS_URI")
+            print(f"[DDS] CYCLONEDDS_URI={uri or '(not set)'}")
             # Create DDS participant
             self.dds_participant = DomainParticipant(DDS_DOMAIN_ID)
             
-            # Reliable QoS for critical control messages (registration, config, commands)
+            # Match FL_Server_DDS.setup_dds QoS so writers/readers interoperate with FL_Client_DDS / unified client.
             reliable_qos = Qos(
                 Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
                 Policy.History.KeepLast(10),
                 Policy.Durability.TransientLocal
             )
-            
-            # Best effort QoS for non-critical bulk paths
-            best_effort_qos = Qos(
-                Policy.Reliability.BestEffort,
-                Policy.History.KeepLast(1),
+            reliable_qos_large = Qos(
+                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),
+                Policy.History.KeepLast(10),
+                Policy.Durability.TransientLocal,
+                Policy.ResourceLimits(max_samples=10, max_instances=10, max_samples_per_instance=10),
             )
-
-            # Reliable QoS for chunked model transfer (long blocking for WAN / large models).
-            _blk = max(1.0, min(DDS_CHUNK_MAX_BLOCKING_SEC, 600.0))
             chunk_qos = Qos(
-                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=_blk)),
+                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
                 Policy.History.KeepLast(2048),
-                Policy.Durability.TransientLocal
+                Policy.Durability.TransientLocal,
             )
             
             # Create topics and readers for model updates
             update_topic = Topic(self.dds_participant, "ModelUpdate", ModelUpdate)
-            update_reader = DataReader(self.dds_participant, update_topic, qos=best_effort_qos)
+            update_reader = DataReader(self.dds_participant, update_topic, qos=reliable_qos_large)
             update_chunk_topic = Topic(self.dds_participant, "ModelUpdateChunk", ModelUpdateChunk)
             update_chunk_reader = DataReader(self.dds_participant, update_chunk_topic, qos=chunk_qos)
             self._dds_update_chunk_reader = update_chunk_reader
             
             # Create topics and readers for metrics
             metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
-            metrics_reader = DataReader(self.dds_participant, metrics_topic, qos=best_effort_qos)
+            metrics_reader = DataReader(self.dds_participant, metrics_topic, qos=reliable_qos)
             
             # Create writers for sending global model and commands to clients
             global_model_topic = Topic(self.dds_participant, "GlobalModel", GlobalModel)
-            self.dds_writers['global_model'] = DataWriter(self.dds_participant, global_model_topic, qos=best_effort_qos)
+            self.dds_writers['global_model'] = DataWriter(self.dds_participant, global_model_topic, qos=reliable_qos)
             global_model_chunk_topic = Topic(self.dds_participant, "GlobalModelChunk", GlobalModelChunk)
             self.dds_writers['global_model_chunk'] = DataWriter(self.dds_participant, global_model_chunk_topic, qos=chunk_qos)
             
             command_topic = Topic(self.dds_participant, "TrainingCommand", TrainingCommand)
             self.dds_writers['command'] = DataWriter(self.dds_participant, command_topic, qos=reliable_qos)
+            time.sleep(0.5)  # discovery ramp-up (FL_Server_DDS.setup_dds)
             
             # Create DDS listener thread that polls for messages
             def dds_listener():
@@ -1559,6 +1559,11 @@ class UnifiedFederatedLearningServer:
                                 chunk_id = sample.chunk_id
                                 total_chunks = sample.total_chunks
                                 round_num = sample.round
+                                # Same guards as FL_Server_DDS.check_model_updates
+                                if round_num != self.current_round:
+                                    continue
+                                if client_id not in self.active_clients or client_id in self.client_updates:
+                                    continue
 
                                 meta = self.model_update_metadata.get(client_id)
                                 buf = self.model_update_chunks.get(client_id)
@@ -1647,6 +1652,13 @@ class UnifiedFederatedLearningServer:
                         for sample in samples_read:
                             if sample:
                                 try:
+                                    if sample.round != self.current_round:
+                                        continue
+                                    if (
+                                        sample.client_id not in self.active_clients
+                                        or sample.client_id in self.client_updates
+                                    ):
+                                        continue
                                     # Convert List[int] back to bytes and deserialize weights
                                     weights_bytes = bytes(sample.weights)
                                     weights = pickle.loads(weights_bytes)
