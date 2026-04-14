@@ -1520,8 +1520,9 @@ class UnifiedFederatedLearningServer:
                 Policy.Durability.TransientLocal,
                 Policy.ResourceLimits(max_samples=10, max_instances=10, max_samples_per_instance=10),
             )
+            _chunk_blk = min(600.0, max(1.0, float(DDS_CHUNK_MAX_BLOCKING_SEC)))
             chunk_qos = Qos(
-                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=_chunk_blk)),
                 Policy.History.KeepLast(2048),
                 Policy.Durability.TransientLocal,
             )

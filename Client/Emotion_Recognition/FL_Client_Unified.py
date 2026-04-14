@@ -1011,8 +1011,9 @@ class UnifiedFLClient_Emotion:
                     Policy.Durability.TransientLocal,
                     Policy.ResourceLimits(max_samples=10, max_instances=10, max_samples_per_instance=10),
                 )
+                _chunk_blk = min(600.0, max(1.0, float(DDS_CHUNK_MAX_BLOCKING_SEC)))
                 chunk_qos = Qos(
-                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=_chunk_blk)),
                     Policy.History.KeepLast(2048),
                     Policy.Durability.TransientLocal,
                 )
@@ -1480,8 +1481,9 @@ class UnifiedFLClient_Emotion:
                     Policy.History.KeepLast(10),
                     Policy.Durability.TransientLocal,
                 )
+                _chunk_blk = min(600.0, max(1.0, float(DDS_CHUNK_MAX_BLOCKING_SEC)))
                 chunk_qos = Qos(
-                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=_chunk_blk)),
                     Policy.History.KeepLast(2048),
                     Policy.Durability.TransientLocal,
                 )
@@ -3103,11 +3105,19 @@ class UnifiedFLClient_Emotion:
     
     def send_model_update_chunked(self, round_num, serialized_weights, num_samples, loss, accuracy):
         """Send model update as chunks via DDS"""
+        # Must match FL_Client_DDS / non-chunk unified path: payload is sequence<int> (list of octets).
+        # Passing Python bytes here can break CDR encoding or matching; standalone client uses list(pickle.dumps(...)).
+        if isinstance(serialized_weights, (bytes, bytearray, memoryview)):
+            serialized_weights = list(bytes(serialized_weights))
         chunks = self.split_into_chunks(serialized_weights)
         total_chunks = len(chunks)
-        
-        print(f"Client {self.client_id}: Sending model update in {total_chunks} chunks ({len(serialized_weights)} bytes total)")
-        
+        byte_len = len(serialized_weights)
+
+        print(f"Client {self.client_id}: Sending model update in {total_chunks} chunks ({byte_len} bytes total)")
+
+        _ack_to = duration(seconds=min(600.0, max(5.0, float(DDS_CHUNK_MAX_BLOCKING_SEC))))
+        _ack_timeout_logged = False
+
         for chunk_id, chunk_data in enumerate(chunks):
             chunk = ModelUpdateChunk(
                 client_id=self.client_id,
@@ -3120,10 +3130,15 @@ class UnifiedFLClient_Emotion:
                 accuracy=accuracy
             )
             self.dds_update_chunk_writer.write(chunk)
-            # Reliable QoS handles delivery, no need for artificial delay
+            if not self.dds_update_chunk_writer.wait_for_acks(_ack_to) and not _ack_timeout_logged:
+                _ack_timeout_logged = True
+                print(
+                    f"[DDS] Client {self.client_id} wait_for_acks timed out (first at chunk "
+                    f"{chunk_id + 1}/{total_chunks}; check server DDS / matching / firewall)"
+                )
             if (chunk_id + 1) % 20 == 0:  # Progress update every 20 chunks
                 print(f"  Sent {chunk_id + 1}/{total_chunks} chunks")
-        
+
         return total_chunks
     
     def deserialize_weights(self, encoded_weights):
@@ -3797,6 +3812,25 @@ class UnifiedFLClient_Emotion:
             raise NotImplementedError("DDS chunk writer not available")
 
         self._ensure_dds_uplink_discovery_wait()
+
+        w = self.dds_update_chunk_writer
+        if w is not None:
+            _match_wait = float(os.environ.get("DDS_PUBLICATION_MATCH_WAIT_S", "45"))
+            match_deadline = time.time() + _match_wait
+            matched = False
+            while time.time() < match_deadline:
+                try:
+                    if w.get_publication_matched_status().current_count > 0:
+                        matched = True
+                        break
+                except Exception:
+                    break
+                time.sleep(0.1)
+            if not matched:
+                print(
+                    f"[DDS] Client {self.client_id} warning: ModelUpdateChunk writer has no matched readers "
+                    f"after {_match_wait:.0f}s (server may not see this uplink; check DDS_PEER_*, firewall, host network)"
+                )
 
         weights_bytes = self._dds_serialized_weights_bytes(message)
 
