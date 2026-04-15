@@ -734,6 +734,7 @@ class UnifiedFLClient_Emotion:
                 save_path=save_path_uplink,
                 initial_load_path=initial_load_path_uplink,
                 use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
+                link_role="uplink",
             )
 
             # --- Downlink agent paths (server -> client model downloads) ---
@@ -773,6 +774,7 @@ class UnifiedFLClient_Emotion:
                 save_path=save_path_downlink,
                 initial_load_path=initial_load_path_downlink,
                 use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
+                link_role="downlink",
             )
 
             # Backward-compat alias: self.rl_selector always points to the uplink agent

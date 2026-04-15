@@ -15,6 +15,16 @@ when ``RL_Q_USE_DETECTED_NETWORK=1`` (default); otherwise the configured label (
 Greedy selection prefers ``converged_protocol_by_scenario`` (streak-filled on every round, not only after Q-updates)
 over raw Q-argmax when ``RL_GREEDY_USE_SCENARIO_CONVERGED`` is true (default). Optional overrides:
 ``RL_FORCE_CONVERGED_PROTOCOL_EXCELLENT``, ``_MODERATE``, ``_POOR`` (e.g. amqp, dds).
+
+Inference / greedy selection (when not in full RL training: not both ``training`` and ``record_learning`` true) can use an explicit
+if/elif/else on coarse scenario via :meth:`QLearningProtocolSelector.protocol_for_uplink_network_scenario` and
+:meth:`QLearningProtocolSelector.protocol_for_downlink_network_scenario` (no Q-table / epsilon-greedy in that path).
+Pass ``link_role="uplink"`` or ``"downlink"`` on each :class:`QLearningProtocolSelector`. Override defaults per regime with
+``RL_SCENARIO_PROTOCOL_UPLINK_EXCELLENT`` / ``_MODERATE`` / ``_POOR`` and ``RL_SCENARIO_PROTOCOL_DOWNLINK_*``.
+Enable with ``RL_INFERENCE_USE_SCENARIO_IFELSE`` (default: true). Per-regime env ``RL_INFERENCE_PROTOCOL_*`` and
+``RL_INFERENCE_FALLBACK_PROTOCOL`` apply only when the scenario function yields no valid protocol. Set
+``RL_INFERENCE_USE_SCENARIO_IFELSE=false`` for the legacy single-path converged-map inference block.
+To force the same rule-based map during training (skip ε-greedy), set ``RL_SELECT_PROTOCOL_BY_SCENARIO_ONLY=true``.
 """
 
 import numpy as np
@@ -155,6 +165,44 @@ class QLearningProtocolSelector:
     BATTERY_LEVELS = ["high", "low"]  # high SoC vs low SoC
 
     @staticmethod
+    def protocol_for_uplink_network_scenario(scenario_label: Optional[str]) -> str:
+        """
+        Rule-based client→server protocol for coarse ``excellent`` / ``moderate`` / ``poor``.
+        Defaults follow merged emotion uplink training; override with ``RL_SCENARIO_PROTOCOL_UPLINK_*``.
+        """
+        key = normalize_coarse_network_scenario(str(scenario_label or ""))
+        if key not in QLearningProtocolSelector.NETWORK_SCENARIO_LEVELS:
+            key = "moderate"
+        env_suffix = key.upper().replace(" ", "_")
+        env_p = os.getenv(f"RL_SCENARIO_PROTOCOL_UPLINK_{env_suffix}", "").strip().lower()
+        if env_p in QLearningProtocolSelector.PROTOCOLS:
+            return env_p
+        if key == "excellent":
+            return "amqp"
+        if key == "moderate":
+            return "mqtt"
+        return "mqtt"
+
+    @staticmethod
+    def protocol_for_downlink_network_scenario(scenario_label: Optional[str]) -> str:
+        """
+        Rule-based server→client protocol for coarse ``excellent`` / ``moderate`` / ``poor``.
+        Defaults follow merged emotion downlink training; override with ``RL_SCENARIO_PROTOCOL_DOWNLINK_*``.
+        """
+        key = normalize_coarse_network_scenario(str(scenario_label or ""))
+        if key not in QLearningProtocolSelector.NETWORK_SCENARIO_LEVELS:
+            key = "moderate"
+        env_suffix = key.upper().replace(" ", "_")
+        env_p = os.getenv(f"RL_SCENARIO_PROTOCOL_DOWNLINK_{env_suffix}", "").strip().lower()
+        if env_p in QLearningProtocolSelector.PROTOCOLS:
+            return env_p
+        if key == "excellent":
+            return "http3"
+        if key == "moderate":
+            return "grpc"
+        return "grpc"
+
+    @staticmethod
     def canonical_policy_lookup_levels() -> Tuple[str, str, str]:
         """
         Discrete tuple for the reference Q-row (inference / reporting / backfill).
@@ -222,6 +270,7 @@ class QLearningProtocolSelector:
         save_path: str = "q_table.pkl",
         initial_load_path: Optional[str] = None,
         use_communication_model_reward: bool = True,
+        link_role: Optional[str] = None,
     ):
         """
         Initialize Q-Learning Protocol Selector
@@ -237,6 +286,8 @@ class QLearningProtocolSelector:
                               If set and file exists, this is tried before save_path.
             use_communication_model_reward: When True, apply the communication-model
                                             T_calc penalty to the RL reward.
+            link_role: ``"uplink"`` or ``"downlink"`` for scenario-based protocol functions;
+                       when omitted, uplink rules are used (backward compatible).
         """
         self.learning_rate = learning_rate
         self.discount_factor = discount_factor
@@ -246,7 +297,9 @@ class QLearningProtocolSelector:
         self.save_path = save_path
         self.initial_load_path = initial_load_path
         self.use_communication_model_reward = use_communication_model_reward
-        
+        lr = (link_role or "").strip().lower()
+        self.link_role: Optional[str] = lr if lr in ("uplink", "downlink") else None
+
         # Data-driven comm-time bucket boundaries (seconds); tune after Phase-1 collection
         self.comm_t_low = 30.0
         self.comm_t_high = 90.0
@@ -482,6 +535,58 @@ class QLearningProtocolSelector:
             return "moderate"
         return scen
 
+    def _protocol_from_converged_or_q_row(self, scenario_key: str) -> Optional[str]:
+        """
+        Best protocol for one coarse scenario slice: streak converged map (and
+        ``RL_FORCE_CONVERGED_PROTOCOL_*``), else argmax of the Q-row at the canonical policy index.
+        """
+        sk = normalize_coarse_network_scenario(str(scenario_key or ""))
+        p = self.get_converged_protocol_for_scenario(sk)
+        if p and p in self.PROTOCOLS:
+            return p
+        idx = self.policy_lookup_state_index(sk)
+        row = self.q_table[idx]
+        if not np.allclose(row, 0.0):
+            return self.PROTOCOLS[int(np.argmax(row))]
+        return None
+
+    def _inference_protocol_ifelse_for_scenario(self, scen_label: str) -> str:
+        """
+        Inference / rule slice: explicit if/elif/else on coarse regime using
+        :meth:`protocol_for_uplink_network_scenario` or :meth:`protocol_for_downlink_network_scenario`
+        (no Q-table or ε-greedy). ``link_role`` selects which function applies.
+
+        If the chosen protocol is invalid, optional per-regime env
+        ``RL_INFERENCE_PROTOCOL_EXCELLENT``, ``RL_INFERENCE_PROTOCOL_MODERATE``,
+        ``RL_INFERENCE_PROTOCOL_POOR``, then ``RL_INFERENCE_FALLBACK_PROTOCOL`` / mqtt.
+        """
+        key = normalize_coarse_network_scenario(str(scen_label or ""))
+        if key not in self.NETWORK_SCENARIO_LEVELS:
+            key = "moderate"
+
+        role = (self.link_role or "uplink").strip().lower()
+        if role == "downlink":
+            p = self.protocol_for_downlink_network_scenario(key)
+        else:
+            p = self.protocol_for_uplink_network_scenario(key)
+
+        if p and p in self.PROTOCOLS:
+            return p
+
+        env_suffix = key.upper().replace(" ", "_")
+        env_fb = os.getenv(f"RL_INFERENCE_PROTOCOL_{env_suffix}", "").strip().lower()
+        if env_fb in self.PROTOCOLS:
+            return env_fb
+
+        fb = os.getenv("RL_INFERENCE_FALLBACK_PROTOCOL", "mqtt").strip().lower()
+        if fb not in self.PROTOCOLS:
+            fb = "mqtt"
+        print(
+            f"[Q-Learning] Inference if/else: no converged/Q data for scenario {key!r}; "
+            f"using RL_INFERENCE_FALLBACK_PROTOCOL={fb!r}."
+        )
+        return fb
+
     def select_protocol(self, state: Dict, training: bool = True, record_learning: bool = True) -> str:
         """
         Select a protocol using epsilon-greedy strategy
@@ -494,7 +599,82 @@ class QLearningProtocolSelector:
         Returns:
             Selected protocol name
         """
-        # Inference: converged protocol per coarse scenario only (no live comm / resource / battery).
+        use_scenario_ifelse = os.getenv(
+            "RL_INFERENCE_USE_SCENARIO_IFELSE", "true"
+        ).strip().lower() in ("1", "true", "yes", "y")
+        in_rl_training = bool(training and record_learning)
+        scenario_protocol_only = os.getenv(
+            "RL_SELECT_PROTOCOL_BY_SCENARIO_ONLY", ""
+        ).strip().lower() in ("1", "true", "yes", "y")
+
+        if scenario_protocol_only:
+            scen_label = self.inference_coarse_scenario_label(state)
+            proto = self._inference_protocol_ifelse_for_scenario(scen_label)
+            action_idx = self.PROTOCOLS.index(proto)
+            _agent_debug_log(
+                "rl_q_learning_selector.py:select_protocol",
+                "protocol_choice",
+                {
+                    "mode": "scenario_rules_only",
+                    "training": bool(training),
+                    "link_role": self.link_role,
+                    "epsilon": float(self.epsilon),
+                    "explored": False,
+                    "network_scenario": scen_label,
+                    "action_idx": int(action_idx),
+                    "protocol": proto,
+                },
+                hypothesis_id="H4",
+            )
+            if record_learning:
+                state_idx = self.get_state_index(state)
+                self.protocol_usage[proto] += 1
+                self.state_history.append(state_idx)
+                self.action_history.append(action_idx)
+                s_idx = int(state_idx[0])
+                ah = self._action_history_by_scenario.setdefault(s_idx, [])
+                ah.append(int(action_idx))
+                if len(ah) > 50:
+                    del ah[:-50]
+                self.refresh_converged_protocols_from_action_history()
+            return proto
+
+        # Inference / greedy (no exploration): explicit if/elif/else on coarse network scenario
+        # (excellent/good, moderate, poor — see ``normalize_coarse_network_scenario``).
+        if use_scenario_ifelse and not in_rl_training:
+            scen_label = self.inference_coarse_scenario_label(state)
+            proto = self._inference_protocol_ifelse_for_scenario(scen_label)
+            action_idx = self.PROTOCOLS.index(proto)
+            _agent_debug_log(
+                "rl_q_learning_selector.py:select_protocol",
+                "protocol_choice",
+                {
+                    "mode": "inference",
+                    "training": bool(training),
+                    "inference_scenario_ifelse": True,
+                    "link_role": self.link_role,
+                    "epsilon": float(self.epsilon),
+                    "explored": False,
+                    "network_scenario": scen_label,
+                    "action_idx": int(action_idx),
+                    "protocol": proto,
+                },
+                hypothesis_id="H4",
+            )
+            if record_learning:
+                state_idx = self.get_state_index(state)
+                self.protocol_usage[proto] += 1
+                self.state_history.append(state_idx)
+                self.action_history.append(action_idx)
+                s_idx = int(state_idx[0])
+                ah = self._action_history_by_scenario.setdefault(s_idx, [])
+                ah.append(int(action_idx))
+                if len(ah) > 50:
+                    del ah[:-50]
+                self.refresh_converged_protocols_from_action_history()
+            return proto
+
+        # Legacy inference path (RL_INFERENCE_USE_SCENARIO_IFELSE=false): converged map / Q slice.
         if not record_learning:
             scen_label = self.inference_coarse_scenario_label(state)
             use_scenario_converged = os.getenv(

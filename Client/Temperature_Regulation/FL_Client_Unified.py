@@ -160,6 +160,7 @@ class UnifiedFLClient_Temperature:
                 save_path=save_path_uplink,
                 initial_load_path=initial_load_path_uplink,
                 use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
+                link_role="uplink",
             )
             # --- Downlink agent ---
             if os.path.exists("/shared_data"):
@@ -183,6 +184,7 @@ class UnifiedFLClient_Temperature:
                 save_path=save_path_downlink,
                 initial_load_path=initial_load_path_downlink,
                 use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
+                link_role="downlink",
             )
             # Backward-compat alias
             self.rl_selector = self.rl_selector_uplink
@@ -692,8 +694,8 @@ class UnifiedFLClient_Temperature:
                     "client_id": self.client_id,
                     "round": int(getattr(self, "current_round", 0)),
                     "loss": float(train_metrics.get("val_loss", 0.0)),
+                    "accuracy": float(train_metrics.get("val_accuracy", 0.0)),
                     "val_mae": float(train_metrics.get("val_mae", 0.0)),
-                    "accuracy_proxy": float(train_metrics.get("val_accuracy", 0.0)),
                     "training_time_sec": float(train_metrics.get("training_time", 0.0)),
                     "total_fl_wall_time_sec": float(round_time),
                     "uplink_model_comm_sec": float(self.round_metrics.get("communication_time", 0.0)),

@@ -173,6 +173,7 @@ class UnifiedFLClient_MentalState:
                 save_path=save_path_uplink,
                 initial_load_path=initial_load_path_uplink,
                 use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
+                link_role="uplink",
             )
             # --- Downlink agent ---
             if os.path.exists("/shared_data"):
@@ -196,6 +197,7 @@ class UnifiedFLClient_MentalState:
                 save_path=save_path_downlink,
                 initial_load_path=initial_load_path_downlink,
                 use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
+                link_role="downlink",
             )
             # Backward-compat alias
             self.rl_selector = self.rl_selector_uplink
