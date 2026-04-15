@@ -393,13 +393,14 @@ class DistributedClientGUI(QMainWindow):
         layout.addWidget(self.communication_model_reward_enabled, 5, 0, 1, 4)
 
         self.mount_shared_data = QCheckBox(
-            "Mount project shared_data for RL Q-tables (same as experiment Docker compose)"
+            "Mount project shared_data (metrics JSONL, packet/Q DBs, RL Q-tables)"
         )
         self.mount_shared_data.setChecked(True)
         self.mount_shared_data.setStyleSheet("padding: 5px; font-size: 12px;")
         self.mount_shared_data.setToolTip(
-            "Binds <project>/shared_data → /shared_data so uplink/downlink Q-table .pkl files load and save "
-            "like local clients. On another PC: sync or copy this folder from the experiment machine to share tables."
+            "Binds <project>/shared_data → /shared_data. Persists per-round client metrics (loss, accuracy, "
+            "training/uplink times, battery), packet_logs / q_learning DBs, and RL Q-table .pkl files — same as "
+            "experiment Docker compose. Recommended ON for distributed clients so JSONL is not lost in the container."
         )
         layout.addWidget(self.mount_shared_data, 6, 0, 1, 4)
 
@@ -825,12 +826,12 @@ class DistributedClientGUI(QMainWindow):
         self.update_rl_shared_data_visibility()
 
     def update_rl_shared_data_visibility(self):
-        """Show shared_data mount + epsilon reset only for RL-unified (matches experiment GUI scope)."""
+        """Always show shared_data mount (metrics + DBs + RL tables). Epsilon reset only for RL-unified training."""
         if not hasattr(self, "mount_shared_data"):
             return
         is_rl_unified = self.protocol_mode.currentData() == "rl_unified"
         training_selected = is_rl_unified and self.rl_mode_training.isChecked()
-        self.mount_shared_data.setVisible(is_rl_unified)
+        self.mount_shared_data.setVisible(True)
         self.reset_epsilon_on_start.setVisible(training_selected)
 
     def _sync_reset_epsilon_flag_for_distributed(self, shared_data_path):
@@ -1622,16 +1623,14 @@ class DistributedClientGUI(QMainWindow):
         if network_scenario == "dynamic":
             net_line += f" (re-randomize every {self.dynamic_interval_sec.value()}s)"
         net_line += "\n"
-        rl_shared_lines = ""
-        if is_unified:
-            rl_shared_lines = (
-                f"RL shared_data mount: {'Yes' if self.mount_shared_data.isChecked() else 'No'} "
-                f"(Q-tables like experiment Docker)\n"
+        shared_data_lines = (
+            f"shared_data mount: {'Yes' if self.mount_shared_data.isChecked() else 'No'} "
+            f"(client metrics JSONL, DBs, RL Q-tables when unified)\n"
+        )
+        if is_unified and self.is_rl_training_mode():
+            shared_data_lines += (
+                f"Reset epsilon: {'Yes' if self.reset_epsilon_on_start.isChecked() else 'No (resume)'}\n"
             )
-            if self.is_rl_training_mode():
-                rl_shared_lines += (
-                    f"Reset epsilon: {'Yes' if self.reset_epsilon_on_start.isChecked() else 'No (resume)'}\n"
-                )
         confirm_msg = (
             f"Ready to start client with:\n\n"
             f"Client ID: {client_id}\n"
@@ -1648,7 +1647,7 @@ class DistributedClientGUI(QMainWindow):
             f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
             f"Q-Learning Convergence: {'Enabled' if self.is_rl_training_mode() else 'Disabled'}\n"
             f"Communication Model Reward: {'Enabled' if is_unified and self.communication_model_reward_enabled.isChecked() else 'Disabled'}\n"
-            f"{rl_shared_lines}"
+            f"{shared_data_lines}"
             f"Quantization: {'Enabled' if self.quantization_enabled.isChecked() else 'Disabled'}\n"
             f"Compression: {'Enabled' if self.compression_enabled.isChecked() else 'Disabled'}\n"
             f"Pruning: {'Enabled' if self.pruning_enabled.isChecked() else 'Disabled'}\n\n"
@@ -1720,13 +1719,14 @@ class DistributedClientGUI(QMainWindow):
         shared_data_path = os.path.abspath(
             os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "shared_data")
         )
-        if is_unified and self.mount_shared_data.isChecked():
+        if self.mount_shared_data.isChecked():
             try:
                 os.makedirs(shared_data_path, exist_ok=True)
             except OSError as e:
                 QMessageBox.critical(self, "shared_data", f"Cannot create shared_data directory:\n{e}")
                 return
-            self._sync_reset_epsilon_flag_for_distributed(shared_data_path)
+            if is_unified:
+                self._sync_reset_epsilon_flag_for_distributed(shared_data_path)
         
         # Base command
         cmd = [
@@ -1738,8 +1738,15 @@ class DistributedClientGUI(QMainWindow):
             "-e", f"NUM_CLIENTS={total_clients}",
             "-e", f"MIN_CLIENTS={total_clients}",
         ]
-        if is_unified and self.mount_shared_data.isChecked():
-            cmd.extend(["-v", f"{shared_data_path}:/shared_data"])
+        if self.mount_shared_data.isChecked():
+            cmd.extend(
+                [
+                    "-v",
+                    f"{shared_data_path}:/shared_data",
+                    "-e",
+                    "CLIENT_METRICS_LOG_DIR=/shared_data",
+                ]
+            )
         ds_val = self.data_shard_combo.currentData()
         if ds_val is not None and str(use_case).lower() in ("emotion", "mentalstate"):
             cmd.extend(["-e", f"DATASET_CLIENT_ID={int(ds_val)}"])

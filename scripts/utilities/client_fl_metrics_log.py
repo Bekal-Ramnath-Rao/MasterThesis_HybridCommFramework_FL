@@ -13,7 +13,7 @@ Every record is normalized to include:
 
 Environment:
   CLIENT_METRICS_LOG — set to 0/false/no to disable
-  CLIENT_METRICS_LOG_DIR — output directory
+  CLIENT_METRICS_LOG_DIR — output directory (distributed_client_gui.py sets this to /shared_data when shared_data is mounted)
   CLIENT_USE_CASE — overrides default use_case (e.g. emotion, temperature, mental_state)
 """
 
