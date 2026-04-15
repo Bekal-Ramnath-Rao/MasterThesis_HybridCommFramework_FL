@@ -259,6 +259,8 @@ class FederatedLearningClient:
         self._global_model_chunk_buffers = {}
         self._fl_client_start_time = time.time()
         self._client_fl_round_history = []
+        # Serialize server→client control messages (avoids races between global_model and start_evaluation).
+        self._inbound_msg_lock = asyncio.Lock()
         
         print(f"Client {self.client_id} initialized with:")
         print(f"  Training samples: {self.train_generator.n}")
@@ -433,25 +435,26 @@ class FederatedLearningClient:
     
     async def handle_message(self, message):
         """Handle incoming messages from server"""
-        try:
-            msg_type = message.get('type')
-            #print(f"[DEBUG] Client {self.client_id} received message type: {msg_type}")
-            
-            if msg_type == 'training_config':
-                await self.handle_training_config(message)
-            elif msg_type == 'global_model':
-                await self.handle_global_model(message)
-            elif msg_type == 'start_training':
-                #print(f"[DEBUG] Client {self.client_id} handling start_training for round {message.get('round')}")
-                await self.handle_start_training(message)
-            elif msg_type == 'start_evaluation':
-                await self.handle_start_evaluation(message)
-            elif msg_type == 'training_complete':
-                await self.handle_training_complete()
-        except Exception as e:
-            print(f"Client {self.client_id} error handling message: {e}")
-            import traceback
-            traceback.print_exc()
+        async with self._inbound_msg_lock:
+            try:
+                msg_type = message.get('type')
+                #print(f"[DEBUG] Client {self.client_id} received message type: {msg_type}")
+                
+                if msg_type == 'training_config':
+                    await self.handle_training_config(message)
+                elif msg_type == 'global_model':
+                    await self.handle_global_model(message)
+                elif msg_type == 'start_training':
+                    #print(f"[DEBUG] Client {self.client_id} handling start_training for round {message.get('round')}")
+                    await self.handle_start_training(message)
+                elif msg_type == 'start_evaluation':
+                    await self.handle_start_evaluation(message)
+                elif msg_type == 'training_complete':
+                    await self.handle_training_complete()
+            except Exception as e:
+                print(f"Client {self.client_id} error handling message: {e}")
+                import traceback
+                traceback.print_exc()
     
     async def handle_training_config(self, message):
         """Update training configuration"""
@@ -905,8 +908,8 @@ async def main():
     # Create client
     client = FederatedLearningClient(CLIENT_ID, NUM_CLIENTS, train_generator, validation_generator)
     
-    # QUIC config: cubic congestion; idle timeout: 0/none = no limit (diagnostic), else env or 60s
-    _idle = os.getenv("IDLE_TIMEOUT", "0" if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else "60").strip().lower()
+    # QUIC idle timeout: local training + straggler waits can exceed 60s; align with other HTTP/3 FL clients (hours-scale default).
+    _idle = os.getenv("IDLE_TIMEOUT", "0" if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else "3600").strip().lower()
     idle_sec = float(_idle) if _idle not in ("0", "none", "inf", "infinity") else 86400.0 * 7  # 7 days = effectively no limit
     # Realistic max payload: HTTP/3 16 KB per stream
     HTTP3_MAX_STREAM_DATA = 16 * 1024  # 16 KB

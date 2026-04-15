@@ -340,6 +340,23 @@ class ExperimentRunner:
             cwd = str(Path(__file__).parent.parent)
         return subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', check=check, env=env, cwd=cwd)
 
+    def _experiment_use_case_results_name(self) -> str:
+        """Folder name under experiment_results mount: emotion | mental_state | temperature."""
+        u = (self.use_case or "emotion").lower()
+        if u == "mentalstate":
+            return "mental_state"
+        return u
+
+    def _rl_unified_training_results_paths_in_container(self, scenario: Optional[str]) -> List[str]:
+        """In-container paths for unified server snapshot JSON (stable filename for the experiment runner)."""
+        uc = self._experiment_use_case_results_name()
+        scen = (scenario or "default").strip() or "default"
+        paths: List[str] = []
+        for base in ("/app/results", "/app/experiment_results"):
+            paths.append(f"{base}/{uc}/unified/{scen}/rl_unified_training_results.json")
+            paths.append(f"{base}/{uc}/unified/default/rl_unified_training_results.json")
+        return paths
+
     def _running_docker_container_names(self) -> set:
         """Names of currently running containers (``docker ps``)."""
         result = self.run_command(["docker", "ps", "--format", "{{.Names}}"], check=False)
@@ -1111,19 +1128,31 @@ class ExperimentRunner:
             # by examining the results file content (not just existence)
             results_dir = f"/app/Server/{self.use_case_dir}/results"
             expected_json = f"{protocol}_training_results.json"
-            
-            # Read the results file content to check if expected rounds are complete
-            read_results = self.run_command([
-                "docker", "exec", server_container, "cat",
-                f"{results_dir}/{expected_json}"
-            ], check=False)
-            
+            cat_paths = [f"{results_dir}/{expected_json}"]
+            if protocol == "rl_unified":
+                cat_paths = self._rl_unified_training_results_paths_in_container(scenario) + cat_paths
+
+            read_results = None
+            for cat_path in cat_paths:
+                read_results = self.run_command(
+                    ["docker", "exec", server_container, "cat", cat_path],
+                    check=False,
+                )
+                if read_results.returncode == 0 and (read_results.stdout or "").strip():
+                    break
+            else:
+                read_results = type("R", (), {"returncode": 1, "stdout": ""})()
+
             if read_results.returncode == 0 and read_results.stdout:
                 try:
                     results_data = json.loads(read_results.stdout)
                     # Check if we have results for all expected rounds
                     if isinstance(results_data, dict):
-                        rounds_completed = results_data.get("rounds_completed", 0)
+                        rounds_completed = int(results_data.get("rounds_completed", 0) or 0)
+                        if not rounds_completed:
+                            rlist = results_data.get("rounds") or []
+                            if isinstance(rlist, list):
+                                rounds_completed = len(rlist)
                         if rounds_completed >= self.num_rounds:
                             print(f"Training completed successfully ({rounds_completed}/{self.num_rounds} rounds)!")
                             time.sleep(3)
@@ -1218,7 +1247,18 @@ class ExperimentRunner:
                 ], check=False)
             except:
                 pass
-        
+
+        if protocol == "rl_unified":
+            dst = os.path.join(exp_dir, "rl_unified_training_results.json")
+            for cp in self._rl_unified_training_results_paths_in_container(scenario):
+                r = self.run_command(
+                    ["docker", "cp", f"{server_container}:{cp}", dst],
+                    check=False,
+                )
+                if r.returncode == 0 and os.path.isfile(dst) and os.path.getsize(dst) > 0:
+                    print(f"  Copied RL-unified training results from container:{cp}")
+                    break
+
         # Save experiment metadata
         metadata = {
             "protocol": protocol,
@@ -1280,6 +1320,7 @@ class ExperimentRunner:
                 server_container=server_container,
                 protocol=protocol,
                 exp_dir=exp_dir,
+                scenario=scenario,
             )
         except Exception as e:
             print(f"  [WARNING] Could not finalize experiment artifacts: {e}")
@@ -1357,6 +1398,20 @@ class ExperimentRunner:
             re.IGNORECASE,
         )
         for round_str, loss_str, acc_str in grpc_summary_pattern.findall(content):
+            round_num = int(round_str)
+            metrics_by_round[round_num] = (float(loss_str), float(acc_str))
+
+        # Pattern 4 (unified / RL-unified emotion server):
+        # Round X Results:
+        #   Avg Loss: ...
+        #   Avg Accuracy: ...
+        unified_round_pattern = re.compile(
+            r"Round\s+(\d+)\s+Results:\s*"
+            r"(?:\n|\r\n)+\s*Avg\s+Loss:\s*([\d.]+)\s*"
+            r"(?:\n|\r\n)+\s*Avg\s+Accuracy:\s*([\d.]+)",
+            re.IGNORECASE,
+        )
+        for round_str, loss_str, acc_str in unified_round_pattern.findall(content):
             round_num = int(round_str)
             metrics_by_round[round_num] = (float(loss_str), float(acc_str))
 
@@ -1525,7 +1580,10 @@ class ExperimentRunner:
 
         per_client_series = []
         for name in os.listdir(exp_dir):
-            if not name.endswith("_logs.txt") or "client" not in name.lower():
+            lower = name.lower()
+            is_named_client_logs = name.endswith("_logs.txt") and "client" in lower
+            is_native_style = lower.startswith("client_") and lower.endswith(".log")
+            if not (is_named_client_logs or is_native_style):
                 continue
 
             path = os.path.join(exp_dir, name)
@@ -1586,16 +1644,22 @@ class ExperimentRunner:
                 avg_series.append(sum(vals) / len(vals))
         return avg_series
 
-    def _copy_server_plots_to_experiment_folder(self, server_container: str, protocol: str, exp_dir: str):
+    def _copy_server_plots_to_experiment_folder(
+        self, server_container: str, protocol: str, exp_dir: str, scenario: Optional[str] = None
+    ):
         """Copy server-side generated plots into this experiment folder when available."""
         protocol_alias = "unified" if protocol == "rl_unified" else protocol
-        use_case_aliases = [self.use_case.lower()]
-        if self.use_case.lower() == "mentalstate":
-            use_case_aliases.append("mental_state")
+        uc_fs = self._experiment_use_case_results_name()
+        use_case_aliases = list({self.use_case.lower(), uc_fs})
+        scen = (scenario or os.getenv("NETWORK_SCENARIO") or "default").strip() or "default"
 
         candidate_dirs = []
         for uc in use_case_aliases:
             candidate_dirs.extend([
+                f"/app/results/{uc}/{protocol_alias}/{scen}",
+                f"/app/results/{uc}/{protocol_alias}/default",
+                f"/app/results/{uc}/{protocol_alias}",
+                f"/app/experiment_results/{uc}/{protocol_alias}/{scen}",
                 f"/app/experiment_results/{uc}/{protocol_alias}/default",
                 f"/app/experiment_results/{uc}/{protocol_alias}",
             ])
@@ -1638,7 +1702,9 @@ class ExperimentRunner:
         loss = training.get("loss", []) or []
         accuracy = training.get("accuracy", []) or []
         total_rounds = int(training.get("total_rounds", len(rounds) if rounds else 0) or 0)
-        convergence_time_sec = float(training.get("convergence_time_seconds", 0.0) or 0.0)
+        convergence_time_sec = float(
+            training.get("convergence_time_seconds", training.get("convergence_time", 0.0)) or 0.0
+        )
 
         if rounds and loss and accuracy and len(rounds) == len(loss) == len(accuracy):
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
@@ -1726,10 +1792,61 @@ class ExperimentRunner:
                 except Exception:
                     return
 
-    def _finalize_experiment_artifacts(self, server_container: str, protocol: str, exp_dir: str):
+    @classmethod
+    def for_artifact_finalization(cls, use_case: str) -> "ExperimentRunner":
+        """Build a minimal runner instance for post-run JSON/plot finalization (e.g. native GUI, no Docker)."""
+        obj = cls.__new__(cls)
+        obj.use_case = use_case
+        obj.use_case_dir_map = {
+            "emotion": "Emotion_Recognition",
+            "mentalstate": "MentalState_Recognition",
+            "temperature": "Temperature_Regulation",
+        }
+        obj.use_case_dir = obj.use_case_dir_map.get(
+            use_case, f"{(use_case or 'emotion').title()}_Recognition"
+        )
+        return obj
+
+    def _ensure_training_includes_battery_series(self, exp_dir: str, training: Optional[Dict]) -> Optional[Dict]:
+        """If training dict has rounds but no battery series, estimate from client logs and attach."""
+        if not training or not isinstance(training, dict):
+            return training
+        rounds = training.get("rounds", []) or []
+        if not rounds:
+            return training
+        has_battery = False
+        for key in ("battery_consumption", "battery_soc", "avg_battery_soc"):
+            series = training.get(key)
+            if isinstance(series, (list, tuple)) and len(series) > 0:
+                has_battery = True
+                break
+        if has_battery:
+            return training
+        est = self._estimate_battery_series_from_logs(exp_dir)
+        if not est:
+            return training
+        n = len(rounds)
+        if len(est) > n:
+            est = est[:n]
+        elif len(est) < n and est:
+            est = list(est) + [est[-1]] * (n - len(est))
+        out = dict(training)
+        out["battery_consumption"] = est
+        out["battery_consumption_source"] = "estimated_from_client_logs"
+        return out
+
+    def _finalize_experiment_artifacts(
+        self,
+        server_container: Optional[str],
+        protocol: str,
+        exp_dir: str,
+        scenario: Optional[str] = None,
+    ):
         """Copy/generate all expected artifacts for an experiment folder."""
-        self._copy_server_plots_to_experiment_folder(server_container, protocol, exp_dir)
+        if server_container:
+            self._copy_server_plots_to_experiment_folder(server_container, protocol, exp_dir, scenario=scenario)
         training = self._resolve_training_results(exp_dir, protocol)
+        training = self._ensure_training_includes_battery_series(exp_dir, training)
         self._persist_training_results(exp_dir, protocol, training)
         self._generate_standard_plots(protocol, exp_dir, training)
         self._ensure_battery_plot_alias(exp_dir)

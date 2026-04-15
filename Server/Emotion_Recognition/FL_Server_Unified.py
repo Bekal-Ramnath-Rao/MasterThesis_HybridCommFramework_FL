@@ -2535,14 +2535,31 @@ class UnifiedFederatedLearningServer:
                 for protocol in set((self.client_delivery_protocols or self.registered_clients).values())
             }
         }
-        
+        n_done = len(self.ROUNDS)
+        results['rounds_completed'] = n_done
+        results['total_rounds'] = n_done
+        results['final_loss'] = self.LOSS[-1] if self.LOSS else None
+        results['final_accuracy'] = self.ACCURACY[-1] if self.ACCURACY else None
+        ct = self.convergence_time
+        if ct is not None:
+            results['convergence_time_seconds'] = float(ct)
+            results['convergence_time_minutes'] = float(ct) / 60.0
+        else:
+            results['convergence_time_seconds'] = None
+            results['convergence_time_minutes'] = None
+
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         results_file = results_dir / f"unified_results_{timestamp}.json"
-        
+
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
-        
+
+        stable_runner = results_dir / 'rl_unified_training_results.json'
+        with open(stable_runner, 'w') as f:
+            json.dump(results, f, indent=2)
+
         print(f"\n✅ Results saved to {results_file}")
+        print(f"✅ Experiment runner snapshot: {stable_runner}")
         self.plot_results()
 
     def plot_results(self):

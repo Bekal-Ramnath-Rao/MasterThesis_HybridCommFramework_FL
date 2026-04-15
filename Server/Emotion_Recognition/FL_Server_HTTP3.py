@@ -472,6 +472,12 @@ class FederatedLearningServer:
         """Handle client registration"""
         client_id = message['client_id']
         print(f"[HTTP/3] Processing registration for client {client_id}")
+        prev = self.registered_clients.get(client_id)
+        if prev is not None and prev is not protocol:
+            print(
+                f"[HTTP/3] WARNING: Client {client_id} registered again on a different QUIC connection. "
+                f"Downlink (global model / start_evaluation) uses only the latest connection."
+            )
         self.registered_clients[client_id] = protocol  # Store protocol reference
         self.active_clients.add(client_id)
         print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
@@ -588,6 +594,10 @@ class FederatedLearningServer:
         client_id = message['client_id']
         round_num = message['round']
         if client_id not in self.active_clients:
+            print(
+                f"[HTTP/3] Ignoring metrics from client {client_id} (not in active_clients; "
+                f"active={sorted(self.active_clients)})"
+            )
             return
         if stop_on_client_convergence() and float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             await self.mark_client_converged(client_id)
@@ -607,6 +617,11 @@ class FederatedLearningServer:
             if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
                 await self.aggregate_metrics()
                 await self.continue_training()
+        else:
+            print(
+                f"[HTTP/3] Ignoring metrics from client {client_id}: message round {round_num} "
+                f"!= server round {self.current_round} (stale client, duplicate POST, or QUIC reconnect race)"
+            )
     
     async def distribute_initial_model(self):
         """Distribute initial global model to all clients"""
@@ -973,8 +988,8 @@ async def main():
     
     server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
-    # QUIC config: idle timeout 0/none = no limit (diagnostic pipeline); else env or 60s
-    _idle = os.getenv("IDLE_TIMEOUT", "0" if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else "60").strip().lower()
+    # QUIC idle timeout must cover client local training + straggler gaps (60s is too low for FL).
+    _idle = os.getenv("IDLE_TIMEOUT", "0" if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else "3600").strip().lower()
     idle_sec = float(_idle) if _idle not in ("0", "none", "inf", "infinity") else 86400.0 * 7  # 7 days = effectively no limit
     # Realistic max payload: HTTP/3 16 KB per stream
     HTTP3_MAX_STREAM_DATA = 16 * 1024  # 16 KB
