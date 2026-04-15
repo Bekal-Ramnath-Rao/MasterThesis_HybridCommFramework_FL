@@ -61,7 +61,10 @@ if _utilities_path not in sys.path:
 
 from packet_logger import log_sent_packet, log_received_packet, init_db, get_round_bytes_sent_received
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
-from client_experiment_results import save_client_training_artifacts
+from client_experiment_results import (
+    save_client_training_artifacts,
+    maybe_checkpoint_client_training_artifacts,
+)
 # Make TensorFlow logs less verbose
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
@@ -177,6 +180,7 @@ class FederatedLearningClient:
         init_db()
         self._fl_client_start_time = time.time()
         self._client_fl_round_history = []
+        self._artifact_emergency_flush_done = False
         # Battery/energy model (same as unified use case)
         self.battery_model = BatteryModel(protocol="mqtt")
         self._last_round_time_sec = 0.0  # training + communication time for last round
@@ -223,8 +227,48 @@ class FederatedLearningClient:
         self._global_model_queue = queue.Queue()
         self._global_model_worker = threading.Thread(target=self._global_model_worker_loop, daemon=True)
         self._global_model_worker.start()
-        
-    
+        self._register_training_artifact_shutdown_hooks()
+
+    def _register_training_artifact_shutdown_hooks(self):
+        """Flush experiment_results JSON/plots on SIGTERM/SIGINT/atexit (distributed clients often miss training_complete)."""
+        import atexit
+        import signal
+
+        def _flush(reason: str) -> None:
+            if self._artifact_emergency_flush_done:
+                return
+            hist = list(self._client_fl_round_history)
+            if not hist:
+                return
+            try:
+                save_client_training_artifacts(
+                    self.client_id,
+                    use_case=use_case_from_env("emotion"),
+                    protocol="mqtt",
+                    round_history=hist,
+                    total_elapsed_sec=time.time() - self._fl_client_start_time,
+                    quiet=True,
+                )
+                self._artifact_emergency_flush_done = True
+            except Exception as e:
+                print(f"[Client {self.client_id}] WARNING: training artifact flush ({reason}): {e}")
+
+        def _on_signal(signum, frame):
+            _flush(f"signal {signum}")
+            self.shutdown_requested = True
+            try:
+                self.mqtt_client.disconnect()
+            except Exception:
+                pass
+            raise SystemExit(128 + int(signum) if signum else 0)
+
+        atexit.register(lambda: _flush("atexit"))
+        try:
+            signal.signal(signal.SIGTERM, _on_signal)
+            signal.signal(signal.SIGINT, _on_signal)
+        except ValueError:
+            pass
+
     def serialize_weights(self, weights):
         """Serialize model weights for MQTT transmission"""
         serialized = pickle.dumps(weights)
@@ -583,13 +627,15 @@ class FederatedLearningClient:
     def handle_training_complete(self):
         """Handle training completion signal from server"""
         try:
-            save_client_training_artifacts(
+            out = save_client_training_artifacts(
                 self.client_id,
                 use_case=use_case_from_env("emotion"),
                 protocol="mqtt",
                 round_history=list(self._client_fl_round_history),
                 total_elapsed_sec=time.time() - self._fl_client_start_time,
             )
+            if out is not None:
+                self._artifact_emergency_flush_done = True
         except Exception as e:
             print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
         print("\n" + "="*70)
@@ -997,17 +1043,26 @@ class FederatedLearningClient:
                 "battery_soc_after": float(self.battery_model.battery_soc),
             }
         )
+        maybe_checkpoint_client_training_artifacts(
+            self.client_id,
+            use_case=use_case_from_env("emotion"),
+            protocol="mqtt",
+            round_history=self._client_fl_round_history,
+            total_elapsed_sec=time.time() - self._fl_client_start_time,
+        )
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
         if self.has_converged and stop_on_client_convergence():
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
             try:
-                save_client_training_artifacts(
+                out = save_client_training_artifacts(
                     self.client_id,
                     use_case=use_case_from_env("emotion"),
                     protocol="mqtt",
                     round_history=list(self._client_fl_round_history),
                     total_elapsed_sec=time.time() - self._fl_client_start_time,
                 )
+                if out is not None:
+                    self._artifact_emergency_flush_done = True
             except Exception as e:
                 print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
             time.sleep(2)

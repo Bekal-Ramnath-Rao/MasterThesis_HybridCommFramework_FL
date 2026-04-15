@@ -18,6 +18,8 @@ import base64
 import logging
 import threading
 import socket
+import signal
+import atexit
 import re
 import fcntl
 from typing import Any, Dict, Tuple, Optional, List, Sequence
@@ -357,7 +359,7 @@ if _utilities_path not in sys.path:
 
 from packet_logger import init_db, log_sent_packet, log_received_packet, get_round_bytes_sent_received
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
-from client_experiment_results import save_client_training_artifacts
+from client_experiment_results import save_client_training_artifacts, maybe_checkpoint_client_training_artifacts
 try:
     from q_learning_logger import init_db as init_qlearning_db, log_q_step, rl_state_network_kwargs
 except ImportError:
@@ -679,6 +681,7 @@ class UnifiedFLClient_Emotion:
         self.shutdown_requested = False
         self._fl_client_start_time = time.time()
         self._client_fl_round_history: List[Dict[str, Any]] = []
+        self._artifact_emergency_flush_done = False
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         
@@ -1148,8 +1151,49 @@ class UnifiedFLClient_Emotion:
                 )
         print(f"{'='*70}\n")
         
+        self._register_client_artifact_shutdown_hooks()
         # Start protocol listeners in background threads
         self.start_all_protocol_listeners()
+
+    def _register_client_artifact_shutdown_hooks(self) -> None:
+        """Save artifacts on exit if the server never sends training_complete (common for distributed clients)."""
+
+        def _flush(reason: str) -> None:
+            if self._artifact_emergency_flush_done:
+                return
+            hist = list(self._client_fl_round_history)
+            if not hist:
+                return
+            try:
+                proto = os.environ.get("CLIENT_EXPERIMENT_PROTOCOL", "unified").strip().lower() or "unified"
+                save_client_training_artifacts(
+                    self.client_id,
+                    use_case=use_case_from_env("emotion"),
+                    protocol=proto,
+                    round_history=hist,
+                    total_elapsed_sec=time.time() - self._fl_client_start_time,
+                    quiet=True,
+                )
+                self._artifact_emergency_flush_done = True
+            except Exception as e:
+                print(f"[Client {self.client_id}] WARNING: training artifact flush ({reason}): {e}")
+
+        def _on_signal(signum, frame):
+            _flush(f"signal {signum}")
+            self.shutdown_requested = True
+            self.is_active = False
+            try:
+                self.cleanup()
+            except Exception:
+                pass
+            raise SystemExit(128 + int(signum) if signum else 0)
+
+        atexit.register(lambda: _flush("atexit"))
+        try:
+            signal.signal(signal.SIGTERM, _on_signal)
+            signal.signal(signal.SIGINT, _on_signal)
+        except ValueError:
+            pass
     
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
@@ -2462,13 +2506,15 @@ class UnifiedFLClient_Emotion:
     def _save_client_experiment_artifacts_if_any(self) -> None:
         try:
             proto = os.environ.get("CLIENT_EXPERIMENT_PROTOCOL", "unified").strip().lower() or "unified"
-            save_client_training_artifacts(
+            out = save_client_training_artifacts(
                 self.client_id,
                 use_case=use_case_from_env("emotion"),
                 protocol=proto,
                 round_history=list(self._client_fl_round_history),
                 total_elapsed_sec=time.time() - self._fl_client_start_time,
             )
+            if out is not None:
+                self._artifact_emergency_flush_done = True
         except Exception as e:
             print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
 
@@ -3488,6 +3534,14 @@ class UnifiedFLClient_Emotion:
                     "total_fl_wall_time_sec": float(total_fl_wall_time_sec),
                     "battery_soc_after": float(battery_soc_after),
                 }
+            )
+            _proto_ck = os.environ.get("CLIENT_EXPERIMENT_PROTOCOL", "unified").strip().lower() or "unified"
+            maybe_checkpoint_client_training_artifacts(
+                self.client_id,
+                use_case=use_case_from_env("emotion"),
+                protocol=_proto_ck,
+                round_history=self._client_fl_round_history,
+                total_elapsed_sec=time.time() - self._fl_client_start_time,
             )
             print(f"Client {self.client_id} sent evaluation metrics for round {report_round}")
             print(f"Evaluation metrics - Loss: {loss_f:.4f}, Accuracy: {accuracy_f:.4f}")

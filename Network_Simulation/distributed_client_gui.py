@@ -1777,6 +1777,7 @@ class DistributedClientGUI(QMainWindow):
         cmd.extend([
             "-e", f"NUM_ROUNDS={self.rounds_spinbox.value()}",
             "-e", f"NODE_TYPE=client",
+            "-e", "CLIENT_EXPERIMENT_CHECKPOINT_EACH_ROUND=true",
             "-e", f"MQTT_BROKER={server_ip}",
             "-e", f"MQTT_PORT={self.remote_mqtt_port}",
             "-e", f"AMQP_HOST={server_ip}",
