@@ -640,6 +640,9 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         elif self.current_round >= self.num_rounds:
             should_stop = True
             stop_reason = f"Maximum rounds ({self.num_rounds}) reached"
+            self.convergence_time = (
+                time.time() - self.start_time if self.start_time else None
+            )
         
         if should_stop:
             print(f"\n{'='*70}")
@@ -648,9 +651,18 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             print(f"Final Loss: {avg_loss:.4f}")
             print(f"Final Accuracy: {avg_accuracy:.4f}")
             print(f"Total rounds: {self.current_round}")
-            print(f"Total time: {time.time() - self.start_time:.2f} seconds")
-            if self.converged:
-                print(f"Convergence time: {self.convergence_time:.2f} seconds")
+            elapsed = (
+                self.convergence_time
+                if self.convergence_time is not None
+                else (
+                    (time.time() - self.start_time)
+                    if self.start_time
+                    else 0.0
+                )
+            )
+            print(
+                f"Total Training Time: {elapsed:.2f} seconds ({elapsed / 60.0:.2f} minutes)"
+            )
             print(f"{'='*70}\n")
             
             with self.lock:
@@ -677,6 +689,9 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
     
     def save_results(self):
         """Save training results to JSON file"""
+        conv_sec = self.convergence_time
+        if conv_sec is None and self.start_time:
+            conv_sec = time.time() - self.start_time
         results = {
             'rounds': self.ROUNDS,
             'loss': self.LOSS,
@@ -688,8 +703,11 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             'avg_training_time_sec': getattr(self, 'AVG_TRAINING_TIME_SEC', []),
             'avg_battery_soc': getattr(self, 'AVG_BATTERY_SOC', []),
             'converged': self.converged,
-            'convergence_time': self.convergence_time if self.converged else None,
-            'total_time': time.time() - self.start_time,
+            'convergence_time_seconds': conv_sec,
+            'convergence_time_minutes': (conv_sec / 60.0) if conv_sec is not None else None,
+            'convergence_time': conv_sec,
+            'total_time': conv_sec,
+            'total_rounds': len(self.ROUNDS),
             'final_loss': self.LOSS[-1] if self.LOSS else None,
             'final_accuracy': self.ACCURACY[-1] if self.ACCURACY else None,
             'num_clients': self.num_clients,

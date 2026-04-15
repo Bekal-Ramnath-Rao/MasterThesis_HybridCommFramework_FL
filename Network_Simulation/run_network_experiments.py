@@ -1454,6 +1454,7 @@ class ExperimentRunner:
         conv_patterns = [
             re.compile(r"Convergence\s*time\s*:\s*([\d.]+)\s*seconds", re.IGNORECASE),
             re.compile(r"Total\s+Training\s+Time\s*:\s*([\d.]+)\s*seconds", re.IGNORECASE),
+            re.compile(r"Total\s+time\s*:\s*([\d.]+)\s*seconds", re.IGNORECASE),
             re.compile(r"Time\s+to\s+Convergence\s*:\s*([\d.]+)\s*seconds", re.IGNORECASE),
         ]
         for pattern in conv_patterns:
