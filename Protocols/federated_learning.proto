@@ -79,6 +79,7 @@ message Metrics {
     double client_converged = 8;  // 1.0 = client has converged locally and will disconnect; server removes from active set
     double training_time_sec = 9; // optional: local FL training wall time (seconds)
     double uplink_model_comm_sec = 10; // optional: time to send model update (seconds)
+    double cumulative_energy_j = 11; // optional: client BatteryModel cumulative energy (Joules)
 }
 
 message MetricsResponse {

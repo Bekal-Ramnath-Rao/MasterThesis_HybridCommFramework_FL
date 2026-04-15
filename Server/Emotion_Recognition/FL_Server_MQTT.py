@@ -33,6 +33,7 @@ if _utilities_path not in sys.path:
 
 print(f"Project root set to: {project_root}")
 from packet_logger import init_db, log_sent_packet, log_received_packet
+from battery_results_agg import avg_battery_model_drain_fraction
 try:
     from experiment_results_path import get_experiment_results_dir
 except ModuleNotFoundError:
@@ -104,6 +105,8 @@ class FederatedLearningServer:
         # Per-round time (sec) and battery consumption (0–1, from client-reported SoC)
         self.ROUND_TIMES = []
         self.BATTERY_CONSUMPTION = []
+        # Cumulative drain fraction from client BatteryModel (energy / capacity), see battery_results_agg
+        self.BATTERY_MODEL_CONSUMPTION = []
 
         # Convergence tracking
         self.best_loss = float('inf')
@@ -877,6 +880,7 @@ class FederatedLearningServer:
             self.BATTERY_CONSUMPTION.append(1.0 - avg_soc)  # consumption = 1 - SoC
         else:
             self.BATTERY_CONSUMPTION.append(0.0)
+        self.BATTERY_MODEL_CONSUMPTION.append(avg_battery_model_drain_fraction(self.client_metrics))
         
         # Calculate total samples
         total_samples = sum(metric['num_samples'] 
@@ -1078,6 +1082,8 @@ class FederatedLearningServer:
             "loss": self.LOSS,
             "round_times_seconds": getattr(self, 'ROUND_TIMES', []),
             "battery_consumption": getattr(self, 'BATTERY_CONSUMPTION', []),
+            "battery_model_consumption": getattr(self, 'BATTERY_MODEL_CONSUMPTION', []),
+            "battery_model_consumption_source": "client_battery_model",
             "convergence_time_seconds": self.convergence_time,
             "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
             "total_rounds": len(self.ROUNDS),

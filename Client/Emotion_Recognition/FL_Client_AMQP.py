@@ -998,6 +998,7 @@ class FederatedLearningClient:
             "loss": float(loss),
             "accuracy": float(accuracy),
             "battery_soc": float(self.battery_model.battery_soc),
+            "cumulative_energy_j": float(self.battery_model.cumulative_energy_j),
         }
         if self.has_converged:
             # Avoid sending client_converged=1.0 when fixed-round mode is enabled.

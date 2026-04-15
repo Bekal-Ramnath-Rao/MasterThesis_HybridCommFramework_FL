@@ -17,6 +17,7 @@ from typing import List, Dict, Optional
 import argparse
 from pathlib import Path
 import tempfile
+import glob
 
 # Set UTF-8 encoding for Windows console
 if sys.platform == 'win32':
@@ -39,6 +40,28 @@ if _env_path.exists():
                     break
     except Exception:
         pass
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+try:
+    from Client.battery_model import (
+        BATTERY_CAP_J,
+        PROTOCOL_CPU_BETA,
+        PROTOCOL_ENERGY_ALPHA,
+        E_fixed,
+        P_CPU_MAX,
+        k_tx,
+        k_rx,
+    )
+except ImportError:
+    BATTERY_CAP_J = 60.0 * 3600.0
+    PROTOCOL_CPU_BETA = {"mqtt": 1.0, "amqp": 1.05, "grpc": 1.1, "quic": 1.05, "http3": 1.15, "dds": 1.0}
+    PROTOCOL_ENERGY_ALPHA = {"mqtt": 1.0, "amqp": 1.1, "grpc": 1.2, "quic": 1.1, "http3": 1.25, "dds": 1.1}
+    E_fixed = 0.1
+    P_CPU_MAX = 10.0
+    k_tx = 1e-8
+    k_rx = 1e-8
 
 
 def parse_fl_dataset_for_client(entries: Optional[List[str]]) -> Optional[Dict[int, int]]:
@@ -1484,7 +1507,14 @@ class ExperimentRunner:
             if json_results.get("num_clients") is not None:
                 merged["num_clients"] = json_results.get("num_clients")
             # merge battery-related series if JSON has them
-            for key in ("battery_consumption", "battery_soc", "avg_battery_soc", "round_times_seconds"):
+            for key in (
+                "battery_consumption",
+                "battery_model_consumption",
+                "battery_model_consumption_source",
+                "battery_soc",
+                "avg_battery_soc",
+                "round_times_seconds",
+            ):
                 if json_results.get(key):
                     merged[key] = json_results.get(key)
             return merged
@@ -1638,6 +1668,147 @@ class ExperimentRunner:
 
         max_len = max(len(s) for s in per_client_series)
         avg_series = []
+        for idx in range(max_len):
+            vals = [s[idx] for s in per_client_series if idx < len(s)]
+            if vals:
+                avg_series.append(sum(vals) / len(vals))
+        return avg_series
+
+    def _battery_model_series_from_jsonl(self, exp_dir: str) -> List[float]:
+        """Cumulative drain fraction per round from client_fl_metrics *.jsonl (BatteryModel on clients)."""
+        roots = [
+            exp_dir,
+            os.path.join(os.path.dirname(exp_dir), "shared_data"),
+            str(_REPO_ROOT / "shared_data"),
+        ]
+        files: List[str] = []
+        for r in roots:
+            if r and os.path.isdir(r):
+                files.extend(glob.glob(os.path.join(r, "client_fl_metrics_*_client*.jsonl")))
+        if not files:
+            return []
+        by_round: Dict[int, List[float]] = {}
+        for fp in files:
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        rec = json.loads(line)
+                        rnd = int(rec.get("round") or 0)
+                        if rnd <= 0:
+                            continue
+                        cum = rec.get("cumulative_battery_energy_joules")
+                        if cum is None:
+                            continue
+                        by_round.setdefault(rnd, []).append(float(cum) / BATTERY_CAP_J)
+            except Exception:
+                continue
+        if not by_round:
+            return []
+        max_r = max(by_round.keys())
+        out: List[float] = []
+        for r in range(1, max_r + 1):
+            vals = by_round.get(r)
+            if vals:
+                out.append(sum(vals) / len(vals))
+        return out
+
+    def _estimate_battery_model_series_from_logs(self, exp_dir: str, protocol: str) -> List[float]:
+        """Like _estimate_battery_series_from_logs but applies PROTOCOL_ENERGY_ALPHA / PROTOCOL_CPU_BETA."""
+        p = (protocol or "mqtt").strip().lower()
+        if p in ("rl_unified", "unified"):
+            p = "mqtt"
+        alpha = float(PROTOCOL_ENERGY_ALPHA.get(p, 1.0))
+        beta = float(PROTOCOL_CPU_BETA.get(p, 1.0))
+
+        k_tx_l = k_tx
+        k_rx_l = k_rx
+        E_fixed_l = E_fixed
+        P_CPU_MAX_l = P_CPU_MAX
+        BATTERY_CAP_J_l = BATTERY_CAP_J
+        cpu_util_fraction = 0.5
+
+        round_start_pattern = re.compile(r"starting training for round\s+(\d+)", re.IGNORECASE)
+        send_size_pattern = re.compile(
+            r"chunking\s+.*?model\s+update:\s*(\d+)\s+bytes\s+total",
+            re.IGNORECASE,
+        )
+        send_size_pattern_alt = re.compile(
+            r"model\s+update.*?\((\d+)\s+bytes(?:\s+total)?\)",
+            re.IGNORECASE,
+        )
+        send_size_pattern_sent = re.compile(
+            r"sent\s+update\s+in\s+\d+\s+chunks\s*\((\d+)\s+bytes(?:\s+total)?\)",
+            re.IGNORECASE,
+        )
+        epoch_time_pattern = re.compile(r"-\s*([\d.]+)(ms|s)/epoch", re.IGNORECASE)
+
+        per_client_series: List[List[float]] = []
+        for name in os.listdir(exp_dir):
+            lower = name.lower()
+            is_named_client_logs = name.endswith("_logs.txt") and "client" in lower
+            is_native_style = lower.startswith("client_") and lower.endswith(".log")
+            if not (is_named_client_logs or is_native_style):
+                continue
+
+            path = os.path.join(exp_dir, name)
+            current_round = None
+            training_times: Dict[int, float] = {}
+            bytes_sent: Dict[int, int] = {}
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        m_round = round_start_pattern.search(line)
+                        if m_round:
+                            current_round = int(m_round.group(1))
+                            training_times.setdefault(current_round, 0.0)
+                            continue
+
+                        if current_round is not None:
+                            m_epoch = epoch_time_pattern.search(line)
+                            if m_epoch:
+                                val = float(m_epoch.group(1))
+                                unit = m_epoch.group(2).lower()
+                                training_times[current_round] = training_times.get(current_round, 0.0) + (
+                                    val / 1000.0 if unit == "ms" else val
+                                )
+
+                            m_send = send_size_pattern.search(line)
+                            if not m_send:
+                                m_send = send_size_pattern_alt.search(line)
+                            if not m_send:
+                                m_send = send_size_pattern_sent.search(line)
+                            if m_send:
+                                bytes_sent[current_round] = int(m_send.group(1))
+
+                rounds = sorted(set(training_times.keys()) & set(bytes_sent.keys()))
+                if not rounds:
+                    continue
+
+                cumulative = 0.0
+                series: List[float] = []
+                for rnd in rounds:
+                    bits_tx = bytes_sent[rnd] * 8
+                    bits_rx = 0
+                    e_radio_baseline = k_tx_l * bits_tx + k_rx_l * bits_rx + E_fixed_l
+                    e_radio = alpha * e_radio_baseline
+                    e_cpu = P_CPU_MAX_l * cpu_util_fraction * training_times.get(rnd, 0.0) * beta
+                    e_total = e_radio + e_cpu
+                    cumulative += e_total / BATTERY_CAP_J_l
+                    series.append(cumulative)
+
+                if series:
+                    per_client_series.append(series)
+            except Exception:
+                continue
+
+        if not per_client_series:
+            return []
+
+        max_len = max(len(s) for s in per_client_series)
+        avg_series: List[float] = []
         for idx in range(max_len):
             vals = [s[idx] for s in per_client_series if idx < len(s)]
             if vals:
@@ -1835,6 +2006,37 @@ class ExperimentRunner:
         out["battery_consumption_source"] = "estimated_from_client_logs"
         return out
 
+    def _ensure_training_includes_battery_model_series(
+        self, exp_dir: str, protocol: str, training: Optional[Dict]
+    ) -> Optional[Dict]:
+        """Attach battery_model_consumption (BatteryModel drain) without changing battery_consumption."""
+        if not training or not isinstance(training, dict):
+            return training
+        rounds = training.get("rounds", []) or []
+        if not rounds:
+            return training
+        existing = training.get("battery_model_consumption")
+        if isinstance(existing, (list, tuple)) and len(existing) == len(rounds):
+            return training
+
+        est = self._battery_model_series_from_jsonl(exp_dir)
+        source = "client_metrics_jsonl"
+        if not est:
+            est = self._estimate_battery_model_series_from_logs(exp_dir, protocol)
+            source = "battery_model_estimated_from_client_logs"
+        if not est:
+            return training
+
+        n = len(rounds)
+        if len(est) > n:
+            est = est[:n]
+        elif len(est) < n and est:
+            est = list(est) + [est[-1]] * (n - len(est))
+        out = dict(training)
+        out["battery_model_consumption"] = est
+        out["battery_model_consumption_source"] = source
+        return out
+
     def _finalize_experiment_artifacts(
         self,
         server_container: Optional[str],
@@ -1847,6 +2049,7 @@ class ExperimentRunner:
             self._copy_server_plots_to_experiment_folder(server_container, protocol, exp_dir, scenario=scenario)
         training = self._resolve_training_results(exp_dir, protocol)
         training = self._ensure_training_includes_battery_series(exp_dir, training)
+        training = self._ensure_training_includes_battery_model_series(exp_dir, protocol, training)
         self._persist_training_results(exp_dir, protocol, training)
         self._generate_standard_plots(protocol, exp_dir, training)
         self._ensure_battery_plot_alias(exp_dir)

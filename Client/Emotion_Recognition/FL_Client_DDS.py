@@ -255,6 +255,7 @@ class EvaluationMetrics(IdlStruct):
     training_time_sec: float = 0.0
     round_time_sec: float = 0.0
     uplink_model_comm_sec: float = 0.0
+    cumulative_energy_j: float = 0.0
 
 
 @dataclass
@@ -895,6 +896,7 @@ class FederatedLearningClient:
             training_time_sec=tt,
             round_time_sec=tt + ul,
             uplink_model_comm_sec=ul,
+            cumulative_energy_j=float(self.battery_model.cumulative_energy_j),
         )
         
         # Write with explicit return check

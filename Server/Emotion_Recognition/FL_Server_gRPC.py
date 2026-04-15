@@ -24,6 +24,7 @@ _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from experiment_results_path import get_experiment_results_dir
+from battery_results_agg import avg_battery_model_drain_fraction
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -83,6 +84,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.ROUNDS = []
         self.ROUND_TIMES = []
         self.BATTERY_CONSUMPTION = []
+        self.BATTERY_MODEL_CONSUMPTION = []
         self.AVG_TRAINING_TIME_SEC = []
         self.AVG_BATTERY_SOC = []
         self.round_start_time = None
@@ -458,6 +460,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 'round_time_sec': float(getattr(request, 'round_time_sec', 0.0)),
                 'training_time_sec': float(getattr(request, 'training_time_sec', 0.0)),
                 'uplink_model_comm_sec': float(getattr(request, 'uplink_model_comm_sec', 0.0)),
+                'cumulative_energy_j': float(getattr(request, 'cumulative_energy_j', 0.0)),
             }
             self.clients_evaluated.add(client_id)
             
@@ -597,6 +600,7 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
         avg_soc = sum(socs) / len(socs) if socs else 1.0
         self.BATTERY_CONSUMPTION.append(1.0 - avg_soc)
+        self.BATTERY_MODEL_CONSUMPTION.append(avg_battery_model_drain_fraction(self.client_metrics))
         # Calculate weighted average metrics
         total_samples = sum(m['num_samples'] for m in self.client_metrics.values())
         
@@ -679,6 +683,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             'accuracy': self.ACCURACY,
             'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
             'battery_consumption': getattr(self, 'BATTERY_CONSUMPTION', []),
+            'battery_model_consumption': getattr(self, 'BATTERY_MODEL_CONSUMPTION', []),
+            'battery_model_consumption_source': 'client_battery_model',
             'avg_training_time_sec': getattr(self, 'AVG_TRAINING_TIME_SEC', []),
             'avg_battery_soc': getattr(self, 'AVG_BATTERY_SOC', []),
             'converged': self.converged,
