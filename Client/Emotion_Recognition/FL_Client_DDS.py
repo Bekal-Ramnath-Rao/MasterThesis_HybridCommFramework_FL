@@ -139,6 +139,7 @@ for _p in (_utilities_path, _project_root):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+from client_experiment_results import save_client_training_artifacts
 
 from cyclonedds.topic import Topic
 from cyclonedds.sub import DataReader
@@ -298,6 +299,8 @@ class FederatedLearningClient:
         self.last_training_round = -1
         self.training_config = {"batch_size": 16, "local_epochs": 20}
         self.running = True
+        self._fl_client_start_time = time.time()
+        self._client_fl_round_history = []
         self._training_lock = threading.Lock()
         self._training_thread = None
         self.best_loss = float('inf')
@@ -597,6 +600,16 @@ class FederatedLearningClient:
             if sample:
                 print(f"Client {self.client_id} received command: round={sample.round}, start_training={sample.start_training}, start_evaluation={sample.start_evaluation}, training_complete={sample.training_complete}")
                 if sample.training_complete:
+                    try:
+                        save_client_training_artifacts(
+                            self.client_id,
+                            use_case=use_case_from_env("emotion"),
+                            protocol="dds",
+                            round_history=list(self._client_fl_round_history),
+                            total_elapsed_sec=time.time() - self._fl_client_start_time,
+                        )
+                    except Exception as e:
+                        print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
                     print(f"\nClient {self.client_id} - Training completed!")
                     self.running = False
                     return
@@ -913,11 +926,34 @@ class FederatedLearningClient:
             use_case=use_case_from_env("emotion"),
             protocol="dds",
         )
+        self._client_fl_round_history.append(
+            {
+                "round": int(self.current_round),
+                "loss": float(loss),
+                "accuracy": float(accuracy),
+                "total_fl_wall_time_sec": float(
+                    self._last_training_time_sec
+                    + self._last_uplink_model_comm_sec
+                    + _uplink_metrics_sec
+                ),
+                "battery_soc_after": float(self.battery_model.battery_soc),
+            }
+        )
         
         print(f"Client {self.client_id} sent evaluation metrics for round {self.current_round}")
         print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}\n")
         if self.has_converged and stop_on_client_convergence():
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
+            try:
+                save_client_training_artifacts(
+                    self.client_id,
+                    use_case=use_case_from_env("emotion"),
+                    protocol="dds",
+                    round_history=list(self._client_fl_round_history),
+                    total_elapsed_sec=time.time() - self._fl_client_start_time,
+                )
+            except Exception as e:
+                print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
             self.running = False
     
     def cleanup(self):

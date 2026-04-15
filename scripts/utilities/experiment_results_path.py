@@ -1,6 +1,18 @@
 """
-Experiment results directory path: experiment_results/{use_case}/{protocol}/{network_scenario}/
-Used by FL servers to save plots and JSON/CSV under a consistent folder structure.
+Experiment results directory:
+
+ {base}/{use_case}/{protocol}/{network_scenario}/
+
+where ``base`` is:
+
+- ``EXPERIMENT_RESULTS_ROOT`` if set (absolute path to the parent of the use_case folders), or
+- ``{project_root}/experiment_results`` otherwise (project_root is /app in Docker, else repo root).
+
+Used by FL servers and client-side artifact writers (plots, JSON) under one tree.
+
+Environment:
+  EXPERIMENT_RESULTS_ROOT — optional; overrides the default ``.../experiment_results`` base.
+  NETWORK_SCENARIO — subfolder name (default ``default``) when scenario is not passed explicitly.
 """
 import os
 from pathlib import Path
@@ -14,9 +26,17 @@ def get_project_root():
     return Path(__file__).resolve().parent.parent.parent
 
 
+def get_experiment_results_base() -> Path:
+    """Parent directory containing ``emotion/``, ``mental_state/``, ``temperature/``, etc."""
+    override = os.getenv("EXPERIMENT_RESULTS_ROOT", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return get_project_root() / "experiment_results"
+
+
 def get_experiment_results_dir(use_case: str, protocol: str, scenario: str = None) -> Path:
     """
-    Return experiment_results/{use_case}/{protocol}/{network_scenario}/.
+    Return {base}/{use_case}/{protocol}/{network_scenario}/.
     Creates the directory if needed.
 
     use_case: "emotion" | "mental_state" | "temperature"
@@ -26,7 +46,6 @@ def get_experiment_results_dir(use_case: str, protocol: str, scenario: str = Non
     """
     if scenario is None:
         scenario = os.getenv("NETWORK_SCENARIO", "default").strip() or "default"
-    root = get_project_root()
-    path = root / "experiment_results" / use_case / protocol / scenario
+    path = get_experiment_results_base() / use_case / protocol / scenario
     path.mkdir(parents=True, exist_ok=True)
     return path

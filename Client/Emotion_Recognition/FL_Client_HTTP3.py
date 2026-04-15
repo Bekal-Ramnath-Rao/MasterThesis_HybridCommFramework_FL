@@ -96,6 +96,7 @@ _utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+from client_experiment_results import save_client_training_artifacts
 
 # HTTP/3 Configuration
 HTTP3_HOST = os.getenv("HTTP3_HOST", "fl-server-http3-emotion")
@@ -256,6 +257,8 @@ class FederatedLearningClient:
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
         self._global_model_chunk_buffers = {}
+        self._fl_client_start_time = time.time()
+        self._client_fl_round_history = []
         
         print(f"Client {self.client_id} initialized with:")
         print(f"  Training samples: {self.train_generator.n}")
@@ -632,6 +635,16 @@ class FederatedLearningClient:
     
     async def handle_training_complete(self):
         """Handle training completion signal from server"""
+        try:
+            save_client_training_artifacts(
+                self.client_id,
+                use_case=use_case_from_env("emotion"),
+                protocol="http3",
+                round_history=list(self._client_fl_round_history),
+                total_elapsed_sec=time.time() - self._fl_client_start_time,
+            )
+        except Exception as e:
+            print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
         print("\n" + "="*70)
         print(f"Client {self.client_id} - Training completed!")
         print("="*70)
@@ -777,8 +790,31 @@ class FederatedLearningClient:
             use_case=use_case_from_env("emotion"),
             protocol="http3",
         )
+        self._client_fl_round_history.append(
+            {
+                "round": int(self.current_round),
+                "loss": float(loss),
+                "accuracy": float(accuracy),
+                "total_fl_wall_time_sec": float(
+                    self._last_training_time_sec
+                    + self._last_uplink_model_comm_sec
+                    + _uplink_metrics_sec
+                ),
+                "battery_soc_after": float(self.battery_model.battery_soc),
+            }
+        )
         if self.has_converged and stop_on_client_convergence():
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
+            try:
+                save_client_training_artifacts(
+                    self.client_id,
+                    use_case=use_case_from_env("emotion"),
+                    protocol="http3",
+                    round_history=list(self._client_fl_round_history),
+                    total_elapsed_sec=time.time() - self._fl_client_start_time,
+                )
+            except Exception as e:
+                print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
             await asyncio.sleep(0.5)
             self.running = False
             if self.protocol:

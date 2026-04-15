@@ -61,6 +61,7 @@ if _utilities_path not in sys.path:
 
 from packet_logger import log_sent_packet, log_received_packet, init_db, get_round_bytes_sent_received
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+from client_experiment_results import save_client_training_artifacts
 # Make TensorFlow logs less verbose
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
@@ -174,6 +175,8 @@ class FederatedLearningClient:
 
         # Initialize packet logger database
         init_db()
+        self._fl_client_start_time = time.time()
+        self._client_fl_round_history = []
         # Battery/energy model (same as unified use case)
         self.battery_model = BatteryModel(protocol="mqtt")
         self._last_round_time_sec = 0.0  # training + communication time for last round
@@ -579,6 +582,16 @@ class FederatedLearningClient:
     
     def handle_training_complete(self):
         """Handle training completion signal from server"""
+        try:
+            save_client_training_artifacts(
+                self.client_id,
+                use_case=use_case_from_env("emotion"),
+                protocol="mqtt",
+                round_history=list(self._client_fl_round_history),
+                total_elapsed_sec=time.time() - self._fl_client_start_time,
+            )
+        except Exception as e:
+            print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
         print("\n" + "="*70)
         print(f"Client {self.client_id} - Training completed!")
         print("="*70)
@@ -971,9 +984,32 @@ class FederatedLearningClient:
             use_case=use_case_from_env("emotion"),
             protocol="mqtt",
         )
+        self._client_fl_round_history.append(
+            {
+                "round": int(self.current_round),
+                "loss": float(loss),
+                "accuracy": float(accuracy),
+                "total_fl_wall_time_sec": float(
+                    self._last_training_time_sec
+                    + self._last_uplink_model_comm_sec
+                    + _uplink_metrics_sec
+                ),
+                "battery_soc_after": float(self.battery_model.battery_soc),
+            }
+        )
         print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
         if self.has_converged and stop_on_client_convergence():
             print(f"Client {self.client_id} notifying server of convergence and disconnecting")
+            try:
+                save_client_training_artifacts(
+                    self.client_id,
+                    use_case=use_case_from_env("emotion"),
+                    protocol="mqtt",
+                    round_history=list(self._client_fl_round_history),
+                    total_elapsed_sec=time.time() - self._fl_client_start_time,
+                )
+            except Exception as e:
+                print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
             time.sleep(2)
             self.mqtt_client.disconnect()
     

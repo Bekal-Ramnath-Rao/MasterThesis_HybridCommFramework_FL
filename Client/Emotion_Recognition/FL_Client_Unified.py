@@ -20,7 +20,7 @@ import threading
 import socket
 import re
 import fcntl
-from typing import Dict, Tuple, Optional, List, Sequence
+from typing import Any, Dict, Tuple, Optional, List, Sequence
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
@@ -357,6 +357,7 @@ if _utilities_path not in sys.path:
 
 from packet_logger import init_db, log_sent_packet, log_received_packet, get_round_bytes_sent_received
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+from client_experiment_results import save_client_training_artifacts
 try:
     from q_learning_logger import init_db as init_qlearning_db, log_q_step, rl_state_network_kwargs
 except ImportError:
@@ -676,6 +677,8 @@ class UnifiedFLClient_Emotion:
         self.is_active = True
         self.has_converged = False
         self.shutdown_requested = False
+        self._fl_client_start_time = time.time()
+        self._client_fl_round_history: List[Dict[str, Any]] = []
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         
@@ -2456,8 +2459,22 @@ class UnifiedFLClient_Emotion:
             self.evaluate_model(evaluation_round_num=round_num)
             print(f"Client {self.client_id} evaluation completed for round {round_num}.")
     
+    def _save_client_experiment_artifacts_if_any(self) -> None:
+        try:
+            proto = os.environ.get("CLIENT_EXPERIMENT_PROTOCOL", "unified").strip().lower() or "unified"
+            save_client_training_artifacts(
+                self.client_id,
+                use_case=use_case_from_env("emotion"),
+                protocol=proto,
+                round_history=list(self._client_fl_round_history),
+                total_elapsed_sec=time.time() - self._fl_client_start_time,
+            )
+        except Exception as e:
+            print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
+
     def handle_training_complete(self):
         """Handle training completion signal from server"""
+        self._save_client_experiment_artifacts_if_any()
         self.is_active = False
         self.shutdown_requested = True
         print("\n" + "="*70)
@@ -3463,6 +3480,15 @@ class UnifiedFLClient_Emotion:
                 use_case=use_case_from_env("emotion"),
                 protocol=protocol,
             )
+            self._client_fl_round_history.append(
+                {
+                    "round": report_round,
+                    "loss": loss_f,
+                    "accuracy": accuracy_f,
+                    "total_fl_wall_time_sec": float(total_fl_wall_time_sec),
+                    "battery_soc_after": float(battery_soc_after),
+                }
+            )
             print(f"Client {self.client_id} sent evaluation metrics for round {report_round}")
             print(f"Evaluation metrics - Loss: {loss_f:.4f}, Accuracy: {accuracy_f:.4f}")
             # RL update and optional Q-convergence end condition (battery already updated above for metrics)
@@ -3723,6 +3749,7 @@ class UnifiedFLClient_Emotion:
 
     def _disconnect_after_convergence(self):
         """Stop participating once local convergence is reached."""
+        self._save_client_experiment_artifacts_if_any()
         self.is_active = False
         self.shutdown_requested = True
         print(f"[Client {self.client_id}] Disconnecting after local convergence")

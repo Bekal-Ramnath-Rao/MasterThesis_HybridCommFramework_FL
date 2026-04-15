@@ -1626,6 +1626,8 @@ class DistributedClientGUI(QMainWindow):
         shared_data_lines = (
             f"shared_data mount: {'Yes' if self.mount_shared_data.isChecked() else 'No'} "
             f"(client metrics JSONL, DBs, RL Q-tables when unified)\n"
+            f"experiment_results mount: Yes → host <project>/experiment_results → /app/experiment_results "
+            f"(client training JSON/plots; same layout as server)\n"
         )
         if is_unified and self.is_rl_training_mode():
             shared_data_lines += (
@@ -1716,9 +1718,16 @@ class DistributedClientGUI(QMainWindow):
         except Exception as e:
             self.log_text.append(f"⚠️ Could not check image: {str(e)}\n")
         
-        shared_data_path = os.path.abspath(
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "shared_data")
+        project_root = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         )
+        shared_data_path = os.path.join(project_root, "shared_data")
+        experiment_results_host = os.path.join(project_root, "experiment_results")
+        try:
+            os.makedirs(experiment_results_host, exist_ok=True)
+        except OSError as e:
+            QMessageBox.critical(self, "experiment_results", f"Cannot create experiment_results directory:\n{e}")
+            return
         if self.mount_shared_data.isChecked():
             try:
                 os.makedirs(shared_data_path, exist_ok=True)
@@ -1727,6 +1736,17 @@ class DistributedClientGUI(QMainWindow):
                 return
             if is_unified:
                 self._sync_reset_epsilon_flag_for_distributed(shared_data_path)
+
+        _uc_key = str(use_case).lower().replace(" ", "")
+        client_use_case_env = {
+            "emotion": "emotion",
+            "mentalstate": "mental_state",
+            "temperature": "temperature",
+        }.get(_uc_key, "emotion")
+        if network_scenario in (None, "none", "dynamic"):
+            network_scenario_env = "default"
+        else:
+            network_scenario_env = str(network_scenario).strip().lower() or "default"
         
         # Base command
         cmd = [
@@ -1734,9 +1754,13 @@ class DistributedClientGUI(QMainWindow):
             "--name", container_name,
             "--network", "host",  # Use host network to access server
             "--cap-add", "NET_ADMIN",  # For network simulation
+            "-v",
+            f"{experiment_results_host}:/app/experiment_results",
             "-e", f"CLIENT_ID={client_id}",
             "-e", f"NUM_CLIENTS={total_clients}",
             "-e", f"MIN_CLIENTS={total_clients}",
+            "-e", f"CLIENT_USE_CASE={client_use_case_env}",
+            "-e", f"NETWORK_SCENARIO={network_scenario_env}",
         ]
         if self.mount_shared_data.isChecked():
             cmd.extend(
