@@ -77,14 +77,17 @@ sudo systemctl restart docker
 
 ```bash
 cat /etc/nv_tegra_release
+# Shows: "R35 (release), REVISION: 4.1 ..." → JetPack 5.1.2
 # OR
-dpkg -l | grep jetpack
+dpkg -l | grep -i jetpack
 ```
 
-| JetPack | L4T release | Devices | L4T_TAG for build |
-|---------|-------------|---------|-------------------|
-| 5.1.x   | r35.x.x     | Orin, Xavier AGX/NX | `r35.4.1-tf2.11-py3` *(default)* |
-| 4.6.x   | r32.7.x     | Nano, Xavier, TX2   | `r32.7.1-tf2.7-py3` |
+| JetPack | L4T release | Devices | `L4T_TAG` for build |
+|---------|-------------|---------|---------------------|
+| 5.1.2   | r35.4.1     | Orin, Xavier AGX/NX | `tf2-r35.4.1` *(default)* |
+| 5.1.1   | r35.3.1     | Orin, Xavier AGX/NX | `tf2-r35.3.1` |
+| 5.1     | r35.2.1     | Orin, Xavier AGX/NX | `tf2-r35.2.1` |
+| 4.6.x   | r32.7.x     | Nano, Xavier, TX2   | `tf2-r32.7.1` |
 
 ### 2.4 Clone the project on Jetson
 
@@ -107,28 +110,42 @@ rsync -avz --exclude '.git' \
 > **Why a separate Dockerfile?**
 > The standard `Client/Dockerfile` uses `tensorflow/tensorflow:2.13.0-gpu` which is
 > `linux/amd64` only and causes an **"exec format error"** on Jetson.
-> `Client/Dockerfile.jetson` uses NVIDIA's official L4T TensorFlow image
-> (`nvcr.io/nvidia/l4t-tensorflow`) which is built for `linux/arm64`.
+> `Client/Dockerfile.jetson` uses `dustynv/l4t-tensorflow` (Docker Hub), which is
+> the official NVIDIA Jetson containers image built natively for `linux/arm64`.
 
 ```bash
 cd ~/MasterThesis_HybridCommFramework_FL
 
-# JetPack 5.x (Orin / Xavier — default)
+# JetPack 5.1.2 / L4T r35.4.1 — default (Orin, Xavier AGX/NX)
 docker build \
   -f Client/Dockerfile.jetson \
   -t fl-client-emotion:jetson \
   .
 
-# JetPack 4.6 (Nano / older Xavier)
+# JetPack 5.1.1 / L4T r35.3.1
 docker build \
   -f Client/Dockerfile.jetson \
-  --build-arg L4T_TAG=r32.7.1-tf2.7-py3 \
+  --build-arg L4T_TAG=tf2-r35.3.1 \
+  -t fl-client-emotion:jetson \
+  .
+
+# JetPack 5.1 / L4T r35.2.1
+docker build \
+  -f Client/Dockerfile.jetson \
+  --build-arg L4T_TAG=tf2-r35.2.1 \
+  -t fl-client-emotion:jetson \
+  .
+
+# JetPack 4.6 / L4T r32.7.1 (Nano, TX2, older Xavier)
+docker build \
+  -f Client/Dockerfile.jetson \
+  --build-arg L4T_TAG=tf2-r32.7.1 \
   -t fl-client-emotion:jetson \
   .
 ```
 
-> **Note:** The build pulls ~5 GB from nvcr.io on first run. Make sure you
-> have a stable network connection and sufficient disk space (~10 GB free).
+> **Note:** The base image is ~5–6 GB and is pulled from Docker Hub on first run.
+> Ensure a stable network connection and ~12 GB of free disk space.
 
 ---
 
@@ -492,18 +509,18 @@ nc -zvu 192.168.1.100 4433   # QUIC (UDP)
 
 This is the most common issue on Jetson. The standard `Client/Dockerfile` uses
 `tensorflow/tensorflow:2.13.0-gpu` which only exists for `linux/amd64`.
-Jetson is `linux/arm64` (aarch64). Use the dedicated Jetson Dockerfile:
+Jetson is `linux/arm64` (aarch64). Use the dedicated Jetson Dockerfile which
+pulls `dustynv/l4t-tensorflow` — a Docker Hub image built natively for arm64:
 
 ```bash
 cd ~/MasterThesis_HybridCommFramework_FL
 
-# JetPack 5.x (Orin / Xavier — default)
+# Default — JetPack 5.1.2 / L4T r35.4.1
 docker build -f Client/Dockerfile.jetson -t fl-client-emotion:jetson .
 
-# JetPack 4.6 (Nano / older Xavier)
-docker build \
-  -f Client/Dockerfile.jetson \
-  --build-arg L4T_TAG=r32.7.1-tf2.7-py3 \
+# JetPack 4.6 (Nano / TX2 / older Xavier)
+docker build -f Client/Dockerfile.jetson \
+  --build-arg L4T_TAG=tf2-r32.7.1 \
   -t fl-client-emotion:jetson .
 ```
 
@@ -513,6 +530,14 @@ Confirm the correct architecture after the build:
 docker inspect fl-client-emotion:jetson | grep Architecture
 # Expected: "Architecture": "arm64"
 ```
+
+### "not found" error pulling the base image
+
+The `nvcr.io/nvidia/l4t-tensorflow` registry uses a different tag format and
+some tags simply do not exist. This Dockerfile uses `dustynv/l4t-tensorflow`
+from Docker Hub instead, which has confirmed arm64 tags for all JetPack versions.
+If the default tag (`tf2-r35.4.1`) doesn't match your JetPack, pass the correct
+one via `--build-arg L4T_TAG=tf2-r35.x.x` (see the table in section 2.3).
 
 ### Docker image not found on Jetson
 
