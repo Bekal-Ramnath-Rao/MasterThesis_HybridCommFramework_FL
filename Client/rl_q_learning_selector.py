@@ -1727,6 +1727,7 @@ class EnvironmentStateManager:
         # Battery / energy state (continuous)
         self.battery_soc = 1.0  # state of charge [0, 1]
         self.last_energy_j = 0.0  # Joules used in the last round
+        self.cumulative_energy_j = 0.0  # total Joules used across all rounds
         # Last psutil net_io snapshot for delta-rate bandwidth (avoids cumulative saturation)
         self._net_io_prev: Optional[Tuple[int, int, float]] = None
         # Configured label (e.g. NETWORK_SCENARIO); Q-index may use ``detected_network_scenario`` instead.
@@ -1879,6 +1880,7 @@ class EnvironmentStateManager:
         """Update battery state of charge [0,1] and last-round energy in Joules."""
         self.battery_soc = max(0.0, min(1.0, soc))
         self.last_energy_j = max(0.0, last_energy_j)
+        self.cumulative_energy_j += self.last_energy_j
         self.sync_battery_level_from_soc(self.battery_soc)
 
     def update_network_condition(self, condition: str) -> None:

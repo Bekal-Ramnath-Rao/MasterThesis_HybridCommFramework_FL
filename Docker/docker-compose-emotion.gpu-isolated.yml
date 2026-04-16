@@ -137,7 +137,7 @@ services:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['0']
+              device_ids: ['1']
     volumes:
       - ../Client/Emotion_Recognition/packet_logger.db:/app/Client/Emotion_Recognition/packet_logger.db
 
@@ -273,7 +273,7 @@ services:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['0']
+              device_ids: ['1']
 
   # ============================================================================
   # gRPC Protocol Services
@@ -387,7 +387,7 @@ services:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['0']
+              device_ids: ['1']
 
   # ============================================================================
   # QUIC Protocol Services
@@ -502,7 +502,7 @@ services:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['0']
+              device_ids: ['1']
 
   # ============================================================================
   # HTTP/3 Protocol Services
@@ -620,7 +620,7 @@ services:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['0']
+              device_ids: ['1']
 
   # ============================================================================
   # DDS Protocol Services
@@ -751,7 +751,7 @@ services:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['0']
+              device_ids: ['1']
 
 networks:
   emotion_network:

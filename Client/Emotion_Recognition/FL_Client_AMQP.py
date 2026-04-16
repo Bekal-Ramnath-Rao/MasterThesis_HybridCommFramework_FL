@@ -200,6 +200,7 @@ class FederatedLearningClient:
         self.battery_model = BatteryModel(protocol="amqp")
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
+        self._last_downlink_model_bytes = 0  # bytes received for global model (downlink)
         
         # AMQP connection
         self.connection = None
@@ -671,6 +672,8 @@ class FederatedLearningClient:
     def on_global_model(self, ch, method, properties, body):
         """Callback for receiving global model"""
         try:
+            # Track downlink bytes for fair battery accounting
+            self._last_downlink_model_bytes = len(body)
             data = json.loads(body.decode())
             
             message_type = data.get('message_type') or data.get('type')
@@ -956,7 +959,9 @@ class FederatedLearningClient:
         try:
             bytes_sent = self._publish_update_with_chunking(update_message)
             communication_time = time.time() - comm_start
-            self.battery_model.update(bytes_sent, 0, training_time, communication_time)
+            self.battery_model.update(
+                bytes_sent, self._last_downlink_model_bytes, training_time, communication_time
+            )
             self._last_training_time_sec = training_time
             self._last_uplink_model_comm_sec = communication_time
             if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":

@@ -3418,6 +3418,7 @@ class UnifiedFLClient_Emotion:
         battery_soc = self.env_manager.battery_soc if (USE_RL_SELECTION and self.env_manager) else 1.0
         battery_soc_before_energy = float(battery_soc)
 
+        cumulative_energy_j = float(self.env_manager.cumulative_energy_j) if (USE_RL_SELECTION and self.env_manager) else 0.0
         metrics_message = {
             "client_id": self.client_id,
             "round": report_round,
@@ -3429,6 +3430,7 @@ class UnifiedFLClient_Emotion:
             "uplink_model_comm_sec": uplink_model_comm_sec,
             "round_time_sec": float(round_time_sec),
             "client_converged": float(client_converged),
+            "cumulative_energy_j": cumulative_energy_j,
             "metrics": {
                 "loss": loss_f,
                 "accuracy": accuracy_f,
@@ -3437,6 +3439,7 @@ class UnifiedFLClient_Emotion:
                 "uplink_model_comm_sec": uplink_model_comm_sec,
                 "round_time_sec": float(round_time_sec),
                 "client_converged": float(client_converged),
+                "cumulative_energy_j": cumulative_energy_j,
             },
         }
         energy_j_total = 0.0
@@ -3465,16 +3468,14 @@ class UnifiedFLClient_Emotion:
                 self.round_metrics.get('uplink_model_comm_time', 0.0)
                 + self.round_metrics['uplink_metrics_comm_time']
             )
-            # Battery from radio (TX and RX bits) + CPU; use all protocols' bytes for the round
+            # Battery from radio (TX and RX bits) + CPU; use actual tracked payload bytes for fairness
             if USE_RL_SELECTION and self.env_manager:
                 try:
                     protocol_for_energy = self.selected_protocol or 'mqtt'
-                    try:
-                        bytes_sent, bytes_recv = get_round_bytes_sent_received(
-                            report_round, protocol=None
-                        )
-                    except Exception:
-                        bytes_sent, bytes_recv = 0, 0
+                    # Use directly tracked payload bytes (same as single-protocol clients).
+                    # get_round_bytes_sent_received returns 0 when round numbers are not stored in DB.
+                    bytes_sent = int(self.round_metrics.get('payload_bytes') or 0)
+                    bytes_recv = int(getattr(self, '_downlink_payload_bytes', None) or 0)
                     t_round = (
                         self.round_metrics.get('training_time', 0.0)
                         + self.round_metrics['communication_time']
@@ -3522,6 +3523,7 @@ class UnifiedFLClient_Emotion:
                     "battery_energy_joules": float(energy_j_total),
                     "battery_soc_before": float(battery_soc_before_energy),
                     "battery_soc_after": float(battery_soc_after),
+                    "cumulative_battery_energy_joules": float(self.env_manager.cumulative_energy_j) if (USE_RL_SELECTION and self.env_manager) else 0.0,
                 },
                 use_case=use_case_from_env("emotion"),
                 protocol=protocol,

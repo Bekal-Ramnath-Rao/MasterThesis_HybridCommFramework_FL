@@ -90,6 +90,11 @@ if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 
+_client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _client_dir not in sys.path:
+    sys.path.insert(0, _client_dir)
+from battery_model import BatteryModel
+
 # QUIC Configuration
 QUIC_HOST = os.getenv("QUIC_HOST", "fl-server-quic-emotion")
 QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
@@ -181,6 +186,8 @@ class FederatedLearningClient:
         self.model_ready = asyncio.Event()  # Event to signal model is ready
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
+        self.battery_model = BatteryModel(protocol="quic")
+        self._last_downlink_model_bytes = 0
         
         print(f"Client {self.client_id} initialized with:")
         print(f"  Training samples: {self.train_generator.n}")
@@ -319,6 +326,11 @@ class FederatedLearningClient:
     async def handle_global_model(self, message):
         """Receive and set global model weights and architecture from server"""
         round_num = message['round']
+        # Track downlink bytes for fair battery accounting
+        try:
+            self._last_downlink_model_bytes = len(json.dumps(message).encode('utf-8'))
+        except Exception:
+            self._last_downlink_model_bytes = 0
         print(f"Client {self.client_id}: Received global_model message for round {round_num}")
         
         # Decompress or deserialize weights
@@ -519,10 +531,14 @@ class FederatedLearningClient:
             send_start_cpu = time.perf_counter()
             msg['diagnostic_send_start_ts'] = send_start_ts
         payload = json.dumps(msg)
+        payload_bytes = len(payload.encode('utf-8'))
         # Send model update to server
         comm_start = time.time()
         await self.send_message(msg)
         communication_time = time.time() - comm_start
+        self.battery_model.update(
+            payload_bytes, self._last_downlink_model_bytes, training_time, communication_time
+        )
         self._last_training_time_sec = training_time
         self._last_uplink_model_comm_sec = communication_time
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
@@ -545,7 +561,9 @@ class FederatedLearningClient:
         
         metrics_dict = {
             'loss': float(loss),
-            'accuracy': float(accuracy)
+            'accuracy': float(accuracy),
+            'battery_soc': float(self.battery_model.battery_soc),
+            'cumulative_energy_j': float(self.battery_model.cumulative_energy_j),
         }
         if self.has_converged:
             # Avoid sending client_converged=1.0 when fixed-round mode is enabled.
@@ -578,8 +596,9 @@ class FederatedLearningClient:
                     + self._last_uplink_model_comm_sec
                     + _uplink_metrics_sec
                 ),
-                "battery_energy_joules": 0.0,
-                "battery_soc_after": 1.0,
+                "battery_energy_joules": float(self.battery_model.last_energy_j),
+                "battery_soc_after": float(self.battery_model.battery_soc),
+                "cumulative_battery_energy_joules": float(self.battery_model.cumulative_energy_j),
             },
             use_case=use_case_from_env("emotion"),
             protocol="quic",

@@ -285,6 +285,7 @@ class FederatedLearningClient:
         self.battery_model = BatteryModel(protocol="dds")
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
+        self._last_downlink_model_bytes = 0  # bytes received for global model (downlink)
         # Initialize quantization compression (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
         use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
@@ -643,6 +644,11 @@ class FederatedLearningClient:
     def _apply_global_model_payload(self, round_num, serialized_weights, config_json=""):
         """Deserialize and apply global model payload (supports both single and chunked DDS paths)."""
         try:
+            # Track downlink bytes for fair battery accounting
+            try:
+                self._last_downlink_model_bytes = len(serialized_weights)
+            except Exception:
+                self._last_downlink_model_bytes = 0
             raw_weights = self.deserialize_weights(serialized_weights)
         except Exception as e:
             print(f"[ERROR] Client {self.client_id}: deserialize failed: {e}")
@@ -833,7 +839,9 @@ class FederatedLearningClient:
             float(final_accuracy)
         )
         communication_time = time.time() - send_start_ts
-        self.battery_model.update(payload_bytes, 0, training_time, communication_time)
+        self.battery_model.update(
+            payload_bytes, self._last_downlink_model_bytes, training_time, communication_time
+        )
         self._last_training_time_sec = training_time
         self._last_uplink_model_comm_sec = communication_time
         if send_start_cpu is not None:

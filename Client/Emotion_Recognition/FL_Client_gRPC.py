@@ -145,6 +145,7 @@ class FederatedLearningClient:
         self._last_round_time_sec = 0.0
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
+        self._last_downlink_model_bytes = 0  # bytes received for global model (downlink)
         # Initialize quantization compression (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
         use_quantization = uq_env.lower() in ("true", "1", "yes", "y")
@@ -420,6 +421,11 @@ class FederatedLearningClient:
     def receive_global_model(self, model_update):
         """Receive and set global model weights from server"""
         try:
+            # Track downlink bytes for fair battery accounting
+            try:
+                self._last_downlink_model_bytes = len(model_update.weights) if model_update.weights else 0
+            except Exception:
+                self._last_downlink_model_bytes = 0
             # Decompress/deserialize weights.
             # If both pruning and quantization are enabled, server should send quantized payload that already reflects pruning.
             candidate = pickle.loads(model_update.weights) if model_update.weights else None
@@ -635,7 +641,9 @@ class FederatedLearningClient:
             
             communication_time = time.time() - comm_start
             bytes_sent = payload_size
-            self.battery_model.update(bytes_sent, 0, training_time, communication_time)
+            self.battery_model.update(
+                bytes_sent, self._last_downlink_model_bytes, training_time, communication_time
+            )
             self._last_round_time_sec = training_time + communication_time
             self._last_training_time_sec = training_time
             self._last_uplink_model_comm_sec = communication_time

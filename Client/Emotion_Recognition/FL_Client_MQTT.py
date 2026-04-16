@@ -60,7 +60,7 @@ _utilities_path = os.path.join(project_root, 'scripts', 'utilities')
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 
-from packet_logger import log_sent_packet, log_received_packet, init_db, get_round_bytes_sent_received
+from packet_logger import log_sent_packet, log_received_packet, init_db
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 from client_experiment_results import (
     save_client_training_artifacts,
@@ -187,6 +187,7 @@ class FederatedLearningClient:
         self._last_round_time_sec = 0.0  # training + communication time for last round
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
+        self._last_downlink_model_bytes = 0  # bytes received for global model (downlink)
 
         # Initialize quantization compression (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
@@ -669,6 +670,8 @@ class FederatedLearningClient:
     def handle_global_model(self, payload):
         """Receive and set global model weights and architecture from server"""
         try:
+            # Track downlink bytes for fair battery accounting
+            self._last_downlink_model_bytes = len(payload)
             data = json.loads(payload.decode())
             message_type = data.get("message_type") or data.get("type")
             if message_type == "global_model_chunk":
@@ -948,13 +951,10 @@ class FederatedLearningClient:
             traceback.print_exc()
         communication_time = time.time() - comm_start
 
-        # Battery model update (same as unified use case)
-        try:
-            bytes_sent, bytes_recv = get_round_bytes_sent_received(self.current_round, "MQTT")
-        except Exception:
-            bytes_sent, bytes_recv = 0, 0
+        # Battery model update: use actual payload bytes for fair comparison with other protocols.
+        # bytes_sent = actual model upload payload; bytes_recv = global model received from server.
         self.battery_model.update(
-            bytes_sent, bytes_recv, training_time, communication_time
+            bytes_sent, self._last_downlink_model_bytes, training_time, communication_time
         )
         self._last_round_time_sec = training_time + communication_time
         self._last_training_time_sec = training_time

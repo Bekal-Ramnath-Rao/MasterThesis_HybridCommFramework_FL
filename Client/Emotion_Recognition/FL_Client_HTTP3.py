@@ -257,6 +257,7 @@ class FederatedLearningClient:
         self.battery_model = BatteryModel(protocol="http3")
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
+        self._last_downlink_model_bytes = 0  # bytes received for global model (downlink)
         self._global_model_chunk_buffers = {}
         self._fl_client_start_time = time.time()
         self._client_fl_round_history = []
@@ -474,6 +475,11 @@ class FederatedLearningClient:
         if round_num <= self.last_global_round:
             print(f"Client {self.client_id}: Ignoring duplicate global model for round {round_num}")
             return
+        # Track downlink bytes for fair battery accounting
+        try:
+            self._last_downlink_model_bytes = len(json.dumps(message).encode('utf-8'))
+        except Exception:
+            self._last_downlink_model_bytes = 0
         print(f"Client {self.client_id}: Received global_model message for round {round_num}")
         
         # Decompress or deserialize weights
@@ -730,7 +736,9 @@ class FederatedLearningClient:
         comm_start = time.time()
         sent_payload_bytes = await self._send_update_with_chunking(update_message)
         communication_time = time.time() - comm_start
-        self.battery_model.update(sent_payload_bytes, 0, training_time, communication_time)
+        self.battery_model.update(
+            sent_payload_bytes, self._last_downlink_model_bytes, training_time, communication_time
+        )
         self._last_training_time_sec = training_time
         self._last_uplink_model_comm_sec = communication_time
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
