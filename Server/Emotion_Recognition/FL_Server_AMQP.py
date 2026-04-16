@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 # Server uses CPU only (aggregation is numpy-only); saves GPU memory for clients
@@ -29,6 +30,7 @@ if _utilities_path not in sys.path:
 
 from packet_logger import log_sent_packet, log_received_packet, init_db
 from experiment_results_path import get_experiment_results_dir
+from battery_results_agg import avg_battery_model_drain_fraction
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -97,6 +99,7 @@ class FederatedLearningServer:
         self.ROUNDS = []
         self.ROUND_TIMES = []
         self.BATTERY_CONSUMPTION = []
+        self.BATTERY_MODEL_CONSUMPTION = []
         self.round_start_time = None
 
         # Convergence tracking
@@ -572,6 +575,7 @@ class FederatedLearningServer:
                     'metrics': data['metrics'],
                     'battery_soc': float(m.get('battery_soc', 1.0)),
                     'round_time_sec': float(m.get('round_time_sec', 0.0)),
+                    'cumulative_energy_j': float(m.get('cumulative_energy_j', 0.0)),
                 }
                 
                 print(f"Received metrics from client {client_id} "
@@ -832,6 +836,7 @@ class FederatedLearningServer:
             self.ROUND_TIMES.append(time.time() - self.round_start_time)
         socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
         self.BATTERY_CONSUMPTION.append(1.0 - (sum(socs) / len(socs) if socs else 1.0))
+        self.BATTERY_MODEL_CONSUMPTION.append(avg_battery_model_drain_fraction(self.client_metrics))
         # Calculate total samples
         total_samples = sum(metric['num_samples'] 
                           for metric in self.client_metrics.values())
@@ -1006,6 +1011,8 @@ class FederatedLearningServer:
             'accuracy': self.ACCURACY,
             'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
             'battery_consumption': getattr(self, 'BATTERY_CONSUMPTION', []),
+            'battery_model_consumption': getattr(self, 'BATTERY_MODEL_CONSUMPTION', []),
+            'battery_model_consumption_source': 'client_battery_model',
             'summary': {
                 'total_rounds': len(self.ROUNDS),
                 'num_clients': self.num_clients,

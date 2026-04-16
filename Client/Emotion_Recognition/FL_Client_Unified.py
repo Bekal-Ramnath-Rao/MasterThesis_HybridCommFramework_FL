@@ -18,9 +18,11 @@ import base64
 import logging
 import threading
 import socket
+import signal
+import atexit
 import re
 import fcntl
-from typing import Dict, Tuple, Optional, List, Sequence
+from typing import Any, Dict, Tuple, Optional, List, Sequence
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
@@ -78,6 +80,45 @@ except ImportError:
     H3Connection = None
     H3Event = None
     StreamReset = None
+
+# Set CycloneDDS config before any cyclonedds import (native lib may read at load time);
+# same logic as FL_Client_DDS.py for DDS_PEER_* static unicast across hosts.
+def _emotion_config_dir():
+    if os.path.exists("/app"):
+        return "/app/config"
+    return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "config"))
+
+
+def _try_distributed_unicast_client():
+    base = _emotion_config_dir()
+    helper = os.path.join(base, "dds_distributed_unicast.py")
+    if not os.path.isfile(helper):
+        return False
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("dds_distributed_unicast", helper)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.try_apply_client_uri()
+
+
+def _ensure_client_cyclonedds_uri():
+    if os.environ.get("CYCLONEDDS_URI"):
+        return
+    if _try_distributed_unicast_client():
+        return
+    base = _emotion_config_dir()
+    mc = os.path.join(base, "cyclonedds-multicast-lan.xml")
+    if os.path.isfile(mc):
+        os.environ["CYCLONEDDS_URI"] = "file://" + os.path.abspath(mc)
+        return
+    _cid = os.environ.get("CLIENT_ID", "1")
+    _path = os.path.join(base, f"cyclonedds-emotion-client{_cid}.xml")
+    if os.path.isfile(_path):
+        os.environ["CYCLONEDDS_URI"] = "file://" + os.path.abspath(_path)
+
+
+_ensure_client_cyclonedds_uri()
 
 try:
     from cyclonedds.domain import DomainParticipant
@@ -318,11 +359,15 @@ if _utilities_path not in sys.path:
 
 from packet_logger import init_db, log_sent_packet, log_received_packet, get_round_bytes_sent_received
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+from client_experiment_results import save_client_training_artifacts, maybe_checkpoint_client_training_artifacts
 try:
-    from q_learning_logger import init_db as init_qlearning_db, log_q_step
+    from q_learning_logger import init_db as init_qlearning_db, log_q_step, rl_state_network_kwargs
 except ImportError:
     init_qlearning_db = None
     log_q_step = None
+
+    def rl_state_network_kwargs(_state=None):
+        return {}
 
 # Import custom modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -422,6 +467,11 @@ def _env_truthy(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "y")
 
 
+# When True, select_protocol uses only frozen converged_protocol_by_scenario (inference path).
+# Default False so USE_RL_EXPLORATION=false still greedy-selects from the Q-table / converged map, not MQTT fallback.
+RL_INFERENCE_ONLY = _env_truthy("RL_INFERENCE_ONLY")
+_RL_PROTOCOL_SELECTION_RECORD_LEARNING = not RL_INFERENCE_ONLY
+
 # Skip loading any on-disk Q-table (zeros + default epsilon). Overrides shared_data / PRETRAINED discovery.
 RL_FRESH_Q_TABLE = _env_truthy("RL_FRESH_Q_TABLE")
 # Optional explicit pickle paths for inference or a chosen checkpoint (highest priority if set and file exists).
@@ -519,6 +569,8 @@ TOPIC_TRAINING_COMPLETE = "fl/training_complete"
 
 # DDS Configuration
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
+# Large model chunk streams (distributed): allow long reliable blocking (seconds).
+DDS_CHUNK_MAX_BLOCKING_SEC = float(os.getenv("DDS_CHUNK_MAX_BLOCKING_SEC", "60.0"))
 
 # Protocol max payload sizes (unified spec: AMQP/MQTT 128KB, gRPC 4MB, HTTP/3 16KB, DDS 64KB)
 MQTT_MAX_PAYLOAD_BYTES = 128 * 1024   # 128 KB
@@ -538,6 +590,7 @@ if DDS_AVAILABLE:
     class GlobalModel(IdlStruct):
         round: int
         weights: sequence[int]  # CycloneDDS sequence type for sequence<octet> in IDL
+        model_config_json: str = ""  # must match Server/Emotion_Recognition/FL_Server_Unified.py
     
     @dataclass
     class GlobalModelChunk(IdlStruct):
@@ -584,6 +637,9 @@ if DDS_AVAILABLE:
         accuracy: float
         client_converged: float = 0.0
         battery_soc: float = 1.0
+        training_time_sec: float = 0.0
+        round_time_sec: float = 0.0
+        uplink_model_comm_sec: float = 0.0
 
 
 class UnifiedFLClient_Emotion:
@@ -623,6 +679,9 @@ class UnifiedFLClient_Emotion:
         self.is_active = True
         self.has_converged = False
         self.shutdown_requested = False
+        self._fl_client_start_time = time.time()
+        self._client_fl_round_history: List[Dict[str, Any]] = []
+        self._artifact_emergency_flush_done = False
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         
@@ -681,6 +740,7 @@ class UnifiedFLClient_Emotion:
                 save_path=save_path_uplink,
                 initial_load_path=initial_load_path_uplink,
                 use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
+                link_role="uplink",
             )
 
             # --- Downlink agent paths (server -> client model downloads) ---
@@ -720,6 +780,7 @@ class UnifiedFLClient_Emotion:
                 save_path=save_path_downlink,
                 initial_load_path=initial_load_path_downlink,
                 use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
+                link_role="downlink",
             )
 
             # Backward-compat alias: self.rl_selector always points to the uplink agent
@@ -897,6 +958,15 @@ class UnifiedFLClient_Emotion:
                 self.env_manager.update_network_condition(_coarse_network_bucket_for_scenario(_sn))
                 self.rl_selector_uplink.ensure_scenario(_sn)
                 self.rl_selector_downlink.ensure_scenario(_sn)
+
+            if os.getenv("RL_PRINT_CANONICAL_Q_VALUES", "").strip().lower() in (
+                "1", "true", "yes", "y",
+            ):
+                print(f"\n[Client {client_id}] Canonical Q-row report — uplink:")
+                self.rl_selector_uplink.print_canonical_q_values_report()
+                print(f"\n[Client {client_id}] Canonical Q-row report — downlink:")
+                self.rl_selector_downlink.print_canonical_q_values_report()
+                print()
         else:
             self.rl_selector_uplink = None
             self.rl_selector_downlink = None
@@ -926,54 +996,64 @@ class UnifiedFLClient_Emotion:
         self._downlink_server_sent_unix = None  # server wall time when downlink send started
         self._downlink_receive_complete_unix = None  # client wall time when model apply finished
         
-        # DDS chunk reassembly buffers (FAIR CONFIG: matching standalone)
+               # DDS chunk reassembly buffers (FAIR CONFIG: matching standalone)
         self.global_model_chunks = {}  # {chunk_id: payload}
-        self.global_model_metadata = {}  # {round, total_chunks, model_config_json}
+        self.global_model_metadata = {}  # {round, total_chunks, model_config_json, server_sent_unix}
+        self._dds_uplink_prepped = False
         
         # DDS Components
         if DDS_AVAILABLE:
             try:
+                # Same as FL_Client_DDS.setup_dds: ensure static unicast XML from DDS_PEER_* before participant.
+                _ensure_client_cyclonedds_uri()
+                uri = os.environ.get("CYCLONEDDS_URI")
+                print(f"[DDS] CYCLONEDDS_URI={uri or '(not set)'}")
+                print(f"[DDS] Setting up DDS on domain {DDS_DOMAIN_ID} (client {client_id})...")
                 # Create DDS participant
                 self.dds_participant = DomainParticipant(DDS_DOMAIN_ID)
                 
-                # Reliable QoS for critical control messages (registration, config, commands)
+                # Match FL_Client_DDS.setup_dds (Reliable + same chunk QoS as FL_Server_DDS).
                 reliable_qos = Qos(
                     Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
                     Policy.History.KeepLast(10),
-                    Policy.Durability.TransientLocal
+                    Policy.Durability.TransientLocal,
                 )
-                
-                # Best effort QoS for non-critical bulk paths
-                best_effort_qos = Qos(
-                    Policy.Reliability.BestEffort,
-                    Policy.History.KeepLast(1),
+                reliable_qos_large = Qos(
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),
+                    Policy.History.KeepLast(10),
+                    Policy.Durability.TransientLocal,
+                    Policy.ResourceLimits(max_samples=10, max_instances=10, max_samples_per_instance=10),
                 )
-
-                # Reliable QoS for chunked model transfer to prevent dropped chunks.
+                _chunk_blk = min(600.0, max(1.0, float(DDS_CHUNK_MAX_BLOCKING_SEC)))
                 chunk_qos = Qos(
-                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=_chunk_blk)),
                     Policy.History.KeepLast(2048),
-                    Policy.Durability.TransientLocal
+                    Policy.Durability.TransientLocal,
                 )
                 
-                # Create topics
-                global_model_topic = Topic(self.dds_participant, "GlobalModel", GlobalModel)
-                global_model_chunk_topic = Topic(self.dds_participant, "GlobalModelChunk", GlobalModelChunk)
+                # Topics + writers only here; DataReaders are created once in start_dds_listener
+                # (avoids duplicate readers on the same topic/participant).
                 self.dds_update_topic = Topic(self.dds_participant, "ModelUpdate", ModelUpdate)
                 update_chunk_topic = Topic(self.dds_participant, "ModelUpdateChunk", ModelUpdateChunk)
                 self.dds_metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
                 
-                # Create readers (for receiving from server)
-                # Use reliable QoS for chunked model data
-                self.dds_global_model_reader = DataReader(self.dds_participant, global_model_topic, qos=best_effort_qos)
-                self.dds_global_model_chunk_reader = DataReader(self.dds_participant, global_model_chunk_topic, qos=chunk_qos)
-                
-                # Create writers (for sending to server)
-                # Use reliable QoS for chunked updates; metrics can remain best-effort
-                self.dds_update_writer = DataWriter(self.dds_participant, self.dds_update_topic, qos=best_effort_qos)
+                self.dds_update_writer = DataWriter(self.dds_participant, self.dds_update_topic, qos=reliable_qos_large)
                 self.dds_update_chunk_writer = DataWriter(self.dds_participant, update_chunk_topic, qos=chunk_qos)
-                self.dds_metrics_writer = DataWriter(self.dds_participant, self.dds_metrics_topic, qos=best_effort_qos)
+                self.dds_metrics_writer = DataWriter(self.dds_participant, self.dds_metrics_topic, qos=reliable_qos)
                 
+                self.dds_global_model_reader = None
+                self.dds_global_model_chunk_reader = None
+                self.dds_command_reader = None
+
+                _peers_set = all(
+                    os.environ.get(k, "").strip()
+                    for k in ("DDS_PEER_SERVER", "DDS_PEER_CLIENT1", "DDS_PEER_CLIENT2")
+                )
+                _disc = float(os.environ.get("DDS_DISCOVERY_WAIT_S", "5" if _peers_set else "2"))
+                if _disc > 0:
+                    print(f"[DDS] Client {client_id} post-participant discovery wait {_disc}s…")
+                    time.sleep(_disc)
+
                 print(f"[DDS] Client {client_id} initialized on domain {DDS_DOMAIN_ID} with chunking support")
             except Exception as e:
                 print(f"[DDS] Initialization failed: {e}")
@@ -983,6 +1063,7 @@ class UnifiedFLClient_Emotion:
                 self.dds_metrics_writer = None
                 self.dds_global_model_reader = None
                 self.dds_global_model_chunk_reader = None
+                self.dds_command_reader = None
         else:
             self.dds_participant = None
             self.dds_update_writer = None
@@ -990,6 +1071,7 @@ class UnifiedFLClient_Emotion:
             self.dds_metrics_writer = None
             self.dds_global_model_reader = None
             self.dds_global_model_chunk_reader = None
+            self.dds_command_reader = None
         
         # Initialize packet logger and Q-learning logger
         init_db()
@@ -1032,10 +1114,8 @@ class UnifiedFLClient_Emotion:
         self.amqp_listener_channel = None
         self.amqp_listener_thread = None
         
-        # DDS listener components
+        # DDS listener components (readers attached in start_dds_listener)
         self.dds_listener_thread = None
-        self.dds_global_model_reader = None
-        self.dds_command_reader = None
         
         # gRPC listener components
         self.grpc_listener_thread = None
@@ -1059,6 +1139,8 @@ class UnifiedFLClient_Emotion:
         print(f"RL Protocol Selection: {'ENABLED' if USE_RL_SELECTION else 'DISABLED'}")
         if USE_RL_SELECTION:
             print(f"RL Exploration (epsilon-greedy): {'ENABLED' if USE_RL_EXPLORATION else 'DISABLED (greedy)'}")
+            if RL_INFERENCE_ONLY:
+                print("RL Inference-only (RL_INFERENCE_ONLY): protocol pick from converged map / frozen Q inference path")
             print(f"Q-Convergence Stop (USE_QL_CONVERGENCE): {'ENABLED' if USE_QL_CONVERGENCE else 'DISABLED'}")
             print(f"Communication Model in Reward: {'ENABLED' if USE_COMMUNICATION_MODEL_REWARD else 'DISABLED'}")
             if getattr(self, "_rl_boundary_collection_phase", False):
@@ -1069,8 +1151,49 @@ class UnifiedFLClient_Emotion:
                 )
         print(f"{'='*70}\n")
         
+        self._register_client_artifact_shutdown_hooks()
         # Start protocol listeners in background threads
         self.start_all_protocol_listeners()
+
+    def _register_client_artifact_shutdown_hooks(self) -> None:
+        """Save artifacts on exit if the server never sends training_complete (common for distributed clients)."""
+
+        def _flush(reason: str) -> None:
+            if self._artifact_emergency_flush_done:
+                return
+            hist = list(self._client_fl_round_history)
+            if not hist:
+                return
+            try:
+                proto = os.environ.get("CLIENT_EXPERIMENT_PROTOCOL", "unified").strip().lower() or "unified"
+                save_client_training_artifacts(
+                    self.client_id,
+                    use_case=use_case_from_env("emotion"),
+                    protocol=proto,
+                    round_history=hist,
+                    total_elapsed_sec=time.time() - self._fl_client_start_time,
+                    quiet=True,
+                )
+                self._artifact_emergency_flush_done = True
+            except Exception as e:
+                print(f"[Client {self.client_id}] WARNING: training artifact flush ({reason}): {e}")
+
+        def _on_signal(signum, frame):
+            _flush(f"signal {signum}")
+            self.shutdown_requested = True
+            self.is_active = False
+            try:
+                self.cleanup()
+            except Exception:
+                pass
+            raise SystemExit(128 + int(signum) if signum else 0)
+
+        atexit.register(lambda: _flush("atexit"))
+        try:
+            signal.signal(signal.SIGTERM, _on_signal)
+            signal.signal(signal.SIGINT, _on_signal)
+        except ValueError:
+            pass
     
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""
@@ -1395,79 +1518,206 @@ class UnifiedFLClient_Emotion:
     # -------------------------------------------------------------------------
     
     def start_dds_listener(self):
-        """Start DDS reader polling thread (mirrors FL_Client_DDS.py)"""
+        """Start DDS reader polling thread (GlobalModel, GlobalModelChunk, TrainingCommand)."""
+        if self.dds_listener_thread and self.dds_listener_thread.is_alive():
+            return
+        if not DDS_AVAILABLE or not self.dds_participant:
+            return
+
         def dds_listener_loop():
             try:
-                # Create readers for GlobalModel and TrainingCommand
                 from cyclonedds.core import Qos, Policy
                 from cyclonedds.util import duration
                 from cyclonedds.topic import Topic
-                
+
                 reliable_qos = Qos(
                     Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
                     Policy.History.KeepLast(10),
-                    Policy.Durability.TransientLocal
+                    Policy.Durability.TransientLocal,
                 )
-                
+                _chunk_blk = min(600.0, max(1.0, float(DDS_CHUNK_MAX_BLOCKING_SEC)))
+                chunk_qos = Qos(
+                    Policy.Reliability.Reliable(max_blocking_time=duration(seconds=_chunk_blk)),
+                    Policy.History.KeepLast(2048),
+                    Policy.Durability.TransientLocal,
+                )
+
                 topic_global_model = Topic(self.dds_participant, "GlobalModel", GlobalModel)
+                topic_global_chunk = Topic(self.dds_participant, "GlobalModelChunk", GlobalModelChunk)
                 topic_command = Topic(self.dds_participant, "TrainingCommand", TrainingCommand)
-                
-                self.dds_global_model_reader = DataReader(self.dds_participant, topic_global_model, qos=reliable_qos)
-                self.dds_command_reader = DataReader(self.dds_participant, topic_command, qos=reliable_qos)
-                
-                print(f"[DDS] Listener started for client {self.client_id}")
-                
-                # Polling loop
+
+                self.dds_global_model_chunk_reader = DataReader(
+                    self.dds_participant, topic_global_chunk, qos=chunk_qos
+                )
+                self.dds_global_model_reader = DataReader(
+                    self.dds_participant, topic_global_model, qos=reliable_qos
+                )
+                self.dds_command_reader = DataReader(
+                    self.dds_participant, topic_command, qos=reliable_qos
+                )
+
+                print(f"[DDS] Listener started for client {self.client_id} (chunk + global + command readers)")
+
                 while True:
-                    # Check for global model
-                    for sample in self.dds_global_model_reader.take():
+                    for sample in self.dds_global_model_chunk_reader.take(100):
+                        if sample and hasattr(sample, "chunk_id"):
+                            self._ingest_dds_global_model_chunk(sample)
+                    for sample in self.dds_global_model_reader.take(20):
                         if sample:
                             self.on_dds_global_model(sample)
-                    
-                    # Check for commands
-                    for sample in self.dds_command_reader.take():
+                    for sample in self.dds_command_reader.take(20):
                         if sample:
                             self.on_dds_command(sample)
-                    
-                    time.sleep(0.1)  # Poll every 100ms
-                    
+                    time.sleep(0.05)
+
             except Exception as e:
                 print(f"[DDS] Listener error: {e}")
                 import traceback
                 traceback.print_exc()
-        
-        self.dds_listener_thread = threading.Thread(target=dds_listener_loop, daemon=True, name=f"DDS-Listener-{self.client_id}")
+
+        self.dds_listener_thread = threading.Thread(
+            target=dds_listener_loop, daemon=True, name=f"DDS-Listener-{self.client_id}"
+        )
         self.dds_listener_thread.start()
-    
-    def on_dds_global_model(self, sample):
-        """DDS callback: received global model"""
+
+    def _ingest_dds_global_model_chunk(self, sample) -> None:
+        """Reassemble GlobalModelChunk samples and apply via _apply_global_model_weights (unified path)."""
         try:
-            round_num = sample.round
-            print(f"[DDS] Client {self.client_id} received global model for round {round_num}")
-            
+            round_num = int(sample.round)
+            chunk_id = int(sample.chunk_id)
+            total_chunks = int(sample.total_chunks)
+            meta = self.global_model_metadata
+
+            need_reset = False
+            if meta and (
+                int(meta.get("round", -1)) != round_num
+                or int(meta.get("total_chunks", -1)) != total_chunks
+            ):
+                need_reset = True
+            if chunk_id == 0 and self.global_model_chunks:
+                need_reset = True
+            if need_reset:
+                self.global_model_chunks.clear()
+                self.global_model_metadata = {}
+
+            if not self.global_model_metadata:
+                self.global_model_metadata = {
+                    "round": round_num,
+                    "total_chunks": total_chunks,
+                    "model_config_json": "",
+                    "server_sent_unix": 0.0,
+                }
+
+            cfg = (getattr(sample, "model_config_json", None) or "").strip()
+            if cfg:
+                self.global_model_metadata["model_config_json"] = cfg
+            if chunk_id == 0:
+                try:
+                    self.global_model_metadata["server_sent_unix"] = float(
+                        getattr(sample, "server_sent_unix", 0.0) or 0.0
+                    )
+                except (TypeError, ValueError):
+                    self.global_model_metadata["server_sent_unix"] = 0.0
+
+            self.global_model_chunks[chunk_id] = sample.payload
+            received = len(self.global_model_chunks)
+            if received % 20 == 0 or received == total_chunks:
+                print(
+                    f"[DDS] Client {self.client_id} global model chunks {received}/{total_chunks} "
+                    f"(round {round_num})"
+                )
+
+            if received < total_chunks:
+                return
+
+            reassembled: List[int] = []
+            for i in range(total_chunks):
+                if i not in self.global_model_chunks:
+                    print(f"[DDS] Client {self.client_id} ERROR: missing global model chunk {i}")
+                    self.global_model_chunks.clear()
+                    self.global_model_metadata.clear()
+                    return
+                reassembled.extend(self.global_model_chunks[i])
+
+            self.global_model_chunks.clear()
+            meta_final = dict(self.global_model_metadata)
+            self.global_model_metadata.clear()
+
+            decoded = pickle.loads(bytes(reassembled))
+            if isinstance(decoded, dict) and "compressed_data" in decoded:
+                if self.quantizer is None:
+                    raise ValueError("Quantized global model on DDS but quantizer is not initialized")
+                weights = self.quantizer.decompress(decoded)
+                print(f"[DDS] Client {self.client_id} dequantized chunked global model (round {round_num})")
+            else:
+                weights = decoded
+
+            mc_raw = (meta_final.get("model_config_json") or "").strip()
+            model_config = json.loads(mc_raw) if mc_raw else None
+
+            self._global_model_receive_t0 = time.time()
+            log_received_packet(
+                packet_size=len(reassembled),
+                peer="server",
+                protocol="DDS",
+                round=self.current_round,
+                extra_info="global_model_chunked",
+            )
+            srv_u = meta_final.get("server_sent_unix") or 0.0
+            applied = self._apply_global_model_weights(
+                round_num=round_num,
+                weights=weights,
+                model_config=model_config,
+                source="DDS",
+                server_sent_unix=float(srv_u) if srv_u and float(srv_u) > 0 else None,
+            )
+            if applied:
+                self.waiting_for_aggregated_model = False
+        except Exception as e:
+            print(f"[DDS] Client {self.client_id} error ingesting global model chunk: {e}")
+            import traceback
+            traceback.print_exc()
+            self.global_model_chunks.clear()
+            self.global_model_metadata.clear()
+
+    def on_dds_global_model(self, sample):
+        """DDS callback: single-message GlobalModel (small payloads)."""
+        try:
+            self._global_model_receive_t0 = time.time()
+            round_num = int(sample.round)
+            print(f"[DDS] Client {self.client_id} received global model (non-chunked) for round {round_num}")
+
             log_received_packet(
                 packet_size=len(sample.weights),
                 peer="server",
                 protocol="DDS",
                 round=self.current_round,
-                extra_info="global_model"
+                extra_info="global_model",
             )
-            
-            # Deserialize weights (DDS uses sequence[int])
+
             weights_bytes = bytes(sample.weights)
-            weights = pickle.loads(weights_bytes)
-            
-            # Update model
-            if self.model and round_num > self.last_global_round:
-                self.model.set_weights(weights)
-                self.last_global_round = round_num
-                print(f"[DDS] Client {self.client_id} updated model weights for round {round_num}")
-                
+            decoded = pickle.loads(weights_bytes)
+            if isinstance(decoded, dict) and "compressed_data" in decoded:
+                if self.quantizer is None:
+                    raise ValueError("Quantized global model on DDS but quantizer is not initialized")
+                weights = self.quantizer.decompress(decoded)
+            else:
+                weights = decoded
+
+            applied = self._apply_global_model_weights(
+                round_num=round_num,
+                weights=weights,
+                model_config=None,
+                source="DDS",
+                server_sent_unix=None,
+            )
+            if applied:
+                self.waiting_for_aggregated_model = False
         except Exception as e:
             print(f"[DDS] Client {self.client_id} error handling global model: {e}")
             import traceback
             traceback.print_exc()
-    
+
     def on_dds_command(self, sample):
         """DDS callback: received training command"""
         try:
@@ -1810,10 +2060,12 @@ class UnifiedFLClient_Emotion:
         if recv_t0 is not None:
             self._global_model_receive_t0 = None
 
-        if self.model is None and source != "gRPC":
+        # gRPC is the default bootstrap in unified mode; DDS can also build the model when
+        # chunked GlobalModel includes model_config_json (standalone parity / DDS-only downlink).
+        if self.model is None and source not in ("gRPC", "DDS"):
             print(
-                f"[{source}] Client {self.client_id} ignoring non-gRPC initial global model. "
-                f"Bootstrap requires gRPC."
+                f"[{source}] Client {self.client_id} ignoring initial global model "
+                f"(bootstrap via gRPC or DDS with model_config only)."
             )
             return False
 
@@ -1827,6 +2079,13 @@ class UnifiedFLClient_Emotion:
                 return False
 
         if round_num >= self.last_global_round:
+            # Second path (e.g. gRPC + DDS) may deliver the same round twice; weights are identical.
+            if (
+                self.model is not None
+                and int(round_num) == int(self.last_global_round)
+                and not self.waiting_for_aggregated_model
+            ):
+                return True
             self.model.set_weights(weights)
             self.current_round = max(self.current_round, round_num)
             self.last_global_round = round_num
@@ -1960,6 +2219,8 @@ class UnifiedFLClient_Emotion:
         """
         if not USE_RL_SELECTION or self.rl_selector_downlink is None or self.env_manager is None:
             return
+        if not USE_RL_EXPLORATION:
+            return
         if self._downlink_select_time is not None and self._last_downlink_rl_state is not None:
             return
         try:
@@ -1969,7 +2230,7 @@ class UnifiedFLClient_Emotion:
             proto = self._downlink_protocol_from_delivery_source(source)
             if proto not in self.rl_selector_downlink.PROTOCOLS:
                 proto = "grpc"
-            self.rl_selector_downlink.register_selection(state, proto)
+            self.rl_selector_downlink.register_selection(state, proto, record_learning=_RL_PROTOCOL_SELECTION_RECORD_LEARNING)
             self._last_downlink_rl_state = state
             self._downlink_select_time = receive_started_at
             self.selected_downlink_protocol = proto
@@ -2017,6 +2278,10 @@ class UnifiedFLClient_Emotion:
         self._downlink_select_time = None
 
         self._last_downlink_comm_wall_s = float(comm_time)
+
+        if not USE_RL_EXPLORATION:
+            self._last_downlink_rl_state = None
+            return
 
         if getattr(self, "_rl_boundary_collection_phase", False):
             import psutil
@@ -2109,6 +2374,7 @@ class UnifiedFLClient_Emotion:
                     state_comm_level=downlink_state.get('comm_level', ''),
                     state_resource=downlink_state.get('resource', ''),
                     state_battery_level=downlink_state.get('battery_level', ''),
+                    **rl_state_network_kwargs(downlink_state),
                     action=protocol,
                     reward=reward,
                     q_delta=q_delta,
@@ -2237,8 +2503,24 @@ class UnifiedFLClient_Emotion:
             self.evaluate_model(evaluation_round_num=round_num)
             print(f"Client {self.client_id} evaluation completed for round {round_num}.")
     
+    def _save_client_experiment_artifacts_if_any(self) -> None:
+        try:
+            proto = os.environ.get("CLIENT_EXPERIMENT_PROTOCOL", "unified").strip().lower() or "unified"
+            out = save_client_training_artifacts(
+                self.client_id,
+                use_case=use_case_from_env("emotion"),
+                protocol=proto,
+                round_history=list(self._client_fl_round_history),
+                total_elapsed_sec=time.time() - self._fl_client_start_time,
+            )
+            if out is not None:
+                self._artifact_emergency_flush_done = True
+        except Exception as e:
+            print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
+
     def handle_training_complete(self):
         """Handle training completion signal from server"""
+        self._save_client_experiment_artifacts_if_any()
         self.is_active = False
         self.shutdown_requested = True
         print("\n" + "="*70)
@@ -2341,7 +2623,9 @@ class UnifiedFLClient_Emotion:
                     training_mode = USE_RL_EXPLORATION
                     if getattr(self, "_rl_boundary_collection_phase", False):
                         self.rl_selector_downlink.epsilon = 1.0
-                    selected = self.rl_selector_downlink.select_protocol(state, training=training_mode)
+                    selected = self.rl_selector_downlink.select_protocol(
+                        state, training=training_mode, record_learning=_RL_PROTOCOL_SELECTION_RECORD_LEARNING
+                    )
                 # Store downlink state and selection time so reward can be computed after model arrives
                 self._last_downlink_rl_state = state
                 self._downlink_select_time = time.time()
@@ -2375,7 +2659,7 @@ class UnifiedFLClient_Emotion:
                 and self.rl_selector_downlink is not None
                 and self.rl_selector_downlink.pop_last_selection()
             ):
-                self.rl_selector_downlink.register_selection(state, 'grpc')
+                self.rl_selector_downlink.register_selection(state, 'grpc', record_learning=_RL_PROTOCOL_SELECTION_RECORD_LEARNING)
                 self._last_downlink_rl_state = state
                 self._downlink_select_time = time.time()
             else:
@@ -2771,7 +3055,9 @@ class UnifiedFLClient_Emotion:
                     training_mode = USE_RL_EXPLORATION
                     if getattr(self, "_rl_boundary_collection_phase", False):
                         self.rl_selector_uplink.epsilon = 1.0
-                    protocol = self.rl_selector_uplink.select_protocol(state, training=training_mode)
+                    protocol = self.rl_selector_uplink.select_protocol(
+                        state, training=training_mode, record_learning=_RL_PROTOCOL_SELECTION_RECORD_LEARNING
+                    )
                 
                 print(f"\n[Uplink RL Protocol Selection]")
                 print(f"  CPU: {cpu:.1f}%, Memory: {memory:.1f}%")
@@ -2864,14 +3150,44 @@ class UnifiedFLClient_Emotion:
         for i in range(0, len(data), CHUNK_SIZE):
             chunks.append(data[i:i + CHUNK_SIZE])
         return chunks
+
+    def _dds_serialized_weights_bytes(self, message: dict) -> bytes:
+        """Bytes to chunk over DDS: same pickle payload JSON transports wrap as base64 strings."""
+        if 'compressed_data' in message:
+            return base64.b64decode(message['compressed_data'].encode('utf-8'))
+        w = message['weights']
+        if isinstance(w, str):
+            return base64.b64decode(w.encode('utf-8'))
+        return pickle.dumps(w)
+
+    def _ensure_dds_uplink_discovery_wait(self) -> None:
+        """Once per process: pause so the server's ModelUpdate reader can discover this writer (distributed DDS)."""
+        if getattr(self, "_dds_uplink_prepped", False):
+            return
+        wait_s = int(os.environ.get("DDS_MODEL_UPDATE_DISCOVERY_WAIT", "12"))
+        if wait_s > 0:
+            print(
+                f"[DDS] Client {self.client_id} waiting {wait_s}s for server "
+                f"model-update reader discovery (first DDS uplink)…"
+            )
+            time.sleep(wait_s)
+        self._dds_uplink_prepped = True
     
     def send_model_update_chunked(self, round_num, serialized_weights, num_samples, loss, accuracy):
         """Send model update as chunks via DDS"""
+        # Must match FL_Client_DDS / non-chunk unified path: payload is sequence<int> (list of octets).
+        # Passing Python bytes here can break CDR encoding or matching; standalone client uses list(pickle.dumps(...)).
+        if isinstance(serialized_weights, (bytes, bytearray, memoryview)):
+            serialized_weights = list(bytes(serialized_weights))
         chunks = self.split_into_chunks(serialized_weights)
         total_chunks = len(chunks)
-        
-        print(f"Client {self.client_id}: Sending model update in {total_chunks} chunks ({len(serialized_weights)} bytes total)")
-        
+        byte_len = len(serialized_weights)
+
+        print(f"Client {self.client_id}: Sending model update in {total_chunks} chunks ({byte_len} bytes total)")
+
+        _ack_to = duration(seconds=min(600.0, max(5.0, float(DDS_CHUNK_MAX_BLOCKING_SEC))))
+        _ack_timeout_logged = False
+
         for chunk_id, chunk_data in enumerate(chunks):
             chunk = ModelUpdateChunk(
                 client_id=self.client_id,
@@ -2884,10 +3200,15 @@ class UnifiedFLClient_Emotion:
                 accuracy=accuracy
             )
             self.dds_update_chunk_writer.write(chunk)
-            # Reliable QoS handles delivery, no need for artificial delay
+            if not self.dds_update_chunk_writer.wait_for_acks(_ack_to) and not _ack_timeout_logged:
+                _ack_timeout_logged = True
+                print(
+                    f"[DDS] Client {self.client_id} wait_for_acks timed out (first at chunk "
+                    f"{chunk_id + 1}/{total_chunks}; check server DDS / matching / firewall)"
+                )
             if (chunk_id + 1) % 20 == 0:  # Progress update every 20 chunks
                 print(f"  Sent {chunk_id + 1}/{total_chunks} chunks")
-        
+
         return total_chunks
     
     def deserialize_weights(self, encoded_weights):
@@ -3070,6 +3391,11 @@ class UnifiedFLClient_Emotion:
             self.validation_generator,
             verbose=0
         )
+        loss_f = float(loss)
+        accuracy_f = float(accuracy)
+        client_converged = (
+            1.0 if (stop_on_client_convergence() and self._would_converge_after_eval(loss_f)) else 0.0
+        )
         
         num_samples = self.validation_generator.n
         
@@ -3096,19 +3422,21 @@ class UnifiedFLClient_Emotion:
             "client_id": self.client_id,
             "round": report_round,
             "num_samples": num_samples,
-            "loss": float(loss),
-            "accuracy": float(accuracy),
+            "loss": loss_f,
+            "accuracy": accuracy_f,
             "battery_soc": float(battery_soc),
             "training_time_sec": training_time_sec,
             "uplink_model_comm_sec": uplink_model_comm_sec,
             "round_time_sec": float(round_time_sec),
+            "client_converged": float(client_converged),
             "metrics": {
-                "loss": float(loss),
-                "accuracy": float(accuracy),
+                "loss": loss_f,
+                "accuracy": accuracy_f,
                 "battery_soc": float(battery_soc),
                 "training_time_sec": training_time_sec,
                 "uplink_model_comm_sec": uplink_model_comm_sec,
                 "round_time_sec": float(round_time_sec),
+                "client_converged": float(client_converged),
             },
         }
         energy_j_total = 0.0
@@ -3185,8 +3513,8 @@ class UnifiedFLClient_Emotion:
                 {
                     "client_id": self.client_id,
                     "round": report_round,
-                    "loss": float(loss),
-                    "accuracy": float(accuracy),
+                    "loss": loss_f,
+                    "accuracy": accuracy_f,
                     "training_time_sec": training_time_sec,
                     "uplink_model_comm_sec": uplink_model_comm_sec,
                     "uplink_metrics_comm_sec": uplink_metrics_comm_sec,
@@ -3198,10 +3526,28 @@ class UnifiedFLClient_Emotion:
                 use_case=use_case_from_env("emotion"),
                 protocol=protocol,
             )
+            self._client_fl_round_history.append(
+                {
+                    "round": report_round,
+                    "loss": loss_f,
+                    "accuracy": accuracy_f,
+                    "total_fl_wall_time_sec": float(total_fl_wall_time_sec),
+                    "battery_soc_after": float(battery_soc_after),
+                }
+            )
+            _proto_ck = os.environ.get("CLIENT_EXPERIMENT_PROTOCOL", "unified").strip().lower() or "unified"
+            maybe_checkpoint_client_training_artifacts(
+                self.client_id,
+                use_case=use_case_from_env("emotion"),
+                protocol=_proto_ck,
+                round_history=self._client_fl_round_history,
+                total_elapsed_sec=time.time() - self._fl_client_start_time,
+            )
             print(f"Client {self.client_id} sent evaluation metrics for round {report_round}")
-            print(f"Evaluation metrics - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
+            print(f"Evaluation metrics - Loss: {loss_f:.4f}, Accuracy: {accuracy_f:.4f}")
             # RL update and optional Q-convergence end condition (battery already updated above for metrics)
-            # When RL is enabled: always update Q and log to DB (so GUI shows data and agent learns).
+            # When USE_RL_EXPLORATION: update Q, log, epsilon decay (training). When false: greedy
+            # protocol from Q-table / converged map (still records selection unless RL_INFERENCE_ONLY); Q unchanged.
             # Only the *stopping* condition differs: USE_QL_CONVERGENCE -> stop when Q converges; else stop on loss.
             # Uses the dedicated UPLINK Q-learning agent.
             if USE_RL_SELECTION and self.rl_selector_uplink and self.env_manager:
@@ -3275,7 +3621,7 @@ class UnifiedFLClient_Emotion:
                             )
                         skip_uplink_training = True
 
-                    if not skip_uplink_training:
+                    if not skip_uplink_training and USE_RL_EXPLORATION:
                         reward = self.rl_selector_uplink.calculate_reward(
                             communication_time=comm_time_for_reward,
                             success=self.round_metrics['success'],
@@ -3332,6 +3678,7 @@ class UnifiedFLClient_Emotion:
                                 state_comm_level=st.get('comm_level', ''),
                                 state_resource=st.get('resource', ''),
                                 state_battery_level=st.get('battery_level', ''),
+                                **rl_state_network_kwargs(st),
                                 action=self._last_update_protocol or self.selected_protocol or 'mqtt',
                                 reward=reward,
                                 q_delta=q_delta,
@@ -3388,11 +3735,19 @@ class UnifiedFLClient_Emotion:
                 except Exception as rl_e:
                     print(f"[Client {self.client_id}] Uplink RL update error: {rl_e}")
             if not USE_QL_CONVERGENCE and ENABLE_LOCAL_CONVERGENCE_STOP and stop_on_client_convergence():
-                self._update_client_convergence_and_maybe_disconnect(loss)
+                self._update_client_convergence_and_maybe_disconnect(loss_f)
         except Exception as e:
             print(f"Client {self.client_id} ERROR sending metrics: {e}")
             import traceback
             traceback.print_exc()
+
+    def _would_converge_after_eval(self, loss: float) -> bool:
+        """True if this eval loss would trigger local convergence in the same round (mirrors FL_Client_gRPC)."""
+        if self.current_round < MIN_ROUNDS or self.has_converged:
+            return False
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            return False
+        return (self.rounds_without_improvement + 1) >= CONVERGENCE_PATIENCE
 
     def _update_client_convergence_and_maybe_disconnect(self, loss: float):
         """Track local convergence and disconnect this client when converged."""
@@ -3448,6 +3803,7 @@ class UnifiedFLClient_Emotion:
 
     def _disconnect_after_convergence(self):
         """Stop participating once local convergence is reached."""
+        self._save_client_experiment_artifacts_if_any()
         self.is_active = False
         self.shutdown_requested = True
         print(f"[Client {self.client_id}] Disconnecting after local convergence")
@@ -3543,10 +3899,28 @@ class UnifiedFLClient_Emotion:
         if not DDS_AVAILABLE or not self.dds_update_chunk_writer:
             raise NotImplementedError("DDS chunk writer not available")
 
-        if 'compressed_data' in message:
-            weights_bytes = base64.b64decode(message['compressed_data'].encode('utf-8'))
-        else:
-            weights_bytes = pickle.dumps(message['weights'])
+        self._ensure_dds_uplink_discovery_wait()
+
+        w = self.dds_update_chunk_writer
+        if w is not None:
+            _match_wait = float(os.environ.get("DDS_PUBLICATION_MATCH_WAIT_S", "45"))
+            match_deadline = time.time() + _match_wait
+            matched = False
+            while time.time() < match_deadline:
+                try:
+                    if w.get_publication_matched_status().current_count > 0:
+                        matched = True
+                        break
+                except Exception:
+                    break
+                time.sleep(0.1)
+            if not matched:
+                print(
+                    f"[DDS] Client {self.client_id} warning: ModelUpdateChunk writer has no matched readers "
+                    f"after {_match_wait:.0f}s (server may not see this uplink; check DDS_PEER_*, firewall, host network)"
+                )
+
+        weights_bytes = self._dds_serialized_weights_bytes(message)
 
         metrics = message.get('metrics', {})
         total_chunks = self.send_model_update_chunked(
@@ -3788,6 +4162,18 @@ class UnifiedFLClient_Emotion:
                         num_samples=message['num_samples'],
                         battery_soc=float(message.get('battery_soc', message.get('metrics', {}).get('battery_soc', 1.0))),
                         round_time_sec=float(message.get('round_time_sec', message.get('metrics', {}).get('round_time_sec', 0.0))),
+                        client_converged=float(
+                            message.get('client_converged', message.get('metrics', {}).get('client_converged', 0.0))
+                        ),
+                        training_time_sec=float(
+                            message.get('training_time_sec', message.get('metrics', {}).get('training_time_sec', 0.0))
+                        ),
+                        uplink_model_comm_sec=float(
+                            message.get(
+                                'uplink_model_comm_sec',
+                                message.get('metrics', {}).get('uplink_model_comm_sec', 0.0),
+                            )
+                        ),
                     )
                 )
                 
@@ -4570,10 +4956,8 @@ class UnifiedFLClient_Emotion:
             raise NotImplementedError("DDS not available - triggering fallback")
         
         try:
-            if 'compressed_data' in message:
-                weights_bytes = base64.b64decode(message['compressed_data'].encode('utf-8'))
-            else:
-                weights_bytes = pickle.dumps(message['weights'])
+            self._ensure_dds_uplink_discovery_wait()
+            weights_bytes = self._dds_serialized_weights_bytes(message)
             metrics = message.get('metrics', {})
             dds_msg = ModelUpdate(
                 client_id=self.client_id,
@@ -4611,8 +4995,22 @@ class UnifiedFLClient_Emotion:
                 num_samples=message.get('num_samples', 0),
                 loss=message.get('loss', message.get('metrics', {}).get('loss', 0.0)),
                 accuracy=message.get('accuracy', message.get('metrics', {}).get('accuracy', 0.0)),
-                client_converged=float(message.get('metrics', {}).get('client_converged', 0.0)),
-                battery_soc=float(message.get('battery_soc', message.get('metrics', {}).get('battery_soc', 1.0)))
+                client_converged=float(
+                    message.get('client_converged', message.get('metrics', {}).get('client_converged', 0.0))
+                ),
+                battery_soc=float(message.get('battery_soc', message.get('metrics', {}).get('battery_soc', 1.0))),
+                training_time_sec=float(
+                    message.get('training_time_sec', message.get('metrics', {}).get('training_time_sec', 0.0))
+                ),
+                round_time_sec=float(
+                    message.get('round_time_sec', message.get('metrics', {}).get('round_time_sec', 0.0))
+                ),
+                uplink_model_comm_sec=float(
+                    message.get(
+                        'uplink_model_comm_sec',
+                        message.get('metrics', {}).get('uplink_model_comm_sec', 0.0),
+                    )
+                ),
             )
             
             # Write to DDS
@@ -4633,69 +5031,15 @@ class UnifiedFLClient_Emotion:
             raise
     
     def check_global_model_chunks(self):
-        """Check for global model chunks from server (matching standalone DDS)"""
+        """Optional extra poll for GlobalModelChunk (listener thread is primary). Applies via _ingest_dds_global_model_chunk."""
         if not DDS_AVAILABLE or not self.dds_global_model_chunk_reader:
             return None
-        
         try:
-            # Check for chunked global model
-            chunk_samples = self.dds_global_model_chunk_reader.take()
-            
-            for sample in chunk_samples:
-                if not sample or not hasattr(sample, 'round'):
-                    continue
-                
-                round_num = sample.round
-                chunk_id = sample.chunk_id
-                total_chunks = sample.total_chunks
-                
-                # Initialize buffers if needed
-                if not self.global_model_metadata:
-                    self.global_model_metadata = {
-                        'round': round_num,
-                        'total_chunks': total_chunks,
-                        'model_config_json': sample.model_config_json if hasattr(sample, 'model_config_json') else ''
-                    }
-                
-                # Store chunk
-                self.global_model_chunks[chunk_id] = sample.payload
-                
-                chunks_received = len(self.global_model_chunks)
-                
-                # Check if all chunks received
-                if chunks_received == total_chunks:
-                    try:
-                        # Reassemble chunks in order
-                        reassembled_data = []
-                        for i in range(total_chunks):
-                            if i in self.global_model_chunks:
-                                reassembled_data.extend(self.global_model_chunks[i])
-                            else:
-                                print(f"ERROR: Missing chunk {i}")
-                                break
-                        
-                        # Only process if we have all chunks
-                        if len(reassembled_data) > 0:
-                            # Deserialize weights
-                            weights = pickle.loads(bytes(reassembled_data))
-                            
-                            # Clear buffers
-                            self.global_model_chunks.clear()
-                            self.global_model_metadata.clear()
-                            
-                            return {'weights': weights, 'round': round_num}
-                    
-                    except Exception as e:
-                        print(f"[ERROR] Client {self.client_id}: Exception during model reassembly: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        # Clear buffers on error
-                        self.global_model_chunks.clear()
-                        self.global_model_metadata.clear()
-        
+            for sample in self.dds_global_model_chunk_reader.take(50):
+                if sample and hasattr(sample, "chunk_id"):
+                    self._ingest_dds_global_model_chunk(sample)
         except Exception as e:
             print(f"Client {self.client_id} ERROR checking global model chunks: {e}")
-        
         return None
     
     def start(self):

@@ -93,6 +93,42 @@ except Exception as e:
     QUIC_AVAILABLE = False
     print(f"Warning: aioquic not available, QUIC disabled (Unexpected error: {type(e).__name__}: {e})")
 
+# Set CycloneDDS config before any cyclonedds import (native lib may read at load time);
+# same logic as FL_Server_DDS.py for DDS_PEER_* static unicast across hosts.
+def _emotion_config_dir():
+    if os.path.exists("/app"):
+        return "/app/config"
+    return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..", "config"))
+
+
+def _try_distributed_unicast_server():
+    base = _emotion_config_dir()
+    helper = os.path.join(base, "dds_distributed_unicast.py")
+    if not os.path.isfile(helper):
+        return False
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("dds_distributed_unicast", helper)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.try_apply_server_uri()
+
+
+def _ensure_server_cyclonedds_uri():
+    if os.environ.get("CYCLONEDDS_URI"):
+        return
+    if _try_distributed_unicast_server():
+        return
+    base = _emotion_config_dir()
+    for name in ("cyclonedds-multicast-lan.xml", "cyclonedds-emotion-server.xml"):
+        p = os.path.join(base, name)
+        if os.path.isfile(p):
+            os.environ["CYCLONEDDS_URI"] = "file://" + os.path.abspath(p)
+            return
+
+
+_ensure_server_cyclonedds_uri()
+
 try:
     from cyclonedds.domain import DomainParticipant  # DDS
     from cyclonedds.topic import Topic
@@ -170,6 +206,7 @@ QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
 HTTP3_HOST = os.getenv("HTTP3_HOST", '0.0.0.0')
 HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
 DDS_DOMAIN_ID = int(os.getenv("DDS_DOMAIN_ID", "0"))
+DDS_CHUNK_MAX_BLOCKING_SEC = float(os.getenv("DDS_CHUNK_MAX_BLOCKING_SEC", "60.0"))
 
 # Protocol max payload sizes (unified spec)
 MQTT_MAX_PAYLOAD_BYTES = 128 * 1024   # 128 KB
@@ -237,6 +274,9 @@ if DDS_AVAILABLE:
         accuracy: float
         client_converged: float = 0.0
         battery_soc: float = 1.0
+        training_time_sec: float = 0.0
+        round_time_sec: float = 0.0
+        uplink_model_comm_sec: float = 0.0
 
 
 class UnifiedFederatedLearningServer:
@@ -264,6 +304,7 @@ class UnifiedFederatedLearningServer:
         # Server state
         self.running = True
         self.training_started = False
+        self._pre_training_update_notice_shown = False
         
         # Metrics storage
         self.ACCURACY = []
@@ -271,6 +312,8 @@ class UnifiedFederatedLearningServer:
         self.ROUNDS = []
         self.ROUND_TIMES = []
         self.BATTERY_CONSUMPTION = []
+        self.AVG_TRAINING_TIME_SEC = []
+        self.AVG_BATTERY_SOC = []
         self.round_start_time = None
 
         # Convergence tracking
@@ -1460,47 +1503,53 @@ class UnifiedFederatedLearningServer:
             return
         
         try:
+            # Same as FL_Server_DDS.setup_dds: refresh URI from DDS_PEER_* / temp XML before participant.
+            _ensure_server_cyclonedds_uri()
+            uri = os.environ.get("CYCLONEDDS_URI")
+            print(f"[DDS] CYCLONEDDS_URI={uri or '(not set)'}")
+            print(f"[DDS] Setting up DDS on domain {DDS_DOMAIN_ID}...")
             # Create DDS participant
             self.dds_participant = DomainParticipant(DDS_DOMAIN_ID)
             
-            # Reliable QoS for critical control messages (registration, config, commands)
+            # Match FL_Server_DDS.setup_dds QoS so writers/readers interoperate with FL_Client_DDS / unified client.
             reliable_qos = Qos(
                 Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
                 Policy.History.KeepLast(10),
                 Policy.Durability.TransientLocal
             )
-            
-            # Best effort QoS for non-critical bulk paths
-            best_effort_qos = Qos(
-                Policy.Reliability.BestEffort,
-                Policy.History.KeepLast(1),
+            reliable_qos_large = Qos(
+                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=600)),
+                Policy.History.KeepLast(10),
+                Policy.Durability.TransientLocal,
+                Policy.ResourceLimits(max_samples=10, max_instances=10, max_samples_per_instance=10),
             )
-
-            # Reliable QoS for chunked model transfer to prevent dropped chunks.
+            _chunk_blk = min(600.0, max(1.0, float(DDS_CHUNK_MAX_BLOCKING_SEC)))
             chunk_qos = Qos(
-                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+                Policy.Reliability.Reliable(max_blocking_time=duration(seconds=_chunk_blk)),
                 Policy.History.KeepLast(2048),
-                Policy.Durability.TransientLocal
+                Policy.Durability.TransientLocal,
             )
             
             # Create topics and readers for model updates
             update_topic = Topic(self.dds_participant, "ModelUpdate", ModelUpdate)
-            update_reader = DataReader(self.dds_participant, update_topic, qos=best_effort_qos)
+            update_reader = DataReader(self.dds_participant, update_topic, qos=reliable_qos_large)
             update_chunk_topic = Topic(self.dds_participant, "ModelUpdateChunk", ModelUpdateChunk)
             update_chunk_reader = DataReader(self.dds_participant, update_chunk_topic, qos=chunk_qos)
+            self._dds_update_chunk_reader = update_chunk_reader
             
             # Create topics and readers for metrics
             metrics_topic = Topic(self.dds_participant, "EvaluationMetrics", EvaluationMetrics)
-            metrics_reader = DataReader(self.dds_participant, metrics_topic, qos=best_effort_qos)
+            metrics_reader = DataReader(self.dds_participant, metrics_topic, qos=reliable_qos)
             
             # Create writers for sending global model and commands to clients
             global_model_topic = Topic(self.dds_participant, "GlobalModel", GlobalModel)
-            self.dds_writers['global_model'] = DataWriter(self.dds_participant, global_model_topic, qos=best_effort_qos)
+            self.dds_writers['global_model'] = DataWriter(self.dds_participant, global_model_topic, qos=reliable_qos)
             global_model_chunk_topic = Topic(self.dds_participant, "GlobalModelChunk", GlobalModelChunk)
             self.dds_writers['global_model_chunk'] = DataWriter(self.dds_participant, global_model_chunk_topic, qos=chunk_qos)
             
             command_topic = Topic(self.dds_participant, "TrainingCommand", TrainingCommand)
             self.dds_writers['command'] = DataWriter(self.dds_participant, command_topic, qos=reliable_qos)
+            time.sleep(0.5)  # discovery ramp-up (FL_Server_DDS.setup_dds)
             
             # Create DDS listener thread that polls for messages
             def dds_listener():
@@ -1513,20 +1562,42 @@ class UnifiedFederatedLearningServer:
                                 client_id = sample.client_id
                                 chunk_id = sample.chunk_id
                                 total_chunks = sample.total_chunks
-                                
-                                # Initialize chunk buffers if needed
+                                round_num = sample.round
+                                # Same guards as FL_Server_DDS.check_model_updates
+                                if round_num != self.current_round:
+                                    continue
+                                if client_id not in self.active_clients or client_id in self.client_updates:
+                                    continue
+
+                                meta = self.model_update_metadata.get(client_id)
+                                buf = self.model_update_chunks.get(client_id)
+                                need_reset = False
+                                if meta is not None:
+                                    if meta.get('round') != round_num or int(meta.get('total_chunks', -1)) != int(total_chunks):
+                                        need_reset = True
+                                if chunk_id == 0 and buf:
+                                    need_reset = True
+                                if need_reset:
+                                    self.model_update_chunks.pop(client_id, None)
+                                    self.model_update_metadata.pop(client_id, None)
+
                                 if client_id not in self.model_update_chunks:
                                     self.model_update_chunks[client_id] = {}
                                     self.model_update_metadata[client_id] = {
+                                        'round': round_num,
                                         'total_chunks': total_chunks,
                                         'num_samples': sample.num_samples,
                                         'loss': sample.loss,
                                         'accuracy': sample.accuracy,
                                     }
-                                
-                                # Store chunk
+
                                 self.model_update_chunks[client_id][chunk_id] = sample.payload
-                                
+                                if chunk_id == 0:
+                                    print(
+                                        f"[DDS] Chunked model update from client {client_id} "
+                                        f"round {round_num} ({total_chunks} chunks) — receiving…"
+                                    )
+
                                 # Check if all chunks received for this client
                                 if len(self.model_update_chunks[client_id]) == total_chunks:
                                     # Reassemble chunks in order
@@ -1585,6 +1656,13 @@ class UnifiedFederatedLearningServer:
                         for sample in samples_read:
                             if sample:
                                 try:
+                                    if sample.round != self.current_round:
+                                        continue
+                                    if (
+                                        sample.client_id not in self.active_clients
+                                        or sample.client_id in self.client_updates
+                                    ):
+                                        continue
                                     # Convert List[int] back to bytes and deserialize weights
                                     weights_bytes = bytes(sample.weights)
                                     weights = pickle.loads(weights_bytes)
@@ -1634,11 +1712,29 @@ class UnifiedFederatedLearningServer:
                                         'loss': sample.loss,
                                         'accuracy': sample.accuracy,
                                         'battery_soc': sample.battery_soc,
+                                        'training_time_sec': getattr(
+                                            sample, 'training_time_sec', 0.0
+                                        ),
+                                        'round_time_sec': getattr(
+                                            sample, 'round_time_sec', 0.0
+                                        ),
+                                        'uplink_model_comm_sec': getattr(
+                                            sample, 'uplink_model_comm_sec', 0.0
+                                        ),
                                         'metrics': {
                                             'loss': sample.loss,
                                             'accuracy': sample.accuracy,
                                             'client_converged': sample.client_converged,
                                             'battery_soc': sample.battery_soc,
+                                            'training_time_sec': getattr(
+                                                sample, 'training_time_sec', 0.0
+                                            ),
+                                            'round_time_sec': getattr(
+                                                sample, 'round_time_sec', 0.0
+                                            ),
+                                            'uplink_model_comm_sec': getattr(
+                                                sample, 'uplink_model_comm_sec', 0.0
+                                            ),
                                         }
                                     }
                                     
@@ -1669,8 +1765,50 @@ class UnifiedFederatedLearningServer:
             
             dds_thread = threading.Thread(target=dds_listener, daemon=True)
             dds_thread.start()
+
+            def _dds_chunk_match_diagnostic():
+                time.sleep(12.0)
+                try:
+                    r = getattr(self, "_dds_update_chunk_reader", None)
+                    if r is None:
+                        return
+                    n_matched = None
+                    # cyclonedds-python versions differ: some DataReaders lack get_subscription_matched_status.
+                    try:
+                        pubs = r.get_matched_publications()
+                        n_matched = len(pubs) if pubs is not None else 0
+                    except Exception:
+                        pass
+                    if n_matched is None:
+                        try:
+                            st = r.get_subscription_matched_status()
+                            n_matched = int(getattr(st, "current_count", 0))
+                        except AttributeError:
+                            n_matched = None
+                    if n_matched is not None:
+                        print(
+                            f"[DDS] ModelUpdateChunk reader matched publications: {n_matched} "
+                            f"(0 after clients start usually means UDP/locators: same-bridge containers "
+                            f"often need DDS_DISABLE_EXTERNAL_ADVERTISE=1 on the server)"
+                        )
+                    else:
+                        print(
+                            "[DDS] ModelUpdateChunk reader: cannot query matched writers "
+                            "(upgrade cyclonedds or ignore; DDS uplink may still work)"
+                        )
+                except Exception as ex:
+                    print(f"[DDS] ModelUpdateChunk match diagnostic failed: {ex}")
+
+            threading.Thread(target=_dds_chunk_match_diagnostic, daemon=True).start()
             
             print(f"[DDS] Server started on domain {DDS_DOMAIN_ID}")
+            if os.path.exists("/.dockerenv"):
+                print(
+                    "[DDS] Running in Docker: if clients log DDS sends but this server never prints "
+                    "'[DDS] Chunked model update', use network_mode:host for unified FL "
+                    "(default Docker/docker-compose-unified-emotion.yml). Bridge layout: "
+                    "docker-compose-unified-emotion.bridge.yml rarely supports DDS without extra UDP mapping."
+                )
 
         except Exception as e:
             print(f"[DDS] Failed to start: {e}")
@@ -1738,11 +1876,18 @@ class UnifiedFederatedLearningServer:
                       f"({len(self.registered_clients)}/{self.num_clients})")
             
             if not self.training_started and len(self.registered_clients) >= self.min_clients:
-                self.training_started = True
                 print(f"\n[Server] All {self.num_clients} clients registered!")
                 print("[Server] Distributing initial global model...\n")
                 time.sleep(2)
-                self.distribute_initial_model()
+                try:
+                    self.distribute_initial_model()
+                except Exception as e:
+                    print(f"[Server] FATAL: distribute_initial_model() failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    print("[Server] Training NOT started; fix the error and restart (or purge stale AMQP queues).")
+                    return
+                self.training_started = True
                 self.start_time = time.time()
                 print(f"[Server] Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
@@ -1781,6 +1926,14 @@ class UnifiedFederatedLearningServer:
         with self.lock:
             client_id = data['client_id']
             round_num = data['round']
+            if not self.training_started:
+                if not self._pre_training_update_notice_shown:
+                    self._pre_training_update_notice_shown = True
+                    print(
+                        f"[{protocol.upper()}] Ignoring model updates until training starts "
+                        f"(e.g. stale durable AMQP from a prior run). Purge client_*_updates queues or use a clean broker."
+                    )
+                return
             client_metrics = data.get('metrics') or {}
             if not client_metrics:
                 client_metrics = {
@@ -1832,7 +1985,12 @@ class UnifiedFederatedLearningServer:
                 }
                 weights = None
             else:
-                weights = self.deserialize_weights(data['weights'])
+                raw_w = data['weights']
+                # JSON transports (MQTT/AMQP/gRPC/…) send base64; DDS reassembly passes decoded tensors.
+                if isinstance(raw_w, str):
+                    weights = self.deserialize_weights(raw_w)
+                else:
+                    weights = raw_w
             
             # Store update (metrics are handled separately via handle_client_metrics)
             if 'compressed_data' not in data or self.quantization_handler is None:
@@ -1903,6 +2061,8 @@ class UnifiedFederatedLearningServer:
         with self.lock:
             client_id = data['client_id']
             round_num = data['round']
+            if not self.training_started:
+                return
             metrics_payload = data.get('metrics') or {}
             loss_value = float(data.get('loss', metrics_payload.get('loss', 0.0)))
             accuracy_value = float(data.get('accuracy', metrics_payload.get('accuracy', 0.0)))
@@ -2292,6 +2452,17 @@ class UnifiedFederatedLearningServer:
         # Weighted average
         avg_loss = sum(m['loss'] * m['num_samples'] for m in self.client_metrics.values()) / total_samples
         avg_accuracy = sum(m['accuracy'] * m['num_samples'] for m in self.client_metrics.values()) / total_samples
+        avg_training_time = (
+            sum(
+                m.get('training_time_sec', 0.0) * m['num_samples']
+                for m in self.client_metrics.values()
+            )
+            / total_samples
+            if total_samples
+            else 0.0
+        )
+        self.AVG_TRAINING_TIME_SEC.append(float(avg_training_time))
+        self.AVG_BATTERY_SOC.append(float(avg_soc))
         
         self.ACCURACY.append(avg_accuracy)
         self.LOSS.append(avg_loss)
@@ -2300,6 +2471,8 @@ class UnifiedFederatedLearningServer:
         print(f"\nRound {self.current_round} Results:")
         print(f"  Avg Loss: {avg_loss:.4f}")
         print(f"  Avg Accuracy: {avg_accuracy:.4f}")
+        print(f"  Avg training time (sample-weighted): {avg_training_time:.3f} s")
+        print(f"  Avg battery SoC: {avg_soc:.4f}")
         print(f"  Active clients: {len(self.active_clients)}/{self.num_clients}")
         
         # Clear metrics
@@ -2350,6 +2523,8 @@ class UnifiedFederatedLearningServer:
             'loss': self.LOSS,
             'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
             'battery_consumption': getattr(self, 'BATTERY_CONSUMPTION', []),
+            'avg_training_time_sec': getattr(self, 'AVG_TRAINING_TIME_SEC', []),
+            'avg_battery_soc': getattr(self, 'AVG_BATTERY_SOC', []),
             'converged': self.converged,
             'total_time': time.time() - self.start_time,
             'convergence_time': self.convergence_time,
@@ -2360,14 +2535,31 @@ class UnifiedFederatedLearningServer:
                 for protocol in set((self.client_delivery_protocols or self.registered_clients).values())
             }
         }
-        
+        n_done = len(self.ROUNDS)
+        results['rounds_completed'] = n_done
+        results['total_rounds'] = n_done
+        results['final_loss'] = self.LOSS[-1] if self.LOSS else None
+        results['final_accuracy'] = self.ACCURACY[-1] if self.ACCURACY else None
+        ct = self.convergence_time
+        if ct is not None:
+            results['convergence_time_seconds'] = float(ct)
+            results['convergence_time_minutes'] = float(ct) / 60.0
+        else:
+            results['convergence_time_seconds'] = None
+            results['convergence_time_minutes'] = None
+
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         results_file = results_dir / f"unified_results_{timestamp}.json"
-        
+
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
-        
+
+        stable_runner = results_dir / 'rl_unified_training_results.json'
+        with open(stable_runner, 'w') as f:
+            json.dump(results, f, indent=2)
+
         print(f"\n✅ Results saved to {results_file}")
+        print(f"✅ Experiment runner snapshot: {stable_runner}")
         self.plot_results()
 
     def plot_results(self):
@@ -2716,6 +2908,8 @@ if GRPC_AVAILABLE:
                     'accuracy': request.accuracy,
                     'battery_soc': getattr(request, 'battery_soc', 1.0),
                     'round_time_sec': getattr(request, 'round_time_sec', 0.0),
+                    'training_time_sec': getattr(request, 'training_time_sec', 0.0),
+                    'uplink_model_comm_sec': getattr(request, 'uplink_model_comm_sec', 0.0),
                 }
                 
                 self.server.handle_client_metrics(data, 'grpc')

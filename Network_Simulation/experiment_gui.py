@@ -857,13 +857,14 @@ class FLExperimentGUI(QMainWindow):
         # Local client count: Docker (--local-clients) and native (--num-clients).
         training_layout.addWidget(QLabel("Clients from this GUI:"), 2, 0)
         self.gui_clients = QSpinBox()
-        self.gui_clients.setRange(1, 2)
+        self.gui_clients.setRange(0, 2)
         self.gui_clients.setValue(2)
         self.gui_clients.setStyleSheet("padding: 5px;")
         self.gui_clients.setToolTip(
             "How many client processes/containers to start on this machine.\n"
+            "Use 0 to start only the server (Docker: plus brokers); connect clients separately (e.g. distributed client GUI).\n"
             "Docker: passed as --local-clients (including RL-unified: only this many unified client services start).\n"
-            "Native mode: same value is used as --num-clients.\n"
+            "Native mode: same value is used as --num-clients (with Min Clients (server) passed as --min-clients).\n"
             "For Docker, Min Clients (server) should usually match the total clients you expect (local + remote)."
         )
         training_layout.addWidget(self.gui_clients, 2, 1)
@@ -1886,9 +1887,9 @@ class FLExperimentGUI(QMainWindow):
         )
 
     def build_docker_images_unified_emotion_host(self):
-        """Build Unified Docker images for Emotion (host network)."""
+        """Build Unified Docker images for Emotion (host network; same images as default unified yml)."""
         self._build_compose(
-            "Docker/docker-compose-unified-emotion.host-network.yml",
+            "Docker/docker-compose-unified-emotion.yml",
             "build_btn_unified_emotion_host",
             "Unified Docker images built successfully (Emotion) [Host Network]",
             "Unified Docker build failed (Emotion) [Host Network]",
@@ -2667,6 +2668,7 @@ class FLExperimentGUI(QMainWindow):
             # Use "Clients from this GUI" so it matches Docker --local-clients behavior (Min Clients is server wait for Docker).
             cmd_parts.extend(["--rounds", str(self.rounds_spinbox.value())])
             cmd_parts.extend(["--num-clients", str(self.gui_clients.value())])
+            cmd_parts.extend(["--min-clients", str(self.min_clients.value())])
             # Pruning (native mode)
             if self.pruning_enabled.isChecked():
                 cmd_parts.append("--use-pruning")

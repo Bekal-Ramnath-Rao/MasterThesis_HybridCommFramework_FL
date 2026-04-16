@@ -1,3 +1,4 @@
+import io
 import numpy as np
 import os
 import sys
@@ -25,6 +26,7 @@ if _utilities_path not in sys.path:
 
 from packet_logger import log_received_packet, log_sent_packet, init_db
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+from client_experiment_results import save_client_training_artifacts
 
 # Battery model (shared with gRPC/MQTT/Unified)
 _client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -191,6 +193,8 @@ class FederatedLearningClient:
         
         # Initialize packet logging database
         init_db()
+        self._fl_client_start_time = time.time()
+        self._client_fl_round_history = []
         
         # Battery/energy model for consumption tracking (server uses for battery plot)
         self.battery_model = BatteryModel(protocol="amqp")
@@ -645,6 +649,16 @@ class FederatedLearningClient:
     
     def on_training_complete(self):
         """Handle training complete signal from server"""
+        try:
+            save_client_training_artifacts(
+                self.client_id,
+                use_case=use_case_from_env("emotion"),
+                protocol="amqp",
+                round_history=list(self._client_fl_round_history),
+                total_elapsed_sec=time.time() - self._fl_client_start_time,
+            )
+        except Exception as e:
+            print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
         print("\n" + "="*70)
         print(f"Client {self.client_id} - Training completed!")
         print("="*70)
@@ -985,6 +999,7 @@ class FederatedLearningClient:
             "loss": float(loss),
             "accuracy": float(accuracy),
             "battery_soc": float(self.battery_model.battery_soc),
+            "cumulative_energy_j": float(self.battery_model.cumulative_energy_j),
         }
         if self.has_converged:
             # Avoid sending client_converged=1.0 when fixed-round mode is enabled.
@@ -1028,6 +1043,19 @@ class FederatedLearningClient:
                 use_case=use_case_from_env("emotion"),
                 protocol="amqp",
             )
+            self._client_fl_round_history.append(
+                {
+                    "round": int(self.current_round),
+                    "loss": float(loss),
+                    "accuracy": float(accuracy),
+                    "total_fl_wall_time_sec": float(
+                        self._last_training_time_sec
+                        + self._last_uplink_model_comm_sec
+                        + _uplink_metrics_sec
+                    ),
+                    "battery_soc_after": float(self.battery_model.battery_soc),
+                }
+            )
             print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
             log_sent_packet(
                 packet_size=len(_body),
@@ -1038,6 +1066,16 @@ class FederatedLearningClient:
             )
             if self.has_converged and stop_on_client_convergence():
                 print(f"Client {self.client_id} notifying server of convergence and disconnecting")
+                try:
+                    save_client_training_artifacts(
+                        self.client_id,
+                        use_case=use_case_from_env("emotion"),
+                        protocol="amqp",
+                        round_history=list(self._client_fl_round_history),
+                        total_elapsed_sec=time.time() - self._fl_client_start_time,
+                    )
+                except Exception as e:
+                    print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
                 time.sleep(2)
                 self.stop()
         else:

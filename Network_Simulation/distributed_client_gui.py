@@ -254,8 +254,8 @@ class DistributedClientGUI(QMainWindow):
             "Broker ports: Docker-mapped MQTT 31883 / AMQP 35672, or host/macvlan MQTT 1883 / AMQP 5672. "
             "Unified FL also needs TCP gRPC 50051 on the server host (initial model is pulled over gRPC, not MQTT). "
             "Standalone gRPC uses TCP 50051 only (no MQTT). QUIC 4433 | HTTP/3 4434 (UDP) | DDS domain 0. "
-            "Test Connection: RL-Unified → MQTT+AMQP TCP, gRPC TCP, QUIC/HTTP3 UDP; gRPC-only → TCP 50051; "
-            "MQTT modes → MQTT + gRPC; QUIC/HTTP3 → UDP; DDS → ping."
+            "Test Connection: RL-Unified → MQTT+AMQP TCP, gRPC TCP, QUIC/HTTP3 UDP, DDS (UDP SPDP 7412 + peer fields); "
+            "gRPC-only → TCP 50051; MQTT modes → MQTT + gRPC; QUIC/HTTP3 → UDP; DDS-only → ping + SPDP."
         )
         info_label.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
         layout.addWidget(info_label, 1, 0, 1, 3)
@@ -393,13 +393,14 @@ class DistributedClientGUI(QMainWindow):
         layout.addWidget(self.communication_model_reward_enabled, 5, 0, 1, 4)
 
         self.mount_shared_data = QCheckBox(
-            "Mount project shared_data for RL Q-tables (same as experiment Docker compose)"
+            "Mount project shared_data (metrics JSONL, packet/Q DBs, RL Q-tables)"
         )
         self.mount_shared_data.setChecked(True)
         self.mount_shared_data.setStyleSheet("padding: 5px; font-size: 12px;")
         self.mount_shared_data.setToolTip(
-            "Binds <project>/shared_data → /shared_data so uplink/downlink Q-table .pkl files load and save "
-            "like local clients. On another PC: sync or copy this folder from the experiment machine to share tables."
+            "Binds <project>/shared_data → /shared_data. Persists per-round client metrics (loss, accuracy, "
+            "training/uplink times, battery), packet_logs / q_learning DBs, and RL Q-table .pkl files — same as "
+            "experiment Docker compose. Recommended ON for distributed clients so JSONL is not lost in the container."
         )
         layout.addWidget(self.mount_shared_data, 6, 0, 1, 4)
 
@@ -825,12 +826,12 @@ class DistributedClientGUI(QMainWindow):
         self.update_rl_shared_data_visibility()
 
     def update_rl_shared_data_visibility(self):
-        """Show shared_data mount + epsilon reset only for RL-unified (matches experiment GUI scope)."""
+        """Always show shared_data mount (metrics + DBs + RL tables). Epsilon reset only for RL-unified training."""
         if not hasattr(self, "mount_shared_data"):
             return
         is_rl_unified = self.protocol_mode.currentData() == "rl_unified"
         training_selected = is_rl_unified and self.rl_mode_training.isChecked()
-        self.mount_shared_data.setVisible(is_rl_unified)
+        self.mount_shared_data.setVisible(True)
         self.reset_epsilon_on_start.setVisible(training_selected)
 
     def _sync_reset_epsilon_flag_for_distributed(self, shared_data_path):
@@ -1065,7 +1066,13 @@ class DistributedClientGUI(QMainWindow):
         """DDS-only experiments do not run MQTT; verify host reachability (ping) and remind about UDP."""
         self.log_text.append(
             f"\n🔍 DDS-only: skipping MQTT (broker not required). "
-            f"Checking host reachability to {server_ip} (ICMP ping)...\n"
+            f"Checking {server_ip} — SPDP UDP + ICMP ping...\n"
+        )
+        spdp_srv_port = self._cyclone_spdp_port_domain0(1)
+        dds_spdp_ok = self._udp_port_probe(server_ip, spdp_srv_port)
+        self.log_text.append(
+            f"{'✅' if dds_spdp_ok else 'ℹ️'} DDS SPDP UDP {spdp_srv_port} on {server_ip} "
+            f"({'reply — Cyclone may be listening' if dds_spdp_ok else 'no reply — normal if server DDS not running; allow UDP ~7400–7500'})\n"
         )
         self.statusBar().showMessage("Testing host reachability (DDS)...")
         ok = self._ping_server_host(server_ip)
@@ -1079,9 +1086,10 @@ class DistributedClientGUI(QMainWindow):
             QMessageBox.information(
                 self,
                 "Host reachable (DDS)",
-                f"Ping to {server_ip} succeeded.\n\n"
+                f"Ping to {server_ip} succeeded.\n"
+                f"SPDP UDP {spdp_srv_port}: {'open (best-effort)' if dds_spdp_ok else 'no nc reply (optional)'}\n\n"
                 "DDS does not use MQTT; no broker is required for this mode.\n"
-                "Discovery uses UDP (multicast on the LAN); allow UDP 7400–7500 between hosts if needed.",
+                "Discovery uses UDP (multicast on the LAN or static DDS_PEER_*); allow UDP 7400–7500 between hosts if needed.",
             )
             self.statusBar().showMessage("DDS: host reachable")
             return
@@ -1130,6 +1138,11 @@ class DistributedClientGUI(QMainWindow):
             return r.returncode == 0
         except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
             return False
+
+    @staticmethod
+    def _cyclone_spdp_port_domain0(participant_index: int) -> int:
+        """CycloneDDS domain 0 SPDP port: 7410 + 2 * ParticipantIndex (config/dds_distributed_unicast.py)."""
+        return 7410 + 2 * int(participant_index)
 
     def _test_connection_quic_http3(self, server_ip: str, protocol: str):
         """QUIC and HTTP/3 use UDP; do not test MQTT."""
@@ -1248,8 +1261,8 @@ class DistributedClientGUI(QMainWindow):
     def _test_connection_unified(self, server_ip: str):
         """RL-Unified needs MQTT, AMQP, gRPC (TCP), QUIC & HTTP/3 (UDP). DDS is separate (UDP multicast/unicast)."""
         self.log_text.append(
-            f"\n🔍 RL-Unified: checking {server_ip} — MQTT, AMQP, gRPC, QUIC, HTTP/3 "
-            f"(DDS uses UDP discovery; see log note)...\n"
+            f"\n🔍 RL-Unified: checking {server_ip} — MQTT, AMQP, gRPC, QUIC, HTTP/3, "
+            f"DDS (UDP SPDP / peers; not a TCP port like the others)...\n"
         )
         self.statusBar().showMessage("Testing RL-Unified endpoints…")
 
@@ -1264,7 +1277,7 @@ class DistributedClientGUI(QMainWindow):
             self.log_text.append("⚠️ `ping` not installed; skipping host ICMP check.\n")
 
         candidates = [
-            (31883, 35672, "Docker-mapped (e.g. docker-compose-unified-emotion.yml)"),
+            (31883, 35672, "Docker-mapped (e.g. docker-compose-unified-emotion.bridge.yml)"),
             (1883, 5672, "Standard broker ports (e.g. macvlan / host / config compose)"),
         ]
 
@@ -1318,10 +1331,28 @@ class DistributedClientGUI(QMainWindow):
             f"{'✅' if http3_ok else '❌'} HTTP/3 UDP 4434 ({'OK' if http3_ok else 'allow UDP / Docker 4434:4434/udp'})\n"
         )
 
-        self.log_text.append(
-            "ℹ️ DDS: CycloneDDS uses UDP (multicast LAN or static DDS_PEER_*); no single TCP port check. "
-            "Ensure same CYCLONEDDS_URI / peers as the server if you use DDS selection.\n"
+        # DDS: not TCP — probe optional SPDP UDP on server (participant index 1 → port 7412) + UI peer fields
+        spdp_srv_port = self._cyclone_spdp_port_domain0(1)
+        dds_spdp_ok = self._udp_port_probe(server_ip, spdp_srv_port)
+        ps = getattr(self, "dds_peer_server", None)
+        p1 = getattr(self, "dds_peer_client1", None)
+        p2 = getattr(self, "dds_peer_client2", None)
+        peers_filled = bool(
+            ps and p1 and p2
+            and ps.text().strip() and p1.text().strip() and p2.text().strip()
         )
+        self.log_text.append(
+            f"{'✅' if dds_spdp_ok else 'ℹ️'} DDS SPDP UDP {spdp_srv_port} on {server_ip} "
+            f"({'reply — Cyclone may be listening on server' if dds_spdp_ok else 'no reply — normal if unified server has no DDS participant yet; allow UDP ~7400–7500 + SPDP'})\n"
+        )
+        if peers_filled:
+            self.log_text.append(
+                "✅ DDS_PEER_*: all three peer fields set (static unicast; must match the experiment server).\n"
+            )
+        else:
+            self.log_text.append(
+                "ℹ️ DDS: set all three DDS peer fields for cross-host static unicast, or rely on multicast LAN XML.\n"
+            )
 
         transport_ok = mqtt_ok and amqp_ok and grpc_ok and quic_ok and http3_ok
         core_ok = mqtt_ok and grpc_ok
@@ -1337,8 +1368,11 @@ class DistributedClientGUI(QMainWindow):
                 f"• AMQP TCP {amqp_p} ✓\n"
                 f"• gRPC TCP {grpc_port} ✓\n"
                 f"• QUIC UDP 4433 ✓\n"
-                f"• HTTP/3 UDP 4434 ✓\n\n"
-                f"DDS is not TCP-probed; use matching multicast/unicast config with the server.",
+                f"• HTTP/3 UDP 4434 ✓\n"
+                f"• DDS: UDP discovery (not TCP); SPDP probe {spdp_srv_port} "
+                f"{'✓' if dds_spdp_ok else '— (optional)'}, peers in UI "
+                f"{'✓' if peers_filled else '— fill for static unicast'}\n\n"
+                f"DDS cannot use the same check as MQTT/gRPC; match DDS_PEER_* / CYCLONEDDS_URI with the server.",
             )
             self.statusBar().showMessage("RL-Unified: all endpoints OK")
             return
@@ -1589,16 +1623,16 @@ class DistributedClientGUI(QMainWindow):
         if network_scenario == "dynamic":
             net_line += f" (re-randomize every {self.dynamic_interval_sec.value()}s)"
         net_line += "\n"
-        rl_shared_lines = ""
-        if is_unified:
-            rl_shared_lines = (
-                f"RL shared_data mount: {'Yes' if self.mount_shared_data.isChecked() else 'No'} "
-                f"(Q-tables like experiment Docker)\n"
+        shared_data_lines = (
+            f"shared_data mount: {'Yes' if self.mount_shared_data.isChecked() else 'No'} "
+            f"(client metrics JSONL, DBs, RL Q-tables when unified)\n"
+            f"experiment_results mount: Yes → host <project>/experiment_results → /app/experiment_results "
+            f"(client training JSON/plots; same layout as server)\n"
+        )
+        if is_unified and self.is_rl_training_mode():
+            shared_data_lines += (
+                f"Reset epsilon: {'Yes' if self.reset_epsilon_on_start.isChecked() else 'No (resume)'}\n"
             )
-            if self.is_rl_training_mode():
-                rl_shared_lines += (
-                    f"Reset epsilon: {'Yes' if self.reset_epsilon_on_start.isChecked() else 'No (resume)'}\n"
-                )
         confirm_msg = (
             f"Ready to start client with:\n\n"
             f"Client ID: {client_id}\n"
@@ -1615,7 +1649,7 @@ class DistributedClientGUI(QMainWindow):
             f"GPU: {'Enabled' if self.gpu_enabled.isChecked() else 'Disabled'}\n"
             f"Q-Learning Convergence: {'Enabled' if self.is_rl_training_mode() else 'Disabled'}\n"
             f"Communication Model Reward: {'Enabled' if is_unified and self.communication_model_reward_enabled.isChecked() else 'Disabled'}\n"
-            f"{rl_shared_lines}"
+            f"{shared_data_lines}"
             f"Quantization: {'Enabled' if self.quantization_enabled.isChecked() else 'Disabled'}\n"
             f"Compression: {'Enabled' if self.compression_enabled.isChecked() else 'Disabled'}\n"
             f"Pruning: {'Enabled' if self.pruning_enabled.isChecked() else 'Disabled'}\n\n"
@@ -1684,16 +1718,35 @@ class DistributedClientGUI(QMainWindow):
         except Exception as e:
             self.log_text.append(f"⚠️ Could not check image: {str(e)}\n")
         
-        shared_data_path = os.path.abspath(
-            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "shared_data")
+        project_root = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
         )
-        if is_unified and self.mount_shared_data.isChecked():
+        shared_data_path = os.path.join(project_root, "shared_data")
+        experiment_results_host = os.path.join(project_root, "experiment_results")
+        try:
+            os.makedirs(experiment_results_host, exist_ok=True)
+        except OSError as e:
+            QMessageBox.critical(self, "experiment_results", f"Cannot create experiment_results directory:\n{e}")
+            return
+        if self.mount_shared_data.isChecked():
             try:
                 os.makedirs(shared_data_path, exist_ok=True)
             except OSError as e:
                 QMessageBox.critical(self, "shared_data", f"Cannot create shared_data directory:\n{e}")
                 return
-            self._sync_reset_epsilon_flag_for_distributed(shared_data_path)
+            if is_unified:
+                self._sync_reset_epsilon_flag_for_distributed(shared_data_path)
+
+        _uc_key = str(use_case).lower().replace(" ", "")
+        client_use_case_env = {
+            "emotion": "emotion",
+            "mentalstate": "mental_state",
+            "temperature": "temperature",
+        }.get(_uc_key, "emotion")
+        if network_scenario in (None, "none", "dynamic"):
+            network_scenario_env = "default"
+        else:
+            network_scenario_env = str(network_scenario).strip().lower() or "default"
         
         # Base command
         cmd = [
@@ -1701,18 +1754,30 @@ class DistributedClientGUI(QMainWindow):
             "--name", container_name,
             "--network", "host",  # Use host network to access server
             "--cap-add", "NET_ADMIN",  # For network simulation
+            "-v",
+            f"{experiment_results_host}:/app/experiment_results",
             "-e", f"CLIENT_ID={client_id}",
             "-e", f"NUM_CLIENTS={total_clients}",
             "-e", f"MIN_CLIENTS={total_clients}",
+            "-e", f"CLIENT_USE_CASE={client_use_case_env}",
+            "-e", f"NETWORK_SCENARIO={network_scenario_env}",
         ]
-        if is_unified and self.mount_shared_data.isChecked():
-            cmd.extend(["-v", f"{shared_data_path}:/shared_data"])
+        if self.mount_shared_data.isChecked():
+            cmd.extend(
+                [
+                    "-v",
+                    f"{shared_data_path}:/shared_data",
+                    "-e",
+                    "CLIENT_METRICS_LOG_DIR=/shared_data",
+                ]
+            )
         ds_val = self.data_shard_combo.currentData()
         if ds_val is not None and str(use_case).lower() in ("emotion", "mentalstate"):
             cmd.extend(["-e", f"DATASET_CLIENT_ID={int(ds_val)}"])
         cmd.extend([
             "-e", f"NUM_ROUNDS={self.rounds_spinbox.value()}",
             "-e", f"NODE_TYPE=client",
+            "-e", "CLIENT_EXPERIMENT_CHECKPOINT_EACH_ROUND=true",
             "-e", f"MQTT_BROKER={server_ip}",
             "-e", f"MQTT_PORT={self.remote_mqtt_port}",
             "-e", f"AMQP_HOST={server_ip}",

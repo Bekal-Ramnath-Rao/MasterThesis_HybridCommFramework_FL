@@ -48,9 +48,10 @@ COPY config/cyclonedds-multicast-lan.xml /app/config/cyclonedds-multicast-lan.xm
 COPY config/dds_distributed_unicast.py /app/config/dds_distributed_unicast.py
 COPY config/dds_distributed_env.sh /app/config/dds_distributed_env.sh
 
-# Copy the Server directory and scripts (DDS discovery server)
-COPY scripts/utilities/packet_logger.py ./
-COPY scripts/utilities/experiment_results_path.py ./
+# Match repo layout: servers add project_root/scripts/utilities to sys.path
+RUN mkdir -p /app/scripts/utilities
+COPY scripts/utilities/packet_logger.py /app/scripts/utilities/
+COPY scripts/utilities/experiment_results_path.py /app/scripts/utilities/
 COPY scripts/dds_discovery_server.py ./scripts/
 COPY Server/ ./Server/
 

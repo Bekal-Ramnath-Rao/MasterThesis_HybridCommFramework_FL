@@ -57,10 +57,13 @@ _utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 try:
-    from q_learning_logger import init_db as init_qlearning_db, log_q_step
+    from q_learning_logger import init_db as init_qlearning_db, log_q_step, rl_state_network_kwargs
 except ImportError:
     init_qlearning_db = None
     log_q_step = None
+
+    def rl_state_network_kwargs(_state=None):
+        return {}
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 
 # Suppress TensorFlow warnings
@@ -98,6 +101,14 @@ elif _ue in ("false", "0", "no"):
 else:
     USE_RL_EXPLORATION = USE_QL_CONVERGENCE
 USE_COMMUNICATION_MODEL_REWARD = os.getenv("USE_COMMUNICATION_MODEL_REWARD", "true").lower() == "true"
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "y")
+
+
+RL_INFERENCE_ONLY = _env_truthy("RL_INFERENCE_ONLY")
+_RL_PROTOCOL_SELECTION_RECORD_LEARNING = not RL_INFERENCE_ONLY
 
 TOPIC_CLIENT_UPDATE = f"fl/client/{CLIENT_ID}/update"
 TOPIC_CLIENT_METRICS = f"fl/client/{CLIENT_ID}/metrics"
@@ -162,6 +173,7 @@ class UnifiedFLClient_MentalState:
                 save_path=save_path_uplink,
                 initial_load_path=initial_load_path_uplink,
                 use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
+                link_role="uplink",
             )
             # --- Downlink agent ---
             if os.path.exists("/shared_data"):
@@ -185,6 +197,7 @@ class UnifiedFLClient_MentalState:
                 save_path=save_path_downlink,
                 initial_load_path=initial_load_path_downlink,
                 use_communication_model_reward=USE_COMMUNICATION_MODEL_REWARD,
+                link_role="downlink",
             )
             # Backward-compat alias
             self.rl_selector = self.rl_selector_uplink
@@ -280,8 +293,10 @@ class UnifiedFLClient_MentalState:
                     self.env_manager.update_resource_level(resource_level)
                     
                     state = self.env_manager.get_current_state()
-                    # Inference: use learned Q-table only (training=False); training: epsilon-greedy (training=True)
-                    protocol = self.rl_selector_uplink.select_protocol(state, training=USE_RL_EXPLORATION)
+                    # Greedy vs explore from USE_RL_EXPLORATION; record_learning decoupled (see RL_INFERENCE_ONLY).
+                    protocol = self.rl_selector_uplink.select_protocol(
+                        state, training=USE_RL_EXPLORATION, record_learning=_RL_PROTOCOL_SELECTION_RECORD_LEARNING
+                    )
                 
                 print(f"\n[Uplink RL Selection] State: {state}")
                 print(f"[Uplink RL Selection] Selected Protocol: {protocol.upper()}")
@@ -317,6 +332,10 @@ class UnifiedFLClient_MentalState:
                 or self.rl_selector_downlink is None
                 or self._downlink_select_time is None
                 or self._last_downlink_rl_state is None):
+            return
+        if not USE_RL_EXPLORATION:
+            self._downlink_select_time = None
+            self._last_downlink_rl_state = None
             return
         try:
             comm_time = time.time() - self._downlink_select_time
@@ -354,6 +373,7 @@ class UnifiedFLClient_MentalState:
                     state_comm_level=downlink_state.get('comm_level', ''),
                     state_resource=downlink_state.get('resource', ''),
                     state_battery_level=downlink_state.get('battery_level', ''),
+                    **rl_state_network_kwargs(downlink_state),
                     action=protocol,
                     reward=reward,
                     q_delta=q_delta,
@@ -398,7 +418,9 @@ class UnifiedFLClient_MentalState:
             try:
                 with tf.device('/CPU:0'):
                     state = self.env_manager.get_current_state()
-                    selected = self.rl_selector_downlink.select_protocol(state, training=USE_RL_EXPLORATION)
+                    selected = self.rl_selector_downlink.select_protocol(
+                        state, training=USE_RL_EXPLORATION, record_learning=_RL_PROTOCOL_SELECTION_RECORD_LEARNING
+                    )
                 self._last_downlink_rl_state = state
                 self._downlink_select_time = time.time()
                 print(f"[Downlink RL] selected {selected.upper()} "
@@ -608,56 +630,56 @@ class UnifiedFLClient_MentalState:
             self.round_metrics['accuracy'] = train_metrics['val_accuracy']
             self.round_metrics['success'] = True
             
-            # Update RL unconditionally so GUI always shows Q-learning data
-            # (USE_QL_CONVERGENCE only controls the *stopping* condition, not whether Q updates happen)
+            # Q-learning updates only while exploring (USE_RL_EXPLORATION); inference is greedy-only, frozen Q.
             if USE_RL_SELECTION and self.rl_selector_uplink and self.env_manager:
-                resources = self.env_manager.get_resource_consumption()
-                payload_bytes = self.round_metrics.get('payload_bytes', 12 * 1024 * 1024)
-                t_calc = self._get_t_calc_for_reward(protocol, payload_bytes) if USE_COMMUNICATION_MODEL_REWARD else None
-                reward = self.rl_selector_uplink.calculate_reward(
-                    communication_time=self.round_metrics['communication_time'],
-                    success=self.round_metrics['success'],
-                    resource_consumption=resources,
-                    t_calc=t_calc,
-                )
-                self.rl_selector_uplink.update_q_value(reward, done=False)
-                if log_q_step is not None:
-                    st = self.env_manager.get_current_state()
-                    q_delta = self.rl_selector_uplink.get_last_q_delta()
-                    q_value = self.rl_selector_uplink.get_last_q_value()
-                    avg_reward = (np.mean(self.rl_selector_uplink.total_rewards[-100:])
-                                 if self.rl_selector_uplink.total_rewards else 0.0)
-                    reward_details = self.rl_selector_uplink.get_last_reward_breakdown()
-                    log_q_step(
-                        client_id=self.client_id,
-                        round_num=int(getattr(self, 'current_round', 0)),
-                        episode=self.rl_selector_uplink.episode_count,
-                        state_comm_level=st.get('comm_level', ''),
-                        state_resource=st.get('resource', ''),
-                        state_battery_level=st.get('battery_level', ''),
-                        action=protocol,
-                        reward=reward,
-                        q_delta=q_delta,
-                        epsilon=self.rl_selector_uplink.epsilon,
-                        q_value=q_value,
-                        avg_reward_last_100=float(avg_reward),
-                        converged=self.rl_selector_uplink.check_q_converged(),
-                        metric_communication_time=reward_details.get('communication_time'),
-                        metric_success=reward_details.get('success'),
-                        metric_cpu_usage=reward_details.get('cpu_usage'),
-                        metric_memory_usage=reward_details.get('memory_usage'),
-                        metric_bandwidth_usage=reward_details.get('bandwidth_usage'),
-                        metric_battery_level=reward_details.get('battery_level'),
-                        metric_energy_usage=reward_details.get('energy_usage'),
-                        reward_base=reward_details.get('reward_base'),
-                        reward_communication_time=reward_details.get('reward_communication_time'),
-                        reward_resource_penalty=reward_details.get('reward_resource_penalty'),
-                        reward_battery_penalty=reward_details.get('reward_battery_penalty'),
-                        reward_total=reward_details.get('reward_total'),
-                        link_direction='uplink',
+                if USE_RL_EXPLORATION:
+                    resources = self.env_manager.get_resource_consumption()
+                    payload_bytes = self.round_metrics.get('payload_bytes', 12 * 1024 * 1024)
+                    t_calc = self._get_t_calc_for_reward(protocol, payload_bytes) if USE_COMMUNICATION_MODEL_REWARD else None
+                    reward = self.rl_selector_uplink.calculate_reward(
+                        communication_time=self.round_metrics['communication_time'],
+                        success=self.round_metrics['success'],
+                        resource_consumption=resources,
+                        t_calc=t_calc,
                     )
-                print(f"[Uplink RL] Reward: {reward:.2f}, epsilon: {self.rl_selector_uplink.epsilon:.4f}")
-                # Compute and log downlink reward if a downlink selection was made this round
+                    self.rl_selector_uplink.update_q_value(reward, done=False)
+                    if log_q_step is not None:
+                        st = self.env_manager.get_current_state()
+                        q_delta = self.rl_selector_uplink.get_last_q_delta()
+                        q_value = self.rl_selector_uplink.get_last_q_value()
+                        avg_reward = (np.mean(self.rl_selector_uplink.total_rewards[-100:])
+                                     if self.rl_selector_uplink.total_rewards else 0.0)
+                        reward_details = self.rl_selector_uplink.get_last_reward_breakdown()
+                        log_q_step(
+                            client_id=self.client_id,
+                            round_num=int(getattr(self, 'current_round', 0)),
+                            episode=self.rl_selector_uplink.episode_count,
+                            state_comm_level=st.get('comm_level', ''),
+                            state_resource=st.get('resource', ''),
+                            state_battery_level=st.get('battery_level', ''),
+                            **rl_state_network_kwargs(st),
+                            action=protocol,
+                            reward=reward,
+                            q_delta=q_delta,
+                            epsilon=self.rl_selector_uplink.epsilon,
+                            q_value=q_value,
+                            avg_reward_last_100=float(avg_reward),
+                            converged=self.rl_selector_uplink.check_q_converged(),
+                            metric_communication_time=reward_details.get('communication_time'),
+                            metric_success=reward_details.get('success'),
+                            metric_cpu_usage=reward_details.get('cpu_usage'),
+                            metric_memory_usage=reward_details.get('memory_usage'),
+                            metric_bandwidth_usage=reward_details.get('bandwidth_usage'),
+                            metric_battery_level=reward_details.get('battery_level'),
+                            metric_energy_usage=reward_details.get('energy_usage'),
+                            reward_base=reward_details.get('reward_base'),
+                            reward_communication_time=reward_details.get('reward_communication_time'),
+                            reward_resource_penalty=reward_details.get('reward_resource_penalty'),
+                            reward_battery_penalty=reward_details.get('reward_battery_penalty'),
+                            reward_total=reward_details.get('reward_total'),
+                            link_direction='uplink',
+                        )
+                    print(f"[Uplink RL] Reward: {reward:.2f}, epsilon: {self.rl_selector_uplink.epsilon:.4f}")
                 self._update_downlink_rl_after_reception(round_num=int(getattr(self, 'current_round', 0)))
             
             _batt_soc = (

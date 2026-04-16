@@ -24,6 +24,7 @@ _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from experiment_results_path import get_experiment_results_dir
+from battery_results_agg import avg_battery_model_drain_fraction
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -83,6 +84,9 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.ROUNDS = []
         self.ROUND_TIMES = []
         self.BATTERY_CONSUMPTION = []
+        self.BATTERY_MODEL_CONSUMPTION = []
+        self.AVG_TRAINING_TIME_SEC = []
+        self.AVG_BATTERY_SOC = []
         self.round_start_time = None
 
         # Convergence tracking
@@ -454,6 +458,9 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                 'num_samples': request.num_samples,
                 'battery_soc': float(getattr(request, 'battery_soc', 1.0)),
                 'round_time_sec': float(getattr(request, 'round_time_sec', 0.0)),
+                'training_time_sec': float(getattr(request, 'training_time_sec', 0.0)),
+                'uplink_model_comm_sec': float(getattr(request, 'uplink_model_comm_sec', 0.0)),
+                'cumulative_energy_j': float(getattr(request, 'cumulative_energy_j', 0.0)),
             }
             self.clients_evaluated.add(client_id)
             
@@ -593,11 +600,20 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
         avg_soc = sum(socs) / len(socs) if socs else 1.0
         self.BATTERY_CONSUMPTION.append(1.0 - avg_soc)
+        self.BATTERY_MODEL_CONSUMPTION.append(avg_battery_model_drain_fraction(self.client_metrics))
         # Calculate weighted average metrics
         total_samples = sum(m['num_samples'] for m in self.client_metrics.values())
         
         avg_loss = sum(m['loss'] * m['num_samples'] for m in self.client_metrics.values()) / total_samples
         avg_accuracy = sum(m['accuracy'] * m['num_samples'] for m in self.client_metrics.values()) / total_samples
+        avg_training_time = (
+            sum(m.get('training_time_sec', 0.0) * m['num_samples'] for m in self.client_metrics.values())
+            / total_samples
+            if total_samples
+            else 0.0
+        )
+        self.AVG_TRAINING_TIME_SEC.append(float(avg_training_time))
+        self.AVG_BATTERY_SOC.append(float(avg_soc))
         
         # Store metrics
         self.ROUNDS.append(self.current_round)
@@ -609,6 +625,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         print(f"{'='*70}")
         print(f"Average Loss: {avg_loss:.4f}")
         print(f"Average Accuracy: {avg_accuracy:.4f}")
+        print(f"Average training time (sample-weighted): {avg_training_time:.3f} s")
+        print(f"Average battery SoC: {avg_soc:.4f}")
         
         # Check stopping criteria
         should_stop = False
@@ -622,6 +640,9 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         elif self.current_round >= self.num_rounds:
             should_stop = True
             stop_reason = f"Maximum rounds ({self.num_rounds}) reached"
+            self.convergence_time = (
+                time.time() - self.start_time if self.start_time else None
+            )
         
         if should_stop:
             print(f"\n{'='*70}")
@@ -630,9 +651,18 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             print(f"Final Loss: {avg_loss:.4f}")
             print(f"Final Accuracy: {avg_accuracy:.4f}")
             print(f"Total rounds: {self.current_round}")
-            print(f"Total time: {time.time() - self.start_time:.2f} seconds")
-            if self.converged:
-                print(f"Convergence time: {self.convergence_time:.2f} seconds")
+            elapsed = (
+                self.convergence_time
+                if self.convergence_time is not None
+                else (
+                    (time.time() - self.start_time)
+                    if self.start_time
+                    else 0.0
+                )
+            )
+            print(
+                f"Total Training Time: {elapsed:.2f} seconds ({elapsed / 60.0:.2f} minutes)"
+            )
             print(f"{'='*70}\n")
             
             with self.lock:
@@ -659,15 +689,25 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
     
     def save_results(self):
         """Save training results to JSON file"""
+        conv_sec = self.convergence_time
+        if conv_sec is None and self.start_time:
+            conv_sec = time.time() - self.start_time
         results = {
             'rounds': self.ROUNDS,
             'loss': self.LOSS,
             'accuracy': self.ACCURACY,
             'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
             'battery_consumption': getattr(self, 'BATTERY_CONSUMPTION', []),
+            'battery_model_consumption': getattr(self, 'BATTERY_MODEL_CONSUMPTION', []),
+            'battery_model_consumption_source': 'client_battery_model',
+            'avg_training_time_sec': getattr(self, 'AVG_TRAINING_TIME_SEC', []),
+            'avg_battery_soc': getattr(self, 'AVG_BATTERY_SOC', []),
             'converged': self.converged,
-            'convergence_time': self.convergence_time if self.converged else None,
-            'total_time': time.time() - self.start_time,
+            'convergence_time_seconds': conv_sec,
+            'convergence_time_minutes': (conv_sec / 60.0) if conv_sec is not None else None,
+            'convergence_time': conv_sec,
+            'total_time': conv_sec,
+            'total_rounds': len(self.ROUNDS),
             'final_loss': self.LOSS[-1] if self.LOSS else None,
             'final_accuracy': self.ACCURACY[-1] if self.ACCURACY else None,
             'num_clients': self.num_clients,

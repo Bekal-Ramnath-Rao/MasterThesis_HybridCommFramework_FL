@@ -11,6 +11,20 @@ Rewards (success, max 30): base 10, communication ≤10, resource ≥-5, battery
 Environment (Q-table state): network scenario (coarse), communication-time bucket, resource availability, battery SoC bucket.
 The coarse network axis prefers client-detected scenario (``EnvironmentStateManager.detected_network_scenario``)
 when ``RL_Q_USE_DETECTED_NETWORK=1`` (default); otherwise the configured label (``data_network_scenario`` / env).
+
+Greedy selection prefers ``converged_protocol_by_scenario`` (streak-filled on every round, not only after Q-updates)
+over raw Q-argmax when ``RL_GREEDY_USE_SCENARIO_CONVERGED`` is true (default). Optional overrides:
+``RL_FORCE_CONVERGED_PROTOCOL_EXCELLENT``, ``_MODERATE``, ``_POOR`` (e.g. amqp, dds).
+
+Inference / greedy selection (when not in full RL training: not both ``training`` and ``record_learning`` true) can use an explicit
+if/elif/else on coarse scenario via :meth:`QLearningProtocolSelector.protocol_for_uplink_network_scenario` and
+:meth:`QLearningProtocolSelector.protocol_for_downlink_network_scenario` (no Q-table / epsilon-greedy in that path).
+Pass ``link_role="uplink"`` or ``"downlink"`` on each :class:`QLearningProtocolSelector`. Override defaults per regime with
+``RL_SCENARIO_PROTOCOL_UPLINK_EXCELLENT`` / ``_MODERATE`` / ``_POOR`` and ``RL_SCENARIO_PROTOCOL_DOWNLINK_*``.
+Enable with ``RL_INFERENCE_USE_SCENARIO_IFELSE`` (default: true). Per-regime env ``RL_INFERENCE_PROTOCOL_*`` and
+``RL_INFERENCE_FALLBACK_PROTOCOL`` apply only when the scenario function yields no valid protocol. Set
+``RL_INFERENCE_USE_SCENARIO_IFELSE=false`` for the legacy single-path converged-map inference block.
+To force the same rule-based map during training (skip ε-greedy), set ``RL_SELECT_PROTOCOL_BY_SCENARIO_ONLY=true``.
 """
 
 import numpy as np
@@ -149,7 +163,103 @@ class QLearningProtocolSelector:
     # Resource is *availability/headroom* (inverse of load): high = low CPU+memory stress.
     RESOURCE_LEVELS = ["high", "low"]  # high = plenty of CPU/memory headroom; low = stressed
     BATTERY_LEVELS = ["high", "low"]  # high SoC vs low SoC
-    
+
+    @staticmethod
+    def protocol_for_uplink_network_scenario(scenario_label: Optional[str]) -> str:
+        """
+        Rule-based client→server protocol for coarse ``excellent`` / ``moderate`` / ``poor``.
+        Defaults follow merged emotion uplink training; override with ``RL_SCENARIO_PROTOCOL_UPLINK_*``.
+        """
+        key = normalize_coarse_network_scenario(str(scenario_label or ""))
+        if key not in QLearningProtocolSelector.NETWORK_SCENARIO_LEVELS:
+            key = "moderate"
+        env_suffix = key.upper().replace(" ", "_")
+        env_p = os.getenv(f"RL_SCENARIO_PROTOCOL_UPLINK_{env_suffix}", "").strip().lower()
+        if env_p in QLearningProtocolSelector.PROTOCOLS:
+            return env_p
+        if key == "excellent":
+            return "amqp"
+        if key == "moderate":
+            return "mqtt"
+        return "mqtt"
+
+    @staticmethod
+    def protocol_for_downlink_network_scenario(scenario_label: Optional[str]) -> str:
+        """
+        Rule-based server→client protocol for coarse ``excellent`` / ``moderate`` / ``poor``.
+        Defaults follow merged emotion downlink training; override with ``RL_SCENARIO_PROTOCOL_DOWNLINK_*``.
+        """
+        key = normalize_coarse_network_scenario(str(scenario_label or ""))
+        if key not in QLearningProtocolSelector.NETWORK_SCENARIO_LEVELS:
+            key = "moderate"
+        env_suffix = key.upper().replace(" ", "_")
+        env_p = os.getenv(f"RL_SCENARIO_PROTOCOL_DOWNLINK_{env_suffix}", "").strip().lower()
+        if env_p in QLearningProtocolSelector.PROTOCOLS:
+            return env_p
+        if key == "excellent":
+            return "http3"
+        if key == "moderate":
+            return "grpc"
+        return "grpc"
+
+    @staticmethod
+    def canonical_policy_lookup_levels() -> Tuple[str, str, str]:
+        """
+        Discrete tuple for the reference Q-row (inference / reporting / backfill).
+
+        Defaults: fast comm (low), plenty of resource headroom (high), low battery SoC bucket (low).
+        Override with ``RL_POLICY_LOOKUP_COMM_LEVEL``, ``RL_POLICY_LOOKUP_RESOURCE``,
+        ``RL_POLICY_LOOKUP_BATTERY_LEVEL`` (must match COMM_LEVELS / RESOURCE_LEVELS / BATTERY_LEVELS).
+        """
+        comm = os.getenv("RL_POLICY_LOOKUP_COMM_LEVEL", "low").strip().lower()
+        if comm not in QLearningProtocolSelector.COMM_LEVELS:
+            comm = "low"
+        res = os.getenv("RL_POLICY_LOOKUP_RESOURCE", "high").strip().lower()
+        if res not in QLearningProtocolSelector.RESOURCE_LEVELS:
+            res = "high"
+        batt = os.getenv("RL_POLICY_LOOKUP_BATTERY_LEVEL", "low").strip().lower()
+        if batt not in QLearningProtocolSelector.BATTERY_LEVELS:
+            batt = "low"
+        return comm, res, batt
+
+    def canonical_policy_state(self, scenario_label: str) -> Dict[str, str]:
+        """State dict pointing at the canonical policy row for ``scenario_label`` (coarse)."""
+        comm, res, batt = self.canonical_policy_lookup_levels()
+        ns = normalize_coarse_network_scenario(str(scenario_label or ""))
+        return {
+            "network_scenario": ns,
+            "comm_level": comm,
+            "resource": res,
+            "battery_level": batt,
+        }
+
+    def policy_lookup_state_index(self, scenario_label: str) -> Tuple[int, int, int, int]:
+        return self.get_state_index(self.canonical_policy_state(scenario_label))
+
+    def q_values_by_protocol_for_scenario(self, scenario_label: str) -> Dict[str, float]:
+        """Q(s,a) for each protocol at the canonical row for this coarse network scenario."""
+        idx = self.policy_lookup_state_index(scenario_label)
+        row = self.q_table[idx]
+        return {self.PROTOCOLS[i]: float(row[i]) for i in range(len(self.PROTOCOLS))}
+
+    def canonical_q_values_report_lines(self) -> List[str]:
+        """Human-readable lines: Q per action for each coarse scenario at the canonical row."""
+        comm, res, batt = self.canonical_policy_lookup_levels()
+        lines = [
+            f"[Q-Learning] Q(s,a) at canonical row comm={comm!r}, resource={res!r}, battery={batt!r} "
+            f"| table {self.save_path!r}",
+        ]
+        for label in self.NETWORK_SCENARIO_LEVELS:
+            qmap = self.q_values_by_protocol_for_scenario(label)
+            parts = [f"{p}={v:.6g}" for p, v in qmap.items()]
+            best = max(qmap, key=qmap.get) if qmap else "?"
+            lines.append(f"  {label}: " + ", ".join(parts) + f"  => argmax {best!r}")
+        return lines
+
+    def print_canonical_q_values_report(self) -> None:
+        for ln in self.canonical_q_values_report_lines():
+            print(ln)
+
     def __init__(
         self,
         learning_rate: float = 0.12,
@@ -160,6 +270,7 @@ class QLearningProtocolSelector:
         save_path: str = "q_table.pkl",
         initial_load_path: Optional[str] = None,
         use_communication_model_reward: bool = True,
+        link_role: Optional[str] = None,
     ):
         """
         Initialize Q-Learning Protocol Selector
@@ -175,6 +286,8 @@ class QLearningProtocolSelector:
                               If set and file exists, this is tried before save_path.
             use_communication_model_reward: When True, apply the communication-model
                                             T_calc penalty to the RL reward.
+            link_role: ``"uplink"`` or ``"downlink"`` for scenario-based protocol functions;
+                       when omitted, uplink rules are used (backward compatible).
         """
         self.learning_rate = learning_rate
         self.discount_factor = discount_factor
@@ -184,7 +297,9 @@ class QLearningProtocolSelector:
         self.save_path = save_path
         self.initial_load_path = initial_load_path
         self.use_communication_model_reward = use_communication_model_reward
-        
+        lr = (link_role or "").strip().lower()
+        self.link_role: Optional[str] = lr if lr in ("uplink", "downlink") else None
+
         # Data-driven comm-time bucket boundaries (seconds); tune after Phase-1 collection
         self.comm_t_low = 30.0
         self.comm_t_high = 90.0
@@ -199,7 +314,10 @@ class QLearningProtocolSelector:
         self.detected_network_scenario: Optional[str] = None
 
         self.q_table = np.zeros(self._full_q_shape())
-        
+        # Per coarse network scenario: protocol that last met the same-action convergence streak (training).
+        # Persisted in the Q-table pickle; used in inference to match training scenario → converged protocol.
+        self._converged_protocol_by_scenario: Dict[str, str] = {}
+
         # Statistics tracking
         self.episode_count = 0
         self.total_rewards = []
@@ -341,46 +459,313 @@ class QLearningProtocolSelector:
             "resource": self.RESOURCE_LEVELS[r_idx],
             "battery_level": self.BATTERY_LEVELS[b_idx],
         }
-    
-    def select_protocol(self, state: Dict, training: bool = True) -> str:
+
+    def _normalize_converged_protocol_map(self) -> None:
+        """Keep only valid scenario keys and protocol names."""
+        allowed_s = set(self.NETWORK_SCENARIO_LEVELS)
+        fixed: Dict[str, str] = {}
+        for k, v in list(self._converged_protocol_by_scenario.items()):
+            nk = normalize_coarse_network_scenario(str(k))
+            if nk not in allowed_s:
+                continue
+            pv = (v or "").strip().lower()
+            if pv in self.PROTOCOLS:
+                fixed[nk] = pv
+        self._converged_protocol_by_scenario = fixed
+
+    def refresh_converged_protocols_from_action_history(self) -> None:
+        """
+        For each network-scenario slice, if the last N actions match ``RL_CONVERGENCE_SAME_PROTOCOL_STREAK``,
+        store that protocol as the converged choice for that scenario (training-time snapshot).
+        """
+        streak = int(os.getenv("RL_CONVERGENCE_SAME_PROTOCOL_STREAK", "5"))
+        for s_idx, label in enumerate(self.NETWORK_SCENARIO_LEVELS):
+            hist = self._action_history_by_scenario.get(s_idx, [])
+            if len(hist) < streak:
+                continue
+            tail = hist[-streak:]
+            first = tail[0]
+            if all(a == first for a in tail):
+                self._converged_protocol_by_scenario[label] = self.PROTOCOLS[int(first)]
+        self._normalize_converged_protocol_map()
+
+    def backfill_converged_protocols_from_q_table(self) -> None:
+        """
+        For scenarios with no converged snapshot, pick argmax Q at the **canonical** policy row
+        (comm/resource/battery from :meth:`canonical_policy_lookup_levels`).
+        Does not overwrite existing snapshot entries.
+        """
+        for label in self.NETWORK_SCENARIO_LEVELS:
+            if self._converged_protocol_by_scenario.get(label):
+                continue
+            idx = self.policy_lookup_state_index(label)
+            row = self.q_table[idx]
+            if np.allclose(row, 0.0):
+                continue
+            self._converged_protocol_by_scenario[label] = self.PROTOCOLS[int(np.argmax(row))]
+        self._normalize_converged_protocol_map()
+
+    def get_converged_protocol_for_scenario(self, scenario_label: str) -> Optional[str]:
+        """
+        Return the protocol to use for this coarse scenario: optional env override, then stored map.
+
+        Env (highest priority): ``RL_FORCE_CONVERGED_PROTOCOL_EXCELLENT``,
+        ``RL_FORCE_CONVERGED_PROTOCOL_MODERATE``, ``RL_FORCE_CONVERGED_PROTOCOL_POOR``
+        (values: mqtt, amqp, grpc, http3, dds).
+        """
+        key = normalize_coarse_network_scenario(str(scenario_label or ""))
+        env_suffix = key.upper().replace(" ", "_")
+        forced = os.getenv(f"RL_FORCE_CONVERGED_PROTOCOL_{env_suffix}", "").strip().lower()
+        if forced and forced in self.PROTOCOLS:
+            return forced
+        return self._converged_protocol_by_scenario.get(key)
+
+    def inference_coarse_scenario_label(self, state: Dict) -> str:
+        """
+        Coarse network-regime label for inference. Uses only scenario fields from ``state``;
+        ignores comm_level, resource, and battery_level so runtime metrics do not change the policy.
+        """
+        raw = state.get("network_scenario")
+        if raw is None:
+            raw = state.get("detected_network_scenario") or state.get("data_network_scenario")
+        scen = normalize_coarse_network_scenario(
+            raw if isinstance(raw, str) else str(raw or "")
+        )
+        if scen not in self.NETWORK_SCENARIO_LEVELS:
+            return "moderate"
+        return scen
+
+    def _protocol_from_converged_or_q_row(self, scenario_key: str) -> Optional[str]:
+        """
+        Best protocol for one coarse scenario slice: streak converged map (and
+        ``RL_FORCE_CONVERGED_PROTOCOL_*``), else argmax of the Q-row at the canonical policy index.
+        """
+        sk = normalize_coarse_network_scenario(str(scenario_key or ""))
+        p = self.get_converged_protocol_for_scenario(sk)
+        if p and p in self.PROTOCOLS:
+            return p
+        idx = self.policy_lookup_state_index(sk)
+        row = self.q_table[idx]
+        if not np.allclose(row, 0.0):
+            return self.PROTOCOLS[int(np.argmax(row))]
+        return None
+
+    def _inference_protocol_ifelse_for_scenario(self, scen_label: str) -> str:
+        """
+        Inference / rule slice: explicit if/elif/else on coarse regime using
+        :meth:`protocol_for_uplink_network_scenario` or :meth:`protocol_for_downlink_network_scenario`
+        (no Q-table or ε-greedy). ``link_role`` selects which function applies.
+
+        If the chosen protocol is invalid, optional per-regime env
+        ``RL_INFERENCE_PROTOCOL_EXCELLENT``, ``RL_INFERENCE_PROTOCOL_MODERATE``,
+        ``RL_INFERENCE_PROTOCOL_POOR``, then ``RL_INFERENCE_FALLBACK_PROTOCOL`` / mqtt.
+        """
+        key = normalize_coarse_network_scenario(str(scen_label or ""))
+        if key not in self.NETWORK_SCENARIO_LEVELS:
+            key = "moderate"
+
+        role = (self.link_role or "uplink").strip().lower()
+        if role == "downlink":
+            p = self.protocol_for_downlink_network_scenario(key)
+        else:
+            p = self.protocol_for_uplink_network_scenario(key)
+
+        if p and p in self.PROTOCOLS:
+            return p
+
+        env_suffix = key.upper().replace(" ", "_")
+        env_fb = os.getenv(f"RL_INFERENCE_PROTOCOL_{env_suffix}", "").strip().lower()
+        if env_fb in self.PROTOCOLS:
+            return env_fb
+
+        fb = os.getenv("RL_INFERENCE_FALLBACK_PROTOCOL", "mqtt").strip().lower()
+        if fb not in self.PROTOCOLS:
+            fb = "mqtt"
+        print(
+            f"[Q-Learning] Inference if/else: no converged/Q data for scenario {key!r}; "
+            f"using RL_INFERENCE_FALLBACK_PROTOCOL={fb!r}."
+        )
+        return fb
+
+    def select_protocol(self, state: Dict, training: bool = True, record_learning: bool = True) -> str:
         """
         Select a protocol using epsilon-greedy strategy
         
         Args:
             state: Current environment state
             training: If True, use epsilon-greedy; if False, use greedy
+            record_learning: If False, do not push (state, action) onto learning history (inference-only).
             
         Returns:
             Selected protocol name
         """
+        use_scenario_ifelse = os.getenv(
+            "RL_INFERENCE_USE_SCENARIO_IFELSE", "true"
+        ).strip().lower() in ("1", "true", "yes", "y")
+        in_rl_training = bool(training and record_learning)
+        scenario_protocol_only = os.getenv(
+            "RL_SELECT_PROTOCOL_BY_SCENARIO_ONLY", ""
+        ).strip().lower() in ("1", "true", "yes", "y")
+
+        if scenario_protocol_only:
+            scen_label = self.inference_coarse_scenario_label(state)
+            proto = self._inference_protocol_ifelse_for_scenario(scen_label)
+            action_idx = self.PROTOCOLS.index(proto)
+            _agent_debug_log(
+                "rl_q_learning_selector.py:select_protocol",
+                "protocol_choice",
+                {
+                    "mode": "scenario_rules_only",
+                    "training": bool(training),
+                    "link_role": self.link_role,
+                    "epsilon": float(self.epsilon),
+                    "explored": False,
+                    "network_scenario": scen_label,
+                    "action_idx": int(action_idx),
+                    "protocol": proto,
+                },
+                hypothesis_id="H4",
+            )
+            if record_learning:
+                state_idx = self.get_state_index(state)
+                self.protocol_usage[proto] += 1
+                self.state_history.append(state_idx)
+                self.action_history.append(action_idx)
+                s_idx = int(state_idx[0])
+                ah = self._action_history_by_scenario.setdefault(s_idx, [])
+                ah.append(int(action_idx))
+                if len(ah) > 50:
+                    del ah[:-50]
+                self.refresh_converged_protocols_from_action_history()
+            return proto
+
+        # Inference / greedy (no exploration): explicit if/elif/else on coarse network scenario
+        # (excellent/good, moderate, poor — see ``normalize_coarse_network_scenario``).
+        if use_scenario_ifelse and not in_rl_training:
+            scen_label = self.inference_coarse_scenario_label(state)
+            proto = self._inference_protocol_ifelse_for_scenario(scen_label)
+            action_idx = self.PROTOCOLS.index(proto)
+            _agent_debug_log(
+                "rl_q_learning_selector.py:select_protocol",
+                "protocol_choice",
+                {
+                    "mode": "inference",
+                    "training": bool(training),
+                    "inference_scenario_ifelse": True,
+                    "link_role": self.link_role,
+                    "epsilon": float(self.epsilon),
+                    "explored": False,
+                    "network_scenario": scen_label,
+                    "action_idx": int(action_idx),
+                    "protocol": proto,
+                },
+                hypothesis_id="H4",
+            )
+            if record_learning:
+                state_idx = self.get_state_index(state)
+                self.protocol_usage[proto] += 1
+                self.state_history.append(state_idx)
+                self.action_history.append(action_idx)
+                s_idx = int(state_idx[0])
+                ah = self._action_history_by_scenario.setdefault(s_idx, [])
+                ah.append(int(action_idx))
+                if len(ah) > 50:
+                    del ah[:-50]
+                self.refresh_converged_protocols_from_action_history()
+            return proto
+
+        # Legacy inference path (RL_INFERENCE_USE_SCENARIO_IFELSE=false): converged map / Q slice.
+        if not record_learning:
+            scen_label = self.inference_coarse_scenario_label(state)
+            use_scenario_converged = os.getenv(
+                "RL_INFERENCE_USE_SCENARIO_CONVERGED_PROTOCOL", "true"
+            ).strip().lower() in ("1", "true", "yes", "y")
+            from_map = self.get_converged_protocol_for_scenario(scen_label)
+            if use_scenario_converged:
+                proto = from_map if (from_map and from_map in self.PROTOCOLS) else None
+                if not proto:
+                    policy_idx = self.policy_lookup_state_index(scen_label)
+                    row = self.q_table[policy_idx]
+                    if not np.allclose(row, 0.0):
+                        proto = self.PROTOCOLS[int(np.argmax(row))]
+                if not proto:
+                    fb = os.getenv("RL_INFERENCE_FALLBACK_PROTOCOL", "mqtt").strip().lower()
+                    if fb not in self.PROTOCOLS:
+                        fb = "mqtt"
+                    print(
+                        f"[Q-Learning] Inference: no converged map or Q signal for {scen_label!r} "
+                        f"(stored map: {self._converged_protocol_by_scenario!r}); "
+                        f"using RL_INFERENCE_FALLBACK_PROTOCOL={fb!r}. "
+                        f"Train with USE_RL_EXPLORATION=true or load a pickle with "
+                        f"converged_protocol_by_scenario / non-zero Q for this regime."
+                    )
+                    proto = fb
+                used_from_map = bool(from_map and from_map in self.PROTOCOLS and proto == from_map)
+            else:
+                policy_idx = self.policy_lookup_state_index(scen_label)
+                row = self.q_table[policy_idx]
+                proto = self.PROTOCOLS[int(np.argmax(row))]
+                used_from_map = False
+            action_idx = self.PROTOCOLS.index(proto)
+            _agent_debug_log(
+                "rl_q_learning_selector.py:select_protocol",
+                "protocol_choice",
+                {
+                    "mode": "inference",
+                    "training": False,
+                    "epsilon": float(self.epsilon),
+                    "explored": False,
+                    "network_scenario": scen_label,
+                    "scenario_converged_protocol": from_map if use_scenario_converged else None,
+                    "used_stored_converged_map": used_from_map,
+                    "action_idx": int(action_idx),
+                    "protocol": proto,
+                },
+                hypothesis_id="H4",
+            )
+            return proto
+
         state_idx = self.get_state_index(state)
-        
-        # Epsilon-greedy action selection
+        scen_label = self.NETWORK_SCENARIO_LEVELS[int(state_idx[0])]
+
+        # Epsilon-greedy action selection (training)
         if training and np.random.random() < self.epsilon:
             # Explore: random action
             action_idx = np.random.randint(len(self.PROTOCOLS))
             explored = True
         else:
-            # Exploit: best known action (uses learned Q-table)
-            # When training=False, this always uses the learned Q-table for inference.
-            # Break ties at random — np.argmax always picks index 0 on all-zero rows, which
-            # incorrectly forces MQTT (protocol index 0) whenever that state was never updated.
-            qrow = self.q_table[state_idx]
-            max_q = float(np.max(qrow))
-            tie = np.flatnonzero(np.isclose(qrow, max_q, rtol=1e-9, atol=1e-12))
-            if tie.size == 0:
-                tie = np.array([0], dtype=np.intp)
-            action_idx = int(np.random.choice(tie))
-            explored = False
+            # Exploit: prefer training-time converged protocol for this scenario (matches thesis policy),
+            # then Q-row for the live discrete state. Q-argmax alone can disagree after biased updates.
+            prefer_conv = os.getenv("RL_GREEDY_USE_SCENARIO_CONVERGED", "true").strip().lower() in (
+                "1", "true", "yes", "y",
+            )
+            cp = self.get_converged_protocol_for_scenario(scen_label) if prefer_conv else None
+            if cp and cp in self.PROTOCOLS:
+                action_idx = self.PROTOCOLS.index(cp)
+                explored = False
+            else:
+                qrow = self.q_table[state_idx]
+                max_q = float(np.max(qrow))
+                tie = np.flatnonzero(np.isclose(qrow, max_q, rtol=1e-9, atol=1e-12))
+                if tie.size == 0:
+                    tie = np.array([0], dtype=np.intp)
+                action_idx = int(np.random.choice(tie))
+                explored = False
+                if np.allclose(qrow, 0.0):
+                    cp0 = self.get_converged_protocol_for_scenario(scen_label)
+                    if cp0 and cp0 in self.PROTOCOLS:
+                        action_idx = self.PROTOCOLS.index(cp0)
         
         # region agent log
         _agent_debug_log(
             "rl_q_learning_selector.py:select_protocol",
             "protocol_choice",
             {
+                "mode": "training",
                 "training": bool(training),
                 "epsilon": float(self.epsilon),
                 "explored": explored,
+                "network_scenario": scen_label,
                 "action_idx": int(action_idx),
                 "protocol": self.PROTOCOLS[int(action_idx)],
                 "max_q": float(np.max(self.q_table[state_idx])),
@@ -390,16 +775,18 @@ class QLearningProtocolSelector:
         # endregion
 
         protocol = self.PROTOCOLS[action_idx]
-        self.protocol_usage[protocol] += 1
-        
-        # Store for learning
-        self.state_history.append(state_idx)
-        self.action_history.append(action_idx)
-        s_idx = int(state_idx[0])
-        ah = self._action_history_by_scenario.setdefault(s_idx, [])
-        ah.append(int(action_idx))
-        if len(ah) > 50:
-            del ah[:-50]
+        if record_learning:
+            self.protocol_usage[protocol] += 1
+            # Store for learning
+            self.state_history.append(state_idx)
+            self.action_history.append(action_idx)
+            s_idx = int(state_idx[0])
+            ah = self._action_history_by_scenario.setdefault(s_idx, [])
+            ah.append(int(action_idx))
+            if len(ah) > 50:
+                del ah[:-50]
+            # Advance streak-based converged map even when USE_RL_EXPLORATION=false (no Q-updates).
+            self.refresh_converged_protocols_from_action_history()
 
         return protocol
 
@@ -417,7 +804,7 @@ class QLearningProtocolSelector:
         self.protocol_usage[protocol] = max(0, int(self.protocol_usage.get(protocol, 0)) - 1)
         return True
 
-    def register_selection(self, state: Dict, protocol: str) -> str:
+    def register_selection(self, state: Dict, protocol: str, record_learning: bool = True) -> str:
         """
         Record a fixed (state, protocol) pair for the next update_q_value, without epsilon-greedy sampling.
         Used when the actual transport is known (e.g. gRPC fallback) or to align history with delivery.
@@ -425,6 +812,8 @@ class QLearningProtocolSelector:
         p = (protocol or "grpc").strip().lower()
         if p not in self.PROTOCOLS:
             p = "grpc"
+        if not record_learning:
+            return p
         state_idx = self.get_state_index(state)
         action_idx = self.PROTOCOLS.index(p)
         self.protocol_usage[p] = int(self.protocol_usage.get(p, 0)) + 1
@@ -435,6 +824,7 @@ class QLearningProtocolSelector:
         ah.append(int(action_idx))
         if len(ah) > 50:
             del ah[:-50]
+        self.refresh_converged_protocols_from_action_history()
         return p
     
     def calculate_reward(
@@ -653,7 +1043,9 @@ class QLearningProtocolSelector:
             self.protocol_success[protocol] += 1
         else:
             self.protocol_failures[protocol] += 1
-    
+
+        self.refresh_converged_protocols_from_action_history()
+
     def decay_epsilon(self):
         """Decay exploration rate"""
         if self.epsilon > self.epsilon_min:
@@ -714,6 +1106,12 @@ class QLearningProtocolSelector:
         ``scenario`` is only used as an archive filename tag (legacy API compatibility).
         """
         archive_path = self._archive_canonical_pickle(scenario)
+        clear_cp = os.getenv("RL_CLEAR_CONVERGED_MAP_ON_FRESH", "").strip().lower() in (
+            "1", "true", "yes", "y",
+        )
+        saved_cp: Dict[str, str] = (
+            {} if clear_cp else dict(self._converged_protocol_by_scenario)
+        )
         self.q_table.fill(0.0)
 
         old_epsilon = self.epsilon
@@ -735,6 +1133,14 @@ class QLearningProtocolSelector:
         self._action_history_by_scenario = {
             i: [] for i in range(len(self.NETWORK_SCENARIO_LEVELS))
         }
+        self._converged_protocol_by_scenario = {}
+        if saved_cp:
+            self._converged_protocol_by_scenario.update(saved_cp)
+            self._normalize_converged_protocol_map()
+            print(
+                f"[Q-Learning] Preserved converged_protocol_by_scenario through fresh reset "
+                f"(set RL_CLEAR_CONVERGED_MAP_ON_FRESH=1 to drop): {self._converged_protocol_by_scenario!r}"
+            )
 
         print(
             f"[Q-Learning] Fresh training: Q-table zeroed, epsilon {old_epsilon:.4f} → 1.0"
@@ -805,6 +1211,7 @@ class QLearningProtocolSelector:
             "protocol_failures": dict(self.protocol_failures),
             "data_network_scenario": self.data_network_scenario,
             "detected_network_scenario": self.detected_network_scenario,
+            "converged_protocol_by_scenario": dict(self._converged_protocol_by_scenario),
         }
         if disk is None or not overlay:
             return self_data
@@ -843,6 +1250,16 @@ class QLearningProtocolSelector:
         det_disk = disk.get("detected_network_scenario") if isinstance(disk, dict) else None
         merged_det = det_self if det_self is not None else det_disk
 
+        disk_cp = disk.get("converged_protocol_by_scenario") if isinstance(disk, dict) else None
+        merged_cp: Dict[str, str] = {}
+        if isinstance(disk_cp, dict):
+            for k, v in disk_cp.items():
+                nk = normalize_coarse_network_scenario(str(k))
+                pv = str(v).strip().lower()
+                if nk in self.NETWORK_SCENARIO_LEVELS and pv in self.PROTOCOLS:
+                    merged_cp[nk] = pv
+        merged_cp.update(dict(self._converged_protocol_by_scenario))
+
         return {
             "q_table": merged_q,
             "network_scenario_levels": list(self.NETWORK_SCENARIO_LEVELS),
@@ -860,6 +1277,7 @@ class QLearningProtocolSelector:
             "protocol_failures": _sum_maps(disk.get("protocol_failures"), self.protocol_failures),
             "data_network_scenario": merged_dns,
             "detected_network_scenario": merged_det,
+            "converged_protocol_by_scenario": merged_cp,
         }
 
     def _atomic_pickle_dump(self, path: str, data: Dict) -> None:
@@ -920,6 +1338,7 @@ class QLearningProtocolSelector:
                     "protocol_failures": self.protocol_failures,
                     "data_network_scenario": self.data_network_scenario,
                     "detected_network_scenario": self.detected_network_scenario,
+                    "converged_protocol_by_scenario": dict(self._converged_protocol_by_scenario),
                 }
                 self._atomic_pickle_dump(self.save_path, data)
                 print(f"[Q-Learning] Saved Q-table to {self.save_path}")
@@ -977,6 +1396,15 @@ class QLearningProtocolSelector:
             self.detected_network_scenario = data.get("detected_network_scenario")
             if self.detected_network_scenario is not None:
                 self.detected_network_scenario = str(self.detected_network_scenario).strip().lower() or None
+            _cp = data.get("converged_protocol_by_scenario")
+            if isinstance(_cp, dict) and _cp:
+                self._converged_protocol_by_scenario = {
+                    str(k).strip().lower(): str(v).strip().lower() for k, v in _cp.items()
+                }
+            else:
+                self._converged_protocol_by_scenario = {}
+            self._normalize_converged_protocol_map()
+            self.backfill_converged_protocols_from_q_table()
             print(f"[Q-Learning] Loaded Q-table from {path} (past experience)")
             print(
                 f"[Q-Learning] Episodes: {self.episode_count}, Epsilon: {self.epsilon:.4f}, "
@@ -991,6 +1419,11 @@ class QLearningProtocolSelector:
                 print(
                     f"[Q-Learning] detected_network_scenario (client-measured metadata): "
                     f"{self.detected_network_scenario!r}"
+                )
+            if self._converged_protocol_by_scenario:
+                print(
+                    f"[Q-Learning] converged_protocol_by_scenario (per coarse network regime): "
+                    f"{self._converged_protocol_by_scenario!r}"
                 )
             return True
         except Exception as e:
@@ -1238,6 +1671,7 @@ class QLearningProtocolSelector:
         self._action_history_by_scenario = {
             i: [] for i in range(len(self.NETWORK_SCENARIO_LEVELS))
         }
+        self._converged_protocol_by_scenario = {}
         # Delete saved Q-table file if it exists
         if os.path.exists(self.save_path):
             try:
@@ -1307,7 +1741,31 @@ class EnvironmentStateManager:
         When ``RL_Q_USE_DETECTED_NETWORK`` is true (default), prefer client-detected scenario
         when available; otherwise fall back to configured ``data_network_scenario``.
         Set ``RL_Q_USE_DETECTED_NETWORK=0`` to always use the configured label only.
+
+        During inference (``USE_RL_EXPLORATION=false``), prefer the configured experiment label
+        (``data_network_scenario`` / ``RL_REWARD_SCENARIO``) when set so the Q slice and
+        ``converged_protocol_by_scenario`` keys match the scenario you trained under.
+        Override with ``RL_Q_INFERENCE_USE_CONFIGURED_SCENARIO=0`` to keep using detected RTT/BW.
         """
+        # Match FL_Client_Unified: explicit USE_RL_EXPLORATION else default from USE_QL_CONVERGENCE.
+        _ue = os.environ.get("USE_RL_EXPLORATION", "").strip().lower()
+        if _ue in ("false", "0", "no"):
+            infer = True
+        elif _ue in ("true", "1", "yes", "y"):
+            infer = False
+        else:
+            _uc = os.environ.get("USE_QL_CONVERGENCE", "false").strip().lower()
+            infer = _uc not in ("true", "1", "yes", "y")
+
+        prefer_cfg = os.environ.get("RL_Q_INFERENCE_USE_CONFIGURED_SCENARIO", "true").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+        )
+        if infer and prefer_cfg and self.data_network_scenario:
+            return normalize_coarse_network_scenario(self.data_network_scenario)
+
         use_det = os.environ.get("RL_Q_USE_DETECTED_NETWORK", "1").strip().lower() in (
             "1",
             "true",

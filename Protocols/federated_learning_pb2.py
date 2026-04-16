@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18\x66\x65\x64\x65rated_learning.proto\x12\x12\x66\x65\x64\x65rated_learning\"\'\n\x12\x43lientRegistration\x12\x11\n\tclient_id\x18\x01 \x01(\x05\"8\n\x14RegistrationResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"E\n\x0cModelRequest\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\r\n\x05round\x18\x02 \x01(\x05\x12\x13\n\x0b\x63hunk_index\x18\x03 \x01(\x05\"\x9b\x01\n\x0bGlobalModel\x12\r\n\x05round\x18\x01 \x01(\x05\x12\x0f\n\x07weights\x18\x02 \x01(\x0c\x12\x11\n\tavailable\x18\x03 \x01(\x08\x12\x14\n\x0cmodel_config\x18\x04 \x01(\t\x12\x13\n\x0b\x63hunk_index\x18\x05 \x01(\x05\x12\x14\n\x0ctotal_chunks\x18\x06 \x01(\x05\x12\x18\n\x10server_sent_unix\x18\x07 \x01(\x01\"\xef\x01\n\x0bModelUpdate\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\r\n\x05round\x18\x02 \x01(\x05\x12\x0f\n\x07weights\x18\x03 \x01(\x0c\x12\x13\n\x0bnum_samples\x18\x04 \x01(\x05\x12=\n\x07metrics\x18\x05 \x03(\x0b\x32,.federated_learning.ModelUpdate.MetricsEntry\x12\x13\n\x0b\x63hunk_index\x18\x06 \x01(\x05\x12\x14\n\x0ctotal_chunks\x18\x07 \x01(\x05\x1a.\n\x0cMetricsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\"2\n\x0eUpdateResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\xa7\x01\n\x07Metrics\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\r\n\x05round\x18\x02 \x01(\x05\x12\x13\n\x0bnum_samples\x18\x03 \x01(\x05\x12\x0c\n\x04loss\x18\x04 \x01(\x01\x12\x10\n\x08\x61\x63\x63uracy\x18\x05 \x01(\x01\x12\x13\n\x0b\x62\x61ttery_soc\x18\x06 \x01(\x01\x12\x16\n\x0eround_time_sec\x18\x07 \x01(\x01\x12\x18\n\x10\x63lient_converged\x18\x08 \x01(\x01\"3\n\x0fMetricsResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\xbf\x01\n\x11\x45valuationMetrics\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\r\n\x05round\x18\x02 \x01(\x05\x12\x13\n\x0bnum_samples\x18\x03 \x01(\x05\x12\x43\n\x07metrics\x18\x04 \x03(\x0b\x32\x32.federated_learning.EvaluationMetrics.MetricsEntry\x1a.\n\x0cMetricsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\"\"\n\rConfigRequest\x12\x11\n\tclient_id\x18\x01 \x01(\x05\":\n\x0eTrainingConfig\x12\x12\n\nbatch_size\x18\x01 \x01(\x05\x12\x14\n\x0clocal_epochs\x18\x02 \x01(\x05\"9\n\rStatusRequest\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\x15\n\rcurrent_round\x18\x02 \x01(\x05\"\xc2\x01\n\x0eTrainingStatus\x12\x14\n\x0cshould_train\x18\x01 \x01(\x08\x12\x15\n\rcurrent_round\x18\x02 \x01(\x05\x12\x17\n\x0fshould_evaluate\x18\x03 \x01(\x08\x12\x13\n\x0bis_complete\x18\x04 \x01(\x08\x12\x1a\n\x12has_protocol_query\x18\x05 \x01(\x08\x12\x39\n\x0eprotocol_query\x18\x06 \x01(\x0b\x32!.federated_learning.ProtocolQuery\"M\n\rProtocolQuery\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\x10\n\x08round_id\x18\x02 \x01(\x05\x12\x17\n\x0fglobal_model_id\x18\x03 \x01(\x05\"v\n\x11ProtocolSelection\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\x10\n\x08round_id\x18\x02 \x01(\x05\x12\x17\n\x0fglobal_model_id\x18\x03 \x01(\x05\x12#\n\x1b\x64ownlink_protocol_requested\x18\x04 \x01(\t\"=\n\x19ProtocolSelectionResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t2\x9e\x05\n\x11\x46\x65\x64\x65ratedLearning\x12\x62\n\x0eRegisterClient\x12&.federated_learning.ClientRegistration\x1a(.federated_learning.RegistrationResponse\x12S\n\x0eGetGlobalModel\x12 .federated_learning.ModelRequest\x1a\x1f.federated_learning.GlobalModel\x12V\n\x0fSendModelUpdate\x12\x1f.federated_learning.ModelUpdate\x1a\".federated_learning.UpdateResponse\x12O\n\x0bSendMetrics\x12\x1b.federated_learning.Metrics\x1a#.federated_learning.MetricsResponse\x12Z\n\x11GetTrainingConfig\x12!.federated_learning.ConfigRequest\x1a\".federated_learning.TrainingConfig\x12\\\n\x13\x43heckTrainingStatus\x12!.federated_learning.StatusRequest\x1a\".federated_learning.TrainingStatus\x12m\n\x15SendProtocolSelection\x12%.federated_learning.ProtocolSelection\x1a-.federated_learning.ProtocolSelectionResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x18\x66\x65\x64\x65rated_learning.proto\x12\x12\x66\x65\x64\x65rated_learning\"\'\n\x12\x43lientRegistration\x12\x11\n\tclient_id\x18\x01 \x01(\x05\"8\n\x14RegistrationResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"E\n\x0cModelRequest\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\r\n\x05round\x18\x02 \x01(\x05\x12\x13\n\x0b\x63hunk_index\x18\x03 \x01(\x05\"\x9b\x01\n\x0bGlobalModel\x12\r\n\x05round\x18\x01 \x01(\x05\x12\x0f\n\x07weights\x18\x02 \x01(\x0c\x12\x11\n\tavailable\x18\x03 \x01(\x08\x12\x14\n\x0cmodel_config\x18\x04 \x01(\t\x12\x13\n\x0b\x63hunk_index\x18\x05 \x01(\x05\x12\x14\n\x0ctotal_chunks\x18\x06 \x01(\x05\x12\x18\n\x10server_sent_unix\x18\x07 \x01(\x01\"\xef\x01\n\x0bModelUpdate\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\r\n\x05round\x18\x02 \x01(\x05\x12\x0f\n\x07weights\x18\x03 \x01(\x0c\x12\x13\n\x0bnum_samples\x18\x04 \x01(\x05\x12=\n\x07metrics\x18\x05 \x03(\x0b\x32,.federated_learning.ModelUpdate.MetricsEntry\x12\x13\n\x0b\x63hunk_index\x18\x06 \x01(\x05\x12\x14\n\x0ctotal_chunks\x18\x07 \x01(\x05\x1a.\n\x0cMetricsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\"2\n\x0eUpdateResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\xfe\x01\n\x07Metrics\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\r\n\x05round\x18\x02 \x01(\x05\x12\x13\n\x0bnum_samples\x18\x03 \x01(\x05\x12\x0c\n\x04loss\x18\x04 \x01(\x01\x12\x10\n\x08\x61\x63\x63uracy\x18\x05 \x01(\x01\x12\x13\n\x0b\x62\x61ttery_soc\x18\x06 \x01(\x01\x12\x16\n\x0eround_time_sec\x18\x07 \x01(\x01\x12\x18\n\x10\x63lient_converged\x18\x08 \x01(\x01\x12\x19\n\x11training_time_sec\x18\t \x01(\x01\x12\x1d\n\x15uplink_model_comm_sec\x18\n \x01(\x01\x12\x1b\n\x13\x63umulative_energy_j\x18\x0b \x01(\x01\"3\n\x0fMetricsResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\xbf\x01\n\x11\x45valuationMetrics\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\r\n\x05round\x18\x02 \x01(\x05\x12\x13\n\x0bnum_samples\x18\x03 \x01(\x05\x12\x43\n\x07metrics\x18\x04 \x03(\x0b\x32\x32.federated_learning.EvaluationMetrics.MetricsEntry\x1a.\n\x0cMetricsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x01:\x02\x38\x01\"\"\n\rConfigRequest\x12\x11\n\tclient_id\x18\x01 \x01(\x05\":\n\x0eTrainingConfig\x12\x12\n\nbatch_size\x18\x01 \x01(\x05\x12\x14\n\x0clocal_epochs\x18\x02 \x01(\x05\"9\n\rStatusRequest\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\x15\n\rcurrent_round\x18\x02 \x01(\x05\"\xc2\x01\n\x0eTrainingStatus\x12\x14\n\x0cshould_train\x18\x01 \x01(\x08\x12\x15\n\rcurrent_round\x18\x02 \x01(\x05\x12\x17\n\x0fshould_evaluate\x18\x03 \x01(\x08\x12\x13\n\x0bis_complete\x18\x04 \x01(\x08\x12\x1a\n\x12has_protocol_query\x18\x05 \x01(\x08\x12\x39\n\x0eprotocol_query\x18\x06 \x01(\x0b\x32!.federated_learning.ProtocolQuery\"M\n\rProtocolQuery\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\x10\n\x08round_id\x18\x02 \x01(\x05\x12\x17\n\x0fglobal_model_id\x18\x03 \x01(\x05\"v\n\x11ProtocolSelection\x12\x11\n\tclient_id\x18\x01 \x01(\x05\x12\x10\n\x08round_id\x18\x02 \x01(\x05\x12\x17\n\x0fglobal_model_id\x18\x03 \x01(\x05\x12#\n\x1b\x64ownlink_protocol_requested\x18\x04 \x01(\t\"=\n\x19ProtocolSelectionResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t2\x9e\x05\n\x11\x46\x65\x64\x65ratedLearning\x12\x62\n\x0eRegisterClient\x12&.federated_learning.ClientRegistration\x1a(.federated_learning.RegistrationResponse\x12S\n\x0eGetGlobalModel\x12 .federated_learning.ModelRequest\x1a\x1f.federated_learning.GlobalModel\x12V\n\x0fSendModelUpdate\x12\x1f.federated_learning.ModelUpdate\x1a\".federated_learning.UpdateResponse\x12O\n\x0bSendMetrics\x12\x1b.federated_learning.Metrics\x1a#.federated_learning.MetricsResponse\x12Z\n\x11GetTrainingConfig\x12!.federated_learning.ConfigRequest\x1a\".federated_learning.TrainingConfig\x12\\\n\x13\x43heckTrainingStatus\x12!.federated_learning.StatusRequest\x1a\".federated_learning.TrainingStatus\x12m\n\x15SendProtocolSelection\x12%.federated_learning.ProtocolSelection\x1a-.federated_learning.ProtocolSelectionResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -50,27 +50,27 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_UPDATERESPONSE']._serialized_start=618
   _globals['_UPDATERESPONSE']._serialized_end=668
   _globals['_METRICS']._serialized_start=671
-  _globals['_METRICS']._serialized_end=838
-  _globals['_METRICSRESPONSE']._serialized_start=840
-  _globals['_METRICSRESPONSE']._serialized_end=891
-  _globals['_EVALUATIONMETRICS']._serialized_start=894
-  _globals['_EVALUATIONMETRICS']._serialized_end=1085
+  _globals['_METRICS']._serialized_end=925
+  _globals['_METRICSRESPONSE']._serialized_start=927
+  _globals['_METRICSRESPONSE']._serialized_end=978
+  _globals['_EVALUATIONMETRICS']._serialized_start=981
+  _globals['_EVALUATIONMETRICS']._serialized_end=1172
   _globals['_EVALUATIONMETRICS_METRICSENTRY']._serialized_start=570
   _globals['_EVALUATIONMETRICS_METRICSENTRY']._serialized_end=616
-  _globals['_CONFIGREQUEST']._serialized_start=1087
-  _globals['_CONFIGREQUEST']._serialized_end=1121
-  _globals['_TRAININGCONFIG']._serialized_start=1123
-  _globals['_TRAININGCONFIG']._serialized_end=1181
-  _globals['_STATUSREQUEST']._serialized_start=1183
-  _globals['_STATUSREQUEST']._serialized_end=1240
-  _globals['_TRAININGSTATUS']._serialized_start=1243
-  _globals['_TRAININGSTATUS']._serialized_end=1437
-  _globals['_PROTOCOLQUERY']._serialized_start=1439
-  _globals['_PROTOCOLQUERY']._serialized_end=1516
-  _globals['_PROTOCOLSELECTION']._serialized_start=1518
-  _globals['_PROTOCOLSELECTION']._serialized_end=1636
-  _globals['_PROTOCOLSELECTIONRESPONSE']._serialized_start=1638
-  _globals['_PROTOCOLSELECTIONRESPONSE']._serialized_end=1699
-  _globals['_FEDERATEDLEARNING']._serialized_start=1702
-  _globals['_FEDERATEDLEARNING']._serialized_end=2372
+  _globals['_CONFIGREQUEST']._serialized_start=1174
+  _globals['_CONFIGREQUEST']._serialized_end=1208
+  _globals['_TRAININGCONFIG']._serialized_start=1210
+  _globals['_TRAININGCONFIG']._serialized_end=1268
+  _globals['_STATUSREQUEST']._serialized_start=1270
+  _globals['_STATUSREQUEST']._serialized_end=1327
+  _globals['_TRAININGSTATUS']._serialized_start=1330
+  _globals['_TRAININGSTATUS']._serialized_end=1524
+  _globals['_PROTOCOLQUERY']._serialized_start=1526
+  _globals['_PROTOCOLQUERY']._serialized_end=1603
+  _globals['_PROTOCOLSELECTION']._serialized_start=1605
+  _globals['_PROTOCOLSELECTION']._serialized_end=1723
+  _globals['_PROTOCOLSELECTIONRESPONSE']._serialized_start=1725
+  _globals['_PROTOCOLSELECTIONRESPONSE']._serialized_end=1786
+  _globals['_FEDERATEDLEARNING']._serialized_start=1789
+  _globals['_FEDERATEDLEARNING']._serialized_end=2459
 # @@protoc_insertion_point(module_scope)

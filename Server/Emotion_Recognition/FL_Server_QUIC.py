@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 # Server uses CPU only (aggregation is numpy-only); saves GPU memory for clients

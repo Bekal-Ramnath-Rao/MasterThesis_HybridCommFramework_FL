@@ -3,6 +3,7 @@ Federated Learning Client for EEG Mental State Recognition using QUIC
 Supports CNN+BiLSTM+MHA architecture with non-IID data partitioning
 """
 
+import io
 import os
 import sys
 import json

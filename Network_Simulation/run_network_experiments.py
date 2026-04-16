@@ -17,6 +17,7 @@ from typing import List, Dict, Optional
 import argparse
 from pathlib import Path
 import tempfile
+import glob
 
 # Set UTF-8 encoding for Windows console
 if sys.platform == 'win32':
@@ -39,6 +40,28 @@ if _env_path.exists():
                     break
     except Exception:
         pass
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+try:
+    from Client.battery_model import (
+        BATTERY_CAP_J,
+        PROTOCOL_CPU_BETA,
+        PROTOCOL_ENERGY_ALPHA,
+        E_fixed,
+        P_CPU_MAX,
+        k_tx,
+        k_rx,
+    )
+except ImportError:
+    BATTERY_CAP_J = 60.0 * 3600.0
+    PROTOCOL_CPU_BETA = {"mqtt": 1.0, "amqp": 1.05, "grpc": 1.1, "quic": 1.05, "http3": 1.15, "dds": 1.0}
+    PROTOCOL_ENERGY_ALPHA = {"mqtt": 1.0, "amqp": 1.1, "grpc": 1.2, "quic": 1.1, "http3": 1.25, "dds": 1.1}
+    E_fixed = 0.1
+    P_CPU_MAX = 10.0
+    k_tx = 1e-8
+    k_rx = 1e-8
 
 
 def parse_fl_dataset_for_client(entries: Optional[List[str]]) -> Optional[Dict[int, int]]:
@@ -92,8 +115,8 @@ class ExperimentRunner:
         self.rl_inference_only = bool(rl_inference_only)
         self.use_communication_model_reward = use_communication_model_reward
         self.reset_epsilon = reset_epsilon
-        # Number of client containers started from this runner on the central machine
-        self.local_clients = max(1, int(local_clients or 1))
+        # Number of client containers started from this runner on the central machine (0 = server/brokers only).
+        self.local_clients = max(0, int(local_clients))
         # Total participants the server should wait for (local + remote); None => same as local_clients
         self.min_clients = int(min_clients) if min_clients is not None else None
         # quantization_params expected to be a dict of simple string values
@@ -218,7 +241,7 @@ class ExperimentRunner:
                 "temperature": str(docker_dir / "docker-compose-temperature.host-network.yml")
             }
             self.unified_compose_files = {
-                "emotion": str(docker_dir / "docker-compose-unified-emotion.host-network.yml"),
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.host-network.yml"),
                 "temperature": str(docker_dir / "docker-compose-unified-temperature.host-network.yml")
             }
@@ -248,7 +271,7 @@ class ExperimentRunner:
                 "temperature": str(docker_dir / "docker-compose-temperature.gpu-isolated.yml")
             }
             self.unified_compose_files = {
-                "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.bridge.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.yml"),
                 "temperature": str(docker_dir / "docker-compose-unified-temperature.yml")
             }
@@ -263,7 +286,7 @@ class ExperimentRunner:
                 "temperature": str(docker_dir / "docker-compose-temperature.yml")
             }
             self.unified_compose_files = {
-                "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.bridge.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.yml"),
                 "temperature": str(docker_dir / "docker-compose-unified-temperature.yml")
             }
@@ -339,6 +362,23 @@ class ExperimentRunner:
         if cwd is None:
             cwd = str(Path(__file__).parent.parent)
         return subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', check=check, env=env, cwd=cwd)
+
+    def _experiment_use_case_results_name(self) -> str:
+        """Folder name under experiment_results mount: emotion | mental_state | temperature."""
+        u = (self.use_case or "emotion").lower()
+        if u == "mentalstate":
+            return "mental_state"
+        return u
+
+    def _rl_unified_training_results_paths_in_container(self, scenario: Optional[str]) -> List[str]:
+        """In-container paths for unified server snapshot JSON (stable filename for the experiment runner)."""
+        uc = self._experiment_use_case_results_name()
+        scen = (scenario or "default").strip() or "default"
+        paths: List[str] = []
+        for base in ("/app/results", "/app/experiment_results"):
+            paths.append(f"{base}/{uc}/unified/{scen}/rl_unified_training_results.json")
+            paths.append(f"{base}/{uc}/unified/default/rl_unified_training_results.json")
+        return paths
 
     def _running_docker_container_names(self) -> set:
         """Names of currently running containers (``docker ps``)."""
@@ -670,10 +710,21 @@ class ExperimentRunner:
                 # Emotion unified client: collect→boundaries→RL training (override via env if needed)
                 os.environ.setdefault("RL_BOUNDARY_PIPELINE", "true")
                 os.environ.setdefault("RL_PHASE0_ROUNDS", "20")
-                # RL training: only one client runs; server waits for 1 client; run until Q converges and exit
-                os.environ["MIN_CLIENTS"] = "1"
-                os.environ["NUM_CLIENTS"] = "1"
-                print("RL training mode: starting only 1 client (converge and exit)")
+                if int(self.local_clients) <= 0:
+                    # Server/brokers only: federation size from --min-clients (same as non-QL unified).
+                    total_fed = self._total_expected_federation_clients()
+                    os.environ["MIN_CLIENTS"] = str(total_fed)
+                    os.environ["NUM_CLIENTS"] = str(total_fed)
+                    os.environ["MAX_CLIENTS"] = "100"
+                    print(
+                        "RL training mode: no local client containers; "
+                        "server uses federation MIN_CLIENTS/NUM_CLIENTS until remote clients attach."
+                    )
+                else:
+                    # RL training: one local client; server waits for 1 client; run until Q converges and exit
+                    os.environ["MIN_CLIENTS"] = "1"
+                    os.environ["NUM_CLIENTS"] = "1"
+                    print("RL training mode: starting only 1 client (converge and exit)")
             else:
                 os.environ["USE_QL_CONVERGENCE"] = "false"
                 # Multi-client FL: explore (train Q) unless explicit inference-only from GUI/CLI.
@@ -693,19 +744,27 @@ class ExperimentRunner:
             # When QL convergence: start only brokers + server + first client (single client for training)
             if self.use_ql_convergence:
                 uc = self.use_case  # emotion, mentalstate, temperature
-                services_single_client = [
-                    "mqtt-broker-unified",
-                    "amqp-broker-unified",
-                    f"fl-server-unified-{uc}",
-                    f"fl-client-unified-{uc}-1",
-                ]
-                compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_single_client
+                if int(self.local_clients) <= 0:
+                    services_ql = [
+                        "mqtt-broker-unified",
+                        "amqp-broker-unified",
+                        f"fl-server-unified-{uc}",
+                    ]
+                    compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_ql
+                else:
+                    services_single_client = [
+                        "mqtt-broker-unified",
+                        "amqp-broker-unified",
+                        f"fl-server-unified-{uc}",
+                        f"fl-client-unified-{uc}-1",
+                    ]
+                    compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_single_client
             else:
                 # Unified compose defines two client services; a bare `up -d` starts both and ignores
                 # --local-clients. Start only brokers + server + the first N client services (N=1 or 2).
                 uc = self.use_case
                 max_unified_clients = 2
-                num_local = max(1, min(int(self.local_clients), max_unified_clients))
+                num_local = max(0, min(int(self.local_clients), max_unified_clients))
                 total_fed = self._total_expected_federation_clients()
                 os.environ["MIN_CLIENTS"] = str(total_fed)
                 os.environ["NUM_CLIENTS"] = str(total_fed)
@@ -720,7 +779,8 @@ class ExperimentRunner:
                 compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_multi
             
             if self.use_ql_convergence:
-                _n_loc, _n_tot = 1, 1
+                _n_loc = 0 if int(self.local_clients) <= 0 else 1
+                _n_tot = self._total_expected_federation_clients()
             else:
                 _n_loc = num_local
                 _n_tot = self._total_expected_federation_clients()
@@ -739,7 +799,10 @@ class ExperimentRunner:
             print("  ✓ MQTT Broker")
             print("  ✓ AMQP Broker")
             print("  ✓ Unified FL Server")
-            print("  ✓ Unified FL Clients")
+            if _n_loc > 0:
+                print("  ✓ Unified FL Clients")
+            else:
+                print("  — Unified FL Clients: none started locally (server-only mode)")
             
             # Wait for services to initialize
             print("\nWaiting for services to initialize (15 seconds)...")
@@ -835,20 +898,23 @@ class ExperimentRunner:
         # Stage 4: Start clients
         if clients:
             # Respect configured number of local clients to start on this machine.
-            num_local = max(1, min(self.local_clients, len(clients)))
+            num_local = max(0, min(self.local_clients, len(clients)))
             clients_to_start = clients[:num_local]
-            stage_num = "[Stage 4/4]" if (broker and self.enable_congestion and congestion_level != "none") else "[Stage 3/4]"
-            print(f"\n{stage_num} Starting clients ({num_local} local): {', '.join(clients_to_start)}")
-            cmd_clients = compose_cmd_base + ["up", "-d"] + clients_to_start
-            result = self.run_command(cmd_clients, check=False)
-            if result.returncode != 0:
-                print(f"[ERROR] Failed to start clients")
-                print(f"[ERROR] stdout: {result.stdout}")
-                print(f"[ERROR] stderr: {result.stderr}")
-                return False
-            
-            print(f"Waiting 5 seconds for clients to connect...")
-            time.sleep(5)
+            if clients_to_start:
+                stage_num = "[Stage 4/4]" if (broker and self.enable_congestion and congestion_level != "none") else "[Stage 3/4]"
+                print(f"\n{stage_num} Starting clients ({num_local} local): {', '.join(clients_to_start)}")
+                cmd_clients = compose_cmd_base + ["up", "-d"] + clients_to_start
+                result = self.run_command(cmd_clients, check=False)
+                if result.returncode != 0:
+                    print(f"[ERROR] Failed to start clients")
+                    print(f"[ERROR] stdout: {result.stdout}")
+                    print(f"[ERROR] stderr: {result.stderr}")
+                    return False
+
+                print(f"Waiting 5 seconds for clients to connect...")
+                time.sleep(5)
+            else:
+                print("\n[Stage 4/4] Skipping local clients (0 requested; server-only mode).")
         
         print(f"\n[OK] All containers started successfully with staged delays")
         return True
@@ -1085,19 +1151,31 @@ class ExperimentRunner:
             # by examining the results file content (not just existence)
             results_dir = f"/app/Server/{self.use_case_dir}/results"
             expected_json = f"{protocol}_training_results.json"
-            
-            # Read the results file content to check if expected rounds are complete
-            read_results = self.run_command([
-                "docker", "exec", server_container, "cat",
-                f"{results_dir}/{expected_json}"
-            ], check=False)
-            
+            cat_paths = [f"{results_dir}/{expected_json}"]
+            if protocol == "rl_unified":
+                cat_paths = self._rl_unified_training_results_paths_in_container(scenario) + cat_paths
+
+            read_results = None
+            for cat_path in cat_paths:
+                read_results = self.run_command(
+                    ["docker", "exec", server_container, "cat", cat_path],
+                    check=False,
+                )
+                if read_results.returncode == 0 and (read_results.stdout or "").strip():
+                    break
+            else:
+                read_results = type("R", (), {"returncode": 1, "stdout": ""})()
+
             if read_results.returncode == 0 and read_results.stdout:
                 try:
                     results_data = json.loads(read_results.stdout)
                     # Check if we have results for all expected rounds
                     if isinstance(results_data, dict):
-                        rounds_completed = results_data.get("rounds_completed", 0)
+                        rounds_completed = int(results_data.get("rounds_completed", 0) or 0)
+                        if not rounds_completed:
+                            rlist = results_data.get("rounds") or []
+                            if isinstance(rlist, list):
+                                rounds_completed = len(rlist)
                         if rounds_completed >= self.num_rounds:
                             print(f"Training completed successfully ({rounds_completed}/{self.num_rounds} rounds)!")
                             time.sleep(3)
@@ -1192,7 +1270,18 @@ class ExperimentRunner:
                 ], check=False)
             except:
                 pass
-        
+
+        if protocol == "rl_unified":
+            dst = os.path.join(exp_dir, "rl_unified_training_results.json")
+            for cp in self._rl_unified_training_results_paths_in_container(scenario):
+                r = self.run_command(
+                    ["docker", "cp", f"{server_container}:{cp}", dst],
+                    check=False,
+                )
+                if r.returncode == 0 and os.path.isfile(dst) and os.path.getsize(dst) > 0:
+                    print(f"  Copied RL-unified training results from container:{cp}")
+                    break
+
         # Save experiment metadata
         metadata = {
             "protocol": protocol,
@@ -1254,6 +1343,7 @@ class ExperimentRunner:
                 server_container=server_container,
                 protocol=protocol,
                 exp_dir=exp_dir,
+                scenario=scenario,
             )
         except Exception as e:
             print(f"  [WARNING] Could not finalize experiment artifacts: {e}")
@@ -1334,6 +1424,20 @@ class ExperimentRunner:
             round_num = int(round_str)
             metrics_by_round[round_num] = (float(loss_str), float(acc_str))
 
+        # Pattern 4 (unified / RL-unified emotion server):
+        # Round X Results:
+        #   Avg Loss: ...
+        #   Avg Accuracy: ...
+        unified_round_pattern = re.compile(
+            r"Round\s+(\d+)\s+Results:\s*"
+            r"(?:\n|\r\n)+\s*Avg\s+Loss:\s*([\d.]+)\s*"
+            r"(?:\n|\r\n)+\s*Avg\s+Accuracy:\s*([\d.]+)",
+            re.IGNORECASE,
+        )
+        for round_str, loss_str, acc_str in unified_round_pattern.findall(content):
+            round_num = int(round_str)
+            metrics_by_round[round_num] = (float(loss_str), float(acc_str))
+
         if not metrics_by_round:
             return None
 
@@ -1350,6 +1454,7 @@ class ExperimentRunner:
         conv_patterns = [
             re.compile(r"Convergence\s*time\s*:\s*([\d.]+)\s*seconds", re.IGNORECASE),
             re.compile(r"Total\s+Training\s+Time\s*:\s*([\d.]+)\s*seconds", re.IGNORECASE),
+            re.compile(r"Total\s+time\s*:\s*([\d.]+)\s*seconds", re.IGNORECASE),
             re.compile(r"Time\s+to\s+Convergence\s*:\s*([\d.]+)\s*seconds", re.IGNORECASE),
         ]
         for pattern in conv_patterns:
@@ -1403,7 +1508,14 @@ class ExperimentRunner:
             if json_results.get("num_clients") is not None:
                 merged["num_clients"] = json_results.get("num_clients")
             # merge battery-related series if JSON has them
-            for key in ("battery_consumption", "battery_soc", "avg_battery_soc", "round_times_seconds"):
+            for key in (
+                "battery_consumption",
+                "battery_model_consumption",
+                "battery_model_consumption_source",
+                "battery_soc",
+                "avg_battery_soc",
+                "round_times_seconds",
+            ):
                 if json_results.get(key):
                     merged[key] = json_results.get(key)
             return merged
@@ -1499,7 +1611,10 @@ class ExperimentRunner:
 
         per_client_series = []
         for name in os.listdir(exp_dir):
-            if not name.endswith("_logs.txt") or "client" not in name.lower():
+            lower = name.lower()
+            is_named_client_logs = name.endswith("_logs.txt") and "client" in lower
+            is_native_style = lower.startswith("client_") and lower.endswith(".log")
+            if not (is_named_client_logs or is_native_style):
                 continue
 
             path = os.path.join(exp_dir, name)
@@ -1560,16 +1675,163 @@ class ExperimentRunner:
                 avg_series.append(sum(vals) / len(vals))
         return avg_series
 
-    def _copy_server_plots_to_experiment_folder(self, server_container: str, protocol: str, exp_dir: str):
+    def _battery_model_series_from_jsonl(self, exp_dir: str) -> List[float]:
+        """Cumulative drain fraction per round from client_fl_metrics *.jsonl (BatteryModel on clients)."""
+        roots = [
+            exp_dir,
+            os.path.join(os.path.dirname(exp_dir), "shared_data"),
+            str(_REPO_ROOT / "shared_data"),
+        ]
+        files: List[str] = []
+        for r in roots:
+            if r and os.path.isdir(r):
+                files.extend(glob.glob(os.path.join(r, "client_fl_metrics_*_client*.jsonl")))
+        if not files:
+            return []
+        by_round: Dict[int, List[float]] = {}
+        for fp in files:
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        rec = json.loads(line)
+                        rnd = int(rec.get("round") or 0)
+                        if rnd <= 0:
+                            continue
+                        cum = rec.get("cumulative_battery_energy_joules")
+                        if cum is None:
+                            continue
+                        by_round.setdefault(rnd, []).append(float(cum) / BATTERY_CAP_J)
+            except Exception:
+                continue
+        if not by_round:
+            return []
+        max_r = max(by_round.keys())
+        out: List[float] = []
+        for r in range(1, max_r + 1):
+            vals = by_round.get(r)
+            if vals:
+                out.append(sum(vals) / len(vals))
+        return out
+
+    def _estimate_battery_model_series_from_logs(self, exp_dir: str, protocol: str) -> List[float]:
+        """Like _estimate_battery_series_from_logs but applies PROTOCOL_ENERGY_ALPHA / PROTOCOL_CPU_BETA."""
+        p = (protocol or "mqtt").strip().lower()
+        if p in ("rl_unified", "unified"):
+            p = "mqtt"
+        alpha = float(PROTOCOL_ENERGY_ALPHA.get(p, 1.0))
+        beta = float(PROTOCOL_CPU_BETA.get(p, 1.0))
+
+        k_tx_l = k_tx
+        k_rx_l = k_rx
+        E_fixed_l = E_fixed
+        P_CPU_MAX_l = P_CPU_MAX
+        BATTERY_CAP_J_l = BATTERY_CAP_J
+        cpu_util_fraction = 0.5
+
+        round_start_pattern = re.compile(r"starting training for round\s+(\d+)", re.IGNORECASE)
+        send_size_pattern = re.compile(
+            r"chunking\s+.*?model\s+update:\s*(\d+)\s+bytes\s+total",
+            re.IGNORECASE,
+        )
+        send_size_pattern_alt = re.compile(
+            r"model\s+update.*?\((\d+)\s+bytes(?:\s+total)?\)",
+            re.IGNORECASE,
+        )
+        send_size_pattern_sent = re.compile(
+            r"sent\s+update\s+in\s+\d+\s+chunks\s*\((\d+)\s+bytes(?:\s+total)?\)",
+            re.IGNORECASE,
+        )
+        epoch_time_pattern = re.compile(r"-\s*([\d.]+)(ms|s)/epoch", re.IGNORECASE)
+
+        per_client_series: List[List[float]] = []
+        for name in os.listdir(exp_dir):
+            lower = name.lower()
+            is_named_client_logs = name.endswith("_logs.txt") and "client" in lower
+            is_native_style = lower.startswith("client_") and lower.endswith(".log")
+            if not (is_named_client_logs or is_native_style):
+                continue
+
+            path = os.path.join(exp_dir, name)
+            current_round = None
+            training_times: Dict[int, float] = {}
+            bytes_sent: Dict[int, int] = {}
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        m_round = round_start_pattern.search(line)
+                        if m_round:
+                            current_round = int(m_round.group(1))
+                            training_times.setdefault(current_round, 0.0)
+                            continue
+
+                        if current_round is not None:
+                            m_epoch = epoch_time_pattern.search(line)
+                            if m_epoch:
+                                val = float(m_epoch.group(1))
+                                unit = m_epoch.group(2).lower()
+                                training_times[current_round] = training_times.get(current_round, 0.0) + (
+                                    val / 1000.0 if unit == "ms" else val
+                                )
+
+                            m_send = send_size_pattern.search(line)
+                            if not m_send:
+                                m_send = send_size_pattern_alt.search(line)
+                            if not m_send:
+                                m_send = send_size_pattern_sent.search(line)
+                            if m_send:
+                                bytes_sent[current_round] = int(m_send.group(1))
+
+                rounds = sorted(set(training_times.keys()) & set(bytes_sent.keys()))
+                if not rounds:
+                    continue
+
+                cumulative = 0.0
+                series: List[float] = []
+                for rnd in rounds:
+                    bits_tx = bytes_sent[rnd] * 8
+                    bits_rx = 0
+                    e_radio_baseline = k_tx_l * bits_tx + k_rx_l * bits_rx + E_fixed_l
+                    e_radio = alpha * e_radio_baseline
+                    e_cpu = P_CPU_MAX_l * cpu_util_fraction * training_times.get(rnd, 0.0) * beta
+                    e_total = e_radio + e_cpu
+                    cumulative += e_total / BATTERY_CAP_J_l
+                    series.append(cumulative)
+
+                if series:
+                    per_client_series.append(series)
+            except Exception:
+                continue
+
+        if not per_client_series:
+            return []
+
+        max_len = max(len(s) for s in per_client_series)
+        avg_series: List[float] = []
+        for idx in range(max_len):
+            vals = [s[idx] for s in per_client_series if idx < len(s)]
+            if vals:
+                avg_series.append(sum(vals) / len(vals))
+        return avg_series
+
+    def _copy_server_plots_to_experiment_folder(
+        self, server_container: str, protocol: str, exp_dir: str, scenario: Optional[str] = None
+    ):
         """Copy server-side generated plots into this experiment folder when available."""
         protocol_alias = "unified" if protocol == "rl_unified" else protocol
-        use_case_aliases = [self.use_case.lower()]
-        if self.use_case.lower() == "mentalstate":
-            use_case_aliases.append("mental_state")
+        uc_fs = self._experiment_use_case_results_name()
+        use_case_aliases = list({self.use_case.lower(), uc_fs})
+        scen = (scenario or os.getenv("NETWORK_SCENARIO") or "default").strip() or "default"
 
         candidate_dirs = []
         for uc in use_case_aliases:
             candidate_dirs.extend([
+                f"/app/results/{uc}/{protocol_alias}/{scen}",
+                f"/app/results/{uc}/{protocol_alias}/default",
+                f"/app/results/{uc}/{protocol_alias}",
+                f"/app/experiment_results/{uc}/{protocol_alias}/{scen}",
                 f"/app/experiment_results/{uc}/{protocol_alias}/default",
                 f"/app/experiment_results/{uc}/{protocol_alias}",
             ])
@@ -1612,7 +1874,9 @@ class ExperimentRunner:
         loss = training.get("loss", []) or []
         accuracy = training.get("accuracy", []) or []
         total_rounds = int(training.get("total_rounds", len(rounds) if rounds else 0) or 0)
-        convergence_time_sec = float(training.get("convergence_time_seconds", 0.0) or 0.0)
+        convergence_time_sec = float(
+            training.get("convergence_time_seconds", training.get("convergence_time", 0.0)) or 0.0
+        )
 
         if rounds and loss and accuracy and len(rounds) == len(loss) == len(accuracy):
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
@@ -1700,10 +1964,93 @@ class ExperimentRunner:
                 except Exception:
                     return
 
-    def _finalize_experiment_artifacts(self, server_container: str, protocol: str, exp_dir: str):
+    @classmethod
+    def for_artifact_finalization(cls, use_case: str) -> "ExperimentRunner":
+        """Build a minimal runner instance for post-run JSON/plot finalization (e.g. native GUI, no Docker)."""
+        obj = cls.__new__(cls)
+        obj.use_case = use_case
+        obj.use_case_dir_map = {
+            "emotion": "Emotion_Recognition",
+            "mentalstate": "MentalState_Recognition",
+            "temperature": "Temperature_Regulation",
+        }
+        obj.use_case_dir = obj.use_case_dir_map.get(
+            use_case, f"{(use_case or 'emotion').title()}_Recognition"
+        )
+        return obj
+
+    def _ensure_training_includes_battery_series(self, exp_dir: str, training: Optional[Dict]) -> Optional[Dict]:
+        """If training dict has rounds but no battery series, estimate from client logs and attach."""
+        if not training or not isinstance(training, dict):
+            return training
+        rounds = training.get("rounds", []) or []
+        if not rounds:
+            return training
+        has_battery = False
+        for key in ("battery_consumption", "battery_soc", "avg_battery_soc"):
+            series = training.get(key)
+            if isinstance(series, (list, tuple)) and len(series) > 0:
+                has_battery = True
+                break
+        if has_battery:
+            return training
+        est = self._estimate_battery_series_from_logs(exp_dir)
+        if not est:
+            return training
+        n = len(rounds)
+        if len(est) > n:
+            est = est[:n]
+        elif len(est) < n and est:
+            est = list(est) + [est[-1]] * (n - len(est))
+        out = dict(training)
+        out["battery_consumption"] = est
+        out["battery_consumption_source"] = "estimated_from_client_logs"
+        return out
+
+    def _ensure_training_includes_battery_model_series(
+        self, exp_dir: str, protocol: str, training: Optional[Dict]
+    ) -> Optional[Dict]:
+        """Attach battery_model_consumption (BatteryModel drain) without changing battery_consumption."""
+        if not training or not isinstance(training, dict):
+            return training
+        rounds = training.get("rounds", []) or []
+        if not rounds:
+            return training
+        existing = training.get("battery_model_consumption")
+        if isinstance(existing, (list, tuple)) and len(existing) == len(rounds):
+            return training
+
+        est = self._battery_model_series_from_jsonl(exp_dir)
+        source = "client_metrics_jsonl"
+        if not est:
+            est = self._estimate_battery_model_series_from_logs(exp_dir, protocol)
+            source = "battery_model_estimated_from_client_logs"
+        if not est:
+            return training
+
+        n = len(rounds)
+        if len(est) > n:
+            est = est[:n]
+        elif len(est) < n and est:
+            est = list(est) + [est[-1]] * (n - len(est))
+        out = dict(training)
+        out["battery_model_consumption"] = est
+        out["battery_model_consumption_source"] = source
+        return out
+
+    def _finalize_experiment_artifacts(
+        self,
+        server_container: Optional[str],
+        protocol: str,
+        exp_dir: str,
+        scenario: Optional[str] = None,
+    ):
         """Copy/generate all expected artifacts for an experiment folder."""
-        self._copy_server_plots_to_experiment_folder(server_container, protocol, exp_dir)
+        if server_container:
+            self._copy_server_plots_to_experiment_folder(server_container, protocol, exp_dir, scenario=scenario)
         training = self._resolve_training_results(exp_dir, protocol)
+        training = self._ensure_training_includes_battery_series(exp_dir, training)
+        training = self._ensure_training_includes_battery_model_series(exp_dir, protocol, training)
         self._persist_training_results(exp_dir, protocol, training)
         self._generate_standard_plots(protocol, exp_dir, training)
         self._ensure_battery_plot_alias(exp_dir)
@@ -2025,7 +2372,7 @@ def main():
         "--local-clients",
         type=int,
         default=2,
-        help="Number of client containers to start from this runner on the central machine (default: 2).",
+        help="Number of client containers to start from this runner on the central machine (default: 2). Use 0 for server/brokers only.",
     )
     parser.add_argument(
         "--min-clients",

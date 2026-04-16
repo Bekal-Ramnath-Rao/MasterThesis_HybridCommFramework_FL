@@ -101,6 +101,10 @@ class UnifiedFederatedLearningServer:
         self.ACCURACY = []
         self.LOSS = []
         self.ROUNDS = []
+        self.ROUND_TIMES = []
+        self.AVG_TRAINING_TIME_SEC = []
+        self.AVG_BATTERY_SOC = []
+        self.round_start_time = None
         
         # Convergence tracking
         self.best_loss = float('inf')
@@ -293,12 +297,17 @@ class UnifiedFederatedLearningServer:
         """Track client evaluation metrics using standalone message routing."""
         with self.lock:
             client_id = payload['client_id']
-            self.client_metrics[client_id] = payload.get('metrics', {})
+            merged = dict(payload.get('metrics') or {})
+            for k in ('loss', 'accuracy', 'battery_soc', 'training_time_sec', 'training_time', 'round_time_sec'):
+                if k in payload and k not in merged:
+                    merged[k] = payload[k]
+            self.client_metrics[client_id] = merged
     
     def start_training(self):
         """Start federated learning process"""
         self.start_time = time.time()
         self.current_round = 1
+        self.round_start_time = time.time()
         for client_id in self.registered_clients.keys():
             self.grpc_model_ready[client_id] = 0
         self.broadcast_global_model()
@@ -349,9 +358,34 @@ class UnifiedFederatedLearningServer:
         
         self.global_weights = aggregated_weights
         
-        # Aggregate metrics
-        avg_accuracy = np.mean([u['metrics']['accuracy'] for u in self.client_updates.values()])
-        avg_loss = np.mean([u['metrics']['loss'] for u in self.client_updates.values()])
+        # Aggregate metrics (clients may report val_* keys)
+        updates = list(self.client_updates.values())
+        avg_accuracy = np.mean([
+            float(u['metrics'].get('accuracy', u['metrics'].get('val_accuracy', 0.0)))
+            for u in updates
+        ])
+        avg_loss = np.mean([
+            float(u['metrics'].get('loss', u['metrics'].get('val_loss', 0.0)))
+            for u in updates
+        ])
+        train_times = []
+        socs = []
+        for u in updates:
+            m = u.get('metrics') or {}
+            t = m.get('training_time_sec', m.get('training_time'))
+            if t is not None:
+                try:
+                    train_times.append(float(t))
+                except (TypeError, ValueError):
+                    pass
+            try:
+                socs.append(float(m.get('battery_soc', 1.0)))
+            except (TypeError, ValueError):
+                socs.append(1.0)
+        if self.round_start_time is not None:
+            self.ROUND_TIMES.append(time.time() - self.round_start_time)
+        self.AVG_TRAINING_TIME_SEC.append(float(np.mean(train_times)) if train_times else 0.0)
+        self.AVG_BATTERY_SOC.append(float(np.mean(socs)) if socs else 1.0)
         
         self.ACCURACY.append(avg_accuracy)
         self.LOSS.append(avg_loss)
@@ -359,6 +393,8 @@ class UnifiedFederatedLearningServer:
         
         print(f"Avg Accuracy: {avg_accuracy:.4f}")
         print(f"Avg Loss: {avg_loss:.4f}")
+        print(f"Avg training time (clients reporting): {self.AVG_TRAINING_TIME_SEC[-1]:.3f} s")
+        print(f"Avg battery SoC: {self.AVG_BATTERY_SOC[-1]:.4f}")
         
         # Check convergence
         if self.current_round >= MIN_ROUNDS:
@@ -380,6 +416,7 @@ class UnifiedFederatedLearningServer:
         # Clear for next round
         self.client_updates.clear()
         self.current_round += 1
+        self.round_start_time = time.time()
         
         if self.current_round <= self.num_rounds:
             self.broadcast_global_model()
@@ -447,21 +484,41 @@ class UnifiedFederatedLearningServer:
             'rounds': self.ROUNDS,
             'accuracy': self.ACCURACY,
             'loss': self.LOSS,
+            'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
+            'avg_training_time_sec': getattr(self, 'AVG_TRAINING_TIME_SEC', []),
+            'avg_battery_soc': getattr(self, 'AVG_BATTERY_SOC', []),
             'converged': self.converged,
             'total_time': time.time() - self.start_time,
             'convergence_time': self.convergence_time,
             'num_clients': self.num_clients,
             'protocols_used': dict(self.registered_clients)
         }
-        
+        n_done = len(self.ROUNDS)
+        results['rounds_completed'] = n_done
+        results['total_rounds'] = n_done
+        results['final_loss'] = self.LOSS[-1] if self.LOSS else None
+        results['final_accuracy'] = self.ACCURACY[-1] if self.ACCURACY else None
+        ct = self.convergence_time
+        if ct is not None:
+            results['convergence_time_seconds'] = float(ct)
+            results['convergence_time_minutes'] = float(ct) / 60.0
+        else:
+            results['convergence_time_seconds'] = None
+            results['convergence_time_minutes'] = None
+
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         results_file = results_dir / f"unified_results_{timestamp}.json"
-        
+
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)
-        
+
+        stable_runner = results_dir / 'rl_unified_training_results.json'
+        with open(stable_runner, 'w') as f:
+            json.dump(results, f, indent=2)
+
         print(f"\n✅ Results saved to {results_file}")
-    
+        print(f"✅ Experiment runner snapshot: {stable_runner}")
+
     def run(self):
         """Run unified server (all protocols)"""
         print("[Server] Starting all protocol handlers...")

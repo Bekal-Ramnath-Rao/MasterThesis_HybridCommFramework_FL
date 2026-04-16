@@ -160,6 +160,10 @@ class EvaluationMetrics(IdlStruct):
     loss: float
     accuracy: float
     client_converged: float = 0.0
+    battery_soc: float = 1.0
+    training_time_sec: float = 0.0
+    round_time_sec: float = 0.0
+    uplink_model_comm_sec: float = 0.0
 
 
 @dataclass
@@ -323,6 +327,10 @@ class FederatedLearningServer:
         self.ACC = []
         self.TOP2 = []
         self.ROUNDS = []
+        self.AVG_CLIENT_TRAINING_TIME_SEC = []
+        self.AVG_CLIENT_BATTERY_SOC = []
+        self.AVG_CLIENT_REPORTED_ACCURACY = []
+        self._client_eval_metrics_by_round = {}
 
         # Initialize quantization handler (default: disabled unless explicitly enabled)
         uq_env = os.getenv("USE_QUANTIZATION", "false")
@@ -390,13 +398,20 @@ class FederatedLearningServer:
         print(f"Test class distribution: {dict(Counter(self.y_test))}")
 
     def serialize_weights(self, weights):
-        """Serialize model weights for DDS transmission"""
-        serialized = pickle.dumps(weights)
-        return list(serialized)
+        """Serialize model weights for DDS transmission using numpy .npz (version-agnostic)."""
+        import io
+        buf = io.BytesIO()
+        import numpy as _np
+        _np.savez(buf, *weights)
+        return list(buf.getvalue())
 
     def deserialize_weights(self, serialized_weights):
-        """Deserialize model weights received from DDS"""
-        return pickle.loads(bytes(serialized_weights))
+        """Deserialize model weights received from DDS."""
+        import io
+        import numpy as _np
+        buf = io.BytesIO(bytes(serialized_weights))
+        loaded = _np.load(buf, allow_pickle=False)
+        return [loaded[f'arr_{i}'] for i in range(len(loaded.files))]
     
     def split_into_chunks(self, data):
         """Split serialized data into chunks of CHUNK_SIZE"""
@@ -527,6 +542,7 @@ class FederatedLearningServer:
                 self.publish_status()
                 self.check_registrations()
                 self.check_model_updates()
+                self.check_client_evaluation_metrics()
                 time.sleep(0.5)
 
             print("\nServer shutting down...")
@@ -630,6 +646,46 @@ class FederatedLearningServer:
                 self.writers['command'].write(command)
                 self.plot_results()
                 self.save_results()
+
+    def check_client_evaluation_metrics(self):
+        """Collect per-client FL training time, battery SoC, and local accuracy from DDS EvaluationMetrics."""
+        samples = self.readers['metrics'].take()
+        for sample in samples:
+            if not sample or not hasattr(sample, 'client_id'):
+                continue
+            r = int(sample.round)
+            cid = int(sample.client_id)
+            if cid not in self.active_clients:
+                continue
+            conv = getattr(sample, 'client_converged', 0.0) or 0.0
+            if STOP_ON_CLIENT_CONVERGENCE and float(conv) >= 1.0:
+                self.mark_client_converged(cid)
+                continue
+            self._client_eval_metrics_by_round.setdefault(r, {})[cid] = {
+                'num_samples': int(sample.num_samples),
+                'accuracy': float(sample.accuracy),
+                'training_time_sec': float(getattr(sample, 'training_time_sec', 0.0)),
+                'battery_soc': float(getattr(sample, 'battery_soc', 1.0)),
+            }
+        buf = self._client_eval_metrics_by_round.get(self.current_round)
+        if not buf or len(buf) < len(self.active_clients) or len(self.active_clients) == 0:
+            return
+        total_samples = sum(v['num_samples'] for v in buf.values())
+        if not total_samples:
+            del self._client_eval_metrics_by_round[self.current_round]
+            return
+        w_acc = sum(v['accuracy'] * v['num_samples'] for v in buf.values()) / total_samples
+        w_tt = sum(v['training_time_sec'] * v['num_samples'] for v in buf.values()) / total_samples
+        socs = [v['battery_soc'] for v in buf.values()]
+        avg_soc = sum(socs) / len(socs) if socs else 1.0
+        self.AVG_CLIENT_REPORTED_ACCURACY.append(float(w_acc))
+        self.AVG_CLIENT_TRAINING_TIME_SEC.append(float(w_tt))
+        self.AVG_CLIENT_BATTERY_SOC.append(float(avg_soc))
+        print(
+            f"[Client metrics] Round {self.current_round}: "
+            f"avg reported acc={w_acc:.4f}, avg train time={w_tt:.3f}s, avg SoC={avg_soc:.4f}"
+        )
+        del self._client_eval_metrics_by_round[self.current_round]
 
     def check_model_updates(self):
         """Check for model updates from clients (chunked version)"""
@@ -884,7 +940,10 @@ class FederatedLearningServer:
             "best_accuracy": max(self.ACC) if self.ACC else 0,
             "best_round": self.ROUNDS[np.argmax(self.ACC)] if self.ACC else 0,
             "num_clients": self.num_clients,
-            "num_rounds": self.num_rounds
+            "num_rounds": self.num_rounds,
+            "avg_client_training_time_sec": getattr(self, "AVG_CLIENT_TRAINING_TIME_SEC", []),
+            "avg_client_battery_soc": getattr(self, "AVG_CLIENT_BATTERY_SOC", []),
+            "avg_client_reported_accuracy": getattr(self, "AVG_CLIENT_REPORTED_ACCURACY", []),
         }
 
         results_dir = get_experiment_results_dir("mental_state", "dds")

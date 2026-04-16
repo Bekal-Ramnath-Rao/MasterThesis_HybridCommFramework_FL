@@ -1,6 +1,11 @@
 """
 Static unicast SPDP peers for Emotion FL across hosts (no multicast).
 
+Deployment note: Docker/docker-compose-emotion.yml runs the DDS-only server and clients with
+network_mode: host so Cyclone can use the full UDP port range. docker-compose-unified-emotion.yml
+does the same for the unified stack. The bridge variant (docker-compose-unified-emotion.bridge.yml)
+only maps SPDP ports; RTPS user-data still uses extra ephemeral ports, so DDS is usually unreliable there.
+
 Set these environment variables (all three required) before starting server/clients:
   DDS_PEER_SERVER   — IP or hostname of the machine running FL_Server_DDS
   DDS_PEER_CLIENT1  — IP or hostname of the machine running CLIENT_ID=1
@@ -34,6 +39,23 @@ Optional:
 Open UDP between all three hosts for the ports Cyclone uses (typically ~7400–7500 and
 per-participant SPDP ports above).
 
+Docker bridge — two valid setups:
+  A) Cross-host (recommended parity with docker-compose-emotion DDS): set DDS_PEER_* and DDS_SPDP_*
+     to real LAN IPs for all three participants. Publish host UDP 7412 / 7414 / 7416 to the containers.
+  B) All containers on one bridge only: you may set DDS_SPDP_SERVER / DDS_SPDP_CLIENT1 to compose
+     service names (e.g. fl-server-unified-emotion) so SPDP targets container IPs. Do not use
+     service names on a machine that is not on that Docker network (e.g. client 2 on another PC);
+     those names will not resolve and DDS discovery will fail silently from the remote host.
+Alternatively use Docker/docker-compose-unified-emotion.yml (host network) for Cyclone on the host NIC.
+
+Server in Docker bridge: DDS_SERVER_ADVERTISE_AS_PEER=1 (default) sets ExternalNetworkAddress = DDS_PEER_SERVER
+so **remote** LAN peers reach user-data on a routable address. That same setting often breaks **co-located**
+containers on one Docker bridge: writers send to host_IP:ephemeral_UDP, which is not published (only SPDP
+ports like 7412/7414 are), so the server never receives ModelUpdateChunk. For server + client1 on the same
+bridge, set DDS_DISABLE_EXTERNAL_ADVERTISE=1 on the server (container-to-container locators). Remote DDS
+then needs host/macvlan networking or a different topology; see Docker/docker-compose-unified-emotion.yml.
+  DDS_EXTERNAL_NETWORK_ADDRESS / DDS_EXTERNAL_NETWORK_MASK — optional explicit advertise address + mask.
+
 Do not set CYCLONEDDS_URI when using this mode; it is set automatically to a temp file.
 """
 
@@ -55,25 +77,41 @@ def _peer(host: str, participant_index: int) -> str:
     return f"{h}:{spdp_port_domain0(participant_index)}"
 
 
-def _general_xml(network_iface: str | None) -> str:
-    """network_iface: only if DDS_NETWORK_INTERFACE is set (interface name recommended)."""
+def _general_xml(
+    network_iface: str | None,
+    external_address: str | None = None,
+    external_mask: str | None = None,
+) -> str:
+    """Optional ExternalNetworkAddress: advertise LAN IP when bound to Docker-internal eth0."""
+    lines = [
+        "        <General>",
+        "            <AllowMulticast>false</AllowMulticast>",
+    ]
     iface = (network_iface or "").strip()
     if iface:
-        return f"""        <General>
-            <AllowMulticast>false</AllowMulticast>
-            <NetworkInterfaceAddress>{iface}</NetworkInterfaceAddress>
-        </General>"""
-    return """        <General>
-            <AllowMulticast>false</AllowMulticast>
-        </General>"""
+        lines.append(f"            <NetworkInterfaceAddress>{iface}</NetworkInterfaceAddress>")
+    ext = (external_address or "").strip()
+    if ext:
+        lines.append(f"            <ExternalNetworkAddress>{ext}</ExternalNetworkAddress>")
+    mask = (external_mask or "").strip()
+    if mask and ext:
+        lines.append(f"            <ExternalNetworkMask>{mask}</ExternalNetworkMask>")
+    lines.append("        </General>")
+    return "\n".join(lines)
 
 
-def _document(participant_index: int, peer_addrs: list[str], network_iface: str | None = None) -> str:
+def _document(
+    participant_index: int,
+    peer_addrs: list[str],
+    network_iface: str | None = None,
+    external_address: str | None = None,
+    external_mask: str | None = None,
+) -> str:
     lines = "\n".join(f'                <Peer address="{a}"/>' for a in peer_addrs)
     return f"""<?xml version="1.0" encoding="UTF-8" ?>
 <CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
     <Domain id="any">
-{_general_xml(network_iface)}
+{_general_xml(network_iface, external_address, external_mask)}
         <Discovery>
             <ParticipantIndex>{participant_index}</ParticipantIndex>
             <Peers>
@@ -180,6 +218,39 @@ def _spdp_host_for_participant(pi: int, s: str, c1: str, c2: str) -> str:
     raise ValueError(f"invalid participant index {pi}")
 
 
+def _external_and_mask_for_server(peer_server_ip: str) -> tuple[str | None, str | None]:
+    """LAN address to advertise when the process binds to a Docker-internal interface."""
+    if os.environ.get("DDS_DISABLE_EXTERNAL_ADVERTISE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return None, None
+    explicit = os.environ.get("DDS_EXTERNAL_NETWORK_ADDRESS", "").strip()
+    mask = os.environ.get("DDS_EXTERNAL_NETWORK_MASK", "").strip()
+    if explicit:
+        return explicit, (mask or None)
+    if os.environ.get("DDS_SERVER_ADVERTISE_AS_PEER", "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return None, None
+    host = (peer_server_ip or "").strip()
+    return (host or None), (mask or None)
+
+
+def _external_and_mask_for_client() -> tuple[str | None, str | None]:
+    """Remote clients behind NAT can set DDS_EXTERNAL_NETWORK_ADDRESS to their WAN/LAN IP."""
+    explicit = os.environ.get("DDS_EXTERNAL_NETWORK_ADDRESS", "").strip()
+    if not explicit:
+        return None, None
+    mask = os.environ.get("DDS_EXTERNAL_NETWORK_MASK", "").strip()
+    return explicit, (mask or None)
+
+
 def try_apply_server_uri() -> bool:
     """If DDS_PEER_* are set, generate XML for server (ParticipantIndex 1) and set CYCLONEDDS_URI."""
     if os.environ.get("CYCLONEDDS_URI"):
@@ -194,12 +265,15 @@ def try_apply_server_uri() -> bool:
         _peer(_spdp_host_for_participant(3, s, c1, c2), 3),
     ]
     bind = _bind_iface_server(s, c1, c2)
-    xml = _document(1, peers, bind)
+    ext, ext_mask = _external_and_mask_for_server(s)
+    xml = _document(1, peers, bind, ext, ext_mask)
     _write_uri(xml)
     extra = f" NetworkInterfaceAddress={bind}" if bind else " (interface: auto)"
+    ext_extra = f" ExternalNetworkAddress={ext}" if ext else ""
+    mask_extra = f" ExternalNetworkMask={ext_mask}" if ext_mask else ""
     print(
         "[DDS] Static unicast peers (server): "
-        f"DDS_PEER_SERVER={s} DDS_PEER_CLIENT1={c1} DDS_PEER_CLIENT2={c2}{extra} "
+        f"DDS_PEER_SERVER={s} DDS_PEER_CLIENT1={c1} DDS_PEER_CLIENT2={c2}{extra}{ext_extra}{mask_extra} "
         f"peers={peers} "
         f"-> CYCLONEDDS_URI={os.environ['CYCLONEDDS_URI']}"
     )
@@ -237,12 +311,15 @@ def try_apply_client_uri() -> bool:
         )
         return False
     bind = _bind_iface_client(s, c1, c2, cid)
-    xml = _document(pi, peers, bind)
+    ext, ext_mask = _external_and_mask_for_client()
+    xml = _document(pi, peers, bind, ext, ext_mask)
     _write_uri(xml)
     extra = f" NetworkInterfaceAddress={bind}" if bind else " (interface: auto)"
+    ext_extra = f" ExternalNetworkAddress={ext}" if ext else ""
+    mask_extra = f" ExternalNetworkMask={ext_mask}" if ext_mask else ""
     print(
         f"[DDS] Static unicast peers (client {cid}): "
-        f"DDS_PEER_SERVER={s} DDS_PEER_CLIENT1={c1} DDS_PEER_CLIENT2={c2}{extra} "
+        f"DDS_PEER_SERVER={s} DDS_PEER_CLIENT1={c1} DDS_PEER_CLIENT2={c2}{extra}{ext_extra}{mask_extra} "
         f"peers={peers} "
         f"-> CYCLONEDDS_URI={os.environ['CYCLONEDDS_URI']}"
     )

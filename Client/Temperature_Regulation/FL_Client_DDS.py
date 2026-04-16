@@ -55,8 +55,9 @@ from quantization_client import Quantization, QuantizationConfig
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 _project_root = os.path.abspath(os.path.join(_script_dir, '..', '..'))
 _utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
-if _utilities_path not in sys.path:
-    sys.path.insert(0, _utilities_path)
+for _p in (_utilities_path, _project_root):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 
 from cyclonedds.topic import Topic
@@ -159,6 +160,10 @@ class EvaluationMetrics(IdlStruct):
     mae: float
     mape: float
     client_converged: float = 0.0
+    battery_soc: float = 1.0
+    training_time_sec: float = 0.0
+    round_time_sec: float = 0.0
+    uplink_model_comm_sec: float = 0.0
 
 
 @dataclass
@@ -258,15 +263,20 @@ class FederatedLearningClient:
         print(f"Client {self.client_id} waiting for initial global model from server...")
     
     def serialize_weights(self, weights):
-        """Serialize model weights for DDS transmission"""
-        serialized = pickle.dumps(weights)
-        # Convert bytes to list of ints for DDS
-        return list(serialized)
-    
+        """Serialize model weights for DDS transmission using numpy .npz (version-agnostic)."""
+        import io
+        buf = io.BytesIO()
+        import numpy as np
+        np.savez(buf, *weights)
+        return list(buf.getvalue())
+
     def deserialize_weights(self, serialized_weights):
-        """Deserialize model weights received from DDS"""
-        # Convert list of ints back to bytes
-        return pickle.loads(bytes(serialized_weights))
+        """Deserialize model weights received from DDS."""
+        import io
+        import numpy as np
+        buf = io.BytesIO(bytes(serialized_weights))
+        loaded = np.load(buf, allow_pickle=False)
+        return [loaded[f'arr_{i}'] for i in range(len(loaded.files))]
     
     def split_into_chunks(self, data):
         """Split serialized data into chunks of CHUNK_SIZE"""
@@ -658,6 +668,8 @@ class FederatedLearningClient:
         self._update_local_convergence(float(loss))
         
         client_converged = 1.0 if (self.has_converged and STOP_ON_CLIENT_CONVERGENCE) else 0.0
+        tt = float(self._last_training_time_sec)
+        ul = float(self._last_uplink_model_comm_sec)
         metrics = EvaluationMetrics(
             client_id=self.client_id,
             round=self.current_round,
@@ -666,7 +678,11 @@ class FederatedLearningClient:
             mse=float(mse),
             mae=float(mae),
             mape=float(mape),
-            client_converged=client_converged
+            client_converged=client_converged,
+            battery_soc=1.0,
+            training_time_sec=tt,
+            round_time_sec=tt + ul,
+            uplink_model_comm_sec=ul,
         )
         
         # Write with explicit return check

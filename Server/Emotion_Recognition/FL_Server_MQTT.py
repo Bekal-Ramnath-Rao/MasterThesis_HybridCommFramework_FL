@@ -4,6 +4,7 @@ import sys
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 
 import numpy as np
+import io
 import pandas as pd
 import json
 import pickle
@@ -33,6 +34,7 @@ if _utilities_path not in sys.path:
 
 print(f"Project root set to: {project_root}")
 from packet_logger import init_db, log_sent_packet, log_received_packet
+from battery_results_agg import avg_battery_model_drain_fraction
 try:
     from experiment_results_path import get_experiment_results_dir
 except ModuleNotFoundError:
@@ -104,6 +106,8 @@ class FederatedLearningServer:
         # Per-round time (sec) and battery consumption (0–1, from client-reported SoC)
         self.ROUND_TIMES = []
         self.BATTERY_CONSUMPTION = []
+        # Cumulative drain fraction from client BatteryModel (energy / capacity), see battery_results_agg
+        self.BATTERY_MODEL_CONSUMPTION = []
 
         # Convergence tracking
         self.best_loss = float('inf')
@@ -264,14 +268,21 @@ class FederatedLearningServer:
     
     def serialize_weights(self, weights):
         """Serialize model weights for MQTT transmission"""
-        serialized = pickle.dumps(weights)
-        encoded = base64.b64encode(serialized).decode('utf-8')
+        buf = io.BytesIO()
+        np.savez(buf, *weights)
+        encoded = base64.b64encode(buf.getvalue()).decode('utf-8')
         return encoded
-    
+
     def deserialize_weights(self, encoded_weights):
-        """Deserialize model weights received from MQTT"""
-        serialized = base64.b64decode(encoded_weights.encode('utf-8'))
-        weights = pickle.loads(serialized)
+        """Deserialize model weights received from MQTT.
+
+        Uses numpy's native .npz format instead of pickle so that weights
+        serialized on NumPy 2.x (numpy._core) can be loaded on NumPy 1.x
+        (numpy.core) and vice-versa.
+        """
+        buf = io.BytesIO(base64.b64decode(encoded_weights.encode('utf-8')))
+        loaded = np.load(buf, allow_pickle=False)
+        weights = [loaded[f'arr_{i}'] for i in range(len(loaded.files))]
         return weights
 
     def _chunk_model_payload(self, model_message):
@@ -877,6 +888,7 @@ class FederatedLearningServer:
             self.BATTERY_CONSUMPTION.append(1.0 - avg_soc)  # consumption = 1 - SoC
         else:
             self.BATTERY_CONSUMPTION.append(0.0)
+        self.BATTERY_MODEL_CONSUMPTION.append(avg_battery_model_drain_fraction(self.client_metrics))
         
         # Calculate total samples
         total_samples = sum(metric['num_samples'] 
@@ -1078,6 +1090,8 @@ class FederatedLearningServer:
             "loss": self.LOSS,
             "round_times_seconds": getattr(self, 'ROUND_TIMES', []),
             "battery_consumption": getattr(self, 'BATTERY_CONSUMPTION', []),
+            "battery_model_consumption": getattr(self, 'BATTERY_MODEL_CONSUMPTION', []),
+            "battery_model_consumption_source": "client_battery_model",
             "convergence_time_seconds": self.convergence_time,
             "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
             "total_rounds": len(self.ROUNDS),

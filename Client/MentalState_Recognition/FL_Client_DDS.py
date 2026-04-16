@@ -78,8 +78,9 @@ from quantization_client import Quantization, QuantizationConfig
 
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 _utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
-if _utilities_path not in sys.path:
-    sys.path.insert(0, _utilities_path)
+for _p in (_utilities_path, _project_root):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 
 from cyclonedds.topic import Topic
@@ -177,6 +178,10 @@ class EvaluationMetrics(IdlStruct):
     loss: float
     accuracy: float
     client_converged: float = 0.0
+    battery_soc: float = 1.0
+    training_time_sec: float = 0.0
+    round_time_sec: float = 0.0
+    uplink_model_comm_sec: float = 0.0
 
 
 @dataclass
@@ -411,13 +416,20 @@ class FederatedLearningClient:
         return model
     
     def serialize_weights(self, weights):
-        """Serialize model weights for DDS transmission"""
-        serialized = pickle.dumps(weights)
-        return list(serialized)
-    
+        """Serialize model weights for DDS transmission using numpy .npz (version-agnostic)."""
+        import io
+        buf = io.BytesIO()
+        import numpy as _np
+        _np.savez(buf, *weights)
+        return list(buf.getvalue())
+
     def deserialize_weights(self, serialized_weights):
-        """Deserialize model weights received from DDS"""
-        return pickle.loads(bytes(serialized_weights))
+        """Deserialize model weights received from DDS."""
+        import io
+        import numpy as _np
+        buf = io.BytesIO(bytes(serialized_weights))
+        loaded = _np.load(buf, allow_pickle=False)
+        return [loaded[f'arr_{i}'] for i in range(len(loaded.files))]
     
     def split_into_chunks(self, data):
         """Split serialized data into chunks of CHUNK_SIZE"""
@@ -761,6 +773,23 @@ class FederatedLearningClient:
             use_case=use_case_from_env("mental_state"),
             protocol="dds",
         )
+
+        try:
+            em = EvaluationMetrics(
+                client_id=self.client_id,
+                round=self.current_round,
+                num_samples=int(len(self.y_train)),
+                loss=float(final_loss),
+                accuracy=float(final_acc),
+                client_converged=float(client_converged),
+                battery_soc=1.0,
+                training_time_sec=float(training_time),
+                round_time_sec=float(training_time + delay + uplink_comm_sec),
+                uplink_model_comm_sec=float(uplink_comm_sec),
+            )
+            self.writers['metrics'].write(em)
+        except Exception as _e:
+            print(f"Client {self.client_id} WARNING: could not publish DDS EvaluationMetrics: {_e}")
         
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
         print(f"Training metrics - Loss: {final_loss:.4f}, Accuracy: {final_acc:.4f}")

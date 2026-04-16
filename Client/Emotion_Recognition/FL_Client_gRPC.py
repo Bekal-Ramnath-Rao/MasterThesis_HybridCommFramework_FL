@@ -100,6 +100,7 @@ _utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+from client_experiment_results import save_client_training_artifacts
 
 # Import generated gRPC code
 import federated_learning_pb2
@@ -181,6 +182,8 @@ class FederatedLearningClient:
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
         self.has_converged = False
+        self._fl_client_start_time = time.time()
+        self._client_fl_round_history = []
         
         print(f"Client {self.client_id} initialized with:")
         print(f"  Training samples: {self.train_generator.n}")
@@ -333,6 +336,16 @@ class FederatedLearningClient:
                 )
                 
                 if status.is_complete:
+                    try:
+                        save_client_training_artifacts(
+                            self.client_id,
+                            use_case=use_case_from_env("emotion"),
+                            protocol="grpc",
+                            round_history=list(self._client_fl_round_history),
+                            total_elapsed_sec=time.time() - self._fl_client_start_time,
+                        )
+                    except Exception as e:
+                        print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {e}")
                     print(f"\n{'='*70}")
                     print(f"Client {self.client_id} - Training completed!")
                     print(f"{'='*70}\n")
@@ -663,6 +676,9 @@ class FederatedLearningClient:
                     battery_soc=float(self.battery_model.battery_soc),
                     round_time_sec=float(self._last_round_time_sec),
                     client_converged=client_converged,
+                    training_time_sec=float(self._last_training_time_sec),
+                    uplink_model_comm_sec=float(self._last_uplink_model_comm_sec),
+                    cumulative_energy_j=float(self.battery_model.cumulative_energy_j),
                 )
             )
             _uplink_metrics_sec = time.time() - _mt0
@@ -689,6 +705,19 @@ class FederatedLearningClient:
                     },
                     use_case=use_case_from_env("emotion"),
                     protocol="grpc",
+                )
+                self._client_fl_round_history.append(
+                    {
+                        "round": int(self.current_round),
+                        "loss": loss_f,
+                        "accuracy": float(accuracy),
+                        "total_fl_wall_time_sec": float(
+                            self._last_training_time_sec
+                            + self._last_uplink_model_comm_sec
+                            + _uplink_metrics_sec
+                        ),
+                        "battery_soc_after": float(self.battery_model.battery_soc),
+                    }
                 )
                 print(f"Client {self.client_id} evaluation - Loss: {loss:.4f}, Accuracy: {accuracy:.4f}")
                 self._update_local_convergence(loss_f)
@@ -743,6 +772,16 @@ class FederatedLearningClient:
         except Exception as e:
             print(f"Client {self.client_id} failed to notify convergence: {e}")
         finally:
+            try:
+                save_client_training_artifacts(
+                    self.client_id,
+                    use_case=use_case_from_env("emotion"),
+                    protocol="grpc",
+                    round_history=list(self._client_fl_round_history),
+                    total_elapsed_sec=time.time() - self._fl_client_start_time,
+                )
+            except Exception as ex:
+                print(f"[Client {self.client_id}] WARNING: client experiment artifacts: {ex}")
             self.running = False
 
 

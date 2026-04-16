@@ -62,6 +62,13 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+      - DDS_DOMAIN_ID=0
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
     volumes:
       - ../Server/Emotion_Recognition:/app/Server/Emotion_Recognition
       - ../experiment_results:/app/results
@@ -73,6 +80,7 @@ services:
       - "4433:4433/udp"  # QUIC
       - "4434:4434/udp"  # HTTP/3 (QUIC)
       - "50051:50051/tcp"  # gRPC (HTTP/2)
+      - "7412:7412/udp"
     depends_on:
       - mqtt-broker-unified
       - amqp-broker-unified
@@ -126,6 +134,13 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+      - DDS_DOMAIN_ID=0
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
       - ../Network_Simulation:/app/Network_Simulation:ro
@@ -134,6 +149,8 @@ services:
       - ../certs:/app/certs:ro
     networks:
       - fl-network
+    ports:
+      - "7414:7414/udp"
     depends_on:
       - fl-server-unified-emotion
       - mqtt-broker-unified
@@ -148,7 +165,7 @@ services:
             - driver: nvidia
               device_ids: ['0']
               capabilities: [gpu]
-  
+
   fl-client-unified-emotion-2:
     build:
       context: ..
@@ -184,6 +201,13 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+      - DDS_DOMAIN_ID=0
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
       - ../Network_Simulation:/app/Network_Simulation:ro
@@ -192,6 +216,8 @@ services:
       - ../certs:/app/certs:ro
     networks:
       - fl-network
+    ports:
+      - "7416:7416/udp"
     depends_on:
       - fl-server-unified-emotion
       - mqtt-broker-unified

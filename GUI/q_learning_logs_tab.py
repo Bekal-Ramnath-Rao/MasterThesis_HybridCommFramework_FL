@@ -98,6 +98,9 @@ _QL_SELECT_SQL = """
            state_comm_level,
            state_resource,
            COALESCE(NULLIF(TRIM(state_battery_level), ''), '') AS state_battery_level,
+           COALESCE(NULLIF(TRIM(state_network_scenario), ''), '') AS state_network_scenario,
+           COALESCE(NULLIF(TRIM(state_data_network_scenario), ''), '') AS state_data_network_scenario,
+           COALESCE(NULLIF(TRIM(state_detected_network_scenario), ''), '') AS state_detected_network_scenario,
            action, reward, q_delta, q_value, epsilon,
            avg_reward_last_100, converged,
            metric_communication_time,
@@ -181,10 +184,11 @@ class QLearningLogsTab(QWidget):
         layout.addWidget(stats_group)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(27)
+        self.table.setColumnCount(30)
         self.table.setHorizontalHeaderLabels([
             "ID", "Timestamp", "Round", "Episode", "Direction",
             "Comm level", "Resource", "Battery (RL)",
+            "Network (Q)", "Network (data)", "Network (detected)",
             "Action", "Reward", "Q Delta", "Q Value", "Epsilon", "Avg R(100)", "Converged",
             "Comm Time", "Success",
             "CPU", "Memory", "Bandwidth",
@@ -239,10 +243,10 @@ class QLearningLogsTab(QWidget):
             print(f"Q-Learning tab error: {e}")
             return
         self.table.setRowCount(0)
-        # Column indices (0-based): 3D RL state = comm, resource, battery
+        # Column indices (0-based): must match _QL_SELECT_SQL column order
         DIR_COL = 4
-        CONVERGED_COL = 14
-        REWARD_COL = 9
+        CONVERGED_COL = 17
+        REWARD_COL = 12
         for r in rows:
             self.table.insertRow(self.table.rowCount())
             row_idx = self.table.rowCount() - 1

@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 # Server uses CPU only (aggregation is numpy-only); saves GPU memory for clients
@@ -32,6 +33,8 @@ except ModuleNotFoundError:
         path = root / "experiment_results" / use_case / protocol / scenario
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+from battery_results_agg import avg_battery_model_drain_fraction
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -243,6 +246,7 @@ class FederatedLearningServer:
         self.ROUNDS = []
         self.ROUND_TIMES = []
         self.BATTERY_CONSUMPTION = []
+        self.BATTERY_MODEL_CONSUMPTION = []
         self.round_start_time = None
 
         # Convergence tracking
@@ -472,6 +476,12 @@ class FederatedLearningServer:
         """Handle client registration"""
         client_id = message['client_id']
         print(f"[HTTP/3] Processing registration for client {client_id}")
+        prev = self.registered_clients.get(client_id)
+        if prev is not None and prev is not protocol:
+            print(
+                f"[HTTP/3] WARNING: Client {client_id} registered again on a different QUIC connection. "
+                f"Downlink (global model / start_evaluation) uses only the latest connection."
+            )
         self.registered_clients[client_id] = protocol  # Store protocol reference
         self.active_clients.add(client_id)
         print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
@@ -588,6 +598,10 @@ class FederatedLearningServer:
         client_id = message['client_id']
         round_num = message['round']
         if client_id not in self.active_clients:
+            print(
+                f"[HTTP/3] Ignoring metrics from client {client_id} (not in active_clients; "
+                f"active={sorted(self.active_clients)})"
+            )
             return
         if stop_on_client_convergence() and float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             await self.mark_client_converged(client_id)
@@ -599,6 +613,7 @@ class FederatedLearningServer:
                 'metrics': message['metrics'],
                 'battery_soc': float(m.get('battery_soc', 1.0)),
                 'round_time_sec': float(m.get('round_time_sec', 0.0)),
+                'cumulative_energy_j': float(m.get('cumulative_energy_j', 0.0)),
             }
             
             print(f"Received metrics from client {client_id} "
@@ -607,6 +622,11 @@ class FederatedLearningServer:
             if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
                 await self.aggregate_metrics()
                 await self.continue_training()
+        else:
+            print(
+                f"[HTTP/3] Ignoring metrics from client {client_id}: message round {round_num} "
+                f"!= server round {self.current_round} (stale client, duplicate POST, or QUIC reconnect race)"
+            )
     
     async def distribute_initial_model(self):
         """Distribute initial global model to all clients"""
@@ -786,6 +806,7 @@ class FederatedLearningServer:
             self.ROUND_TIMES.append(time.time() - self.round_start_time)
         socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
         self.BATTERY_CONSUMPTION.append(1.0 - (sum(socs) / len(socs) if socs else 1.0))
+        self.BATTERY_MODEL_CONSUMPTION.append(avg_battery_model_drain_fraction(self.client_metrics))
         total_samples = sum(metric['num_samples'] 
                           for metric in self.client_metrics.values())
 
@@ -921,6 +942,8 @@ class FederatedLearningServer:
             "loss": self.LOSS,
             "round_times_seconds": getattr(self, 'ROUND_TIMES', []),
             "battery_consumption": getattr(self, 'BATTERY_CONSUMPTION', []),
+            "battery_model_consumption": getattr(self, 'BATTERY_MODEL_CONSUMPTION', []),
+            "battery_model_consumption_source": "client_battery_model",
             "convergence_time_seconds": self.convergence_time,
             "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
             "total_rounds": len(self.ROUNDS),
@@ -973,8 +996,8 @@ async def main():
     
     server = FederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, MAX_CLIENTS)
     
-    # QUIC config: idle timeout 0/none = no limit (diagnostic pipeline); else env or 60s
-    _idle = os.getenv("IDLE_TIMEOUT", "0" if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else "60").strip().lower()
+    # QUIC idle timeout must cover client local training + straggler gaps (60s is too low for FL).
+    _idle = os.getenv("IDLE_TIMEOUT", "0" if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else "3600").strip().lower()
     idle_sec = float(_idle) if _idle not in ("0", "none", "inf", "infinity") else 86400.0 * 7  # 7 days = effectively no limit
     # Realistic max payload: HTTP/3 16 KB per stream
     HTTP3_MAX_STREAM_DATA = 16 * 1024  # 16 KB

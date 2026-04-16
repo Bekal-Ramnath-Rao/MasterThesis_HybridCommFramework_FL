@@ -20,19 +20,39 @@ combination sequentially.
 """
 
 import argparse
+import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 NETWORK_SIM_DIR = PROJECT_ROOT / "Network_Simulation"
+
+
+def _native_use_case_results_subdir(use_case: str) -> str:
+    u = (use_case or "emotion").lower()
+    if u == "mentalstate":
+        return "mental_state"
+    return u
+
+
+def _native_protocol_results_subdir(protocol: str) -> str:
+    return "unified" if protocol == "rl_unified" else protocol
+
+
+def _native_training_results_basename(protocol: str) -> str:
+    if protocol == "rl_unified":
+        return "rl_unified_training_results.json"
+    return f"{protocol}_training_results.json"
 
 try:
     from run_network_experiments import parse_fl_dataset_for_client
@@ -199,12 +219,16 @@ class NativeExperimentRunner:
         use_communication_model_reward: bool = True,
         reset_epsilon: bool = True,
         dataset_client_map: Optional[Dict[int, int]] = None,
+        server_min_clients: Optional[int] = None,
+        experiment_session_dir: Optional[Path] = None,
     ) -> None:
         self.use_case = use_case
         self.protocol = protocol
         self.scenario = scenario
         self.num_rounds = num_rounds
         self.num_clients = num_clients
+        # When set (e.g. from experiment GUI), federation floor for MIN_CLIENTS can exceed local num_clients (server-only + remote).
+        self.server_min_clients = server_min_clients
         self.downstream_scenario = downstream_scenario or scenario
         self.upstream_scenario = upstream_scenario or scenario
         self.enable_gpu = enable_gpu
@@ -243,6 +267,64 @@ class NativeExperimentRunner:
         self._amqp_host: Optional[str] = None  # When set, AMQP uses this (e.g. gateway for host RabbitMQ fallback)
         self._amqp_port: Optional[int] = None  # When set (e.g. 25673), use proxy port so namespaces can reach host RabbitMQ
         self._log_files: list = []  # keep refs so files stay open until processes exit
+        # When set, each completed run is archived under experiment_results/<session>/{protocol}_{scenario}/ (matches Docker GUI)
+        self.experiment_session_dir = experiment_session_dir
+
+    def _copy_native_training_json_into(self, exp_dir: Path) -> None:
+        """Copy the server's training JSON from the host experiment_results tree into the run archive."""
+        util = PROJECT_ROOT / "scripts" / "utilities"
+        if str(util) not in sys.path:
+            sys.path.insert(0, str(util))
+        try:
+            from experiment_results_path import get_experiment_results_dir
+        except ImportError:
+            return
+        uc = _native_use_case_results_subdir(self.use_case)
+        proto_sub = _native_protocol_results_subdir(self.protocol)
+        fname = _native_training_results_basename(self.protocol)
+        seen = set()
+        for scen in (self.scenario, "default"):
+            if not scen or scen in seen:
+                continue
+            seen.add(scen)
+            src_dir = get_experiment_results_dir(uc, proto_sub, scen)
+            src = src_dir / fname
+            if src.is_file() and src.stat().st_size > 0:
+                shutil.copy2(src, exp_dir / fname)
+                print(f"[INFO] Copied training results into archive: {exp_dir / fname}")
+                return
+
+    def _archive_native_run_to_experiment_session(self, session_dir: Path) -> None:
+        """Mirror Docker runner layout: logs + training JSON + standard plots under experiment_results."""
+        native_logs = PROJECT_ROOT / "Network_Simulation" / "native_logs"
+        exp_dir = session_dir / f"{self.protocol}_{self.scenario}"
+        exp_dir.mkdir(parents=True, exist_ok=True)
+        srv = native_logs / "server.log"
+        if srv.is_file():
+            shutil.copy2(srv, exp_dir / "server_logs.txt")
+        for i in range(1, self.num_clients + 1):
+            p = native_logs / f"client_{i}.log"
+            if p.is_file():
+                shutil.copy2(p, exp_dir / f"native_client_{i}_logs.txt")
+        metadata = {
+            "protocol": self.protocol,
+            "scenario": self.scenario,
+            "use_case": self.use_case,
+            "num_rounds": self.num_rounds,
+            "timestamp": datetime.now().isoformat(),
+            "baseline_mode": False,
+            "network_conditions_applied": True,
+            "execution": "native",
+            "num_clients": self.num_clients,
+        }
+        with open(exp_dir / "metadata.json", "w", encoding="utf-8") as mf:
+            json.dump(metadata, mf, indent=2)
+        self._copy_native_training_json_into(exp_dir)
+        from run_network_experiments import ExperimentRunner
+
+        helper = ExperimentRunner.for_artifact_finalization(self.use_case)
+        helper._finalize_experiment_artifacts(None, self.protocol, str(exp_dir), self.scenario)
+        print(f"[INFO] Native run archived to {exp_dir}")
 
     def _start_rabbitmq_log_capture(self, broker_log_dir: Path) -> None:
         """Capture host RabbitMQ service logs into the native log directory."""
@@ -677,6 +759,31 @@ class NativeExperimentRunner:
                         if localhost_ok:
                             print("  → Add NODE_IP_ADDRESS=0.0.0.0 to /etc/rabbitmq/rabbitmq-env.conf and restart RabbitMQ.")
 
+    def _federation_min_for_server(self) -> int:
+        if self.protocol == "rl_unified" and self.use_ql_convergence and self.num_clients > 0:
+            return 1
+        if self.num_clients == 0:
+            if self.server_min_clients is None:
+                print(
+                    "[WARNING] --num-clients 0 but --min-clients not set; "
+                    "using MIN_CLIENTS=1 for the server process."
+                )
+                return 1
+            return max(0, int(self.server_min_clients))
+        if self.server_min_clients is not None:
+            return max(self.num_clients, int(self.server_min_clients))
+        return self.num_clients
+
+    def _federation_max_for_server(self) -> int:
+        if self.protocol == "rl_unified" and self.use_ql_convergence and self.num_clients > 0:
+            return 1
+        fmin = self._federation_min_for_server()
+        if self.num_clients == 0:
+            return 100
+        if self.server_min_clients is not None and int(self.server_min_clients) > self.num_clients:
+            return 100
+        return max(fmin, self.num_clients)
+
     def _netns_exec_args(self, ns_name: str, executable: str, script: str) -> tuple:
         """
         Build command list to run a script inside a network namespace.
@@ -705,21 +812,15 @@ class NativeExperimentRunner:
             env["NUM_ROUNDS"] = str(effective_num_rounds)
         else:
             env.pop("NUM_ROUNDS", None)
-        if self.protocol == "rl_unified":
-            if self.use_ql_convergence:
-                # RL training: run with a single client until the learned table converges.
-                env["MIN_CLIENTS"] = "1"
-                env["MAX_CLIENTS"] = "1"
-            else:
-                env["MIN_CLIENTS"] = str(self.num_clients)
-                env["MAX_CLIENTS"] = str(self.num_clients)
-        else:
-            env["MIN_CLIENTS"] = str(self.num_clients)
-            env["MAX_CLIENTS"] = str(self.num_clients)
+        fmin = self._federation_min_for_server()
+        fmax = self._federation_max_for_server()
+        env["MIN_CLIENTS"] = str(fmin)
+        env["MAX_CLIENTS"] = str(fmax)
         # Match Docker defaults for convergence behaviour unless explicitly overridden
         env.setdefault("CONVERGENCE_THRESHOLD", "0.001")
         env.setdefault("CONVERGENCE_PATIENCE", "2")
         env.setdefault("MIN_ROUNDS", "3")
+        env["NETWORK_SCENARIO"] = str(self.scenario)
 
         # Protocol-specific server-side configuration
         if self.protocol == "grpc":
@@ -806,6 +907,7 @@ class NativeExperimentRunner:
         for idx, ep in enumerate(client_eps, start=1):
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"  # Flush FL_DIAG immediately for diagnostic pipeline T_actual
+            env["NETWORK_SCENARIO"] = str(self.scenario)
             env["CLIENT_ID"] = str(idx)
             env["NUM_CLIENTS"] = str(self.num_clients)
             if idx in self.dataset_client_map:
@@ -1164,6 +1266,12 @@ class NativeExperimentRunner:
             except Exception as e:
                 print(f"[WARNING] Could not generate pruning memory plot: {e}")
 
+        if getattr(self, "experiment_session_dir", None) is not None:
+            try:
+                self._archive_native_run_to_experiment_session(self.experiment_session_dir)
+            except Exception as e:
+                print(f"[WARNING] Could not archive native run to experiment_results: {e}")
+
         print(f"\n=== Native experiment finished with code {exit_code} ===\n")
         return exit_code
 
@@ -1257,7 +1365,17 @@ def parse_args() -> argparse.Namespace:
         "-n",
         type=int,
         default=2,
-        help="Number of FL clients to start.",
+        help="Number of FL clients to start on this machine (0 = server only; use --min-clients for expected federation size).",
+    )
+    parser.add_argument(
+        "--min-clients",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Participants the server waits for before training (local + remote). "
+            "Defaults to matching --num-clients when omitted. Recommended when --num-clients is 0."
+        ),
     )
     parser.add_argument(
         "--enable-gpu",
@@ -1368,11 +1486,39 @@ def main() -> None:
     use_quant = getattr(args, "use_quantization", False)
     run_results: List[Tuple[str, str, int]] = []
 
+    folder_parts = [args.use_case]
+    if use_quant:
+        folder_parts.append("quantized")
+        qb = getattr(args, "quantization_bits", None)
+        if qb:
+            folder_parts.append(f"{qb}bit")
+    if getattr(args, "use_pruning", False):
+        folder_parts.append("pruned")
+        sp = getattr(args, "pruning_sparsity", None)
+        if sp is not None:
+            try:
+                sv = float(sp)
+                pct = int(round(sv * 100)) if sv <= 1.0 else int(round(sv))
+                folder_parts.append(f"{pct}pct")
+            except (ValueError, TypeError):
+                pass
+    folder_parts.append(datetime.now().strftime("%Y%m%d_%H%M%S"))
+    native_session_dir = PROJECT_ROOT / "experiment_results" / "_".join(folder_parts)
+    native_session_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] Native experiment session folder: {native_session_dir}")
+
     for protocol in protocols:
         for scenario in scenarios:
             run_num_clients = args.num_clients
-            if protocol == "rl_unified" and args.use_ql_convergence and run_num_clients != 1:
-                print(f"[INFO] RL unified: forcing num_clients=1 for training (was {run_num_clients}) for protocol={protocol}, scenario={scenario}.")
+            if (
+                protocol == "rl_unified"
+                and args.use_ql_convergence
+                and run_num_clients not in (0, 1)
+            ):
+                print(
+                    f"[INFO] RL unified: forcing num_clients=1 for training (was {run_num_clients}) "
+                    f"for protocol={protocol}, scenario={scenario}."
+                )
                 run_num_clients = 1
 
             print(
@@ -1402,6 +1548,8 @@ def main() -> None:
                 use_communication_model_reward=not getattr(args, "disable_communication_model_reward", False),
                 reset_epsilon=not getattr(args, "no_reset_epsilon", False),  # Default True (reset), --no-reset-epsilon makes it False
                 dataset_client_map=native_dataset_map,
+                server_min_clients=getattr(args, "min_clients", None),
+                experiment_session_dir=native_session_dir,
             )
             _install_signal_handlers(runner)
             code = runner.run()

@@ -1,3 +1,4 @@
+import io
 import numpy as np
 import pandas as pd
 import math
@@ -181,16 +182,16 @@ class FederatedLearningClient:
         print(f"Client {self.client_id} waiting for initial global model from server...")
     
     def serialize_weights(self, weights):
-        """Serialize model weights for MQTT transmission"""
-        serialized = pickle.dumps(weights)
-        encoded = base64.b64encode(serialized).decode('utf-8')
-        return encoded
+        """Serialize model weights for transmission."""
+        buf = io.BytesIO()
+        np.savez(buf, *weights)
+        return base64.b64encode(buf.getvalue()).decode('utf-8')
     
     def deserialize_weights(self, encoded_weights):
-        """Deserialize model weights received from MQTT"""
-        serialized = base64.b64decode(encoded_weights.encode('utf-8'))
-        weights = pickle.loads(serialized)
-        return weights
+        """Deserialize model weights; uses numpy .npz format to avoid pickle/NumPy version mismatches."""
+        buf = io.BytesIO(base64.b64decode(encoded_weights.encode('utf-8')))
+        loaded = np.load(buf, allow_pickle=False)
+        return [loaded[f'arr_{i}'] for i in range(len(loaded.files))]
     
     def on_connect(self, client, userdata, flags, rc):
         """Callback when connected to MQTT broker"""

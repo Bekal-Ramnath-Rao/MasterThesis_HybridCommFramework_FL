@@ -43,9 +43,13 @@ RUN cd Protocols && \
     python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. federated_learning.proto && \
     cd ..
 
-COPY scripts/utilities/packet_logger.py ./
-COPY scripts/utilities/q_learning_logger.py ./
-COPY scripts/utilities/client_fl_metrics_log.py ./
+# Match repo layout: clients add project_root/scripts/utilities to sys.path (see FL_Client_*.py)
+RUN mkdir -p /app/scripts/utilities
+COPY scripts/utilities/packet_logger.py /app/scripts/utilities/
+COPY scripts/utilities/q_learning_logger.py /app/scripts/utilities/
+COPY scripts/utilities/client_fl_metrics_log.py /app/scripts/utilities/
+COPY scripts/utilities/experiment_results_path.py /app/scripts/utilities/
+COPY scripts/utilities/client_experiment_results.py /app/scripts/utilities/
 # DDS: LAN multicast + runtime static unicast generator (DDS_PEER_*)
 COPY config/cyclonedds-multicast-lan.xml /app/config/cyclonedds-multicast-lan.xml
 COPY config/dds_distributed_unicast.py /app/config/dds_distributed_unicast.py
