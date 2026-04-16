@@ -171,6 +171,7 @@ if _utilities_path not in sys.path:
 
 from packet_logger import init_db, log_sent_packet, log_received_packet
 from experiment_results_path import get_experiment_results_dir
+from battery_results_agg import avg_battery_model_drain_fraction
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -312,6 +313,7 @@ class UnifiedFederatedLearningServer:
         self.ROUNDS = []
         self.ROUND_TIMES = []
         self.BATTERY_CONSUMPTION = []
+        self.BATTERY_MODEL_CONSUMPTION = []
         self.AVG_TRAINING_TIME_SEC = []
         self.AVG_BATTERY_SOC = []
         self.round_start_time = None
@@ -2104,6 +2106,7 @@ class UnifiedFederatedLearningServer:
                 self.mark_client_converged(client_id)
                 return
             
+            _cum_energy = data.get('cumulative_energy_j', (metrics_payload or {}).get('cumulative_energy_j'))
             self.client_metrics[client_id] = {
                 'round': round_num,
                 'num_samples': data['num_samples'],
@@ -2114,6 +2117,7 @@ class UnifiedFederatedLearningServer:
                 'round_time_sec': round_time_sec,
                 'training_time_sec': training_time_sec,
                 'uplink_model_comm_sec': uplink_model_comm_sec,
+                'cumulative_energy_j': _cum_energy,
                 'metrics': metrics_payload or {
                     'loss': loss_value,
                     'accuracy': accuracy_value,
@@ -2439,6 +2443,7 @@ class UnifiedFederatedLearningServer:
         socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
         avg_soc = sum(socs) / len(socs) if socs else 1.0
         self.BATTERY_CONSUMPTION.append(1.0 - avg_soc)
+        self.BATTERY_MODEL_CONSUMPTION.append(avg_battery_model_drain_fraction(self.client_metrics))
         # Check if we still have active clients before aggregating
         if len(self.active_clients) == 0:
             print("[Server] No active clients remaining. Stopping training.")
@@ -2523,6 +2528,8 @@ class UnifiedFederatedLearningServer:
             'loss': self.LOSS,
             'round_times_seconds': getattr(self, 'ROUND_TIMES', []),
             'battery_consumption': getattr(self, 'BATTERY_CONSUMPTION', []),
+            'battery_model_consumption': getattr(self, 'BATTERY_MODEL_CONSUMPTION', []),
+            'battery_model_consumption_source': 'client_battery_model',
             'avg_training_time_sec': getattr(self, 'AVG_TRAINING_TIME_SEC', []),
             'avg_battery_soc': getattr(self, 'AVG_BATTERY_SOC', []),
             'converged': self.converged,

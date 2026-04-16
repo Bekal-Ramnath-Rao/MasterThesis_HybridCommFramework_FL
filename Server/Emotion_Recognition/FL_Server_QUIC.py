@@ -24,6 +24,7 @@ _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from experiment_results_path import get_experiment_results_dir
+from battery_results_agg import avg_battery_model_drain_fraction
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -142,6 +143,7 @@ class FederatedLearningServer:
         self.ROUNDS = []
         self.ROUND_TIMES = []
         self.BATTERY_CONSUMPTION = []
+        self.BATTERY_MODEL_CONSUMPTION = []
         self.round_start_time = None
 
         # Convergence tracking
@@ -425,6 +427,7 @@ class FederatedLearningServer:
                 'metrics': message['metrics'],
                 'battery_soc': float(m.get('battery_soc', 1.0)),
                 'round_time_sec': float(m.get('round_time_sec', 0.0)),
+                'cumulative_energy_j': m.get('cumulative_energy_j'),
             }
             
             print(f"Received metrics from client {client_id} "
@@ -600,6 +603,7 @@ class FederatedLearningServer:
             self.ROUND_TIMES.append(time.time() - self.round_start_time)
         socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
         self.BATTERY_CONSUMPTION.append(1.0 - (sum(socs) / len(socs) if socs else 1.0))
+        self.BATTERY_MODEL_CONSUMPTION.append(avg_battery_model_drain_fraction(self.client_metrics))
         total_samples = sum(metric['num_samples'] 
                           for metric in self.client_metrics.values())
         
@@ -726,6 +730,8 @@ class FederatedLearningServer:
             "loss": self.LOSS,
             "round_times_seconds": getattr(self, 'ROUND_TIMES', []),
             "battery_consumption": getattr(self, 'BATTERY_CONSUMPTION', []),
+            "battery_model_consumption": getattr(self, 'BATTERY_MODEL_CONSUMPTION', []),
+            "battery_model_consumption_source": "client_battery_model",
             "convergence_time_seconds": self.convergence_time,
             "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
             "total_rounds": len(self.ROUNDS),

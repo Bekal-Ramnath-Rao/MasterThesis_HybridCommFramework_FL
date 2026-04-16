@@ -398,6 +398,48 @@ class ExperimentRunner:
         r = self.run_command(["docker", "inspect", "-f", "{{.Id}}", name], check=False)
         return r.returncode == 0 and bool((r.stdout or "").strip())
 
+    def _delete_stale_results_files(self, protocol: str, scenario: str) -> None:
+        """Delete stale results files from volume-mounted host paths before starting containers.
+
+        For protocols whose server container bind-mounts a host directory as /app/results
+        (notably rl_unified via ../experiment_results:/app/results), any JSON results file
+        left over from a previous run is immediately visible in the new container, causing
+        wait_for_completion to declare false success on the very first poll.
+
+        For other protocols, the results directory is NOT volume-mounted (results live only
+        inside the container and are lost on docker compose down), so no cleanup is needed
+        beyond the .dockerignore fix that prevents stale files from being baked into images.
+        """
+        use_case_lc = self.use_case.lower()
+        scenario_norm = (scenario or "default").strip() or "default"
+
+        if protocol == "rl_unified":
+            # rl_unified server mounts ../experiment_results → /app/results in container.
+            # Results are written to /app/results/{use_case}/unified/{scenario}/ and
+            # /app/results/{use_case}/unified/default/ (fallback when NETWORK_SCENARIO unset).
+            # Files are created by the Docker container as root, so a sudo fallback is needed.
+            base = self.project_root / "experiment_results"
+            subdirs_to_clean = {scenario_norm, "default"}
+            filenames = ["rl_unified_training_results.json", "rl_unified_training_results.csv"]
+            import subprocess as _sp
+            for subdir in subdirs_to_clean:
+                for fname in filenames:
+                    stale = base / use_case_lc / "unified" / subdir / fname
+                    if not stale.exists():
+                        continue
+                    try:
+                        stale.unlink()
+                        print(f"[INFO] Removed stale results file: {stale}")
+                    except PermissionError:
+                        # Container writes as root; try sudo (passwordless on this machine)
+                        try:
+                            _sp.run(["sudo", "rm", "-f", str(stale)], check=True, timeout=10)
+                            print(f"[INFO] Removed stale results file (sudo): {stale}")
+                        except Exception as e2:
+                            print(f"[WARN] Could not remove stale file {stale}: {e2}")
+                    except OSError as e:
+                        print(f"[WARN] Could not remove stale file {stale}: {e}")
+
     def _running_fl_client_containers(self, protocol: str) -> List[str]:
         """Client service names from the protocol list that are actually running (e.g. RL single-client)."""
         running = self._running_docker_container_names()
@@ -1069,6 +1111,7 @@ class ExperimentRunner:
 
         start_time = time.time()
         while timeout is None or (time.time() - start_time < timeout):
+            elapsed = time.time() - start_time
             # Check if server container is still running
             result = self.run_command([
                 "docker", "ps", "--filter", f"name={server_container}", "--format", "{{.Names}}"
@@ -1185,18 +1228,23 @@ class ExperimentRunner:
                     check=False,
                 )
                 if r.returncode == 0 and (r.stdout or "").strip():
-                    # For the legacy path, validate the round count matches the current run
-                    # to guard against stale files baked into the Docker image.
-                    if cat_path == legacy_path:
-                        try:
-                            _d = json.loads(r.stdout)
-                            _total = int(_d.get("total_rounds", 0) or 0)
-                            if _total and _total != self.num_rounds:
-                                # Stale file from a different run – skip it
-                                print(f"[WARN] Stale results at legacy path ({_total} rounds, expected {self.num_rounds}) – ignoring")
-                                continue
-                        except (json.JSONDecodeError, TypeError, ValueError):
-                            pass
+                    # Guard against stale results files from a previous run.
+                    # This applies to ALL paths because:
+                    #   - legacy path: file may be baked into the Docker image
+                    #   - rl_unified paths: file persists on the bind-mounted host filesystem
+                    # A file is considered stale when it reports more rounds than what the
+                    # current run is supposed to do AND the elapsed time is too short for
+                    # training to have actually completed.  We use a minimum elapsed-time
+                    # heuristic (60 s) because convergence-based runs may legitimately stop
+                    # early (total_rounds < num_rounds), so we cannot rely on an exact match.
+                    try:
+                        _d = json.loads(r.stdout)
+                        _total = int(_d.get("total_rounds", 0) or len(_d.get("rounds") or []))
+                        if _total and _total >= self.num_rounds and elapsed < 60:
+                            print(f"[WARN] Stale results at {cat_path} ({_total} rounds in {elapsed:.0f}s < 60s) – ignoring")
+                            continue
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        pass
                     read_results = r
                     matched_path = cat_path
                     break
@@ -1800,10 +1848,15 @@ class ExperimentRunner:
     def _estimate_battery_model_series_from_logs(self, exp_dir: str, protocol: str) -> List[float]:
         """Like _estimate_battery_series_from_logs but applies PROTOCOL_ENERGY_ALPHA / PROTOCOL_CPU_BETA."""
         p = (protocol or "mqtt").strip().lower()
+        # For rl_unified/unified the protocol is dynamically selected each round, so we use
+        # the neutral baseline multipliers (alpha=1.0, beta=1.0) to avoid biasing the estimate
+        # toward any single protocol's overhead coefficients.
         if p in ("rl_unified", "unified"):
-            p = "mqtt"
-        alpha = float(PROTOCOL_ENERGY_ALPHA.get(p, 1.0))
-        beta = float(PROTOCOL_CPU_BETA.get(p, 1.0))
+            alpha = 1.0
+            beta = 1.0
+        else:
+            alpha = float(PROTOCOL_ENERGY_ALPHA.get(p, 1.0))
+            beta = float(PROTOCOL_CPU_BETA.get(p, 1.0))
 
         k_tx_l = k_tx
         k_rx_l = k_rx
@@ -2222,6 +2275,13 @@ class ExperimentRunner:
             # Propagate NETWORK_SCENARIO so server containers write results to the
             # correct subdirectory via get_experiment_results_dir().
             os.environ["NETWORK_SCENARIO"] = scenario
+
+            # Pre-run cleanup: remove stale results files from volume-mounted paths so
+            # the completion detector cannot be fooled by data from previous runs.
+            # This is critical for rl_unified where ../experiment_results is bind-mounted
+            # as /app/results inside the server container, making leftover JSON files
+            # from a prior run immediately visible to the new container.
+            self._delete_stale_results_files(protocol, scenario)
 
             # 1. Start containers (includes traffic generators if congestion enabled)
             if not self.start_containers(protocol, scenario, congestion_level):
