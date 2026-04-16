@@ -1812,7 +1812,23 @@ class ExperimentRunner:
         return avg_series
 
     def _battery_model_series_from_jsonl(self, exp_dir: str) -> List[float]:
-        """Cumulative drain fraction per round from client_fl_metrics *.jsonl (BatteryModel on clients)."""
+        """Cumulative drain fraction per round from client_fl_metrics *.jsonl (BatteryModel on clients).
+
+        Only reads JSONL files whose filename matches the use case inferred from *exp_dir* so that
+        emotion / mental_state / temperature experiments never cross-contaminate each other's
+        battery drain series (all three write to the same shared_data directory).
+        """
+        # Infer use case from experiment directory path so we only read the matching JSONL files.
+        path_lower = exp_dir.lower().replace(os.sep, "/")
+        if "mentalstate" in path_lower or "mental_state" in path_lower:
+            use_case_filter = "mental_state"
+        elif "temperature" in path_lower:
+            use_case_filter = "temperature"
+        elif "emotion" in path_lower:
+            use_case_filter = "emotion"
+        else:
+            use_case_filter = None  # unknown use case — accept all files
+
         roots = [
             exp_dir,
             os.path.join(os.path.dirname(exp_dir), "shared_data"),
@@ -1824,6 +1840,16 @@ class ExperimentRunner:
                 files.extend(glob.glob(os.path.join(r, "client_fl_metrics_*_client*.jsonl")))
         if not files:
             return []
+
+        # Filter to only JSONL files that belong to the current experiment's use case.
+        if use_case_filter:
+            files = [
+                fp for fp in files
+                if os.path.basename(fp).startswith(f"client_fl_metrics_{use_case_filter}_")
+            ]
+        if not files:
+            return []
+
         by_round: Dict[int, List[float]] = {}
         for fp in files:
             try:

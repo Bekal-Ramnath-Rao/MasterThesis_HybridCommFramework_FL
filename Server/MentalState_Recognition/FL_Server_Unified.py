@@ -612,7 +612,7 @@ if GRPC_PROTO_AVAILABLE:
 
 def main():
     """Main function"""
-    server = UnifiedFederatedLearningServer(NUM_CLIENTS, NUM_ROUNDS)
+    server = UnifiedFederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, max_clients=MAX_CLIENTS)
     server.run()
 
 
