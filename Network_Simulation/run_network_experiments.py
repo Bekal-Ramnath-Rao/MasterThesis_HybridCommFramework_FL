@@ -307,7 +307,14 @@ class ExperimentRunner:
         # Service name patterns (broker names differ: host/gpu-isolated use amqp-broker, standard bridge uses rabbitmq)
         broker_mqtt = "mqtt-broker"
         broker_amqp = "amqp-broker" if (self.network_mode in ("host", "host_macvlan") or enable_gpu) else "rabbitmq"
-        
+
+        # gpu-isolated and macvlan compose files use -mentalstate suffix with plain broker names;
+        # host-network and standard bridge compose files use -mental suffix with namespaced broker names.
+        _ms_new_naming = enable_gpu or self.network_mode == "host_macvlan"
+        _ms = "mentalstate" if _ms_new_naming else "mental"
+        _ms_mqtt_broker = "mqtt-broker" if _ms_new_naming else "mqtt-broker-mental"
+        _ms_amqp_broker = "amqp-broker" if _ms_new_naming else "rabbitmq-mental"
+
         self.service_patterns = {
             "emotion": {
                 "mqtt": [broker_mqtt, "fl-server-mqtt-emotion", "fl-client-mqtt-emotion-1", "fl-client-mqtt-emotion-2"],
@@ -316,16 +323,16 @@ class ExperimentRunner:
                 "quic": ["fl-server-quic-emotion", "fl-client-quic-emotion-1", "fl-client-quic-emotion-2"],
                 "http3": ["fl-server-http3-emotion", "fl-client-http3-emotion-1", "fl-client-http3-emotion-2"],
                 "dds": ["fl-server-dds-emotion", "fl-client-dds-emotion-1", "fl-client-dds-emotion-2"],
-                "rl_unified": ["fl-server-unified-emotion", "fl-client-unified-emotion-1", "fl-client-unified-emotion-2"]
+                "rl_unified": ["fl-server-unified-emotion", "fl-client-unified-emotion-1", "fl-client-unified-emotion-2", "fl-client-unified-emotion-3"]
             },
             "mentalstate": {
-                "mqtt": ["mqtt-broker-mental", "fl-server-mqtt-mental", "fl-client-mqtt-mental-1", "fl-client-mqtt-mental-2"],
-                "amqp": ["rabbitmq-mental", "fl-server-amqp-mental", "fl-client-amqp-mental-1", "fl-client-amqp-mental-2"],
-                "grpc": ["fl-server-grpc-mental", "fl-client-grpc-mental-1", "fl-client-grpc-mental-2"],
-                "quic": ["fl-server-quic-mental", "fl-client-quic-mental-1", "fl-client-quic-mental-2"],
-                "http3": ["fl-server-http3-mental", "fl-client-http3-mental-1", "fl-client-http3-mental-2"],
-                "dds": ["fl-server-dds-mental", "fl-client-dds-mental-1", "fl-client-dds-mental-2"],
-                "rl_unified": ["fl-server-unified-mental", "fl-client-unified-mental-1", "fl-client-unified-mental-2"]
+                "mqtt": [_ms_mqtt_broker, f"fl-server-mqtt-{_ms}", f"fl-client-mqtt-{_ms}-1", f"fl-client-mqtt-{_ms}-2"],
+                "amqp": [_ms_amqp_broker, f"fl-server-amqp-{_ms}", f"fl-client-amqp-{_ms}-1", f"fl-client-amqp-{_ms}-2"],
+                "grpc": [f"fl-server-grpc-{_ms}", f"fl-client-grpc-{_ms}-1", f"fl-client-grpc-{_ms}-2"],
+                "quic": [f"fl-server-quic-{_ms}", f"fl-client-quic-{_ms}-1", f"fl-client-quic-{_ms}-2"],
+                "http3": [f"fl-server-http3-{_ms}", f"fl-client-http3-{_ms}-1", f"fl-client-http3-{_ms}-2"],
+                "dds": [f"fl-server-dds-{_ms}", f"fl-client-dds-{_ms}-1", f"fl-client-dds-{_ms}-2"],
+                "rl_unified": ["fl-server-unified-mentalstate", "fl-client-unified-mentalstate-1", "fl-client-unified-mentalstate-2"]
             },
             "temperature": {
                 "mqtt": ["mqtt-broker-temp", "fl-server-mqtt-temp", "fl-client-mqtt-temp-1", "fl-client-mqtt-temp-2"],
@@ -808,10 +815,10 @@ class ExperimentRunner:
                     ]
                     compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_single_client
             else:
-                # Unified compose defines two client services; a bare `up -d` starts both and ignores
-                # --local-clients. Start only brokers + server + the first N client services (N=1 or 2).
+                # Unified compose defines up to three client services; a bare `up -d` starts all and ignores
+                # --local-clients. Start only brokers + server + the first N client services (N=0..3).
                 uc = self.use_case
-                max_unified_clients = 2
+                max_unified_clients = 3
                 num_local = max(0, min(int(self.local_clients), max_unified_clients))
                 total_fed = self._total_expected_federation_clients()
                 os.environ["MIN_CLIENTS"] = str(total_fed)
