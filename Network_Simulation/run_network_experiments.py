@@ -270,8 +270,11 @@ class ExperimentRunner:
                 "mentalstate": str(docker_dir / "docker-compose-mentalstate.gpu-isolated.yml"),
                 "temperature": str(docker_dir / "docker-compose-temperature.gpu-isolated.yml")
             }
+            # Unified uses host-network compose so CycloneDDS RTPS (ephemeral UDP ports) can
+            # reach all participants.  The bridge variant only publishes SPDP ports and breaks
+            # DDS uplink/downlink; single-protocol DDS in gpu-isolated already uses host_mode.
             self.unified_compose_files = {
-                "emotion": str(docker_dir / "docker-compose-unified-emotion.bridge.yml"),
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.yml"),
                 "temperature": str(docker_dir / "docker-compose-unified-temperature.yml")
             }
@@ -285,8 +288,11 @@ class ExperimentRunner:
                 "mentalstate": str(docker_dir / "docker-compose-mentalstate.yml"),
                 "temperature": str(docker_dir / "docker-compose-temperature.yml")
             }
+            # Same as GPU path above: unified must use host-network so DDS works.
+            # docker-compose-unified-emotion.bridge.yml is kept for non-DDS protocol-only
+            # deployments; the rl_unified experiment includes DDS so host mode is required.
             self.unified_compose_files = {
-                "emotion": str(docker_dir / "docker-compose-unified-emotion.bridge.yml"),
+                "emotion": str(docker_dir / "docker-compose-unified-emotion.yml"),
                 "mentalstate": str(docker_dir / "docker-compose-unified-mentalstate.yml"),
                 "temperature": str(docker_dir / "docker-compose-unified-temperature.yml")
             }
@@ -1149,19 +1155,50 @@ class ExperimentRunner:
 
             # Check if training has reached the target number of rounds
             # by examining the results file content (not just existence)
-            results_dir = f"/app/Server/{self.use_case_dir}/results"
+            #
+            # Servers write results via get_experiment_results_dir() which resolves to:
+            #   /app/results/{use_case}/{protocol}/{scenario}/  (if /app/results is mounted)
+            #   /app/experiment_results/{use_case}/{protocol}/{scenario}/  (fallback)
+            # NETWORK_SCENARIO may not be injected into the container → defaults to "default".
+            # The legacy path /app/Server/{use_case_dir}/results/ can contain STALE files baked
+            # into the Docker image from a previous run (COPY Server/ ./Server/ in Dockerfile).
+            # Always check the actively-written new paths FIRST to avoid stale-file false positives.
             expected_json = f"{protocol}_training_results.json"
-            cat_paths = [f"{results_dir}/{expected_json}"]
+            use_case_lc = self.use_case.lower()  # e.g. "emotion"
+            scenario_norm = (scenario or "default").lower()
+            new_paths = []
+            for base in ("/app/results", "/app/experiment_results"):
+                for scen in (scenario_norm, "default"):
+                    p = f"{base}/{use_case_lc}/{protocol}/{scen}/{expected_json}"
+                    if p not in new_paths:
+                        new_paths.append(p)
+            legacy_path = f"/app/Server/{self.use_case_dir}/results/{expected_json}"
+            cat_paths = new_paths + [legacy_path]
             if protocol == "rl_unified":
                 cat_paths = self._rl_unified_training_results_paths_in_container(scenario) + cat_paths
 
             read_results = None
+            matched_path = None
             for cat_path in cat_paths:
-                read_results = self.run_command(
+                r = self.run_command(
                     ["docker", "exec", server_container, "cat", cat_path],
                     check=False,
                 )
-                if read_results.returncode == 0 and (read_results.stdout or "").strip():
+                if r.returncode == 0 and (r.stdout or "").strip():
+                    # For the legacy path, validate the round count matches the current run
+                    # to guard against stale files baked into the Docker image.
+                    if cat_path == legacy_path:
+                        try:
+                            _d = json.loads(r.stdout)
+                            _total = int(_d.get("total_rounds", 0) or 0)
+                            if _total and _total != self.num_rounds:
+                                # Stale file from a different run – skip it
+                                print(f"[WARN] Stale results at legacy path ({_total} rounds, expected {self.num_rounds}) – ignoring")
+                                continue
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            pass
+                    read_results = r
+                    matched_path = cat_path
                     break
             else:
                 read_results = type("R", (), {"returncode": 1, "stdout": ""})()
@@ -1259,17 +1296,34 @@ class ExperimentRunner:
         ]
         if getattr(self, "use_pruning", False):
             result_files.append("pruning_metrics.json")
-        
+
+        use_case_lc = self.use_case.lower()
+        scenario_norm = (scenario or "default").lower()
+
         for result_file in result_files:
-            try:
-                # Try to copy from server container
-                self.run_command([
-                    "docker", "cp",
-                    f"{server_container}:/app/Server/{self.use_case_dir}/results/{result_file}",
-                    os.path.join(exp_dir, result_file)
-                ], check=False)
-            except:
-                pass
+            dest = os.path.join(exp_dir, result_file)
+            copied = False
+            # Try new paths first (where servers actually write via get_experiment_results_dir),
+            # then fall back to the legacy path. This avoids collecting stale baked-in files.
+            for base in ("/app/results", "/app/experiment_results"):
+                for scen in (scenario_norm, "default"):
+                    src = f"{server_container}:{base}/{use_case_lc}/{protocol}/{scen}/{result_file}"
+                    r = self.run_command(["docker", "cp", src, dest], check=False)
+                    if r.returncode == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                        copied = True
+                        break
+                if copied:
+                    break
+            if not copied:
+                # Legacy fallback
+                try:
+                    self.run_command([
+                        "docker", "cp",
+                        f"{server_container}:/app/Server/{self.use_case_dir}/results/{result_file}",
+                        dest
+                    ], check=False)
+                except Exception:
+                    pass
 
         if protocol == "rl_unified":
             dst = os.path.join(exp_dir, "rl_unified_training_results.json")
@@ -1487,6 +1541,33 @@ class ExperimentRunner:
             "final_loss": loss[-1] if loss else None,
         }
 
+    @staticmethod
+    def _normalize_training_results(data: Dict) -> Dict:
+        """Ensure convergence_time_seconds is always available at the top level.
+
+        Some protocols (e.g. AMQP, DDS) nest it inside a ``summary`` sub-dict when
+        fixed-round mode is used instead of convergence-based early stopping.  The
+        plot generator and cross-run comparison scripts only read the top-level key,
+        so promote it here once and fall back to summing round_times_seconds when
+        both locations are absent.
+        """
+        if data.get("convergence_time_seconds") is None:
+            summary = data.get("summary") or {}
+            ct = summary.get("convergence_time_seconds")
+            if ct is None:
+                # Last resort: sum the per-round wall times recorded by the server
+                rts = data.get("round_times_seconds") or []
+                ct = sum(float(t) for t in rts) if rts else None
+            if ct is not None:
+                data = dict(data)
+                data["convergence_time_seconds"] = float(ct)
+                data["convergence_time_minutes"] = float(ct) / 60.0
+                # Promote other useful summary fields when missing at top level
+                for key in ("total_rounds", "num_clients", "final_accuracy", "final_loss", "converged"):
+                    if data.get(key) is None and summary.get(key) is not None:
+                        data[key] = summary[key]
+        return data
+
     def _resolve_training_results(self, exp_dir: str, protocol: str) -> Optional[Dict]:
         """Resolve best available training results, preferring data consistent with server logs."""
         json_results = self._read_training_results(exp_dir, protocol)
@@ -1495,9 +1576,9 @@ class ExperimentRunner:
         if json_results is None and log_results is None:
             return None
         if json_results is None:
-            return log_results
+            return self._normalize_training_results(log_results)
         if log_results is None:
-            return json_results
+            return self._normalize_training_results(json_results)
 
         # If JSON rounds are stale/incomplete, trust server log parse
         json_rounds = json_results.get("rounds", []) or []
@@ -1518,9 +1599,9 @@ class ExperimentRunner:
             ):
                 if json_results.get(key):
                     merged[key] = json_results.get(key)
-            return merged
+            return self._normalize_training_results(merged)
 
-        return json_results
+        return self._normalize_training_results(json_results)
 
     def _persist_training_results(self, exp_dir: str, protocol: str, training: Optional[Dict]):
         """Persist corrected training results to protocol JSON in experiment folder."""
@@ -2138,6 +2219,10 @@ class ExperimentRunner:
                 
                 print(f"{'='*70}\n")
             
+            # Propagate NETWORK_SCENARIO so server containers write results to the
+            # correct subdirectory via get_experiment_results_dir().
+            os.environ["NETWORK_SCENARIO"] = scenario
+
             # 1. Start containers (includes traffic generators if congestion enabled)
             if not self.start_containers(protocol, scenario, congestion_level):
                 print(f"[ERROR] Failed to start containers for {protocol}")
