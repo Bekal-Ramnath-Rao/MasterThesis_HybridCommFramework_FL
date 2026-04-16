@@ -1,0 +1,48 @@
+# =============================================================================
+# requirements.jetson.txt — Python dependencies for NVIDIA Jetson (arm64)
+#
+# IMPORTANT: Do NOT add tensorflow or keras here.
+# The nvcr.io/nvidia/l4t-tensorflow base image already ships TensorFlow and
+# Keras compiled for arm64 + CUDA.  Installing them via pip would either:
+#   (a) fail because no arm64 wheel exists for the requested version, or
+#   (b) overwrite the GPU-optimised build with a CPU-only wheel.
+#
+# TF version shipped per base image tag:
+#   r35.x.x  (JetPack 5.x — Orin / Xavier)  →  TensorFlow 2.11
+#   r32.7.1  (JetPack 4.6 — Nano / Xavier)   →  TensorFlow 2.7
+# =============================================================================
+
+# --- Data Science ---
+numpy>=1.21.0,<2.0.0
+pandas>=1.5.0
+python-dateutil>=2.8.0
+pytz>=2023.3
+Pillow>=9.0.0
+matplotlib>=3.5.0
+seaborn>=0.12.0
+scikit-learn>=1.1.0
+
+# --- Communication Protocols ---
+# MQTT
+paho-mqtt>=1.6.0
+
+# AMQP / RabbitMQ
+pika>=1.3.0
+
+# gRPC  (pinned to same versions as amd64 for protobuf compatibility)
+grpcio==1.59.0
+grpcio-tools==1.59.0
+protobuf==4.25.3
+
+# DDS (Eclipse CycloneDDS Python binding — C lib built from source in Dockerfile)
+cyclonedds>=0.10.0
+
+# HTTP/3
+httpx[http3]>=0.25.0
+
+# --- Utilities ---
+joblib>=1.2.0
+psutil>=5.9.0
+PyYAML>=6.0.0
+openpyxl>=3.1.0
+cryptography>=41.0.0

@@ -39,9 +39,14 @@ docs/
 
 # Results and logs (mounted as volumes)
 results/
+**/results/
 logs/
 *.json
+**/*.json
 *.csv
+**/*.csv
+**/results/*.png
+**/results/*.jpg
 
 # Jupyter Notebooks
 *.ipynb

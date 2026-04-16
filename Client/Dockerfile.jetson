@@ -1,0 +1,109 @@
+# =============================================================================
+# Client Dockerfile for NVIDIA Jetson (linux/arm64 / aarch64)
+#
+# The upstream tensorflow/tensorflow:2.13.0-gpu image is amd64-only and will
+# fail with "exec format error" on Jetson.  Instead we use NVIDIA's official
+# L4T TensorFlow image, which is built for arm64 and ships TF + CUDA + cuDNN
+# pre-compiled for the Jetson hardware.
+#
+# Base image selection (pass --build-arg L4T_TAG=... to override):
+#
+#   JetPack 5.x  (Orin, Xavier AGX/NX)  — default
+#     nvcr.io/nvidia/l4t-tensorflow:r35.4.1-tf2.11-py3
+#
+#   JetPack 4.6  (Nano, Xavier, TX2)
+#     nvcr.io/nvidia/l4t-tensorflow:r32.7.1-tf2.7-py3
+#
+# To find your JetPack version on the Jetson:
+#   cat /etc/nv_tegra_release
+#   # or: dpkg -l | grep "jetpack"
+#
+# Build (from the project ROOT, not from Client/):
+#   JetPack 5.x (default):
+#     docker build -f Client/Dockerfile.jetson -t fl-client-emotion:jetson .
+#
+#   JetPack 4.6:
+#     docker build -f Client/Dockerfile.jetson \
+#       --build-arg L4T_TAG=r32.7.1-tf2.7-py3 \
+#       -t fl-client-emotion:jetson .
+# =============================================================================
+
+ARG L4T_TAG=r35.4.1-tf2.11-py3
+FROM nvcr.io/nvidia/l4t-tensorflow:${L4T_TAG}
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies including build tools for CycloneDDS
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libssl-dev \
+    libffi-dev \
+    iproute2 \
+    cmake \
+    git \
+    tcpdump \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install CycloneDDS C library from source (same version as amd64 Dockerfile)
+RUN git clone --depth 1 --branch 0.10.5 \
+        https://github.com/eclipse-cyclonedds/cyclonedds.git /tmp/cyclonedds && \
+    cd /tmp/cyclonedds && \
+    mkdir build && cd build && \
+    cmake -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_EXAMPLES=OFF .. && \
+    cmake --build . && \
+    cmake --install . && \
+    ldconfig && \
+    cd / && rm -rf /tmp/cyclonedds
+
+# Copy Jetson-specific requirements (TF + Keras excluded — already in base image)
+COPY requirements.jetson.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.jetson.txt
+
+# Install QUIC support
+RUN pip install --no-cache-dir aioquic
+
+# Copy the Protocols directory for gRPC and DDS
+COPY Protocols/ ./Protocols/
+
+# Compile gRPC protobuf files
+RUN cd Protocols && \
+    python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. federated_learning.proto && \
+    cd ..
+
+# Match repo layout: clients add project_root/scripts/utilities to sys.path
+RUN mkdir -p /app/scripts/utilities
+COPY scripts/utilities/packet_logger.py         /app/scripts/utilities/
+COPY scripts/utilities/q_learning_logger.py     /app/scripts/utilities/
+COPY scripts/utilities/client_fl_metrics_log.py /app/scripts/utilities/
+COPY scripts/utilities/experiment_results_path.py /app/scripts/utilities/
+COPY scripts/utilities/client_experiment_results.py /app/scripts/utilities/
+
+# DDS: LAN multicast + runtime static unicast generator
+COPY config/cyclonedds-multicast-lan.xml  /app/config/cyclonedds-multicast-lan.xml
+COPY config/dds_distributed_unicast.py   /app/config/dds_distributed_unicast.py
+COPY config/dds_distributed_env.sh       /app/config/dds_distributed_env.sh
+
+# Copy the Client source and Network_Simulation (used for RL reward calculations)
+COPY Client/           ./Client/
+COPY Network_Simulation/ ./Network_Simulation/
+
+# Environment
+ENV PYTHONUNBUFFERED=1
+ENV TF_CPP_MIN_LOG_LEVEL=3
+
+# Default client configuration (override at runtime via -e / docker-compose env)
+ENV CLIENT_ID=1
+ENV NUM_CLIENTS=2
+ENV MQTT_BROKER=mqtt-broker
+ENV AMQP_HOST=rabbitmq
+ENV GRPC_HOST=fl-server
+ENV QUIC_HOST=fl-server
+ENV DDS_DOMAIN_ID=0
+ENV DDS_PEER_SERVER=129.69.102.245
+ENV DDS_PEER_CLIENT1=129.69.102.245
+ENV DDS_PEER_CLIENT2=129.69.102.173
+
+CMD ["python", "-u", "Client/Emotion_Recognition/FL_Client_MQTT.py"]

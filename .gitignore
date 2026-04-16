@@ -77,6 +77,7 @@ mosquitto/data/
 
 # Generated Results
 *.png
+!experiment_results/cross_run_emotion*_fl_metrics.png
 *.jpg
 *.jpeg
 *.pdf
@@ -122,6 +123,7 @@ Supervised/plots/
 
 # JSON files
 *.json
+!experiment_results/cross_run_emotion*_fl_metrics.json
 !launch.json
 !.vscode/launch.json
 
@@ -135,6 +137,8 @@ Supervised/plots/
 
 # log files
 *.txt
+# Keep all requirements files regardless of the *.txt rule above
+!requirements*.txt
 
 # plant uml files
 *.puml
