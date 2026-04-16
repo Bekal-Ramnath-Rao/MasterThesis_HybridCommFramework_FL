@@ -6,9 +6,18 @@
 #   file:///tmp/cyclonedds-distributed-*.xml (SPDP domain 0: PI1=7412, PI2=7414, PI3=7416).
 # Cyclone RTPS needs the host UDP port range; Docker bridge + mapping only SPDP ports breaks DDS
 # — use docker-compose-unified-emotion.bridge.yml only without DDS, or switch fully to this file.
+# run_network_experiments.py selects this file for rl_unified in all network modes.
 #
 # Brokers listen on the host: MQTT 1883, AMQP 5672 (and 15672 for Rabbit UI). Server binds gRPC/QUIC/HTTP3
 # on all interfaces; clients use UNIFIED_FL_SERVER_HOST for control/data plane (default 127.0.0.1).
+#
+# --- Same-machine testing ---
+# Set DDS_PEER_SERVER and DDS_PEER_CLIENT1 to the host's actual LAN IP (e.g. 192.168.1.100),
+# NOT 127.0.0.1.  Using the loopback address causes Cyclone to pick the wrong locator and prevents
+# SPDP packets from being routed between participants.  Example:
+#   export DDS_PEER_SERVER=192.168.1.100 DDS_PEER_CLIENT1=192.168.1.100 DDS_PEER_CLIENT2=192.168.1.100
+#   docker compose -f Docker/docker-compose-unified-emotion.yml up
+# If both clients are on the same machine as the server, set all three to that machine's LAN IP.
 #
 # --- Second client on another PC (DDS + unified protocols) ---
 # 1) On the FL server PC: set DDS_PEER_* / DDS_SPDP_* to real LAN IPs (server, client1, client2) and

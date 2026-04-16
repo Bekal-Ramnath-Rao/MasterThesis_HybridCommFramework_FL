@@ -1,10 +1,21 @@
 # Unified Emotion FL on Docker bridge (fl-network).
 # MQTT/AMQP use mapped host ports (31883, 35672). gRPC/QUIC/HTTP3 use published ports.
 #
-# DDS (Cyclone): for the same working layout as fl-server-dds-emotion / fl-client-dds-emotion-*
-# (network_mode: host, full UDP range, CYCLONEDDS_URI from dds_distributed_unicast.py), use
-# Docker/docker-compose-unified-emotion.yml — not this file. Bridge + partial UDP publish breaks
-# SPDP/SEDP and RTPS user-data locators; DDS_DISABLE_EXTERNAL_ADVERTISE is only a partial mitigation.
+# DDS (Cyclone): for the same reliable layout as fl-server-dds-emotion / fl-client-dds-emotion-*
+# (network_mode: host, full UDP range), use Docker/docker-compose-unified-emotion.yml instead.
+# run_network_experiments.py uses the host-network file for rl_unified so DDS works end-to-end.
+#
+# This file CAN be used for DDS with the following caveats and mitigations applied below:
+#   - DDS_DISABLE_EXTERNAL_ADVERTISE=1 (default): prevents advertising the wrong lab LAN IP as
+#     Cyclone's ExternalNetworkAddress to co-located bridge containers.
+#   - DDS_SPDP_SERVER/CLIENT1 default to Docker service names so intra-bridge SPDP resolves via DNS.
+#   - SPDP unicast ports (7412,7414,7416) AND user-data unicast ports (7413,7415,7417) are published
+#     to the host so the server/clients can exchange both discovery and RTPS data traffic.
+#   - Cross-machine DDS (client2 on another PC): set DDS_PEER_CLIENT2 to the remote PC's LAN IP,
+#     set DDS_SPDP_CLIENT2 to the same IP, and open UDP 7416+7417 on the remote PC's firewall.
+#     The server's RTPS data locator will be published on the host via port 7413; the remote client
+#     must be able to reach that host IP:7413.  For simpler cross-machine DDS use the host-network
+#     file (docker-compose-unified-emotion.yml) and set DDS_PEER_* to real LAN IPs.
 
 services:
   mqtt-broker-unified:
@@ -59,15 +70,19 @@ services:
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
-      # DDS env order matches fl-server-dds-emotion (prefer docker-compose-unified-emotion.yml for DDS)
+      # DDS env — matches fl-server-dds-emotion layout.
+      # DDS_SPDP_SERVER/CLIENT1 default to Docker service names for intra-bridge DNS resolution.
+      # DDS_PEER_* hold the LAN IPs used for interface auto-detection and as fallback for SPDP.
+      # DDS_DISABLE_EXTERNAL_ADVERTISE=1: server advertises its bridge-internal locator, not a
+      # hardcoded lab IP — required for co-located containers to discover each other correctly.
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-unified-emotion}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-unified-emotion-1}
       - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
       - DDS_DOMAIN_ID=0
-      - DDS_DISABLE_EXTERNAL_ADVERTISE=${DDS_DISABLE_EXTERNAL_ADVERTISE:-0}
+      - DDS_DISABLE_EXTERNAL_ADVERTISE=${DDS_DISABLE_EXTERNAL_ADVERTISE:-1}
     volumes:
       - ../Server/Emotion_Recognition:/app/Server/Emotion_Recognition
       - ../experiment_results:/app/results
@@ -80,6 +95,7 @@ services:
       - "4434:4434/udp"
       - "50051:50051/tcp"
       - "7412:7412/udp"
+      - "7413:7413/udp"
     depends_on:
       - mqtt-broker-unified
       - amqp-broker-unified
@@ -132,8 +148,8 @@ services:
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-unified-emotion}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-unified-emotion-1}
       - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
       - DDS_DOMAIN_ID=0
     volumes:
@@ -146,6 +162,7 @@ services:
       - fl-network
     ports:
       - "7414:7414/udp"
+      - "7415:7415/udp"
     depends_on:
       - fl-server-unified-emotion
       - mqtt-broker-unified
@@ -199,8 +216,8 @@ services:
       - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
       - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
       - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-fl-server-unified-emotion}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-fl-client-unified-emotion-1}
       - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
       - DDS_DOMAIN_ID=0
     volumes:
@@ -213,6 +230,7 @@ services:
       - fl-network
     ports:
       - "7416:7416/udp"
+      - "7417:7417/udp"
     depends_on:
       - fl-server-unified-emotion
       - mqtt-broker-unified

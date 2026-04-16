@@ -322,15 +322,20 @@ class FederatedLearningClient:
         print(f"  Waiting for initial global model from server...")
         
     def serialize_weights(self, weights):
-        """Serialize model weights for DDS transmission"""
-        serialized = pickle.dumps(weights)
-        # Convert bytes to list of ints for DDS
-        return list(serialized)
-    
+        """Serialize model weights for DDS transmission using numpy .npz (version-agnostic)."""
+        import io
+        buf = io.BytesIO()
+        import numpy as np
+        np.savez(buf, *weights)
+        return list(buf.getvalue())
+
     def deserialize_weights(self, serialized_weights):
-        """Deserialize model weights received from DDS"""
-        # Convert list of ints back to bytes
-        return pickle.loads(bytes(serialized_weights))
+        """Deserialize model weights received from DDS."""
+        import io
+        import numpy as np
+        buf = io.BytesIO(bytes(serialized_weights))
+        loaded = np.load(buf, allow_pickle=False)
+        return [loaded[f'arr_{i}'] for i in range(len(loaded.files))]
 
     def _apply_generator_batch_size(self, batch_size):
         """Sync DirectoryIterator batch size with training config."""

@@ -1,4 +1,5 @@
 import numpy as np
+import io
 import os
 import sys
 import logging
@@ -270,15 +271,22 @@ class FederatedLearningClient:
             pass
 
     def serialize_weights(self, weights):
-        """Serialize model weights for MQTT transmission"""
-        serialized = pickle.dumps(weights)
-        encoded = base64.b64encode(serialized).decode('utf-8')
+        """Serialize model weights for MQTT transmission.
+
+        Uses numpy's native .npz format instead of pickle so that weights
+        serialized on NumPy 2.x (numpy._core) can be loaded on NumPy 1.x
+        (numpy.core) and vice-versa.
+        """
+        buf = io.BytesIO()
+        np.savez(buf, *weights)
+        encoded = base64.b64encode(buf.getvalue()).decode('utf-8')
         return encoded
-    
+
     def deserialize_weights(self, encoded_weights):
-        """Deserialize model weights received from MQTT"""
-        serialized = base64.b64decode(encoded_weights.encode('utf-8'))
-        weights = pickle.loads(serialized)
+        """Deserialize model weights received from MQTT."""
+        buf = io.BytesIO(base64.b64decode(encoded_weights.encode('utf-8')))
+        loaded = np.load(buf, allow_pickle=False)
+        weights = [loaded[f'arr_{i}'] for i in range(len(loaded.files))]
         return weights
 
     def _apply_generator_batch_size(self, batch_size):

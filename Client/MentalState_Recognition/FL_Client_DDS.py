@@ -416,13 +416,20 @@ class FederatedLearningClient:
         return model
     
     def serialize_weights(self, weights):
-        """Serialize model weights for DDS transmission"""
-        serialized = pickle.dumps(weights)
-        return list(serialized)
-    
+        """Serialize model weights for DDS transmission using numpy .npz (version-agnostic)."""
+        import io
+        buf = io.BytesIO()
+        import numpy as _np
+        _np.savez(buf, *weights)
+        return list(buf.getvalue())
+
     def deserialize_weights(self, serialized_weights):
-        """Deserialize model weights received from DDS"""
-        return pickle.loads(bytes(serialized_weights))
+        """Deserialize model weights received from DDS."""
+        import io
+        import numpy as _np
+        buf = io.BytesIO(bytes(serialized_weights))
+        loaded = _np.load(buf, allow_pickle=False)
+        return [loaded[f'arr_{i}'] for i in range(len(loaded.files))]
     
     def split_into_chunks(self, data):
         """Split serialized data into chunks of CHUNK_SIZE"""
