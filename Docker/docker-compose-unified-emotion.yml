@@ -54,12 +54,15 @@ services:
     environment:
       - RABBITMQ_DEFAULT_USER=guest
       - RABBITMQ_DEFAULT_PASS=guest
+      - RABBITMQ_NODENAME=rabbit@localhost
+      - RABBITMQ_ERLANG_COOKIE=fl_experiment_cookie
+      - RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=-setcookie fl_experiment_cookie
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 10s
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/5672"]
+      interval: 15s
       timeout: 5s
-      retries: 12
-      start_period: 30s
+      retries: 20
+      start_period: 90s
 
   fl-server-unified-emotion:
     build:

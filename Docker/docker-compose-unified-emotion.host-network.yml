@@ -17,6 +17,9 @@ services:
     environment:
       - RABBITMQ_DEFAULT_USER=guest
       - RABBITMQ_DEFAULT_PASS=guest
+      - RABBITMQ_NODENAME=rabbit@localhost
+      - RABBITMQ_ERLANG_COOKIE=fl_experiment_cookie
+      - RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=-setcookie fl_experiment_cookie
     container_name: amqp-broker-unified
 
   fl-server-unified-emotion:
