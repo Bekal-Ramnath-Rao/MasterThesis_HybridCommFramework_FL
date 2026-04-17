@@ -353,14 +353,19 @@ class FederatedLearningClient:
     
     def serialize_weights(self, weights):
         """Serialize model weights for HTTP/3 transmission"""
-        serialized = pickle.dumps(weights)
-        encoded = base64.b64encode(serialized).decode('utf-8')
-        return encoded
-    
+        buf = io.BytesIO()
+        np.savez(buf, *weights)
+        return base64.b64encode(buf.getvalue()).decode('utf-8')
+
     def deserialize_weights(self, encoded_weights):
-        """Deserialize model weights received from HTTP/3"""
-        serialized = base64.b64decode(encoded_weights.encode('utf-8'))
-        weights = pickle.loads(serialized)
+        """Deserialize model weights received from HTTP/3."""
+        buf = io.BytesIO(base64.b64decode(encoded_weights.encode('utf-8')))
+        try:
+            loaded = np.load(buf, allow_pickle=False)
+            weights = [loaded[f'arr_{i}'] for i in range(len(loaded.files))]
+        except Exception:
+            buf.seek(0)
+            weights = pickle.loads(buf.read())
         return weights
     
     def build_model_from_config(self, model_config):

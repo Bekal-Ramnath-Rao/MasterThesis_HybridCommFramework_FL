@@ -11,6 +11,7 @@ Architecture: Event-driven, polls gRPC control-plane for round signals/queries
 
 import os
 import sys
+import io
 import time
 import json
 import pickle
@@ -2035,8 +2036,7 @@ class UnifiedFLClient_Emotion:
                 if 'weights' in data:
                     encoded_weights = data['weights']
                     if isinstance(encoded_weights, str):
-                        import io as _io
-                        _buf = _io.BytesIO(base64.b64decode(encoded_weights.encode('utf-8')))
+                        _buf = io.BytesIO(base64.b64decode(encoded_weights.encode('utf-8')))
                         try:
                             _loaded = np.load(_buf, allow_pickle=False)
                             weights = [_loaded[f'arr_{i}'] for i in range(len(_loaded.files))]
@@ -3220,9 +3220,14 @@ class UnifiedFLClient_Emotion:
         return total_chunks
     
     def deserialize_weights(self, encoded_weights):
-        """Deserialize model weights received from server"""
-        serialized = base64.b64decode(encoded_weights.encode('utf-8'))
-        weights = pickle.loads(serialized)
+        """Deserialize model weights received from server (NPZ format with pickle fallback)."""
+        buf = io.BytesIO(base64.b64decode(encoded_weights.encode('utf-8')))
+        try:
+            loaded = np.load(buf, allow_pickle=False)
+            weights = [loaded[f'arr_{i}'] for i in range(len(loaded.files))]
+        except Exception:
+            buf.seek(0)
+            weights = pickle.loads(buf.read())
         return weights
     
     def train_local_model(self):

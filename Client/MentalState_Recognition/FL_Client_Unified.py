@@ -112,7 +112,41 @@ _RL_PROTOCOL_SELECTION_RECORD_LEARNING = not RL_INFERENCE_ONLY
 
 TOPIC_CLIENT_UPDATE = f"fl/client/{CLIENT_ID}/update"
 TOPIC_CLIENT_METRICS = f"fl/client/{CLIENT_ID}/metrics"
-GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(4 * 1024 * 1024)))
+GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(64 * 1024 * 1024)))
+
+
+# ---------------------------------------------------------------------------
+# Model architecture helpers — must exactly match FL_Server_MQTT.py so that
+# weights are compatible across server and all clients.
+# ---------------------------------------------------------------------------
+def _se_block(x, r=8):
+    ch = x.shape[-1]
+    s = keras.layers.GlobalAveragePooling1D()(x)
+    s = keras.layers.Dense(max(ch // r, 8), activation='relu')(s)
+    s = keras.layers.Dense(ch, activation='sigmoid', dtype='float32')(s)
+    s = keras.layers.Reshape((1, ch))(s)
+    return keras.layers.Multiply()([x, s])
+
+
+def _conv_bn_relu(x, f, k, d=1):
+    x = keras.layers.Conv1D(f, k, padding="same", dilation_rate=d, use_bias=False)(x)
+    x = keras.layers.BatchNormalization()(x)
+    x = keras.layers.ReLU()(x)
+    return x
+
+
+def _res_block(x, f, k, d=1):
+    sc = x
+    y = _conv_bn_relu(x, f, k, d)
+    y = keras.layers.Conv1D(f, k, padding="same", dilation_rate=d, use_bias=False)(y)
+    y = keras.layers.BatchNormalization()(y)
+    if sc.shape[-1] != f:
+        sc = keras.layers.Conv1D(f, 1, padding="same", use_bias=False)(sc)
+        sc = keras.layers.BatchNormalization()(sc)
+    y = keras.layers.Add()([y, sc])
+    y = keras.layers.ReLU()(y)
+    y = _se_block(y)
+    return y
 
 
 class UnifiedFLClient_MentalState:
@@ -253,32 +287,52 @@ class UnifiedFLClient_MentalState:
         print(f"{'='*70}\n")
     
     def build_model(self, input_shape, num_classes) -> keras.Model:
-        """Build mental state recognition model (CNN+LSTM for EEG)"""
-        model = keras.Sequential([
-            # CNN layers for feature extraction
-            keras.layers.Conv1D(64, 3, activation='relu', input_shape=input_shape),
-            keras.layers.MaxPooling1D(2),
-            keras.layers.Conv1D(128, 3, activation='relu'),
-            keras.layers.MaxPooling1D(2),
-            
-            # LSTM for temporal patterns
-            keras.layers.Bidirectional(keras.layers.LSTM(64, return_sequences=True)),
-            keras.layers.Dropout(0.3),
-            keras.layers.Bidirectional(keras.layers.LSTM(32)),
-            keras.layers.Dropout(0.3),
-            
-            # Dense layers
-            keras.layers.Dense(64, activation='relu'),
-            keras.layers.Dropout(0.3),
-            keras.layers.Dense(num_classes, activation='softmax')
-        ])
-        
+        """Build mental state recognition model.
+
+        Architecture is identical to FL_Server_MQTT.py so that weight tensors
+        are fully compatible for FedAvg aggregation (both produce 88 tensors).
+        Compiled with SparseCategoricalCrossentropy because client labels are
+        integer-encoded; the server uses CategoricalCrossentropy but that only
+        affects local training, not weight structure.
+        """
+        inp = keras.Input(shape=input_shape)
+
+        x = _conv_bn_relu(inp, 64, 7, d=1)
+        x = _res_block(x, 64, 7, d=1)
+        x = keras.layers.MaxPooling1D(2)(x)
+
+        for d in [1, 2, 4]:
+            x = _res_block(x, 128, 5, d=d)
+
+        x = keras.layers.Bidirectional(
+            keras.layers.LSTM(64, return_sequences=True, dropout=0.25)
+        )(x)
+
+        attn = keras.layers.MultiHeadAttention(num_heads=4, key_dim=32, dropout=0.1)(x, x)
+        x = keras.layers.Add()([x, attn])
+        x = keras.layers.LayerNormalization()(x)
+
+        x = keras.layers.GlobalAveragePooling1D()(x)
+        x = keras.layers.Dense(256, activation="relu")(x)
+        x = keras.layers.Dropout(0.4)(x)
+        x = keras.layers.Dense(128, activation="relu")(x)
+        x = keras.layers.Dropout(0.35)(x)
+        out = keras.layers.Dense(num_classes, activation="softmax", dtype="float32")(x)
+
+        model = keras.Model(inp, out)
+
+        lr_sched = keras.optimizers.schedules.CosineDecayRestarts(
+            initial_learning_rate=1e-3, first_decay_steps=4,
+            t_mul=2.0, m_mul=0.8, alpha=1e-5
+        )
+        opt = keras.optimizers.AdamW(
+            learning_rate=lr_sched, weight_decay=1e-4, global_clipnorm=1.0
+        )
         model.compile(
-            optimizer='adam',
+            optimizer=opt,
             loss='sparse_categorical_crossentropy',
             metrics=['accuracy']
         )
-        
         return model
     
     def select_protocol(self) -> str:
@@ -329,15 +383,12 @@ class UnifiedFLClient_MentalState:
             return None
 
     def _update_downlink_rl_after_reception(self, round_num: int = 0):
-        """Compute and log downlink Q-learning reward after global model is received."""
+        """Compute and log downlink Q-learning reward after global model is received.
+        Q-value is updated only when USE_RL_EXPLORATION is True; logging always runs."""
         if (not USE_RL_SELECTION
                 or self.rl_selector_downlink is None
                 or self._downlink_select_time is None
                 or self._last_downlink_rl_state is None):
-            return
-        if not USE_RL_EXPLORATION:
-            self._downlink_select_time = None
-            self._last_downlink_rl_state = None
             return
         try:
             comm_time = time.time() - self._downlink_select_time
@@ -354,14 +405,16 @@ class UnifiedFLClient_MentalState:
                 resource_consumption=resources,
                 t_calc=t_calc,
             )
-            self.rl_selector_downlink.update_q_value(reward, next_state=None, done=True)
+            if USE_RL_EXPLORATION:
+                self.rl_selector_downlink.update_q_value(reward, next_state=None, done=True)
             q_delta = self.rl_selector_downlink.get_last_q_delta()
             q_value = self.rl_selector_downlink.get_last_q_value()
             avg_reward = (
                 float(np.mean(self.rl_selector_downlink.total_rewards[-100:]))
                 if self.rl_selector_downlink.total_rewards else 0.0
             )
-            self.rl_selector_downlink.end_episode()
+            if USE_RL_EXPLORATION:
+                self.rl_selector_downlink.end_episode()
             q_converged = self.rl_selector_downlink.check_q_converged()
             print(f"[Downlink RL] round={round_num} | protocol={protocol.upper()} | "
                   f"comm_time={comm_time:.3f}s | reward={reward:.2f} | "
@@ -715,56 +768,56 @@ class UnifiedFLClient_MentalState:
             self.round_metrics['communication_time'] = comm_time
             self.round_metrics['success'] = True
             
-            # Q-learning updates only while exploring (USE_RL_EXPLORATION); inference is greedy-only, frozen Q.
+            # Uplink RL: compute reward always for logging; update Q only when exploring.
             if USE_RL_SELECTION and self.rl_selector_uplink and self.env_manager:
+                resources = self.env_manager.get_resource_consumption()
+                payload_bytes = self.round_metrics.get('payload_bytes', 12 * 1024 * 1024)
+                t_calc = self._get_t_calc_for_reward(protocol, payload_bytes) if USE_COMMUNICATION_MODEL_REWARD else None
+                reward = self.rl_selector_uplink.calculate_reward(
+                    communication_time=self.round_metrics['communication_time'],
+                    success=self.round_metrics['success'],
+                    resource_consumption=resources,
+                    t_calc=t_calc,
+                )
                 if USE_RL_EXPLORATION:
-                    resources = self.env_manager.get_resource_consumption()
-                    payload_bytes = self.round_metrics.get('payload_bytes', 12 * 1024 * 1024)
-                    t_calc = self._get_t_calc_for_reward(protocol, payload_bytes) if USE_COMMUNICATION_MODEL_REWARD else None
-                    reward = self.rl_selector_uplink.calculate_reward(
-                        communication_time=self.round_metrics['communication_time'],
-                        success=self.round_metrics['success'],
-                        resource_consumption=resources,
-                        t_calc=t_calc,
-                    )
                     self.rl_selector_uplink.update_q_value(reward, done=False)
-                    if log_q_step is not None:
-                        st = self.env_manager.get_current_state()
-                        q_delta = self.rl_selector_uplink.get_last_q_delta()
-                        q_value = self.rl_selector_uplink.get_last_q_value()
-                        avg_reward = (np.mean(self.rl_selector_uplink.total_rewards[-100:])
-                                     if self.rl_selector_uplink.total_rewards else 0.0)
-                        reward_details = self.rl_selector_uplink.get_last_reward_breakdown()
-                        log_q_step(
-                            client_id=self.client_id,
-                            round_num=int(getattr(self, 'current_round', 0)),
-                            episode=self.rl_selector_uplink.episode_count,
-                            state_comm_level=st.get('comm_level', ''),
-                            state_resource=st.get('resource', ''),
-                            state_battery_level=st.get('battery_level', ''),
-                            **rl_state_network_kwargs(st),
-                            action=protocol,
-                            reward=reward,
-                            q_delta=q_delta,
-                            epsilon=self.rl_selector_uplink.epsilon,
-                            q_value=q_value,
-                            avg_reward_last_100=float(avg_reward),
-                            converged=self.rl_selector_uplink.check_q_converged(),
-                            metric_communication_time=reward_details.get('communication_time'),
-                            metric_success=reward_details.get('success'),
-                            metric_cpu_usage=reward_details.get('cpu_usage'),
-                            metric_memory_usage=reward_details.get('memory_usage'),
-                            metric_bandwidth_usage=reward_details.get('bandwidth_usage'),
-                            metric_battery_level=reward_details.get('battery_level'),
-                            metric_energy_usage=reward_details.get('energy_usage'),
-                            reward_base=reward_details.get('reward_base'),
-                            reward_communication_time=reward_details.get('reward_communication_time'),
-                            reward_resource_penalty=reward_details.get('reward_resource_penalty'),
-                            reward_battery_penalty=reward_details.get('reward_battery_penalty'),
-                            reward_total=reward_details.get('reward_total'),
-                            link_direction='uplink',
-                        )
-                    print(f"[Uplink RL] Reward: {reward:.2f}, epsilon: {self.rl_selector_uplink.epsilon:.4f}")
+                if log_q_step is not None:
+                    st = self.env_manager.get_current_state()
+                    q_delta = self.rl_selector_uplink.get_last_q_delta()
+                    q_value = self.rl_selector_uplink.get_last_q_value()
+                    avg_reward = (np.mean(self.rl_selector_uplink.total_rewards[-100:])
+                                 if self.rl_selector_uplink.total_rewards else 0.0)
+                    reward_details = self.rl_selector_uplink.get_last_reward_breakdown()
+                    log_q_step(
+                        client_id=self.client_id,
+                        round_num=int(getattr(self, 'current_round', 0)),
+                        episode=self.rl_selector_uplink.episode_count,
+                        state_comm_level=st.get('comm_level', ''),
+                        state_resource=st.get('resource', ''),
+                        state_battery_level=st.get('battery_level', ''),
+                        **rl_state_network_kwargs(st),
+                        action=protocol,
+                        reward=reward,
+                        q_delta=q_delta,
+                        epsilon=self.rl_selector_uplink.epsilon,
+                        q_value=q_value,
+                        avg_reward_last_100=float(avg_reward),
+                        converged=self.rl_selector_uplink.check_q_converged(),
+                        metric_communication_time=reward_details.get('communication_time'),
+                        metric_success=reward_details.get('success'),
+                        metric_cpu_usage=reward_details.get('cpu_usage'),
+                        metric_memory_usage=reward_details.get('memory_usage'),
+                        metric_bandwidth_usage=reward_details.get('bandwidth_usage'),
+                        metric_battery_level=reward_details.get('battery_level'),
+                        metric_energy_usage=reward_details.get('energy_usage'),
+                        reward_base=reward_details.get('reward_base'),
+                        reward_communication_time=reward_details.get('reward_communication_time'),
+                        reward_resource_penalty=reward_details.get('reward_resource_penalty'),
+                        reward_battery_penalty=reward_details.get('reward_battery_penalty'),
+                        reward_total=reward_details.get('reward_total'),
+                        link_direction='uplink',
+                    )
+                print(f"[Uplink RL] Reward: {reward:.2f}, epsilon: {self.rl_selector_uplink.epsilon:.4f}")
                 self._update_downlink_rl_after_reception(round_num=int(getattr(self, 'current_round', 0)))
             
             _batt_soc = (
