@@ -2029,13 +2029,21 @@ class UnifiedFLClient_Emotion:
                     weights = compressed_data
                 print(f"Client {self.client_id} received quantized global model (dequantized to float32)")
             else:
-                # Normal weights
+                # Normal weights — MQTT server serialises with np.savez (NPZ/ZIP format).
+                # NPZ bytes start with 'PK' whose first byte 'P' is the pickle PERSID opcode,
+                # so pickle.loads() raises "persistent_load not specified".  Use np.load instead.
                 if 'weights' in data:
                     encoded_weights = data['weights']
                     if isinstance(encoded_weights, str):
-                        import base64, pickle
-                        serialized = base64.b64decode(encoded_weights.encode('utf-8'))
-                        weights = pickle.loads(serialized)
+                        import io as _io
+                        _buf = _io.BytesIO(base64.b64decode(encoded_weights.encode('utf-8')))
+                        try:
+                            _loaded = np.load(_buf, allow_pickle=False)
+                            weights = [_loaded[f'arr_{i}'] for i in range(len(_loaded.files))]
+                        except Exception:
+                            # Fallback: older server versions may still send pickle-encoded weights
+                            _buf.seek(0)
+                            weights = pickle.loads(_buf.read())
                     else:
                         weights = encoded_weights
                 else:
