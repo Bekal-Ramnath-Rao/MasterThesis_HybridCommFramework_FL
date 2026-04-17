@@ -427,14 +427,13 @@ class FederatedLearningServer:
             msg_size_mb = len(payload) / (1024 * 1024)
             print(f"Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(payload)} bytes = {msg_size_mb:.2f} MB)")
             
-            # Multiple transmit calls for large messages (improved for poor networks)
-            if len(payload) > 1_000_000:  # > 1MB
-                for _ in range(3):
-                    await asyncio.sleep(0.5)
+            # For large payloads, flush send buffer across multiple flow-control windows
+            if len(payload) > 1_000_000:  # > 1 MB
+                for _ in range(5):
+                    await asyncio.sleep(0.3)
                     protocol.transmit()
             else:
-                # Small delay for flow control
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05)
     
     async def broadcast_message(self, message):
         """Broadcast message to all registered clients"""
@@ -922,7 +921,7 @@ async def main():
     configuration = QuicConfiguration(
         is_client=False,
         alpn_protocols=H3_ALPN,
-        # Align HTTP/3 transport with the configured 16 KB stream payload cap
+        # Large windows so the full model can be sent without many MAX_DATA round-trips
         max_stream_data=16 * 1024,  # 16 KB per stream
         max_data=32 * 1024,  # 32 KB total connection
         # FAIR CONFIG: Timeout 600s for very_poor network scenarios

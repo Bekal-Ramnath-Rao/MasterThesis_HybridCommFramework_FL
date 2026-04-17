@@ -287,7 +287,50 @@ class DistributedClientGUI(QMainWindow):
         self.dds_peer_client3.setPlaceholderText("machine running CLIENT_ID=3 (leave empty for 2-client setup)")
         self.dds_peer_client3.setStyleSheet("padding: 8px; font-size: 12px;")
         layout.addWidget(self.dds_peer_client3, 6, 1, 1, 2)
-        
+
+        # ── WSL2 / Windows NAT support ──────────────────────────────────────
+        wsl2_help = QLabel(
+            "WSL2 fix: Docker --network host inside WSL2 binds to the WSL2 virtual IP (172.x.x.x), "
+            "not the Windows LAN IP. CycloneDDS then advertises the unreachable WSL2 address to peers. "
+            "Enable the checkbox and enter the Windows host LAN IP so DDS advertises a reachable address "
+            "(DDS_EXTERNAL_NETWORK_ADDRESS). Also set up UDP port-forwarding — see "
+            "scripts/windows_wsl2_dds_portforward.ps1."
+        )
+        wsl2_help.setWordWrap(True)
+        wsl2_help.setStyleSheet(
+            "color: #8a6d00; background: #fff8e1; border: 1px solid #ffe082; "
+            "font-size: 11px; padding: 6px; border-radius: 3px;"
+        )
+        layout.addWidget(wsl2_help, 7, 0, 1, 3)
+
+        self.wsl2_mode = QCheckBox("Running inside WSL2 on Windows (DDS NAT fix)")
+        self.wsl2_mode.setStyleSheet("font-size: 12px; padding: 4px;")
+        self.wsl2_mode.setToolTip(
+            "Tick this when the GUI is launched inside WSL2 on Windows.\n"
+            "Sets DDS_EXTERNAL_NETWORK_ADDRESS so CycloneDDS advertises the Windows\n"
+            "host LAN IP instead of the internal WSL2 virtual IP."
+        )
+        layout.addWidget(self.wsl2_mode, 8, 0, 1, 3)
+
+        layout.addWidget(QLabel("Windows host LAN IP:"), 9, 0)
+        self.wsl2_host_ip = QLineEdit()
+        self.wsl2_host_ip.setPlaceholderText("e.g. 192.168.0.100  (same as DDS peer — client N host for this machine)")
+        self.wsl2_host_ip.setStyleSheet("padding: 8px; font-size: 12px;")
+        self.wsl2_host_ip.setEnabled(False)
+        layout.addWidget(self.wsl2_host_ip, 9, 1, 1, 2)
+
+        layout.addWidget(QLabel("WSL2 network interface:"), 10, 0)
+        self.wsl2_iface = QLineEdit("eth0")
+        self.wsl2_iface.setPlaceholderText("e.g. eth0  (run 'ip link' inside WSL2 to find the interface name)")
+        self.wsl2_iface.setStyleSheet("padding: 8px; font-size: 12px;")
+        self.wsl2_iface.setEnabled(False)
+        layout.addWidget(self.wsl2_iface, 10, 1, 1, 2)
+
+        self.wsl2_mode.toggled.connect(self.wsl2_host_ip.setEnabled)
+        self.wsl2_mode.toggled.connect(self.wsl2_iface.setEnabled)
+        # Auto-populate Windows host IP from peer field matching this machine's client ID
+        self.wsl2_mode.toggled.connect(self._on_wsl2_mode_toggled)
+
         group.setLayout(layout)
         return group
     
@@ -1529,6 +1572,25 @@ class DistributedClientGUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Connection test failed: {str(e)}")
             self.statusBar().showMessage("Connection test error")
 
+    def _on_wsl2_mode_toggled(self, checked: bool) -> None:
+        """Auto-fill Windows host LAN IP from the DDS peer field for this client."""
+        if not checked:
+            return
+        try:
+            cid = int(self.client_id.value())
+        except (AttributeError, ValueError):
+            return
+        peer_map = {
+            1: getattr(self, "dds_peer_client1", None),
+            2: getattr(self, "dds_peer_client2", None),
+            3: getattr(self, "dds_peer_client3", None),
+        }
+        peer_widget = peer_map.get(cid)
+        if peer_widget:
+            ip = peer_widget.text().strip()
+            if ip and not self.wsl2_host_ip.text().strip():
+                self.wsl2_host_ip.setText(ip)
+
     def _resolve_docker_container_name_conflict(self, container_name):
         """Free the Docker name for `docker run --name` by removing a leftover container.
 
@@ -1847,6 +1909,31 @@ class DistributedClientGUI(QMainWindow):
                 self.log_text.append(
                     f"⚠️ DDS multicast config not found ({_mc_xml}); remote DDS discovery may fail.\n"
                 )
+
+            # WSL2 NAT fix: advertise the Windows host LAN IP so remote peers can reach this client.
+            # Without this, CycloneDDS advertises the internal WSL2 virtual IP (172.x.x.x) which is
+            # unreachable from other LAN machines.  DDS_EXTERNAL_NETWORK_ADDRESS overrides the
+            # advertised locator; DDS_NETWORK_INTERFACE pins Cyclone to the correct WSL2 interface.
+            if getattr(self, "wsl2_mode", None) and self.wsl2_mode.isChecked():
+                wsl2_ip = self.wsl2_host_ip.text().strip()
+                wsl2_if = self.wsl2_iface.text().strip() or "eth0"
+                if wsl2_ip:
+                    cmd.extend(["-e", f"DDS_EXTERNAL_NETWORK_ADDRESS={wsl2_ip}"])
+                    cmd.extend(["-e", f"DDS_NETWORK_INTERFACE={wsl2_if}"])
+                    self.log_text.append(
+                        f"WSL2 DDS fix: DDS_EXTERNAL_NETWORK_ADDRESS={wsl2_ip} "
+                        f"DDS_NETWORK_INTERFACE={wsl2_if}\n"
+                        "CycloneDDS will advertise the Windows host LAN IP to remote peers.\n"
+                        "⚠️  Also ensure UDP ports 7412–7418 (and ~7400–7500 for RTPS user-data) are\n"
+                        "   forwarded from the Windows host to the WSL2 instance.\n"
+                        "   Run scripts/windows_wsl2_dds_portforward.ps1 on Windows, or enable\n"
+                        "   WSL2 mirrored networking (Windows 11 22H2+) in %USERPROFILE%\\.wslconfig.\n"
+                    )
+                else:
+                    self.log_text.append(
+                        "⚠️ WSL2 mode is checked but 'Windows host LAN IP' is empty. "
+                        "DDS_EXTERNAL_NETWORK_ADDRESS was NOT set; DDS discovery may fail.\n"
+                    )
 
         termination_mode = self.termination_mode_combo.currentData() or self.termination_mode_combo.currentText()
         stop_on_client_convergence = "false" if termination_mode == "fixed_rounds" else "true"

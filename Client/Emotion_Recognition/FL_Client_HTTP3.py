@@ -603,26 +603,18 @@ class FederatedLearningClient:
         if self.last_training_round == round_num:
             print(f"Client {self.client_id} ignoring duplicate start_training for round {round_num}")
             return
-        
-        # Wait for model to be initialized (optional timeout; no timeout in diagnostic pipeline)
+
+        # If the global model has not arrived yet, store the round and return immediately.
+        # DO NOT await model_ready while holding _inbound_msg_lock – that would deadlock
+        # because handle_global_model (which sets model_ready) also needs the lock.
+        # handle_global_model will call _start_training_for_round once the model is ready.
         if not self.model_ready.is_set():
-            print(f"Client {self.client_id} waiting for model initialization before training round {round_num}...")
+            print(f"Client {self.client_id}: global model not yet received; "
+                  f"storing pending start_training for round {round_num} "
+                  f"(will start automatically when model arrives)")
             self.pending_start_training_round = round_num
-            if MODEL_INIT_TIMEOUT is None:
-                print(f"Client {self.client_id} no timeout (wait indefinitely; set MODEL_INIT_TIMEOUT for a limit)")
-                await self.model_ready.wait()
-                print(f"Client {self.client_id} model ready, proceeding with training")
-            else:
-                print(f"Client {self.client_id} using timeout of {MODEL_INIT_TIMEOUT}s (MODEL_INIT_TIMEOUT=0 for no timeout)")
-                try:
-                    await asyncio.wait_for(self.model_ready.wait(), timeout=MODEL_INIT_TIMEOUT)
-                    print(f"Client {self.client_id} model ready, proceeding with training")
-                except asyncio.TimeoutError:
-                    print(f"Client {self.client_id} ERROR: Timeout waiting for model initialization after {MODEL_INIT_TIMEOUT}s")
-                    print(f"Client {self.client_id} TIP: Set MODEL_INIT_TIMEOUT=0 to wait indefinitely")
-                    return
-            self.pending_start_training_round = None
-        
+            return
+
         if self.current_round == 0 and round_num == 1:
             await self._start_training_for_round(round_num)
         elif round_num == self.current_round:
@@ -633,12 +625,15 @@ class FederatedLearningClient:
     async def handle_start_evaluation(self, message):
         """Start evaluation when server signals"""
         round_num = message['round']
-        
-        # Ensure model is ready
+
+        # If the updated global model hasn't arrived yet, defer evaluation.
+        # Do NOT await model_ready while holding _inbound_msg_lock (deadlock risk).
         if not self.model_ready.is_set():
-            print(f"Client {self.client_id} waiting for model before evaluation...")
-            await self.model_ready.wait()
-        
+            print(f"Client {self.client_id}: model not ready for evaluation round {round_num}, deferring...")
+            # model_ready is set (and never cleared) once the very first global model
+            # arrives, so in practice this branch should never trigger after round 1.
+            return
+
         if round_num == self.current_round:
             print(f"Client {self.client_id} starting evaluation for round {round_num}...")
             await self.evaluate_model()

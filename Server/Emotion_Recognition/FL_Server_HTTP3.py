@@ -382,15 +382,16 @@ class FederatedLearningServer:
             import traceback
             traceback.print_exc()
             return
-            
-            # Multiple transmit calls for large messages (improved for poor networks)
-            if len(payload) > 1_000_000:  # > 1MB
-                for _ in range(3):
-                    await asyncio.sleep(0.5)
-                    protocol.transmit()
-            else:
-                # Small delay for flow control
-                await asyncio.sleep(0.1)
+
+        # For large payloads, call transmit() multiple times with short sleeps so QUIC can
+        # drain the send buffer across multiple flow-control windows without relying solely
+        # on the internal timer.
+        if len(payload) > 1_000_000:  # > 1 MB
+            for _ in range(5):
+                await asyncio.sleep(0.3)
+                protocol.transmit()
+        else:
+            await asyncio.sleep(0.05)
     
     async def broadcast_message(self, message):
         """Broadcast message to all registered clients"""
