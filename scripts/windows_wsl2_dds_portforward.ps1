@@ -143,7 +143,7 @@ $client3DataPort = 7419
 Write-Host ""
 Write-Host "  CLIENT_ID=3 SPDP port : $client3SpdpPort  (critical for DDS discovery)" -ForegroundColor Yellow
 Write-Host "  CLIENT_ID=3 data port : $client3DataPort  (needed for model weights)" -ForegroundColor Yellow
-Write-Host "  Relay range           : $StartPort – $EndPort" -ForegroundColor Yellow
+Write-Host "  Relay range           : $StartPort - $EndPort" -ForegroundColor Yellow
 
 # ── Stop existing relay jobs ────────────────────────────────────────────────────
 Write-Host "`nStopping any existing DDS relay jobs..." -ForegroundColor Cyan
@@ -215,7 +215,7 @@ $relayBlock = {
 
 # ── Launch relay jobs ───────────────────────────────────────────────────────────
 Write-Host "`nStarting PowerShell UDP relay jobs..." -ForegroundColor Cyan
-Write-Host "  $WindowsLanIp:<port>  →  $Wsl2Ip:<port>  for ports $StartPort to $EndPort" -ForegroundColor Cyan
+Write-Host "  ${WindowsLanIp}:<port>  ->  ${Wsl2Ip}:<port>  for ports $StartPort to $EndPort" -ForegroundColor Cyan
 
 $started = 0
 for ($port = $StartPort; $port -le $EndPort; $port++) {
@@ -234,55 +234,53 @@ Write-Host "`nVerifying critical ports..." -ForegroundColor Cyan
 foreach ($cp in @($client3SpdpPort, $client3DataPort)) {
     $job = Get-Job -Name "DDS_UDP_$cp" -ErrorAction SilentlyContinue
     if ($job -and $job.State -eq "Running") {
-        Write-Host "  Port $cp : relay job RUNNING  ✓" -ForegroundColor Green
+        Write-Host "  Port $cp : relay job RUNNING  [OK]" -ForegroundColor Green
     } else {
-        Write-Host "  Port $cp : relay job NOT running  ✗ (check if another process holds this port)" -ForegroundColor Red
+        Write-Host "  Port $cp : relay job NOT running  [!!] (check if another process holds this port)" -ForegroundColor Red
     }
 }
 
 # ── Summary ─────────────────────────────────────────────────────────────────────
-Write-Host @"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  DDS UDP relay is ACTIVE for CLIENT_ID=3 (WSL2)
-  Windows LAN IP : $WindowsLanIp
-  WSL2 IP        : $Wsl2Ip
-  Ports relayed  : $StartPort – $EndPort
-  SPDP port 7418 : forwarded  (DDS discovery)
-  Data port 7419 : forwarded  (model weight transfer)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-CHECKLIST before starting the client:
-
-  [Windows — done] Run this script as Administrator  ✓
-
-  [WSL2 / distributed_client_gui.py]
-    1. In the GUI "DDS peer" section:
-         DDS peer — server host   : 192.168.0.102
-         DDS peer — client 1 host : 192.168.0.102
-         DDS peer — client 2 host : 192.168.0.101
-         DDS peer — client 3 host : 192.168.0.100
-    2. Tick   "Running inside WSL2 on Windows (DDS NAT fix)"
-    3. Set    Windows host LAN IP = $WindowsLanIp
-    4. Leave  WSL2 network interface = eth0
-       (confirm with:  ip link  inside WSL2)
-    5. Set    Client ID = 3
-
-  [Ubuntu server — distributed_3pc.env already updated]
-    DDS_PEER_CLIENT2=192.168.0.101  (Linux PC)
-    DDS_PEER_CLIENT3=192.168.0.100  (Windows/WSL2)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Manage jobs:
-  Check  : Get-Job -Name "DDS_UDP_*"
-  Stop   : Get-Job -Name "DDS_UDP_*" | Stop-Job; Get-Job -Name "DDS_UDP_*" | Remove-Job
-
-Re-run after every WSL2 restart (WSL2 IP changes each time).
-
-PERMANENT FIX (Windows 11 22H2+):
-  notepad %USERPROFILE%\.wslconfig
-  Add:  [wsl2]
-        networkingMode=mirrored
-  Then: wsl --shutdown
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"@ -ForegroundColor Cyan
+Write-Host ""
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host "  DDS UDP relay is ACTIVE for CLIENT_ID=3 (WSL2)"               -ForegroundColor Cyan
+Write-Host "  Windows LAN IP : $WindowsLanIp"                               -ForegroundColor Cyan
+Write-Host "  WSL2 IP        : $Wsl2Ip"                                     -ForegroundColor Cyan
+Write-Host "  Ports relayed  : $StartPort - $EndPort"                       -ForegroundColor Cyan
+Write-Host "  SPDP port 7418 : forwarded  (DDS discovery)"                  -ForegroundColor Cyan
+Write-Host "  Data port 7419 : forwarded  (model weight transfer)"          -ForegroundColor Cyan
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "CHECKLIST before starting the client:" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  [Windows - done] Run this script as Administrator  [OK]" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  [WSL2 / distributed_client_gui.py]" -ForegroundColor Yellow
+Write-Host "    1. In the GUI 'DDS peer' section:" -ForegroundColor Yellow
+Write-Host "         DDS peer - server host   : 192.168.0.102" -ForegroundColor Yellow
+Write-Host "         DDS peer - client 1 host : 192.168.0.102" -ForegroundColor Yellow
+Write-Host "         DDS peer - client 2 host : 192.168.0.101" -ForegroundColor Yellow
+Write-Host "         DDS peer - client 3 host : 192.168.0.100" -ForegroundColor Yellow
+Write-Host "    2. Tick   'Running inside WSL2 on Windows (DDS NAT fix)'" -ForegroundColor Yellow
+Write-Host "    3. Set    Windows host LAN IP = $WindowsLanIp" -ForegroundColor Yellow
+Write-Host "    4. Leave  WSL2 network interface = eth0" -ForegroundColor Yellow
+Write-Host "       (confirm with:  ip link  inside WSL2)" -ForegroundColor Yellow
+Write-Host "    5. Set    Client ID = 3" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  [Ubuntu server - distributed_3pc.env already updated]" -ForegroundColor Yellow
+Write-Host "    DDS_PEER_CLIENT2=192.168.0.101  (Linux PC)" -ForegroundColor Yellow
+Write-Host "    DDS_PEER_CLIENT3=192.168.0.100  (Windows/WSL2)" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "================================================================" -ForegroundColor Cyan
+Write-Host "Manage jobs:" -ForegroundColor Cyan
+Write-Host "  Check : Get-Job -Name ""DDS_UDP_*""" -ForegroundColor Cyan
+Write-Host "  Stop  : Get-Job -Name ""DDS_UDP_*"" | Stop-Job; Get-Job -Name ""DDS_UDP_*"" | Remove-Job" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Re-run after every WSL2 restart (WSL2 IP changes each time)." -ForegroundColor Cyan
+Write-Host ""
+Write-Host "PERMANENT FIX (Windows 11 22H2+):" -ForegroundColor Green
+Write-Host "  notepad %USERPROFILE%\.wslconfig" -ForegroundColor Green
+Write-Host "  Add:  [wsl2]" -ForegroundColor Green
+Write-Host "        networkingMode=mirrored" -ForegroundColor Green
+Write-Host "  Then: wsl --shutdown" -ForegroundColor Green
+Write-Host "================================================================" -ForegroundColor Cyan
