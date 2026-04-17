@@ -1735,6 +1735,23 @@ class EnvironmentStateManager:
         # Raw label from client latency/bandwidth classifier (excellent/moderate/poor).
         self.detected_network_scenario: Optional[str] = None
 
+    # ------------------------------------------------------------------
+    # Backward-compatibility: attributes added in later versions that may
+    # be missing on instances running with older code (e.g. remote clients
+    # that have not yet been updated).
+    # ------------------------------------------------------------------
+    _ATTR_DEFAULTS: dict = {
+        "cumulative_energy_j": 0.0,
+        "last_energy_j": 0.0,
+    }
+
+    def __getattr__(self, name: str):
+        if name in EnvironmentStateManager._ATTR_DEFAULTS:
+            val = EnvironmentStateManager._ATTR_DEFAULTS[name]
+            object.__setattr__(self, name, val)
+            return val
+        raise AttributeError(f"'EnvironmentStateManager' object has no attribute '{name!r}'")
+
     def effective_network_scenario_for_q_state(self) -> str:
         """
         Coarse network label for Q-table axis 0.

@@ -3427,7 +3427,7 @@ class UnifiedFLClient_Emotion:
         battery_soc = self.env_manager.battery_soc if (USE_RL_SELECTION and self.env_manager) else 1.0
         battery_soc_before_energy = float(battery_soc)
 
-        cumulative_energy_j = float(self.env_manager.cumulative_energy_j) if (USE_RL_SELECTION and self.env_manager) else 0.0
+        cumulative_energy_j = float(getattr(self.env_manager, 'cumulative_energy_j', 0.0)) if (USE_RL_SELECTION and self.env_manager) else 0.0
         metrics_message = {
             "client_id": self.client_id,
             "round": report_round,
@@ -3532,7 +3532,7 @@ class UnifiedFLClient_Emotion:
                     "battery_energy_joules": float(energy_j_total),
                     "battery_soc_before": float(battery_soc_before_energy),
                     "battery_soc_after": float(battery_soc_after),
-                    "cumulative_battery_energy_joules": float(self.env_manager.cumulative_energy_j) if (USE_RL_SELECTION and self.env_manager) else 0.0,
+                    "cumulative_battery_energy_joules": float(getattr(self.env_manager, 'cumulative_energy_j', 0.0)) if (USE_RL_SELECTION and self.env_manager) else 0.0,
                 },
                 use_case=use_case_from_env("emotion"),
                 protocol=protocol,
