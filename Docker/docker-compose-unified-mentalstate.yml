@@ -48,6 +48,7 @@ services:
       - MQTT_BROKER=mqtt-broker-unified
       - AMQP_BROKER=amqp-broker-unified
       - GRPC_PORT=50051
+      - GRPC_MAX_MESSAGE_BYTES=67108864
       - CONVERGENCE_THRESHOLD=0.001
       - CONVERGENCE_PATIENCE=2
       - MIN_ROUNDS=3
@@ -104,6 +105,7 @@ services:
       - AMQP_BROKER=amqp-broker-unified
       - GRPC_HOST=fl-server-unified-mentalstate
       - GRPC_PORT=50051
+      - GRPC_MAX_MESSAGE_BYTES=67108864
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
@@ -154,6 +156,7 @@ services:
       - AMQP_BROKER=amqp-broker-unified
       - GRPC_HOST=fl-server-unified-mentalstate
       - GRPC_PORT=50051
+      - GRPC_MAX_MESSAGE_BYTES=67108864
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}

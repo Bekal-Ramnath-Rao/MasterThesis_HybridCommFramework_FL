@@ -228,9 +228,11 @@ class UnifiedFLClient_MentalState:
             'success': False
         }
         self.current_round = 0
+        self._total_rounds = 0
         self.selected_downlink_protocol = 'grpc'
         self.initial_global_model_downloaded = False
         self.last_protocol_query_key = None
+        self._registered_with_server = False
         # Downlink RL tracking
         self._last_downlink_rl_state = None
         self._downlink_select_time = None
@@ -409,6 +411,92 @@ class UnifiedFLClient_MentalState:
         stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
         return channel, stub
 
+    def _register_with_server_via_grpc(self) -> bool:
+        """Register this client with the FL server via gRPC (idempotent)."""
+        if self._registered_with_server:
+            return True
+        channel, stub = self._open_grpc_stub()
+        if stub is None:
+            return False
+        try:
+            resp = stub.RegisterClient(
+                federated_learning_pb2.ClientRegistration(client_id=self.client_id)
+            )
+            if resp.success:
+                self._registered_with_server = True
+                print(f"[gRPC] Client {self.client_id} registered with server (msg: {resp.message})")
+                return True
+            print(f"[gRPC] Registration rejected: {resp.message}")
+            return False
+        except Exception as e:
+            print(f"[gRPC] Registration failed: {e}")
+            return False
+        finally:
+            channel.close()
+
+    def _upload_model_via_grpc(self, round_num: int, train_metrics: dict) -> float:
+        """Serialize current model weights and send to server via gRPC SendModelUpdate.
+        Returns elapsed uplink communication time in seconds (0.0 on failure)."""
+        if self.model is None:
+            return 0.0
+        channel, stub = self._open_grpc_stub()
+        if stub is None:
+            return 0.0
+        try:
+            weights_bytes = self.get_model_weights()
+            t0 = time.time()
+            resp = stub.SendModelUpdate(
+                federated_learning_pb2.ModelUpdate(
+                    client_id=self.client_id,
+                    round=round_num,
+                    weights=weights_bytes,
+                    num_samples=int(len(self.y_train)),
+                    metrics={
+                        'val_accuracy': float(train_metrics.get('val_accuracy', 0.0)),
+                        'val_loss':     float(train_metrics.get('val_loss', 0.0)),
+                        'training_time': float(train_metrics.get('training_time', 0.0)),
+                    },
+                    chunk_index=0,
+                    total_chunks=1,
+                )
+            )
+            comm_time = time.time() - t0
+            print(f"[gRPC] Model uploaded (round={round_num}, {comm_time:.2f}s): {resp.message}")
+            return comm_time
+        except Exception as e:
+            print(f"[gRPC] Model upload failed (round={round_num}): {e}")
+            return 0.0
+        finally:
+            channel.close()
+
+    def _wait_and_apply_global_model_via_grpc(self, target_round: int, timeout: int = 180) -> bool:
+        """Poll server until it has a global model for target_round, then apply it.
+        Returns True if the model was successfully downloaded and applied."""
+        channel, stub = self._open_grpc_stub()
+        if stub is None:
+            return False
+        deadline = time.time() + timeout
+        try:
+            while time.time() < deadline:
+                try:
+                    response = stub.GetGlobalModel(
+                        federated_learning_pb2.ModelRequest(
+                            client_id=self.client_id, round=target_round, chunk_index=0
+                        )
+                    )
+                    if response.available and response.weights and response.round >= target_round:
+                        self.set_model_weights(response.weights)
+                        self.initial_global_model_downloaded = True
+                        print(f"[gRPC] Applied global model (server round={response.round})")
+                        return True
+                except Exception as e:
+                    print(f"[gRPC] GetGlobalModel error (target={target_round}): {e}")
+                time.sleep(2.0)
+            print(f"[gRPC] Timed out waiting for global model (target_round={target_round})")
+            return False
+        finally:
+            channel.close()
+
     def _select_downlink_protocol(self, round_id: int, global_model_id: int) -> str:
         # First global model bootstrap is always forced to gRPC.
         if round_id <= 1 or global_model_id <= 1 or not self.initial_global_model_downloaded:
@@ -480,22 +568,10 @@ class UnifiedFLClient_MentalState:
             channel.close()
 
     def _ensure_initial_global_model_via_grpc(self):
+        """Download and apply the initial global model (round 0) from the server."""
         if self.initial_global_model_downloaded:
             return
-        channel, stub = self._open_grpc_stub()
-        if stub is None:
-            return
-        try:
-            response = stub.GetGlobalModel(
-                federated_learning_pb2.ModelRequest(client_id=self.client_id, round=0, chunk_index=0)
-            )
-            if response.available and response.weights:
-                self.initial_global_model_downloaded = True
-                print(f"[gRPC] Client {self.client_id} downloaded initial global model via gRPC")
-        except Exception as e:
-            print(f"[gRPC] Client {self.client_id} initial global model download failed: {e}")
-        finally:
-            channel.close()
+        self._wait_and_apply_global_model_via_grpc(target_round=0, timeout=180)
 
     def train_local_model(self) -> Dict:
         """Train model locally using real EEG data"""
@@ -623,11 +699,20 @@ class UnifiedFLClient_MentalState:
             # Train locally
             print(f"[Training] Starting local training...")
             train_metrics = self.train_local_model()
-            
+
+            # ---- Uplink: upload model to server via gRPC and record communication time ----
+            comm_time = self._upload_model_via_grpc(self.current_round, train_metrics)
+
+            # ---- Downlink: wait for server to aggregate and broadcast new global model ----
+            next_round = self.current_round + 1
+            if next_round <= self._total_rounds:
+                self._wait_and_apply_global_model_via_grpc(target_round=next_round, timeout=180)
+
             # Update metrics
             round_time = time.time() - round_start
             self.round_metrics['convergence_time'] = train_metrics['training_time']
             self.round_metrics['accuracy'] = train_metrics['val_accuracy']
+            self.round_metrics['communication_time'] = comm_time
             self.round_metrics['success'] = True
             
             # Q-learning updates only while exploring (USE_RL_EXPLORATION); inference is greedy-only, frozen Q.
@@ -719,16 +804,32 @@ class UnifiedFLClient_MentalState:
         print(f"\n{'='*70}")
         print(f"STARTING FEDERATED LEARNING - {num_rounds} ROUNDS")
         print(f"{'='*70}\n")
-        
-        for round_num in range(num_rounds):
+
+        self._total_rounds = num_rounds
+
+        # Register with server before starting (retry for up to 60 s)
+        print("[gRPC] Registering with FL server...")
+        for attempt in range(30):
+            if self._register_with_server_via_grpc():
+                break
+            print(f"[gRPC] Registration attempt {attempt + 1}/30 failed, retrying in 2s...")
+            time.sleep(2.0)
+        else:
+            print("[gRPC] Could not register with server – proceeding in stand-alone mode")
+
+        # Wait for server to start training and deliver the initial global model
+        print("[gRPC] Waiting for initial global model from server...")
+        self._ensure_initial_global_model_via_grpc()
+
+        for round_num in range(1, num_rounds + 1):
             self.current_round = round_num
             print(f"\n{'#'*70}")
-            print(f"# ROUND {round_num + 1}/{num_rounds}")
+            print(f"# ROUND {round_num}/{num_rounds}")
             print(f"{'#'*70}\n")
             
             metrics = self.federated_learning_round()
             
-            print(f"\n[Round {round_num + 1}] Metrics:")
+            print(f"\n[Round {round_num}] Metrics:")
             for key, value in metrics.items():
                 print(f"  {key}: {value}")
             

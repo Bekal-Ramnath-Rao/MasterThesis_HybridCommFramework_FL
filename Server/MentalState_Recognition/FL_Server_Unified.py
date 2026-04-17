@@ -138,26 +138,50 @@ class UnifiedFederatedLearningServer:
         self.initialize_global_model()
         
         print(f"\n{'='*70}")
-        print(f"UNIFIED FEDERATED LEARNING SERVER - EMOTION RECOGNITION")
+        print(f"UNIFIED FEDERATED LEARNING SERVER - MENTAL STATE RECOGNITION")
         print(f"{'='*70}")
         print(f"Clients Expected: {self.num_clients}")
         print(f"Max Rounds: {self.num_rounds}")
-        print(f"Protocols: MQTT, AMQP, gRPC, QUIC, DDS")
+        print(f"Protocols: MQTT, AMQP, gRPC, QUIC, HTTP/3, DDS")
         print(f"{'='*70}\n")
     
     def initialize_global_model(self):
-        """Initialize global model weights (mentalstate recognition CNN)"""
-        # Simple initialization - clients will have actual trained weights
-        # This creates a structure that matches the CNN architecture
-        self.global_weights = {
-            'conv1': np.random.randn(3, 3, 1, 32) * 0.01,
-            'conv2': np.random.randn(3, 3, 32, 64) * 0.01,
-            'conv3': np.random.randn(3, 3, 64, 128) * 0.01,
-            'conv4': np.random.randn(3, 3, 128, 128) * 0.01,
-            'dense1': np.random.randn(6272, 1024) * 0.01,  # After flatten
-            'dense2': np.random.randn(1024, 7) * 0.01  # 7 mentalstates
-        }
-        print("[Model] Global model initialized")
+        """Initialize global model weights using the actual mentalstate CNN+BiLSTM+MHA architecture."""
+        import tensorflow as tf
+        try:
+            _server_dir = os.path.dirname(os.path.abspath(__file__))
+            if _server_dir not in sys.path:
+                sys.path.insert(0, _server_dir)
+            from FL_Server_MQTT import build_model as _build_ms_model
+            _model = _build_ms_model()
+            self.global_weights = _model.get_weights()
+            print(f"[Model] Global model initialized (CNN+BiLSTM+MHA, {len(self.global_weights)} weight tensors)")
+        except Exception as e:
+            print(f"[Model] Could not load mentalstate build_model ({e}); falling back to random weights")
+            # Fallback: build the architecture inline so weight shapes are always correct
+            inp = tf.keras.Input(shape=(256, 20))
+            x = tf.keras.layers.Conv1D(64, 7, padding="same", use_bias=False)(inp)
+            x = tf.keras.layers.BatchNormalization()(x)
+            x = tf.keras.layers.ReLU()(x)
+            x = tf.keras.layers.MaxPooling1D(2)(x)
+            x = tf.keras.layers.Conv1D(128, 5, padding="same", use_bias=False)(x)
+            x = tf.keras.layers.BatchNormalization()(x)
+            x = tf.keras.layers.ReLU()(x)
+            x = tf.keras.layers.Bidirectional(
+                tf.keras.layers.LSTM(64, return_sequences=True, dropout=0.25)
+            )(x)
+            attn = tf.keras.layers.MultiHeadAttention(num_heads=4, key_dim=32, dropout=0.1)(x, x)
+            x = tf.keras.layers.Add()([x, attn])
+            x = tf.keras.layers.LayerNormalization()(x)
+            x = tf.keras.layers.GlobalAveragePooling1D()(x)
+            x = tf.keras.layers.Dense(256, activation="relu")(x)
+            x = tf.keras.layers.Dropout(0.4)(x)
+            x = tf.keras.layers.Dense(128, activation="relu")(x)
+            x = tf.keras.layers.Dropout(0.35)(x)
+            out = tf.keras.layers.Dense(5, activation="softmax", dtype="float32")(x)
+            _model = tf.keras.Model(inp, out)
+            self.global_weights = _model.get_weights()
+            print(f"[Model] Global model initialized via fallback ({len(self.global_weights)} weight tensors)")
     
     def start_mqtt_server(self):
         """Start MQTT protocol handler"""
@@ -198,11 +222,24 @@ class UnifiedFederatedLearningServer:
             print(f"[MQTT] Error handling message: {e}")
     
     def start_amqp_server(self):
-        """Start AMQP protocol handler"""
+        """Start AMQP protocol handler (with retry for broker startup delay)"""
+        max_retries = 10
+        retry_delay = 3
+        connection = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                connection = pika.BlockingConnection(
+                    pika.ConnectionParameters(host=AMQP_BROKER, connection_attempts=1, retry_delay=0)
+                )
+                break
+            except Exception as e:
+                print(f"[AMQP] Connection attempt {attempt}/{max_retries} failed: {e}")
+                if attempt < max_retries:
+                    time.sleep(retry_delay)
+        if connection is None:
+            print("[AMQP] Could not connect to broker after retries; AMQP disabled")
+            return
         try:
-            connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=AMQP_BROKER)
-            )
             channel = connection.channel()
             
             channel.exchange_declare(exchange='fl_client_updates', exchange_type='direct', durable=True)
@@ -350,12 +387,15 @@ class UnifiedFederatedLearningServer:
         print(f"ROUND {self.current_round}/{self.num_rounds}")
         print(f"{'='*70}")
         
-        # Aggregate weights (FedAvg)
-        aggregated_weights = {}
-        for key in self.global_weights.keys():
-            weights_list = [update['weights'][key] for update in self.client_updates.values()]
-            aggregated_weights[key] = np.mean(weights_list, axis=0)
-        
+        # Aggregate weights (FedAvg) — global_weights is a list of numpy arrays
+        updates_list = [update['weights'] for update in self.client_updates.values()]
+        if isinstance(self.global_weights, list) and updates_list:
+            aggregated_weights = [
+                np.mean([upd[i] for upd in updates_list], axis=0)
+                for i in range(len(self.global_weights))
+            ]
+        else:
+            aggregated_weights = self.global_weights
         self.global_weights = aggregated_weights
         
         # Aggregate metrics (clients may report val_* keys)
@@ -601,7 +641,20 @@ if GRPC_PROTO_AVAILABLE:
             return federated_learning_pb2.ProtocolSelectionResponse(success=True, message='recorded')
 
         def SendModelUpdate(self, request, context):
-            return federated_learning_pb2.UpdateResponse(success=False, message='not implemented in this unified mode')
+            try:
+                payload = {
+                    'client_id': request.client_id,
+                    'round':     request.round,
+                    # handle_client_update expects base64-encoded pickle bytes
+                    'weights':   base64.b64encode(request.weights).decode('utf-8'),
+                    'metrics':   dict(request.metrics),
+                    'num_samples': request.num_samples,
+                }
+                self.server.handle_client_update(payload, 'grpc')
+                return federated_learning_pb2.UpdateResponse(success=True, message='ok')
+            except Exception as e:
+                print(f"[gRPC] SendModelUpdate error: {e}")
+                return federated_learning_pb2.UpdateResponse(success=False, message=str(e))
 
         def SendMetrics(self, request, context):
             return federated_learning_pb2.MetricsResponse(success=False, message='not implemented in this unified mode')
