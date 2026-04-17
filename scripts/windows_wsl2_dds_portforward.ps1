@@ -1,154 +1,288 @@
 <#
 .SYNOPSIS
-    Forward DDS/CycloneDDS UDP ports from the Windows host NIC into the WSL2 instance.
+    Forward DDS/CycloneDDS UDP ports from the Windows host NIC into a WSL2 instance.
+    Tailored for CLIENT_ID=3 (SPDP port 7418, data port 7419) but covers the full
+    DDS port range so discovery and model-weight transfer both work.
 
 .DESCRIPTION
-    WSL2 uses a virtual NAT network.  Docker containers started with --network host
-    inside WSL2 bind to the WSL2 virtual IP (e.g. 172.x.x.x), NOT to the Windows host
-    LAN IP (e.g. 192.168.0.100).  This means:
+    ── Why this script is needed ──────────────────────────────────────────────────
+    Running "ifconfig" inside WSL2 shows the internal virtual IP (e.g. 172.29.13.112).
+    Running "ipconfig" on Windows shows the real LAN IP  (e.g. 192.168.0.100).
 
-      1. CycloneDDS advertises the unreachable 172.x.x.x address as its RTPS locator.
-         Fix → set  DDS_EXTERNAL_NETWORK_ADDRESS=<Windows-LAN-IP>  so Cyclone
-         advertises a reachable address (the distributed_client_gui.py WSL2 mode does
-         this automatically).
+    Docker --network host inside WSL2 binds to the WSL2 virtual IP, NOT the Windows
+    LAN IP.  This breaks CycloneDDS discovery in two ways:
 
-      2. SPDP discovery packets sent to <Windows-LAN-IP>:7412-7418 by the server and
-         other clients arrive at the Windows NIC but are never forwarded to WSL2.
-         Fix → this script sets up socat-based UDP relays inside WSL2.
+      Problem 1 — wrong advertised locator
+        CycloneDDS advertises 172.29.13.112 as its RTPS address.
+        The FL server (192.168.0.102) tries to send to 172.29.13.112 which is
+        unreachable from the LAN.
+        FIX → set  DDS_EXTERNAL_NETWORK_ADDRESS=192.168.0.100  in the container so
+        CycloneDDS advertises the reachable Windows LAN IP.
+        The distributed_client_gui.py "WSL2 mode" checkbox does this automatically.
 
-    REQUIREMENTS
-    ────────────
-    • WSL2 with the distro you use for Docker  (Ubuntu, Debian, …)
-    • socat installed inside that distro  →  sudo apt install -y socat
-    • This script must be run as Administrator in PowerShell on the Windows host.
+      Problem 2 — inbound UDP never reaches WSL2
+        When the server sends SPDP/RTPS to 192.168.0.100:7418 (CLIENT_ID=3 SPDP port)
+        the packet arrives at the Windows NIC but Windows does NOT automatically
+        forward UDP to WSL2 at 172.29.13.112.
+        FIX → this script creates PowerShell background jobs that bind on the Windows
+        LAN IP and forward every received datagram into the WSL2 instance.
 
-    ALTERNATIVE (Windows 11 22H2+, recommended)
-    ────────────────────────────────────────────
-    Enable WSL2 mirrored networking in  %USERPROFILE%\.wslconfig :
+    ── Port assignment for CLIENT_ID=3 ───────────────────────────────────────────
+    CycloneDDS port formula (Domain 0, ParticipantIndex = ClientID + 1):
+      CLIENT_ID=3  →  ParticipantIndex=4
+      SPDP (meta unicast) : 7410 + 2 * 4 = 7418   ← critical for discovery
+      Data (user unicast) : 7411 + 2 * 4 = 7419   ← needed for model weights
+    The script relays 7400–7500 so both ports and any ephemeral RTPS ports are covered.
 
+    ── Network layout (distributed_3pc.env) ──────────────────────────────────────
+      192.168.0.102  Server + Client1  (Ubuntu)
+      192.168.0.101  Client2           (Linux PC)
+      192.168.0.100  Client3           (Windows/WSL2)  ← this machine
+
+    ── Recommended permanent fix (Windows 11 22H2+) ─────────────────────────────
+    Add to  %USERPROFILE%\.wslconfig  then run  wsl --shutdown :
         [wsl2]
         networkingMode=mirrored
+    WSL2 will share the Windows network stack and see 192.168.0.100 directly.
+    No relay script needed after that.
 
-    Then restart WSL2:  wsl --shutdown
-    With mirrored networking WSL2 shares the Windows host's network stack, so the
-    container sees 192.168.0.100 directly — no port-forwarding script needed.
+.PARAMETER WindowsLanIp
+    Windows host LAN IP (default: auto-detected).  Example: 192.168.0.100
+
+.PARAMETER Wsl2Ip
+    WSL2 instance IP (default: auto-detected from wsl hostname -I).
+    Run "ifconfig" inside WSL2 to find it.  Example: 172.29.13.112
 
 .PARAMETER WslDistro
-    Name of the WSL2 distro to use (default: default WSL distro).
+    Name of the WSL2 distro (default: default distro).
 
-.PARAMETER DdsPorts
-    Comma-separated list of UDP ports to relay.  Defaults to the SPDP ports for
-    participants 1-4 (server=7412, client1=7414, client2=7416, client3=7418) plus
-    the base RTPS discovery port 7400 and the RTPS user-data range 7401-7430.
-    Widen the range if you see "unreachable locator" warnings in Cyclone logs.
+.PARAMETER StartPort
+    First UDP port to relay (default: 7400).
+
+.PARAMETER EndPort
+    Last UDP port to relay (default: 7500).
 
 .EXAMPLE
-    # Relay default DDS ports into the default WSL2 distro (run as Administrator):
+    # Auto-detect IPs (run as Administrator):
     .\windows_wsl2_dds_portforward.ps1
 
 .EXAMPLE
-    # Specify a distro and only the SPDP ports:
-    .\windows_wsl2_dds_portforward.ps1 -WslDistro Ubuntu-22.04 -DdsPorts "7412,7414,7416,7418"
+    # Explicit IPs — use these when auto-detect picks the wrong NIC:
+    .\windows_wsl2_dds_portforward.ps1 -WindowsLanIp 192.168.0.100 -Wsl2Ip 172.29.13.112
 
 .NOTES
-    To stop all relays:  wsl -d <distro> -- pkill socat
-    To list relays:      wsl -d <distro> -- pgrep -a socat
+    Must be run as Administrator.
+    Re-run after every WSL2 restart (WSL2 IP changes on restart).
+
+    Check running jobs :  Get-Job -Name "DDS_UDP_*"
+    Stop all relay jobs:  Get-Job -Name "DDS_UDP_*" | Stop-Job; Get-Job -Name "DDS_UDP_*" | Remove-Job
 #>
 
 param(
-    [string]$WslDistro   = "",
-    [string]$DdsPorts    = "7400,7401,7402,7403,7404,7405,7406,7407,7408,7409,7410,7411,7412,7413,7414,7415,7416,7417,7418,7419,7420,7421,7422,7423,7424,7425,7426,7427,7428,7429,7430"
+    [string]$WindowsLanIp = "",
+    [string]$Wsl2Ip       = "",
+    [string]$WslDistro    = "",
+    [int]   $StartPort    = 7400,
+    [int]   $EndPort      = 7500
 )
 
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
 # ── Require Administrator ───────────────────────────────────────────────────────
-$currentPrincipal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
-if (-not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+$principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Error "This script must be run as Administrator. Re-launch PowerShell with 'Run as Administrator'."
     exit 1
 }
 
-# ── Resolve WSL2 distro ─────────────────────────────────────────────────────────
+# ── WSL distro arg ──────────────────────────────────────────────────────────────
 $wslArgs = if ($WslDistro) { @("-d", $WslDistro) } else { @() }
 
-# ── Detect WSL2 IP ──────────────────────────────────────────────────────────────
-Write-Host "Detecting WSL2 IP address..." -ForegroundColor Cyan
-$wsl2Ip = (wsl @wslArgs -- hostname -I 2>$null).Trim().Split(" ")[0]
-if (-not $wsl2Ip) {
-    Write-Error "Could not determine WSL2 IP.  Is WSL2 running?  Try: wsl --list --running"
+# ── Detect / validate WSL2 IP ──────────────────────────────────────────────────
+if ($Wsl2Ip) {
+    Write-Host "Using provided WSL2 IP: $Wsl2Ip" -ForegroundColor Cyan
+} else {
+    Write-Host "Detecting WSL2 IP address..." -ForegroundColor Cyan
+    $raw = (wsl @wslArgs -- hostname -I 2>$null)
+    if ($raw) { $Wsl2Ip = $raw.Trim().Split(" ")[0] }
+}
+if (-not $Wsl2Ip) {
+    Write-Error "Could not determine WSL2 IP. Pass it explicitly: -Wsl2Ip 172.29.13.112`nRun 'ifconfig' inside WSL2 to find it."
     exit 1
 }
-Write-Host "  WSL2 IP: $wsl2Ip" -ForegroundColor Green
+Write-Host "  WSL2 IP      : $Wsl2Ip" -ForegroundColor Green
 
-# ── Detect Windows host LAN IP (first non-loopback, non-WSL IPv4) ──────────────
-$windowsIp = (
-    Get-NetIPAddress -AddressFamily IPv4 |
-    Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "172.*" -and $_.InterfaceAlias -notlike "*WSL*" -and $_.InterfaceAlias -notlike "*Loopback*" } |
-    Sort-Object -Property PrefixLength |
-    Select-Object -First 1
-).IPAddress
-Write-Host "  Windows LAN IP: $windowsIp" -ForegroundColor Green
-
-# ── Check / install socat ───────────────────────────────────────────────────────
-Write-Host "`nChecking socat inside WSL2..." -ForegroundColor Cyan
-$socatCheck = wsl @wslArgs -- which socat 2>$null
-if (-not $socatCheck) {
-    Write-Host "  socat not found — installing..." -ForegroundColor Yellow
-    wsl @wslArgs -- sudo apt-get install -y socat
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error "Failed to install socat inside WSL2.  Install it manually: sudo apt install -y socat"
-        exit 1
-    }
+# ── Detect / validate Windows LAN IP ───────────────────────────────────────────
+if ($WindowsLanIp) {
+    Write-Host "Using provided Windows LAN IP: $WindowsLanIp" -ForegroundColor Cyan
+} else {
+    Write-Host "Detecting Windows LAN IP..." -ForegroundColor Cyan
+    $WindowsLanIp = (
+        Get-NetIPAddress -AddressFamily IPv4 |
+        Where-Object {
+            $_.IPAddress -notlike "127.*"     -and
+            $_.IPAddress -notlike "169.254.*" -and
+            $_.IPAddress -notlike "172.*"     -and
+            $_.InterfaceAlias -notlike "*Loopback*" -and
+            $_.InterfaceAlias -notlike "*WSL*"
+        } |
+        Sort-Object PrefixLength |
+        Select-Object -First 1
+    ).IPAddress
 }
-Write-Host "  socat OK." -ForegroundColor Green
+if (-not $WindowsLanIp) {
+    Write-Error "Could not auto-detect Windows LAN IP. Pass it: -WindowsLanIp 192.168.0.100"
+    exit 1
+}
+Write-Host "  Windows LAN  : $WindowsLanIp" -ForegroundColor Green
 
-# ── Kill any existing socat DDS relays ─────────────────────────────────────────
-Write-Host "`nStopping any existing DDS socat relays in WSL2..." -ForegroundColor Cyan
-wsl @wslArgs -- bash -c "pkill -f 'socat.*UDP' 2>/dev/null; echo done" | Out-Null
+# ── Port range info ─────────────────────────────────────────────────────────────
+$client3SpdpPort = 7418
+$client3DataPort = 7419
+Write-Host ""
+Write-Host "  CLIENT_ID=3 SPDP port : $client3SpdpPort  (critical for DDS discovery)" -ForegroundColor Yellow
+Write-Host "  CLIENT_ID=3 data port : $client3DataPort  (needed for model weights)" -ForegroundColor Yellow
+Write-Host "  Relay range           : $StartPort – $EndPort" -ForegroundColor Yellow
 
-# ── Open Windows Firewall for incoming DDS UDP ─────────────────────────────────
-$portList = $DdsPorts -replace ",", ","    # already comma-separated
-Write-Host "`nAdding Windows Firewall rule for DDS UDP ports ($portList)..." -ForegroundColor Cyan
-$ruleName = "CycloneDDS_WSL2_UDP"
-netsh advfirewall firewall delete rule name=$ruleName | Out-Null
+# ── Stop existing relay jobs ────────────────────────────────────────────────────
+Write-Host "`nStopping any existing DDS relay jobs..." -ForegroundColor Cyan
+$existing = Get-Job -Name "DDS_UDP_*" -ErrorAction SilentlyContinue
+if ($existing) {
+    $existing | Stop-Job
+    $existing | Remove-Job -Force
+    Write-Host "  Stopped $($existing.Count) existing job(s)." -ForegroundColor Yellow
+} else {
+    Write-Host "  None running." -ForegroundColor Gray
+}
+
+# ── Windows Firewall rule ───────────────────────────────────────────────────────
+Write-Host "`nUpdating Windows Firewall rule for DDS UDP $StartPort-$EndPort ..." -ForegroundColor Cyan
+$ruleName = "CycloneDDS_WSL2_CLIENT3_UDP"
+netsh advfirewall firewall delete rule name=$ruleName 2>$null | Out-Null
 netsh advfirewall firewall add rule `
     name=$ruleName `
     dir=in `
     action=allow `
     protocol=UDP `
-    localport=$portList `
-    description="Allow CycloneDDS SPDP/RTPS UDP traffic for WSL2 port-forwarding" | Out-Null
-Write-Host "  Firewall rule '$ruleName' added." -ForegroundColor Green
+    localport="${StartPort}-${EndPort}" `
+    description="CycloneDDS SPDP/RTPS UDP relay for WSL2 CLIENT_ID=3" | Out-Null
+Write-Host "  Firewall rule '$ruleName' added (UDP $StartPort-$EndPort inbound)." -ForegroundColor Green
 
-# ── Start socat relays inside WSL2 ─────────────────────────────────────────────
-Write-Host "`nStarting UDP relays: Windows $windowsIp → WSL2 $wsl2Ip" -ForegroundColor Cyan
-$ports = $DdsPorts.Split(",") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
+# ── UDP relay script block ─────────────────────────────────────────────────────
+# Each background job:
+#   1. Binds a UdpClient on <WindowsLanIp>:<port>  — catches packets from the server
+#      and other LAN clients that send to the Windows host IP.
+#   2. Forwards every datagram to <Wsl2Ip>:<port>  — delivers it to CycloneDDS
+#      running inside WSL2 (Docker --network host).
+#   3. Skips datagrams whose source is already the WSL2 IP to prevent relay loops.
+#
+# Why NOT socat: socat inside WSL2 can only bind to the WSL2 virtual IP
+# (172.x.x.x). Packets sent to the Windows LAN IP (192.168.0.100) never reach
+# the WSL2 socat process — Windows has no route to forward them. PowerShell
+# UdpClient runs on the Windows side and CAN bind to 192.168.0.100 directly.
 
-foreach ($port in $ports) {
-    $socatCmd = "nohup socat UDP4-RECVFROM:${port},bind=${wsl2Ip},reuseaddr,fork UDP4-SENDTO:localhost:${port} </dev/null >/tmp/socat_dds_${port}.log 2>&1 &"
-    wsl @wslArgs -- bash -c $socatCmd
+$relayBlock = {
+    param([string]$WinIp, [string]$Wsl2, [int]$Port)
+    try {
+        $winEp  = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($WinIp), $Port)
+        $wsl2Ep = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Parse($Wsl2),  $Port)
+        $udp    = [System.Net.Sockets.UdpClient]::new()
+        $udp.Client.SetSocketOption(
+            [System.Net.Sockets.SocketOptionLevel]::Socket,
+            [System.Net.Sockets.SocketOptionName]::ReuseAddress, $true)
+        $udp.Client.Bind($winEp)
+        $udp.Client.ReceiveTimeout = 500   # ms — allows clean shutdown
+
+        while ($true) {
+            try {
+                $remoteEp = [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Any, 0)
+                $data = $udp.Receive([ref]$remoteEp)
+                # Forward only if sender is NOT the WSL2 instance (avoid echo loops)
+                if ($remoteEp.Address.ToString() -ne $Wsl2) {
+                    $fwd = [System.Net.Sockets.UdpClient]::new()
+                    [void]$fwd.Send($data, $data.Length, $wsl2Ep)
+                    $fwd.Close()
+                }
+            } catch [System.Net.Sockets.SocketException] {
+                # ReceiveTimeout fired — loop back and wait again
+            }
+        }
+    } finally {
+        if ($null -ne $udp) { $udp.Close() }
+    }
 }
-Write-Host "  Started $($ports.Count) UDP relays." -ForegroundColor Green
 
-# ── netsh portproxy note (TCP only, for reference) ─────────────────────────────
+# ── Launch relay jobs ───────────────────────────────────────────────────────────
+Write-Host "`nStarting PowerShell UDP relay jobs..." -ForegroundColor Cyan
+Write-Host "  $WindowsLanIp:<port>  →  $Wsl2Ip:<port>  for ports $StartPort to $EndPort" -ForegroundColor Cyan
+
+$started = 0
+for ($port = $StartPort; $port -le $EndPort; $port++) {
+    Start-Job -Name "DDS_UDP_$port" `
+              -ScriptBlock $relayBlock `
+              -ArgumentList $WindowsLanIp, $Wsl2Ip, $port | Out-Null
+    $started++
+}
+Write-Host "  $started relay job(s) started." -ForegroundColor Green
+
+# Give jobs a moment to bind their sockets
+Start-Sleep -Milliseconds 800
+
+# ── Verify the two critical ports are bound ────────────────────────────────────
+Write-Host "`nVerifying critical ports..." -ForegroundColor Cyan
+foreach ($cp in @($client3SpdpPort, $client3DataPort)) {
+    $job = Get-Job -Name "DDS_UDP_$cp" -ErrorAction SilentlyContinue
+    if ($job -and $job.State -eq "Running") {
+        Write-Host "  Port $cp : relay job RUNNING  ✓" -ForegroundColor Green
+    } else {
+        Write-Host "  Port $cp : relay job NOT running  ✗ (check if another process holds this port)" -ForegroundColor Red
+    }
+}
+
+# ── Summary ─────────────────────────────────────────────────────────────────────
 Write-Host @"
 
-NOTE: Windows 'netsh interface portproxy' only supports TCP — DDS uses UDP.
-The socat relays above handle UDP forwarding.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  DDS UDP relay is ACTIVE for CLIENT_ID=3 (WSL2)
+  Windows LAN IP : $WindowsLanIp
+  WSL2 IP        : $Wsl2Ip
+  Ports relayed  : $StartPort – $EndPort
+  SPDP port 7418 : forwarded  (DDS discovery)
+  Data port 7419 : forwarded  (model weight transfer)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-To verify relays are running inside WSL2:
-  wsl $(@($wslArgs) -join ' ') -- pgrep -a socat
+CHECKLIST before starting the client:
 
-To stop all relays:
-  wsl $(@($wslArgs) -join ' ') -- pkill socat
+  [Windows — done] Run this script as Administrator  ✓
 
-ALTERNATIVE (Windows 11 22H2+ — no script needed):
-  Add the following to %USERPROFILE%\.wslconfig and run 'wsl --shutdown':
+  [WSL2 / distributed_client_gui.py]
+    1. In the GUI "DDS peer" section:
+         DDS peer — server host   : 192.168.0.102
+         DDS peer — client 1 host : 192.168.0.102
+         DDS peer — client 2 host : 192.168.0.101
+         DDS peer — client 3 host : 192.168.0.100
+    2. Tick   "Running inside WSL2 on Windows (DDS NAT fix)"
+    3. Set    Windows host LAN IP = $WindowsLanIp
+    4. Leave  WSL2 network interface = eth0
+       (confirm with:  ip link  inside WSL2)
+    5. Set    Client ID = 3
 
-    [wsl2]
-    networkingMode=mirrored
+  [Ubuntu server — distributed_3pc.env already updated]
+    DDS_PEER_CLIENT2=192.168.0.101  (Linux PC)
+    DDS_PEER_CLIENT3=192.168.0.100  (Windows/WSL2)
 
-  Mirrored networking gives WSL2 the same IP as the Windows host, so DDS
-  discovery works across the LAN without any port-forwarding.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Manage jobs:
+  Check  : Get-Job -Name "DDS_UDP_*"
+  Stop   : Get-Job -Name "DDS_UDP_*" | Stop-Job; Get-Job -Name "DDS_UDP_*" | Remove-Job
+
+Re-run after every WSL2 restart (WSL2 IP changes each time).
+
+PERMANENT FIX (Windows 11 22H2+):
+  notepad %USERPROFILE%\.wslconfig
+  Add:  [wsl2]
+        networkingMode=mirrored
+  Then: wsl --shutdown
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 "@ -ForegroundColor Cyan
-
-Write-Host "`nDone. CycloneDDS UDP relay is active." -ForegroundColor Green
