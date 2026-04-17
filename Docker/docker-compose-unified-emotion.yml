@@ -3,7 +3,8 @@
 # DDS matches docker-compose-emotion.yml (fl-server-dds-emotion / fl-client-dds-emotion-*):
 # - network_mode: host, cap_add NET_ADMIN, DDS_DOMAIN_ID=0, same DDS_PEER_* / DDS_SPDP_*.
 # - Do not set CYCLONEDDS_URI: config/dds_distributed_unicast.py writes
-#   file:///tmp/cyclonedds-distributed-*.xml (SPDP domain 0: PI1=7412, PI2=7414, PI3=7416).
+#   file:///tmp/cyclonedds-distributed-*.xml
+#   SPDP ports domain 0: server PI1=7412, client1 PI2=7414, client2 PI3=7416, client3 PI4=7418.
 # Cyclone RTPS needs the host UDP port range; Docker bridge + mapping only SPDP ports breaks DDS
 # — use docker-compose-unified-emotion.bridge.yml only without DDS, or switch fully to this file.
 # run_network_experiments.py selects this file for rl_unified in all network modes.
@@ -11,24 +12,28 @@
 # Brokers listen on the host: MQTT 1883, AMQP 5672 (and 15672 for Rabbit UI). Server binds gRPC/QUIC/HTTP3
 # on all interfaces; clients use UNIFIED_FL_SERVER_HOST for control/data plane (default 127.0.0.1).
 #
-# --- Same-machine testing ---
-# Set DDS_PEER_SERVER and DDS_PEER_CLIENT1 to the host's actual LAN IP (e.g. 192.168.1.100),
-# NOT 127.0.0.1.  Using the loopback address causes Cyclone to pick the wrong locator and prevents
-# SPDP packets from being routed between participants.  Example:
-#   export DDS_PEER_SERVER=192.168.1.100 DDS_PEER_CLIENT1=192.168.1.100 DDS_PEER_CLIENT2=192.168.1.100
-#   docker compose -f Docker/docker-compose-unified-emotion.yml up
-# If both clients are on the same machine as the server, set all three to that machine's LAN IP.
+# --- 3-PC distributed setup (192.168.0.x network) ---
+# PC1 (server + client1): 192.168.0.102
+# PC2 (client2, Windows):  192.168.0.100
+# PC3 (client3, Linux):    192.168.0.101
 #
-# --- Second client on another PC (DDS + unified protocols) ---
-# 1) On the FL server PC: set DDS_PEER_* / DDS_SPDP_* to real LAN IPs (server, client1, client2) and
-#    start brokers + server + local client(s) as usual (docker compose up).
-# 2) On the remote PC: export the same DDS_PEER_* / DDS_SPDP_* (client2 = this machine's LAN IP),
-#    set UNIFIED_FL_SERVER_HOST to the server PC's LAN IP, open its firewall for MQTT 1883, AMQP 5672,
-#    TCP 50051, UDP 4433/4434, and DDS UDP (roughly 7400–7500 plus SPDP 7412/7414/7416 — see
-#    config/dds_distributed_unicast.py). Mount the same certs/ and Dataset; sync shared_data if you
-#    need shared Q-tables/metrics (e.g. NFS).
-# 3) Start only the remote client without pulling server/brokers from this file:
-#    docker compose -f Docker/docker-compose-unified-emotion.yml up --no-deps fl-client-unified-emotion-2
+# On the server PC (192.168.0.102), export before running:
+#   export DDS_PEER_SERVER=192.168.0.102
+#   export DDS_PEER_CLIENT1=192.168.0.102
+#   export DDS_PEER_CLIENT2=192.168.0.100
+#   export DDS_PEER_CLIENT3=192.168.0.101
+#   export UNIFIED_FL_SERVER_HOST=192.168.0.102
+#   docker compose -f Docker/docker-compose-unified-emotion.yml up -d \
+#     mqtt-broker-unified amqp-broker-unified fl-server-unified-emotion fl-client-unified-emotion-1
+#
+# On remote PC2 (192.168.0.100) and PC3 (192.168.0.101), use distributed_client_gui.py and set:
+#   Server IP: 192.168.0.102
+#   DDS peers: server=192.168.0.102, client1=192.168.0.102, client2=192.168.0.100, client3=192.168.0.101
+#   Client ID: 2 (PC2) or 3 (PC3), Total clients: 3
+#
+# Firewall rules on the server PC (must allow inbound from 192.168.0.100 and 192.168.0.101):
+#   TCP: 1883 (MQTT), 5672 (AMQP), 50051 (gRPC)
+#   UDP: 4433 (QUIC), 4434 (HTTP/3), 7400-7500 + 7412/7414/7416/7418 (DDS RTPS + SPDP)
 #
 # For an isolated bridge deployment (no host-wide ports; DDS may be unreliable), see
 # docker-compose-unified-emotion.bridge.yml
@@ -58,7 +63,7 @@ services:
     network_mode: host
     environment:
       - NODE_TYPE=server
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -81,12 +86,14 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
       # --- DDS (same order/env as fl-server-dds-emotion in docker-compose-emotion.yml) ---
-      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
-      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
-      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
-      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-192.168.0.102}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-192.168.0.102}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-192.168.0.100}
+      - DDS_PEER_CLIENT3=${DDS_PEER_CLIENT3:-192.168.0.101}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-}
+      - DDS_SPDP_CLIENT3=${DDS_SPDP_CLIENT3:-}
       - DDS_DOMAIN_ID=0
     volumes:
       - ../Server/Emotion_Recognition:/app/Server/Emotion_Recognition
@@ -116,7 +123,7 @@ services:
     environment:
       - NODE_TYPE=client
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -145,12 +152,14 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
       # --- DDS (same as fl-client-dds-emotion-1) ---
-      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
-      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
-      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
-      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-192.168.0.102}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-192.168.0.102}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-192.168.0.100}
+      - DDS_PEER_CLIENT3=${DDS_PEER_CLIENT3:-192.168.0.101}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-}
+      - DDS_SPDP_CLIENT3=${DDS_SPDP_CLIENT3:-}
       - DDS_DOMAIN_ID=0
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
@@ -182,7 +191,7 @@ services:
     environment:
       - NODE_TYPE=client
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -211,12 +220,82 @@ services:
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
       # --- DDS (same as fl-client-dds-emotion-2) ---
-      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
-      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
-      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
-      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-192.168.0.102}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-192.168.0.102}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-192.168.0.100}
+      - DDS_PEER_CLIENT3=${DDS_PEER_CLIENT3:-192.168.0.101}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-}
+      - DDS_SPDP_CLIENT3=${DDS_SPDP_CLIENT3:-}
+      - DDS_DOMAIN_ID=0
+    volumes:
+      - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition
+      - ../Network_Simulation:/app/Network_Simulation:ro
+      - ../shared_data:/shared_data
+      - ../experiment_results:/app/results
+      - ../certs:/app/certs:ro
+    depends_on:
+      - fl-server-unified-emotion
+      - mqtt-broker-unified
+      - amqp-broker-unified
+    cap_add:
+      - NET_ADMIN
+    command: python3 Client/Emotion_Recognition/FL_Client_Unified.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+
+  fl-client-unified-emotion-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-unified-emotion-3
+    network_mode: host
+    environment:
+      - NODE_TYPE=client
+      - CLIENT_ID=3
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - USE_RL_SELECTION=true
+      - USE_COMMUNICATION_MODEL_REWARD=${USE_COMMUNICATION_MODEL_REWARD:-true}
+      - USE_QL_CONVERGENCE=${USE_QL_CONVERGENCE:-false}
+      - USE_RL_EXPLORATION=${USE_RL_EXPLORATION:-}
+      - Q_CONVERGENCE_THRESHOLD=${Q_CONVERGENCE_THRESHOLD:-0.01}
+      - Q_CONVERGENCE_PATIENCE=${Q_CONVERGENCE_PATIENCE:-5}
+      - RL_BOUNDARY_PIPELINE=${RL_BOUNDARY_PIPELINE:-true}
+      - RL_PHASE0_ROUNDS=${RL_PHASE0_ROUNDS:-20}
+      - RL_QTABLE_MERGE=${RL_QTABLE_MERGE:-false}
+      - RL_QTABLE_OVERLAY_SCENARIOS=${RL_QTABLE_OVERLAY_SCENARIOS:-}
+      - DEFAULT_PROTOCOL=mqtt
+      - MQTT_BROKER=${UNIFIED_FL_SERVER_HOST:-192.168.0.102}
+      - AMQP_BROKER=${UNIFIED_FL_SERVER_HOST:-192.168.0.102}
+      - AMQP_HOST=${UNIFIED_FL_SERVER_HOST:-192.168.0.102}
+      - GRPC_HOST=${UNIFIED_FL_SERVER_HOST:-192.168.0.102}
+      - GRPC_PORT=50051
+      - QUIC_HOST=${UNIFIED_FL_SERVER_HOST:-192.168.0.102}
+      - QUIC_PORT=4433
+      - HTTP3_HOST=${UNIFIED_FL_SERVER_HOST:-192.168.0.102}
+      - HTTP3_PORT=4434
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+      # --- DDS ---
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-192.168.0.102}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-192.168.0.102}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-192.168.0.100}
+      - DDS_PEER_CLIENT3=${DDS_PEER_CLIENT3:-192.168.0.101}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-}
+      - DDS_SPDP_CLIENT3=${DDS_SPDP_CLIENT3:-}
       - DDS_DOMAIN_ID=0
     volumes:
       - ../Client/Emotion_Recognition:/app/Client/Emotion_Recognition

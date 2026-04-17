@@ -229,8 +229,8 @@ class DistributedClientGUI(QMainWindow):
         
         # Server IP
         layout.addWidget(QLabel("Server IP Address:"), 0, 0)
-        self.server_ip = QLineEdit("129.69.102.245")
-        self.server_ip.setPlaceholderText("e.g., 129.69.102.245")
+        self.server_ip = QLineEdit("192.168.0.102")
+        self.server_ip.setPlaceholderText("e.g., 192.168.0.102")
         self.server_ip.setStyleSheet("padding: 8px; font-size: 12px;")
         layout.addWidget(self.server_ip, 0, 1)
         
@@ -261,26 +261,32 @@ class DistributedClientGUI(QMainWindow):
         layout.addWidget(info_label, 1, 0, 1, 3)
 
         dds_help = QLabel(
-            "DDS static unicast (optional): set all three if multicast discovery fails across subnets/routers. "
-            "Must match the FL server and both client hosts (see config/dds_distributed_unicast.py)."
+            "DDS static unicast (optional): set all fields if multicast discovery fails across subnets/routers. "
+            "Must match the FL server and all client hosts (see config/dds_distributed_unicast.py). "
+            "Leave client3 empty if using only 2 clients."
         )
         dds_help.setStyleSheet("color: #666; font-size: 11px; padding: 5px;")
         layout.addWidget(dds_help, 2, 0, 1, 3)
         layout.addWidget(QLabel("DDS peer — server host:"), 3, 0)
-        self.dds_peer_server = QLineEdit("129.69.102.245")
+        self.dds_peer_server = QLineEdit("192.168.0.102")
         self.dds_peer_server.setPlaceholderText("empty = use multicast LAN XML")
         self.dds_peer_server.setStyleSheet("padding: 8px; font-size: 12px;")
         layout.addWidget(self.dds_peer_server, 3, 1, 1, 2)
         layout.addWidget(QLabel("DDS peer — client 1 host:"), 4, 0)
-        self.dds_peer_client1 = QLineEdit("129.69.102.245")
+        self.dds_peer_client1 = QLineEdit("192.168.0.102")
         self.dds_peer_client1.setPlaceholderText("machine running CLIENT_ID=1")
         self.dds_peer_client1.setStyleSheet("padding: 8px; font-size: 12px;")
         layout.addWidget(self.dds_peer_client1, 4, 1, 1, 2)
         layout.addWidget(QLabel("DDS peer — client 2 host:"), 5, 0)
-        self.dds_peer_client2 = QLineEdit("129.69.102.173")
+        self.dds_peer_client2 = QLineEdit("192.168.0.100")
         self.dds_peer_client2.setPlaceholderText("machine running CLIENT_ID=2")
         self.dds_peer_client2.setStyleSheet("padding: 8px; font-size: 12px;")
         layout.addWidget(self.dds_peer_client2, 5, 1, 1, 2)
+        layout.addWidget(QLabel("DDS peer — client 3 host:"), 6, 0)
+        self.dds_peer_client3 = QLineEdit("192.168.0.101")
+        self.dds_peer_client3.setPlaceholderText("machine running CLIENT_ID=3 (leave empty for 2-client setup)")
+        self.dds_peer_client3.setStyleSheet("padding: 8px; font-size: 12px;")
+        layout.addWidget(self.dds_peer_client3, 6, 1, 1, 2)
         
         group.setLayout(layout)
         return group
@@ -308,7 +314,7 @@ class DistributedClientGUI(QMainWindow):
         layout.addWidget(QLabel("Total Expected Clients:"), 0, 2)
         self.total_clients = QSpinBox()
         self.total_clients.setRange(1, 100)
-        self.total_clients.setValue(2)
+        self.total_clients.setValue(3)
         self.total_clients.setStyleSheet("padding: 8px; font-size: 12px;")
         self.total_clients.setToolTip("Match the total number of clients expected by the main experiment, including remote clients.")
         layout.addWidget(self.total_clients, 0, 3)
@@ -1347,7 +1353,7 @@ class DistributedClientGUI(QMainWindow):
         )
         if peers_filled:
             self.log_text.append(
-                "✅ DDS_PEER_*: all three peer fields set (static unicast; must match the experiment server).\n"
+                "✅ DDS_PEER_*: peer fields set (static unicast; must match the experiment server and all client hosts).\n"
             )
         else:
             self.log_text.append(
@@ -1795,31 +1801,34 @@ class DistributedClientGUI(QMainWindow):
             "-e", "DDS_DOMAIN_ID=0",
         ])
 
-        # DDS on a remote PC: multicast LAN, or static unicast peers (DDS_PEER_*) if all three set.
+        # DDS on a remote PC: multicast LAN, or static unicast peers (DDS_PEER_*) if minimum three set.
         if protocol == "dds" or is_unified:
             _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             _mc_xml = os.path.join(_repo_root, "config", "cyclonedds-multicast-lan.xml")
             ps = getattr(self, "dds_peer_server", None)
             p1 = getattr(self, "dds_peer_client1", None)
             p2 = getattr(self, "dds_peer_client2", None)
+            p3 = getattr(self, "dds_peer_client3", None)
             ps_t = ps.text().strip() if ps else ""
             p1_t = p1.text().strip() if p1 else ""
             p2_t = p2.text().strip() if p2 else ""
+            p3_t = p3.text().strip() if p3 else ""
             if ps_t and p1_t and p2_t:
                 cmd.extend(
                     [
-                        "-e",
-                        f"DDS_PEER_SERVER={ps_t}",
-                        "-e",
-                        f"DDS_PEER_CLIENT1={p1_t}",
-                        "-e",
-                        f"DDS_PEER_CLIENT2={p2_t}",
+                        "-e", f"DDS_PEER_SERVER={ps_t}",
+                        "-e", f"DDS_PEER_CLIENT1={p1_t}",
+                        "-e", f"DDS_PEER_CLIENT2={p2_t}",
                     ]
                 )
+                if p3_t:
+                    cmd.extend(["-e", f"DDS_PEER_CLIENT3={p3_t}"])
                 self.log_text.append(
-                    "DDS: static unicast peers (DDS_PEER_SERVER / CLIENT1 / CLIENT2). "
-                    "CYCLONEDDS_URI is generated at runtime; open UDP between hosts (~7400–7500 + SPDP ports). "
-                    "The main experiment server must set the same three DDS_PEER_* variables (no CYCLONEDDS_URI).\n"
+                    f"DDS: static unicast peers (SERVER={ps_t} / CLIENT1={p1_t} / CLIENT2={p2_t}"
+                    + (f" / CLIENT3={p3_t}" if p3_t else "")
+                    + "). CYCLONEDDS_URI is generated at runtime; open UDP between hosts "
+                    "(~7400–7500 + SPDP ports 7412/7414/7416/7418). "
+                    "The main experiment server must set the same DDS_PEER_* variables (no CYCLONEDDS_URI).\n"
                 )
             elif os.path.isfile(_mc_xml):
                 cmd.extend(

@@ -6,14 +6,22 @@ network_mode: host so Cyclone can use the full UDP port range. docker-compose-un
 does the same for the unified stack. The bridge variant (docker-compose-unified-emotion.bridge.yml)
 only maps SPDP ports; RTPS user-data still uses extra ephemeral ports, so DDS is usually unreliable there.
 
-Set these environment variables (all three required) before starting server/clients:
+Set these environment variables before starting server/clients:
   DDS_PEER_SERVER   — IP or hostname of the machine running FL_Server_DDS
   DDS_PEER_CLIENT1  — IP or hostname of the machine running CLIENT_ID=1
   DDS_PEER_CLIENT2  — IP or hostname of the machine running CLIENT_ID=2
+  DDS_PEER_CLIENT3  — (optional) IP or hostname of the machine running CLIENT_ID=3 (3-PC setup)
 
-Participant indices match config/cyclonedds-emotion-server.xml and client1/2:
-  server: 1, client1: 2, client2: 3
+Participant indices (PI):
+  server: 1, client1: 2, client2: 3, client3: 4 (optional)
 SPDP unicast port for domain 0 (CycloneDDS 0.10.x): 7410 + 2 * ParticipantIndex
+
+3-PC distributed setup (192.168.0.x example):
+  DDS_PEER_SERVER=192.168.0.102   (server machine — also runs client1 locally)
+  DDS_PEER_CLIENT1=192.168.0.102  (client1 co-located with server)
+  DDS_PEER_CLIENT2=192.168.0.100  (Windows PC)
+  DDS_PEER_CLIENT3=192.168.0.101  (Linux PC)
+  → SPDP ports: server=7412, client1=7414, client2=7416, client3=7418
 
 Optional SPDP address overrides (same logical deployment, different reachability):
   DDS_SPDP_SERVER   — hostname/IP Cyclone uses in <Peer> for participant 1 (default: DDS_PEER_SERVER)
@@ -140,12 +148,16 @@ def _write_uri(xml: str) -> str:
     return path
 
 
-def _peers_from_env() -> tuple[str, str, str] | None:
+def _peers_from_env() -> tuple | None:
+    """Return (server, client1, client2[, client3]) from env, or None if any required peer is missing."""
     s = os.environ.get("DDS_PEER_SERVER", "").strip()
     c1 = os.environ.get("DDS_PEER_CLIENT1", "").strip()
     c2 = os.environ.get("DDS_PEER_CLIENT2", "").strip()
     if not (s and c1 and c2):
         return None
+    c3 = os.environ.get("DDS_PEER_CLIENT3", "").strip()
+    if c3:
+        return (s, c1, c2, c3)
     return (s, c1, c2)
 
 
@@ -183,14 +195,14 @@ def _iface_for_route_to(dst: str) -> str | None:
     return iface
 
 
-def _bind_iface_server(s: str, c1: str, c2: str) -> str | None:
+def _bind_iface_server(s: str, c1: str, c2: str, c3: str = "") -> str | None:
     explicit = os.environ.get("DDS_NETWORK_INTERFACE", "").strip()
     if explicit:
         return explicit
     if not _auto_iface_enabled():
         return None
     # Prefer route toward a peer on another host (reveals LAN-facing NIC)
-    for dst in (c2, c1):
+    for dst in (c3, c2, c1):
         if dst and dst != s:
             hit = _iface_for_route_to(dst)
             if hit:
@@ -207,14 +219,16 @@ def _bind_iface_client(s: str, _c1: str, _c2: str, _cid: int) -> str | None:
     return _iface_for_route_to(s)
 
 
-def _spdp_host_for_participant(pi: int, s: str, c1: str, c2: str) -> str:
-    """Host part of <Peer> for the given remote participant index (1=server, 2=client1, 3=client2)."""
+def _spdp_host_for_participant(pi: int, s: str, c1: str, c2: str, c3: str = "") -> str:
+    """Host part of <Peer> for the given remote participant index (1=server, 2=client1, 3=client2, 4=client3)."""
     if pi == 1:
         return os.environ.get("DDS_SPDP_SERVER", "").strip() or s
     if pi == 2:
         return os.environ.get("DDS_SPDP_CLIENT1", "").strip() or c1
     if pi == 3:
         return os.environ.get("DDS_SPDP_CLIENT2", "").strip() or c2
+    if pi == 4:
+        return os.environ.get("DDS_SPDP_CLIENT3", "").strip() or c3
     raise ValueError(f"invalid participant index {pi}")
 
 
@@ -258,22 +272,26 @@ def try_apply_server_uri() -> bool:
     t = _peers_from_env()
     if not t:
         return False
-    s, c1, c2 = t
-    # Other participants: client1 (PI=2), client2 (PI=3)
+    c3 = t[3] if len(t) == 4 else ""
+    s, c1, c2 = t[0], t[1], t[2]
+    # Build peer list: client1 (PI=2), client2 (PI=3), optional client3 (PI=4)
     peers = [
-        _peer(_spdp_host_for_participant(2, s, c1, c2), 2),
-        _peer(_spdp_host_for_participant(3, s, c1, c2), 3),
+        _peer(_spdp_host_for_participant(2, s, c1, c2, c3), 2),
+        _peer(_spdp_host_for_participant(3, s, c1, c2, c3), 3),
     ]
-    bind = _bind_iface_server(s, c1, c2)
+    if c3:
+        peers.append(_peer(_spdp_host_for_participant(4, s, c1, c2, c3), 4))
+    bind = _bind_iface_server(s, c1, c2, c3)
     ext, ext_mask = _external_and_mask_for_server(s)
     xml = _document(1, peers, bind, ext, ext_mask)
     _write_uri(xml)
     extra = f" NetworkInterfaceAddress={bind}" if bind else " (interface: auto)"
     ext_extra = f" ExternalNetworkAddress={ext}" if ext else ""
     mask_extra = f" ExternalNetworkMask={ext_mask}" if ext_mask else ""
+    c3_info = f" DDS_PEER_CLIENT3={c3}" if c3 else ""
     print(
         "[DDS] Static unicast peers (server): "
-        f"DDS_PEER_SERVER={s} DDS_PEER_CLIENT1={c1} DDS_PEER_CLIENT2={c2}{extra}{ext_extra}{mask_extra} "
+        f"DDS_PEER_SERVER={s} DDS_PEER_CLIENT1={c1} DDS_PEER_CLIENT2={c2}{c3_info}{extra}{ext_extra}{mask_extra} "
         f"peers={peers} "
         f"-> CYCLONEDDS_URI={os.environ['CYCLONEDDS_URI']}"
     )
@@ -281,32 +299,45 @@ def try_apply_server_uri() -> bool:
 
 
 def try_apply_client_uri() -> bool:
-    """If DDS_PEER_* are set, generate XML for this client (PI 2 or 3) and set CYCLONEDDS_URI."""
+    """If DDS_PEER_* are set, generate XML for this client (PI 2, 3 or 4) and set CYCLONEDDS_URI."""
     if os.environ.get("CYCLONEDDS_URI"):
         return False
     t = _peers_from_env()
     if not t:
         return False
-    s, c1, c2 = t
+    c3 = t[3] if len(t) == 4 else ""
+    s, c1, c2 = t[0], t[1], t[2]
     try:
         cid = int(os.environ.get("CLIENT_ID", "1"))
     except ValueError:
         cid = 1
+
     if cid == 1:
         pi = 2
-        peers = [
-            _peer(_spdp_host_for_participant(1, s, c1, c2), 1),
-            _peer(_spdp_host_for_participant(3, s, c1, c2), 3),
-        ]
+        peers = [_peer(_spdp_host_for_participant(1, s, c1, c2, c3), 1),
+                 _peer(_spdp_host_for_participant(3, s, c1, c2, c3), 3)]
+        if c3:
+            peers.append(_peer(_spdp_host_for_participant(4, s, c1, c2, c3), 4))
     elif cid == 2:
         pi = 3
-        peers = [
-            _peer(_spdp_host_for_participant(1, s, c1, c2), 1),
-            _peer(_spdp_host_for_participant(2, s, c1, c2), 2),
-        ]
+        peers = [_peer(_spdp_host_for_participant(1, s, c1, c2, c3), 1),
+                 _peer(_spdp_host_for_participant(2, s, c1, c2, c3), 2)]
+        if c3:
+            peers.append(_peer(_spdp_host_for_participant(4, s, c1, c2, c3), 4))
+    elif cid == 3:
+        if not c3:
+            print(
+                "[DDS] CLIENT_ID=3 but DDS_PEER_CLIENT3 is not set; "
+                "falling back to CYCLONEDDS_URI / multicast."
+            )
+            return False
+        pi = 4
+        peers = [_peer(_spdp_host_for_participant(1, s, c1, c2, c3), 1),
+                 _peer(_spdp_host_for_participant(2, s, c1, c2, c3), 2),
+                 _peer(_spdp_host_for_participant(3, s, c1, c2, c3), 3)]
     else:
         print(
-            f"[DDS] DDS_PEER_* set but CLIENT_ID must be 1 or 2 for static unicast (got {cid}); "
+            f"[DDS] DDS_PEER_* set but CLIENT_ID must be 1, 2 or 3 for static unicast (got {cid}); "
             "falling back to CYCLONEDDS_URI / multicast."
         )
         return False
@@ -317,9 +348,10 @@ def try_apply_client_uri() -> bool:
     extra = f" NetworkInterfaceAddress={bind}" if bind else " (interface: auto)"
     ext_extra = f" ExternalNetworkAddress={ext}" if ext else ""
     mask_extra = f" ExternalNetworkMask={ext_mask}" if ext_mask else ""
+    c3_info = f" DDS_PEER_CLIENT3={c3}" if c3 else ""
     print(
         f"[DDS] Static unicast peers (client {cid}): "
-        f"DDS_PEER_SERVER={s} DDS_PEER_CLIENT1={c1} DDS_PEER_CLIENT2={c2}{extra}{ext_extra}{mask_extra} "
+        f"DDS_PEER_SERVER={s} DDS_PEER_CLIENT1={c1} DDS_PEER_CLIENT2={c2}{c3_info}{extra}{ext_extra}{mask_extra} "
         f"peers={peers} "
         f"-> CYCLONEDDS_URI={os.environ['CYCLONEDDS_URI']}"
     )

@@ -599,6 +599,9 @@ services:
 
   # ============================================================================
   # DDS Discovery Server (unicast peer on 127.0.0.1:7410)
+  # Only used in single-machine (local) mode. For distributed 3-PC mode, do NOT start this
+  # service; instead set DDS_PEER_* env vars (see below) and let dds_distributed_unicast.py
+  # generate the Cyclone XML automatically.
   # ============================================================================
   dds-discovery-emotion:
     build:
@@ -615,10 +618,23 @@ services:
     # Start before DDS server and clients
 
   # ============================================================================
-  # DDS Protocol Services (Discovery at 127.0.0.1:7410; server 7412, client1 7414, client2 7416)
-  # For multi-machine static unicast (129.69.102.x lab), use docker run --network host with
-  # DDS_PEER_* from config/dds_distributed_env.sh / Server+Client Dockerfiles — do not use this
-  # localhost discovery block.
+  # DDS Protocol Services
+  #
+  # LOCAL mode (single machine): uses dds-discovery-emotion on 127.0.0.1:7410.
+  #   CYCLONEDDS_URI is set to the static local XML; DDS_PEER_* are not needed.
+  #
+  # DISTRIBUTED 3-PC mode (192.168.0.x): do NOT start dds-discovery-emotion.
+  #   Set the following before running docker compose:
+  #     export DDS_PEER_SERVER=192.168.0.102
+  #     export DDS_PEER_CLIENT1=192.168.0.102   # co-located with server
+  #     export DDS_PEER_CLIENT2=192.168.0.100   # Windows PC
+  #     export DDS_PEER_CLIENT3=192.168.0.101   # Linux PC
+  #     export CYCLONEDDS_URI=""                # must be empty so dds_distributed_unicast.py activates
+  #   The server and local client (client1) are started by:
+  #     docker compose ... up -d fl-server-dds-emotion fl-client-dds-emotion-1
+  #   Remote clients 2 and 3 are started via distributed_client_gui.py on their respective PCs.
+  #   SPDP ports: server 7412, client1 7414, client2 7416, client3 7418.
+  #   Open UDP 7400-7500 on all machines' firewalls.
   # ============================================================================
   fl-server-dds-emotion:
     build:
@@ -638,9 +654,16 @@ services:
       - CUDA_VISIBLE_DEVICES=
       - LOCAL_EPOCHS=20
       - DDS_DOMAIN_ID=0
-      - CYCLONEDDS_URI=file:///app/config/cyclonedds-emotion-server.xml
-      - ROS_DISCOVERY_SERVER=127.0.0.1:7410
+      # For local mode: static XML via discovery server.
+      # For distributed mode: unset CYCLONEDDS_URI and set DDS_PEER_* — dds_distributed_unicast.py takes over.
+      - CYCLONEDDS_URI=${CYCLONEDDS_URI:-file:///app/config/cyclonedds-emotion-server.xml}
+      - ROS_DISCOVERY_SERVER=${ROS_DISCOVERY_SERVER:-127.0.0.1:7410}
       - DDS_USE_PRIMITIVE_CONFIG=1
+      # DDS_PEER_* for distributed mode (ignored when CYCLONEDDS_URI is set above)
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-}
+      - DDS_PEER_CLIENT3=${DDS_PEER_CLIENT3:-}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -663,7 +686,7 @@ services:
     network_mode: host
     environment:
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -674,9 +697,13 @@ services:
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
       - DDS_DOMAIN_ID=0
-      - CYCLONEDDS_URI=file:///app/config/cyclonedds-emotion-client1.xml
-      - ROS_DISCOVERY_SERVER=127.0.0.1:7410
+      - CYCLONEDDS_URI=${CYCLONEDDS_URI:-file:///app/config/cyclonedds-emotion-client1.xml}
+      - ROS_DISCOVERY_SERVER=${ROS_DISCOVERY_SERVER:-127.0.0.1:7410}
       - DDS_USE_PRIMITIVE_CONFIG=1
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-}
+      - DDS_PEER_CLIENT3=${DDS_PEER_CLIENT3:-}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -707,7 +734,7 @@ services:
     network_mode: host
     environment:
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -718,9 +745,13 @@ services:
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
       - DDS_DOMAIN_ID=0
-      - CYCLONEDDS_URI=file:///app/config/cyclonedds-emotion-client2.xml
-      - ROS_DISCOVERY_SERVER=127.0.0.1:7410
+      - CYCLONEDDS_URI=${CYCLONEDDS_URI:-file:///app/config/cyclonedds-emotion-client2.xml}
+      - ROS_DISCOVERY_SERVER=${ROS_DISCOVERY_SERVER:-127.0.0.1:7410}
       - DDS_USE_PRIMITIVE_CONFIG=1
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-}
+      - DDS_PEER_CLIENT3=${DDS_PEER_CLIENT3:-}
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}

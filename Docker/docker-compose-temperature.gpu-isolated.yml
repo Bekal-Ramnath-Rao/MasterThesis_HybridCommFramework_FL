@@ -27,7 +27,7 @@ services:
     environment:
       - PROTOCOL=MQTT
       - USE_CASE=temperature
-      - MQTT_BROKER=mqtt-broker:1883
+      - MQTT_BROKER=mqtt-broker
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -61,7 +61,7 @@ services:
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=MQTT
       - USE_CASE=temperature
-      - MQTT_BROKER=mqtt-broker:1883
+      - MQTT_BROKER=mqtt-broker
       - CUDA_VISIBLE_DEVICES=0
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
@@ -91,7 +91,7 @@ services:
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=MQTT
       - USE_CASE=temperature
-      - MQTT_BROKER=mqtt-broker:1883
+      - MQTT_BROKER=mqtt-broker
       - CUDA_VISIBLE_DEVICES=1
       - GPU_DEVICE_ID=1
       - TF_FORCE_GPU_ALLOW_GROWTH=true

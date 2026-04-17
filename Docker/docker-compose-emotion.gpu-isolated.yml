@@ -1,11 +1,28 @@
 # Docker Compose for Emotion Recognition with GPU Support (Device-Isolated)
-# This version isolates GPU devices to prevent memory contention between clients
-# Client 1 uses GPU 0, Client 2 uses GPU 1, Server uses both but with memory limits
-# Requires: 2+ NVIDIA GPUs with NVIDIA Container Toolkit
-# Note: Uses Docker Compose V2 syntax (no version: field)
+# This version isolates GPU devices to prevent memory contention between clients.
+# Requires: NVIDIA Container Toolkit.
+#
+# GPU assignment (single-GPU machine — all clients share GPU 0):
+#   client-1 and client-2: device_ids ['0']  (adjust to ['1'] for a second physical GPU)
+#   server: CPU only (CUDA_VISIBLE_DEVICES= empty)
 #
 # For lower DDS/HTTP3 latency (avoids bridge): use docker-compose-emotion.host-network.yml
 # See Docker/README-host-network.md for port layout and QUIC buffer/GSO tuning.
+#
+# ---- 3-PC distributed setup (192.168.0.x network) ----
+# PC1 (server + client1):  192.168.0.102  — runs this compose with --local-clients 1 --min-clients 3
+# PC2 (client2, Windows):  192.168.0.100  — uses distributed_client_gui.py
+# PC3 (client3, Linux):    192.168.0.101  — uses distributed_client_gui.py
+#
+# Mapped host ports for remote clients:
+#   MQTT 31883 → broker:1883   AMQP 35672 → broker:5672
+#   gRPC 50051/tcp   QUIC 4433/udp   HTTP/3 4434/udp
+#   DDS: network_mode=host, UDP 7400-7500 + SPDP 7412/7414/7416/7418
+#
+# Before running on the server PC (for distributed mode):
+#   export NUM_CLIENTS=3 MIN_CLIENTS=3
+#   export DDS_PEER_SERVER=192.168.0.102 DDS_PEER_CLIENT1=192.168.0.102
+#   export DDS_PEER_CLIENT2=192.168.0.100 DDS_PEER_CLIENT3=192.168.0.101
 
 services:
   mqtt-broker:
@@ -63,7 +80,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -105,7 +122,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -137,7 +154,49 @@ services:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['1']
+              device_ids: ['0']
+    volumes:
+      - ../Client/Emotion_Recognition/packet_logger.db:/app/Client/Emotion_Recognition/packet_logger.db
+
+  fl-client-mqtt-emotion-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=3
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=MQTT
+      - USE_CASE=emotion
+      - MQTT_BROKER=mqtt-broker
+      - MQTT_PORT=1883
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - mqtt-broker
+      - fl-server-mqtt-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-mqtt-emotion-3
+    command: python -u Client/Emotion_Recognition/FL_Client_MQTT.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
     volumes:
       - ../Client/Emotion_Recognition/packet_logger.db:/app/Client/Emotion_Recognition/packet_logger.db
 
@@ -197,7 +256,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -239,7 +298,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -273,7 +332,49 @@ services:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['1']
+              device_ids: ['0']
+
+  fl-client-amqp-emotion-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=3
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=AMQP
+      - USE_CASE=emotion
+      - AMQP_HOST=amqp-broker
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - amqp-broker
+      - fl-server-amqp-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-amqp-emotion-3
+    command: python -u Client/Emotion_Recognition/FL_Client_AMQP.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
 
   # ============================================================================
   # gRPC Protocol Services
@@ -286,6 +387,7 @@ services:
     environment:
       - PROTOCOL=gRPC
       - USE_CASE=emotion
+      - GRPC_HOST=0.0.0.0
       - GRPC_PORT=50051
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
@@ -317,7 +419,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -356,7 +458,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -387,7 +489,46 @@ services:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['1']
+              device_ids: ['0']
+
+  fl-client-grpc-emotion-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=3
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=gRPC
+      - USE_CASE=emotion
+      - GRPC_HOST=fl-server-grpc-emotion
+      - GRPC_PORT=50051
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-grpc-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-grpc-emotion-3
+    command: python -u Client/Emotion_Recognition/FL_Client_gRPC.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
 
   # ============================================================================
   # QUIC Protocol Services
@@ -400,6 +541,7 @@ services:
     environment:
       - PROTOCOL=QUIC
       - USE_CASE=emotion
+      - QUIC_HOST=0.0.0.0
       - QUIC_PORT=4433
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
@@ -432,7 +574,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -471,7 +613,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -502,7 +644,46 @@ services:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['1']
+              device_ids: ['0']
+
+  fl-client-quic-emotion-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=3
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=QUIC
+      - USE_CASE=emotion
+      - QUIC_HOST=fl-server-quic-emotion
+      - QUIC_PORT=4433
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-quic-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-quic-emotion-3
+    command: python -u Client/Emotion_Recognition/FL_Client_QUIC.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
 
   # ============================================================================
   # HTTP/3 Protocol Services
@@ -550,7 +731,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -589,7 +770,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -620,24 +801,68 @@ services:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['1']
+              device_ids: ['0']
+
+  fl-client-http3-emotion-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=3
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=HTTP3
+      - USE_CASE=emotion
+      - HTTP3_HOST=fl-server-http3-emotion
+      - HTTP3_PORT=4434
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-http3-emotion
+    networks:
+      - emotion_network
+    container_name: fl-client-http3-emotion-3
+    command: python -u Client/Emotion_Recognition/FL_Client_HTTP3.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
 
   # ============================================================================
   # DDS Protocol Services
+  # DDS requires network_mode: host so Cyclone can use the full ephemeral UDP port range.
+  # Set DDS_PEER_* env vars before running (see header comment for 3-PC example).
+  # SPDP ports (domain 0): server=7412, client1=7414, client2=7416, client3=7418.
   # ============================================================================
-  
+
   fl-server-dds-emotion:
     build:
       context: ..
       dockerfile: Server/Dockerfile
     network_mode: host
     environment:
-      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
-      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
-      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
-      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-192.168.0.102}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-192.168.0.102}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-192.168.0.100}
+      - DDS_PEER_CLIENT3=${DDS_PEER_CLIENT3:-192.168.0.101}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-}
+      - DDS_SPDP_CLIENT3=${DDS_SPDP_CLIENT3:-}
       - PROTOCOL=DDS
       - USE_CASE=emotion
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
@@ -647,7 +872,7 @@ services:
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
-      - CUDA_VISIBLE_DEVICES=  # Server runs on CPU only (no GPU needed for aggregation)
+      - CUDA_VISIBLE_DEVICES=
       - LOCAL_EPOCHS=20
       - DDS_DOMAIN_ID=0
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
@@ -661,7 +886,6 @@ services:
     volumes:
       - ../Server/Emotion_Recognition/results:/app/Server/Emotion_Recognition/results
     command: bash -c "sleep 10 && python -u Server/Emotion_Recognition/FL_Server_DDS.py"
-    # Server does not need GPU resources - only aggregates models
 
   fl-client-dds-emotion-1:
     build:
@@ -669,14 +893,16 @@ services:
       dockerfile: Client/Dockerfile
     network_mode: host
     environment:
-      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
-      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
-      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
-      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-192.168.0.102}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-192.168.0.102}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-192.168.0.100}
+      - DDS_PEER_CLIENT3=${DDS_PEER_CLIENT3:-192.168.0.101}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-}
+      - DDS_SPDP_CLIENT3=${DDS_SPDP_CLIENT3:-}
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -714,14 +940,16 @@ services:
       dockerfile: Client/Dockerfile
     network_mode: host
     environment:
-      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-129.69.102.245}
-      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-129.69.102.245}
-      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-129.69.102.173}
-      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-129.69.102.245}
-      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-129.69.102.245}
-      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-129.69.102.173}
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-192.168.0.102}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-192.168.0.102}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-192.168.0.100}
+      - DDS_PEER_CLIENT3=${DDS_PEER_CLIENT3:-192.168.0.101}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-}
+      - DDS_SPDP_CLIENT3=${DDS_SPDP_CLIENT3:-}
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
@@ -751,7 +979,54 @@ services:
           devices:
             - capabilities: [gpu]
               driver: nvidia
-              device_ids: ['1']
+              device_ids: ['0']
+
+  fl-client-dds-emotion-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    environment:
+      - DDS_PEER_SERVER=${DDS_PEER_SERVER:-192.168.0.102}
+      - DDS_PEER_CLIENT1=${DDS_PEER_CLIENT1:-192.168.0.102}
+      - DDS_PEER_CLIENT2=${DDS_PEER_CLIENT2:-192.168.0.100}
+      - DDS_PEER_CLIENT3=${DDS_PEER_CLIENT3:-192.168.0.101}
+      - DDS_SPDP_SERVER=${DDS_SPDP_SERVER:-}
+      - DDS_SPDP_CLIENT1=${DDS_SPDP_CLIENT1:-}
+      - DDS_SPDP_CLIENT2=${DDS_SPDP_CLIENT2:-}
+      - DDS_SPDP_CLIENT3=${DDS_SPDP_CLIENT3:-}
+      - CLIENT_ID=3
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - FL_DIAGNOSTIC_PIPELINE=${FL_DIAGNOSTIC_PIPELINE:-0}
+      - PROTOCOL=DDS
+      - USE_CASE=emotion
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - DDS_DOMAIN_ID=0
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    depends_on:
+      - fl-server-dds-emotion
+    container_name: fl-client-dds-emotion-3
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ../Client/Emotion_Recognition/Dataset:/app/Client/Emotion_Recognition/Dataset
+    command: python -u Client/Emotion_Recognition/FL_Client_DDS.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
 
 networks:
   emotion_network:

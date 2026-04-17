@@ -317,12 +317,12 @@ class ExperimentRunner:
 
         self.service_patterns = {
             "emotion": {
-                "mqtt": [broker_mqtt, "fl-server-mqtt-emotion", "fl-client-mqtt-emotion-1", "fl-client-mqtt-emotion-2"],
-                "amqp": [broker_amqp, "fl-server-amqp-emotion", "fl-client-amqp-emotion-1", "fl-client-amqp-emotion-2"],
-                "grpc": ["fl-server-grpc-emotion", "fl-client-grpc-emotion-1", "fl-client-grpc-emotion-2"],
-                "quic": ["fl-server-quic-emotion", "fl-client-quic-emotion-1", "fl-client-quic-emotion-2"],
-                "http3": ["fl-server-http3-emotion", "fl-client-http3-emotion-1", "fl-client-http3-emotion-2"],
-                "dds": ["fl-server-dds-emotion", "fl-client-dds-emotion-1", "fl-client-dds-emotion-2"],
+                "mqtt": [broker_mqtt, "fl-server-mqtt-emotion", "fl-client-mqtt-emotion-1", "fl-client-mqtt-emotion-2", "fl-client-mqtt-emotion-3"],
+                "amqp": [broker_amqp, "fl-server-amqp-emotion", "fl-client-amqp-emotion-1", "fl-client-amqp-emotion-2", "fl-client-amqp-emotion-3"],
+                "grpc": ["fl-server-grpc-emotion", "fl-client-grpc-emotion-1", "fl-client-grpc-emotion-2", "fl-client-grpc-emotion-3"],
+                "quic": ["fl-server-quic-emotion", "fl-client-quic-emotion-1", "fl-client-quic-emotion-2", "fl-client-quic-emotion-3"],
+                "http3": ["fl-server-http3-emotion", "fl-client-http3-emotion-1", "fl-client-http3-emotion-2", "fl-client-http3-emotion-3"],
+                "dds": ["fl-server-dds-emotion", "fl-client-dds-emotion-1", "fl-client-dds-emotion-2", "fl-client-dds-emotion-3"],
                 "rl_unified": ["fl-server-unified-emotion", "fl-client-unified-emotion-1", "fl-client-unified-emotion-2", "fl-client-unified-emotion-3"]
             },
             "mentalstate": {
