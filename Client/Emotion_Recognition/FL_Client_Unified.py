@@ -1350,31 +1350,30 @@ class UnifiedFLClient_Emotion:
             return
 
         def amqp_consumer_loop():
-            # Retry with exponential backoff for startup race condition
-            max_retries = 5
-            retry_delay = 2
-            
-            for attempt in range(max_retries):
+            # Retry indefinitely with capped exponential backoff so we survive slow
+            # RabbitMQ startups (can take 30-60 s) and transient network glitches.
+            attempt = 0
+            retry_delay = 5
+            while True:
+                attempt += 1
                 try:
-                    if attempt > 0:
-                        print(f"[AMQP] Retry {attempt}/{max_retries} after {retry_delay}s...")
+                    if attempt > 1:
+                        print(f"[AMQP] Retry {attempt} after {retry_delay}s...")
                         time.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
-                    
+                        retry_delay = min(retry_delay * 2, 30)
+
                     parameters = self._get_amqp_connection_parameters()
                     self.amqp_listener_connection = pika.BlockingConnection(parameters)
                     self.amqp_listener_channel = self.amqp_listener_connection.channel()
-                    
-                    # Declare client-specific queues (server creates these)
+
                     queue_global_model = f'client_{self.client_id}_global_model'
                     queue_start_evaluation = f'client_{self.client_id}_start_evaluation'
                     queue_start_training = f'client_{self.client_id}_start_training'
-                    
+
                     self.amqp_listener_channel.queue_declare(queue=queue_global_model, durable=True)
                     self.amqp_listener_channel.queue_declare(queue=queue_start_evaluation, durable=True)
                     self.amqp_listener_channel.queue_declare(queue=queue_start_training, durable=True)
-                    
-                    # Set up consumers
+
                     self.amqp_listener_channel.basic_consume(
                         queue=queue_global_model,
                         on_message_callback=self.on_amqp_global_model,
@@ -1390,22 +1389,19 @@ class UnifiedFLClient_Emotion:
                         on_message_callback=self.on_amqp_start_training,
                         auto_ack=True
                     )
-                    
+
                     print(f"[AMQP] Listener started for client {self.client_id}")
-                    
-                    # Start consuming (blocks in this thread)
+                    retry_delay = 5  # reset on successful connect
+
+                    # Blocks until the connection drops or the broker disappears
                     self.amqp_listener_channel.start_consuming()
-                    break  # Success - exit retry loop
-                    
+                    # start_consuming returned cleanly — server closed the channel
+                    break
+
                 except Exception as e:
                     self.amqp_listener_connection = None
                     self.amqp_listener_channel = None
-                    if attempt == max_retries - 1:
-                        print(f"[AMQP] Listener failed after {max_retries} attempts: {e}")
-                        import traceback
-                        traceback.print_exc()
-                    else:
-                        print(f"[AMQP] Connection attempt {attempt + 1} failed: {e}")
+                    print(f"[AMQP] Connection attempt {attempt} failed: {e}")
         
         self.amqp_listener_thread = threading.Thread(target=amqp_consumer_loop, daemon=True, name=f"AMQP-Listener-{self.client_id}")
         self.amqp_listener_thread.start()

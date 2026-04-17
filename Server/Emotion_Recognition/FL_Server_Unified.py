@@ -617,40 +617,35 @@ class UnifiedFederatedLearningServer:
     # =========================================================================
     
     def start_amqp_server(self):
-        """Start AMQP protocol handler"""
+        """Start AMQP protocol handler with application-level retry for broker startup race."""
         if not AMQP_AVAILABLE:
             return
-        
-        try:
+
+        def _try_connect():
             credentials = pika.PlainCredentials('guest', 'guest')
-            # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
             parameters = pika.ConnectionParameters(
                 host=AMQP_BROKER,
                 port=AMQP_PORT,
                 credentials=credentials,
-                heartbeat=600,  # 10 minutes for very_poor network
-                blocked_connection_timeout=600,  # Aligned with heartbeat
-                connection_attempts=5,
+                heartbeat=600,
+                blocked_connection_timeout=600,
+                connection_attempts=3,
                 retry_delay=2,
-                frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
+                frame_max=AMQP_MAX_FRAME_BYTES
             )
-            
-            # Connection 1: Consumer (owned by consumer thread)
+
             self.amqp_connection = pika.BlockingConnection(parameters)
             self.amqp_channel = self.amqp_connection.channel()
-            
-            # Connection 2: Sender (owned by main thread - thread-safe!)
+
             self.amqp_send_connection = pika.BlockingConnection(parameters)
             self.amqp_send_channel = self.amqp_send_connection.channel()
-            
-            # Declare exchanges and queues
+
             self.amqp_channel.exchange_declare(
                 exchange='fl_client_updates',
                 exchange_type='direct',
                 durable=True
             )
-            
-            # Queue for client registrations
+
             self.amqp_channel.queue_declare(queue='fl_client_register', durable=True)
             self.amqp_channel.queue_declare(queue='fl_client_update', durable=True)
             self.amqp_channel.queue_declare(queue='fl_client_metrics', durable=True)
@@ -664,27 +659,40 @@ class UnifiedFederatedLearningServer:
                 queue='fl_client_metrics',
                 routing_key='client.metrics'
             )
-            
-            # Set up registration consumer
+
             self.amqp_channel.basic_consume(
                 queue='fl_client_register',
                 on_message_callback=self.on_amqp_register,
                 auto_ack=True
             )
-            
-            # Start consuming in separate thread
+
             def consume():
                 try:
                     self.amqp_channel.start_consuming()
                 except Exception as e:
                     print(f"[AMQP] Consumer error: {e}")
-            
+
             amqp_thread = threading.Thread(target=consume, daemon=True)
             amqp_thread.start()
-            
             print("[AMQP] Server started with separate send/receive connections")
-        except Exception as e:
-            print(f"[AMQP] Failed to start (will retry on client registration): {e}")
+
+        def _start_with_retry():
+            max_attempts = 15
+            delay = 5
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    _try_connect()
+                    return
+                except Exception as e:
+                    if attempt < max_attempts:
+                        print(f"[AMQP] Server startup attempt {attempt}/{max_attempts} failed: {e} — retrying in {delay}s")
+                        time.sleep(delay)
+                        delay = min(delay * 2, 30)
+                    else:
+                        print(f"[AMQP] Server failed to start after {max_attempts} attempts: {e}")
+
+        retry_thread = threading.Thread(target=_start_with_retry, daemon=True, name="AMQP-Server-Start")
+        retry_thread.start()
     
     def on_amqp_register(self, ch, method, properties, body):
         """AMQP registration callback"""
@@ -1284,25 +1292,37 @@ class UnifiedFederatedLearningServer:
     # =========================================================================
     
     def start_amqp_consumer(self):
-        """Polling-based AMQP consumer for all clients"""
+        """Polling-based AMQP consumer for all clients, with startup retry."""
+        max_connect_attempts = 15
+        connect_delay = 5
+        for connect_attempt in range(1, max_connect_attempts + 1):
+            try:
+                credentials = pika.PlainCredentials('guest', 'guest')
+                parameters = pika.ConnectionParameters(
+                    host=AMQP_BROKER,
+                    port=AMQP_PORT,
+                    credentials=credentials,
+                    heartbeat=600,
+                    blocked_connection_timeout=600,
+                    connection_attempts=3,
+                    retry_delay=2,
+                    frame_max=AMQP_MAX_FRAME_BYTES
+                )
+                self.amqp_consumer_connection = pika.BlockingConnection(parameters)
+                self.amqp_consumer_channel = self.amqp_consumer_connection.channel()
+                print("[AMQP] Consumer connection established")
+                break  # connected — proceed to polling loop below
+            except Exception as e:
+                if connect_attempt < max_connect_attempts:
+                    print(f"[AMQP] Consumer connect attempt {connect_attempt}/{max_connect_attempts} failed: {e} — retrying in {connect_delay}s")
+                    time.sleep(connect_delay)
+                    connect_delay = min(connect_delay * 2, 30)
+                else:
+                    print(f"[AMQP] Consumer failed to connect after {max_connect_attempts} attempts: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    return
         try:
-            credentials = pika.PlainCredentials('guest', 'guest')
-            # FAIR CONFIG: heartbeat=600s for very_poor network scenarios
-            parameters = pika.ConnectionParameters(
-                host=AMQP_BROKER,
-                port=AMQP_PORT,
-                credentials=credentials,
-                heartbeat=600,  # 10 minutes for very_poor network
-                blocked_connection_timeout=600,  # Aligned with heartbeat
-                connection_attempts=5,
-                retry_delay=2,
-                frame_max=AMQP_MAX_FRAME_BYTES  # 128 KB
-            )
-            self.amqp_consumer_connection = pika.BlockingConnection(parameters)
-            self.amqp_consumer_channel = self.amqp_consumer_connection.channel()
-            
-            print("[AMQP] Consumer connection established")
-            
             # Give time for initial setup
             time.sleep(3)
             
@@ -1495,7 +1515,7 @@ class UnifiedFederatedLearningServer:
                     traceback.print_exc()
                     time.sleep(1)
         except Exception as e:
-            print(f"[AMQP] Consumer connection failed: {e}")
+            print(f"[AMQP] Consumer polling loop failed: {e}")
             import traceback
             traceback.print_exc()
     

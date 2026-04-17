@@ -54,6 +54,12 @@ services:
     environment:
       - RABBITMQ_DEFAULT_USER=guest
       - RABBITMQ_DEFAULT_PASS=guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
   fl-server-unified-emotion:
     build:
@@ -101,8 +107,10 @@ services:
       - ../certs:/app/certs:ro
       - ../shared_data:/shared_data
     depends_on:
-      - mqtt-broker-unified
-      - amqp-broker-unified
+      mqtt-broker-unified:
+        condition: service_started
+      amqp-broker-unified:
+        condition: service_healthy
     cap_add:
       - NET_ADMIN
     command: python3 Server/Emotion_Recognition/FL_Server_Unified.py
@@ -168,9 +176,12 @@ services:
       - ../experiment_results:/app/results
       - ../certs:/app/certs:ro
     depends_on:
-      - fl-server-unified-emotion
-      - mqtt-broker-unified
-      - amqp-broker-unified
+      fl-server-unified-emotion:
+        condition: service_started
+      mqtt-broker-unified:
+        condition: service_started
+      amqp-broker-unified:
+        condition: service_healthy
     cap_add:
       - NET_ADMIN
     command: python3 Client/Emotion_Recognition/FL_Client_Unified.py
@@ -236,9 +247,12 @@ services:
       - ../experiment_results:/app/results
       - ../certs:/app/certs:ro
     depends_on:
-      - fl-server-unified-emotion
-      - mqtt-broker-unified
-      - amqp-broker-unified
+      fl-server-unified-emotion:
+        condition: service_started
+      mqtt-broker-unified:
+        condition: service_started
+      amqp-broker-unified:
+        condition: service_healthy
     cap_add:
       - NET_ADMIN
     command: python3 Client/Emotion_Recognition/FL_Client_Unified.py
@@ -304,9 +318,12 @@ services:
       - ../experiment_results:/app/results
       - ../certs:/app/certs:ro
     depends_on:
-      - fl-server-unified-emotion
-      - mqtt-broker-unified
-      - amqp-broker-unified
+      fl-server-unified-emotion:
+        condition: service_started
+      mqtt-broker-unified:
+        condition: service_started
+      amqp-broker-unified:
+        condition: service_healthy
     cap_add:
       - NET_ADMIN
     command: python3 Client/Emotion_Recognition/FL_Client_Unified.py
