@@ -583,7 +583,7 @@ class FederatedLearningClient:
             self.pending_start_evaluation_round = None
             if pending_eval_round == self.current_round:
                 print(f"Client {self.client_id} running deferred evaluation for round {pending_eval_round} now that global model has arrived")
-                await self.evaluate_model()
+                await self.evaluate_model(pending_eval_round)
                 self.current_round = pending_eval_round + 1
                 print(f"Client {self.client_id} ready for next round {self.current_round}")
 
@@ -658,7 +658,7 @@ class FederatedLearningClient:
 
         if round_num == self.current_round:
             print(f"Client {self.client_id} starting evaluation for round {round_num}...")
-            await self.evaluate_model()
+            await self.evaluate_model(round_num)
             self.current_round = round_num + 1
             print(f"Client {self.client_id} ready for next round {self.current_round}")
         else:
@@ -772,8 +772,14 @@ class FederatedLearningClient:
             O_send = time.perf_counter() - send_start_cpu
             print(f"FL_DIAG O_send={O_send:.9f} payload_bytes={sent_payload_bytes} send_start_ts={send_start_ts:.9f}")
     
-    async def evaluate_model(self):
-        """Evaluate model on validation data and send metrics to server"""
+    async def evaluate_model(self, eval_round: int):
+        """Evaluate model on validation data and send metrics to server.
+
+        ``eval_round`` is the FL round being evaluated (from the server's ``start_evaluation``
+        signal). Using it explicitly avoids rare races where ``self.current_round`` already
+        advanced due to concurrent inbound messages, which would tag metrics with the wrong
+        round and cause the server to ignore them.
+        """
         print(f"Evaluating on {self.validation_generator.n} validation samples...")
         
         # Evaluate in thread pool (http3k operation, <1s)
@@ -801,7 +807,7 @@ class FederatedLearningClient:
         _metrics_msg = {
             'type': 'metrics',
             'client_id': self.client_id,
-            'round': self.current_round,
+            'round': eval_round,
             'num_samples': self.validation_generator.n,
             'metrics': metrics_dict
         }
@@ -812,7 +818,7 @@ class FederatedLearningClient:
             self.client_id,
             {
                 "client_id": self.client_id,
-                "round": self.current_round,
+                "round": int(eval_round),
                 "loss": float(loss),
                 "accuracy": float(accuracy),
                 "training_time_sec": float(self._last_training_time_sec),
@@ -832,7 +838,7 @@ class FederatedLearningClient:
         )
         self._client_fl_round_history.append(
             {
-                "round": int(self.current_round),
+                "round": int(eval_round),
                 "loss": float(loss),
                 "accuracy": float(accuracy),
                 "total_fl_wall_time_sec": float(

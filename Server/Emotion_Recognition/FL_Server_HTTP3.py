@@ -11,7 +11,7 @@ import base64
 import time
 import asyncio
 import socket
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 import matplotlib.pyplot as plt
 from pathlib import Path
 
@@ -245,6 +245,12 @@ class FederatedLearningServer:
         self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
+        # Serialize FL state transitions (metrics/updates) — concurrent asyncio tasks from
+        # multiple QUIC streams could otherwise double-aggregate or accept stale payloads.
+        self._fl_state_lock = asyncio.Lock()
+        # Downlink target: connection that last received an uplink for this client_id
+        # (avoids sending evaluation signals only to a stale duplicate QUIC socket).
+        self._client_uplink_protocol: Dict[int, Any] = {}
         self.transport_update_chunks = {}  # {(protocol, client_id, round): {'chunks': {}, ...}}
         self.global_weights = None
         
@@ -361,6 +367,9 @@ class FederatedLearningServer:
         ]
 
         protocols = list(self.registered_clients[client_id])
+        preferred = self._client_uplink_protocol.get(client_id)
+        if preferred is not None and preferred in protocols:
+            protocols = [preferred]
         dead_protocols = set()
 
         for protocol in protocols:
@@ -479,7 +488,9 @@ class FederatedLearningServer:
         try:
             msg_type = message.get('type')
             client_id = message.get('client_id', 'unknown')
-            
+            if isinstance(client_id, int):
+                self._client_uplink_protocol[client_id] = protocol
+
             if msg_type == 'register':
                 await self.handle_client_registration(message, protocol)
             elif msg_type in ('model_update', 'update'):
@@ -584,51 +595,55 @@ class FederatedLearningServer:
         if stop_on_client_convergence() and float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             await self.mark_client_converged(client_id)
             return
-        if round_num == self.current_round:
-            # Decompress or deserialize client weights
-            if 'compressed_data' in message and self.quantization_handler is not None:
-                compressed_data = pickle.loads(base64.b64decode(message['compressed_data']))
-                # Keep quantized end-to-end: do NOT decompress/dequantize on server.
-                self.client_updates[client_id] = {
-                    'compressed_data': compressed_data,
-                    'num_samples': message['num_samples'],
-                    'metrics': message['metrics']
-                }
-                print(f"Server: Received quantized update from client {message['client_id']} (kept quantized)")
-                weights = None
-            else:
-                encoded = message.get('weights')
-                if encoded is None:
-                    print(f"[ERROR] Missing 'weights' in model_update from client {client_id}")
-                    return
-                start_t = time.time()
-                loop = asyncio.get_event_loop()
-                try:
-                    weights = await loop.run_in_executor(None, self.deserialize_weights, encoded)
-                except Exception as e:
-                    print(f"[ERROR] Failed to deserialize weights from client {client_id}: {e}")
-                    import traceback; traceback.print_exc()
-                    return
-                dt = time.time() - start_t
-            
-            if recv_start_cpu is not None:
-                O_recv = time.perf_counter() - recv_start_cpu
-                recv_end_ts = time.time()
-                send_start_ts = message.get("diagnostic_send_start_ts", recv_end_ts)
-                print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={send_start_ts:.9f}")
-            
-            if 'compressed_data' not in message or self.quantization_handler is None:
-                self.client_updates[client_id] = {
-                    'weights': weights,
-                    'num_samples': message['num_samples'],
-                    'metrics': message['metrics']
-                }
-            
+        if round_num != self.current_round:
+            return
+
+        entry = None
+        if 'compressed_data' in message and self.quantization_handler is not None:
+            compressed_data = pickle.loads(base64.b64decode(message['compressed_data']))
+            entry = {
+                'compressed_data': compressed_data,
+                'num_samples': message['num_samples'],
+                'metrics': message['metrics']
+            }
+            print(f"Server: Received quantized update from client {message['client_id']} (kept quantized)")
+        else:
+            encoded = message.get('weights')
+            if encoded is None:
+                print(f"[ERROR] Missing 'weights' in model_update from client {client_id}")
+                return
+            loop = asyncio.get_event_loop()
+            try:
+                weights = await loop.run_in_executor(None, self.deserialize_weights, encoded)
+            except Exception as e:
+                print(f"[ERROR] Failed to deserialize weights from client {client_id}: {e}")
+                import traceback; traceback.print_exc()
+                return
+            entry = {
+                'weights': weights,
+                'num_samples': message['num_samples'],
+                'metrics': message['metrics']
+            }
+
+        if recv_start_cpu is not None:
+            O_recv = time.perf_counter() - recv_start_cpu
+            recv_end_ts = time.time()
+            send_start_ts = message.get("diagnostic_send_start_ts", recv_end_ts)
+            print(f"FL_DIAG client_id={client_id} O_recv={O_recv:.9f} recv_end_ts={recv_end_ts:.9f} send_start_ts={send_start_ts:.9f}")
+
+        updates_snapshot = None
+        async with self._fl_state_lock:
+            if round_num != self.current_round or client_id not in self.active_clients:
+                return
+            self.client_updates[client_id] = entry
             print(f"Received update from client {client_id} "
                   f"({len(self.client_updates)}/{len(self.active_clients)})")
-            
             if len(self.client_updates) >= len(self.active_clients) and len(self.active_clients) > 0:
-                await self.aggregate_models()
+                updates_snapshot = dict(self.client_updates)
+                self.client_updates.clear()
+
+        if updates_snapshot:
+            await self.aggregate_models(updates_snapshot)
     
     async def handle_client_metrics(self, message):
         """Handle evaluation metrics from client"""
@@ -643,7 +658,15 @@ class FederatedLearningServer:
         if stop_on_client_convergence() and float(message.get('metrics', {}).get('client_converged', 0.0)) >= 1.0:
             await self.mark_client_converged(client_id)
             return
-        if round_num == self.current_round:
+
+        metrics_snapshot = None
+        async with self._fl_state_lock:
+            if round_num != self.current_round:
+                print(
+                    f"[HTTP/3] Ignoring metrics from client {client_id}: message round {round_num} "
+                    f"!= server round {self.current_round} (stale client, duplicate POST, or QUIC reconnect race)"
+                )
+                return
             m = message.get('metrics', {})
             self.client_metrics[client_id] = {
                 'num_samples': message['num_samples'],
@@ -652,18 +675,17 @@ class FederatedLearningServer:
                 'round_time_sec': float(m.get('round_time_sec', 0.0)),
                 'cumulative_energy_j': float(m.get('cumulative_energy_j', 0.0)),
             }
-            
+
             print(f"Received metrics from client {client_id} "
                   f"({len(self.client_metrics)}/{len(self.active_clients)})")
-            
+
             if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
-                await self.aggregate_metrics()
-                await self.continue_training()
-        else:
-            print(
-                f"[HTTP/3] Ignoring metrics from client {client_id}: message round {round_num} "
-                f"!= server round {self.current_round} (stale client, duplicate POST, or QUIC reconnect race)"
-            )
+                metrics_snapshot = dict(self.client_metrics)
+                self.client_metrics.clear()
+
+        if metrics_snapshot:
+            await self.aggregate_metrics(metrics_snapshot)
+            await self.continue_training()
     
     async def distribute_initial_model(self):
         """Distribute initial global model to all clients"""
@@ -743,22 +765,34 @@ class FederatedLearningServer:
         })
         print("Start training signal sent successfully\n")
     
-    async def aggregate_models(self):
-        """Aggregate model weights using FedAvg algorithm"""
-        print(f"\nAggregating models from {len(self.client_updates)} clients...")
+    async def aggregate_models(self, client_updates_snapshot=None):
+        """Aggregate model weights using FedAvg algorithm.
 
-        if not self.client_updates:
+        When ``client_updates_snapshot`` is provided, it is consumed directly and
+        ``self.client_updates`` is assumed already cleared (see handle_client_update).
+        Otherwise a snapshot is taken under lock (e.g. convergence paths).
+        """
+        if client_updates_snapshot is None:
+            async with self._fl_state_lock:
+                if not self.client_updates or len(self.client_updates) < len(self.active_clients):
+                    return
+                client_updates_snapshot = dict(self.client_updates)
+                self.client_updates.clear()
+
+        print(f"\nAggregating models from {len(client_updates_snapshot)} clients...")
+
+        if not client_updates_snapshot:
             print("No client updates available to aggregate; waiting for next round signal.")
             return
 
         # Quantization end-to-end: aggregate directly on compressed quantized tensors.
         if (
             self.quantization_handler is not None
-            and 'compressed_data' in list(self.client_updates.values())[0]
+            and 'compressed_data' in list(client_updates_snapshot.values())[0]
         ):
             compressed_updates = {
                 cid: {"compressed_data": upd["compressed_data"], "num_samples": upd.get("num_samples", 1)}
-                for cid, upd in self.client_updates.items()
+                for cid, upd in client_updates_snapshot.items()
             }
             aggregated_compressed, _stats = self.quantization_handler.aggregate_compressed_updates(compressed_updates)
             self.global_compressed = aggregated_compressed
@@ -781,25 +815,25 @@ class FederatedLearningServer:
             return
         
         total_samples = sum(update['num_samples'] 
-                          for update in self.client_updates.values())
+                          for update in client_updates_snapshot.values())
 
         if total_samples <= 0:
             print("Warning: total_samples is 0 during model aggregation; falling back to equal-weight averaging.")
-            total_samples = len(self.client_updates)
-            sample_weights = {cid: 1.0 / total_samples for cid in self.client_updates.keys()}
+            total_samples = len(client_updates_snapshot)
+            sample_weights = {cid: 1.0 / total_samples for cid in client_updates_snapshot.keys()}
         else:
             sample_weights = {
                 cid: (update['num_samples'] / total_samples)
-                for cid, update in self.client_updates.items()
+                for cid, update in client_updates_snapshot.items()
             }
         
         aggregated_weights = []
-        first_client_weights = list(self.client_updates.values())[0]['weights']
+        first_client_weights = list(client_updates_snapshot.values())[0]['weights']
         
         for layer_idx in range(len(first_client_weights)):
             layer_weights = np.zeros_like(first_client_weights[layer_idx])
             
-            for client_id, update in self.client_updates.items():
+            for client_id, update in client_updates_snapshot.items():
                 weight = sample_weights[client_id]
                 layer_weights += weight * update['weights'][layer_idx]
             
@@ -833,34 +867,35 @@ class FederatedLearningServer:
             'round': self.current_round
         })
     
-    async def aggregate_metrics(self):
-        """Aggregate evaluation metrics from all clients"""
-        print(f"\nAggregating metrics from {len(self.client_metrics)} clients...")
-        if not self.client_metrics:
+    async def aggregate_metrics(self, metrics_snapshot=None):
+        """Aggregate evaluation metrics from all clients."""
+        src = metrics_snapshot if metrics_snapshot is not None else self.client_metrics
+        print(f"\nAggregating metrics from {len(src)} clients...")
+        if not src:
             print("No client metrics available to aggregate; waiting for next round signal.")
             return
         if getattr(self, 'round_start_time', None) is not None:
             self.ROUND_TIMES.append(time.time() - self.round_start_time)
-        socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
+        socs = [m.get('battery_soc', 1.0) for m in src.values()]
         self.BATTERY_CONSUMPTION.append(1.0 - (sum(socs) / len(socs) if socs else 1.0))
-        self.BATTERY_MODEL_CONSUMPTION.append(avg_battery_model_drain_fraction(self.client_metrics))
+        self.BATTERY_MODEL_CONSUMPTION.append(avg_battery_model_drain_fraction(src))
         total_samples = sum(metric['num_samples'] 
-                          for metric in self.client_metrics.values())
+                          for metric in src.values())
 
         if total_samples <= 0:
             print("Warning: total_samples is 0 during metrics aggregation; using simple mean over clients.")
             aggregated_accuracy = float(np.mean([
-                metric['metrics']['accuracy'] for metric in self.client_metrics.values()
+                metric['metrics']['accuracy'] for metric in src.values()
             ]))
             aggregated_loss = float(np.mean([
-                metric['metrics']['loss'] for metric in self.client_metrics.values()
+                metric['metrics']['loss'] for metric in src.values()
             ]))
         else:
             aggregated_accuracy = sum(metric['metrics']['accuracy'] * metric['num_samples']
-                                     for metric in self.client_metrics.values()) / total_samples
+                                     for metric in src.values()) / total_samples
             
             aggregated_loss = sum(metric['metrics']['loss'] * metric['num_samples']
-                                 for metric in self.client_metrics.values()) / total_samples
+                                 for metric in src.values()) / total_samples
         
         self.ACCURACY.append(aggregated_accuracy)
         self.LOSS.append(aggregated_loss)
