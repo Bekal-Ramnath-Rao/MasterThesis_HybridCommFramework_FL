@@ -921,15 +921,15 @@ async def main():
     # QUIC idle timeout: local training + straggler waits can exceed 60s; align with other HTTP/3 FL clients (hours-scale default).
     _idle = os.getenv("IDLE_TIMEOUT", "0" if os.getenv("FL_DIAGNOSTIC_PIPELINE") == "1" else "3600").strip().lower()
     idle_sec = float(_idle) if _idle not in ("0", "none", "inf", "infinity") else 86400.0 * 7  # 7 days = effectively no limit
-    # Realistic max payload: HTTP/3 16 KB per stream
-    HTTP3_MAX_STREAM_DATA = 16 * 1024  # 16 KB
     configuration = QuicConfiguration(
         is_client=True,
         alpn_protocols=H3_ALPN,
         congestion_control_algorithm="cubic",
         idle_timeout=idle_sec,
-        max_data=HTTP3_MAX_STREAM_DATA * 2,  # 32 KB total
-        max_stream_data=HTTP3_MAX_STREAM_DATA,  # 16 KB per stream
+        # Large windows so the server's aggregated model (12-17 MB) arrives without
+        # stalling on thousands of MAX_DATA round-trips (critical for WSL2 / NAT).
+        max_data=128 * 1024 * 1024,          # 128 MB connection total
+        max_stream_data=32 * 1024 * 1024,    # 32 MB per stream
         max_datagram_frame_size=65536,
         initial_rtt=0.15,
     )

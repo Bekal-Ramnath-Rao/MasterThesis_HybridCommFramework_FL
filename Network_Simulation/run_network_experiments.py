@@ -1716,19 +1716,34 @@ class ExperimentRunner:
                 avg_series.append(sum(vals) / len(vals))
         return avg_series
 
-    def _estimate_battery_series_from_logs(self, exp_dir: str) -> List[float]:
+    def _estimate_battery_series_from_logs(self, exp_dir: str, protocol: str = "") -> List[float]:
         """Estimate cumulative battery consumption per round from saved client logs.
 
         Fallback for historical experiments where the server generated a battery plot
         but the timestamped experiment folder did not receive either the plot or the
         `battery_consumption` series in copied JSON.
+
+        Applies the same PROTOCOL_ENERGY_ALPHA / PROTOCOL_CPU_BETA multipliers used by
+        BatteryModel so that the fallback estimate is consistent with _estimate_battery_model_series_from_logs
+        and the live server-computed battery_consumption values.
         """
         # Shared battery model constants used by clients
         k_tx = 1e-8
+        k_rx = 1e-8
         E_fixed = 0.1
         P_CPU_MAX = 10.0
         BATTERY_CAP_J = 60.0 * 3600.0
         cpu_util_fraction = 0.5  # conservative fallback when exact runtime CPU is unavailable
+
+        p = (protocol or "").strip().lower()
+        # For rl_unified/unified the protocol changes per round; use neutral baseline (alpha=beta=1.0)
+        # to avoid biasing the estimate, consistent with _estimate_battery_model_series_from_logs.
+        if p in ("rl_unified", "unified"):
+            alpha = 1.0
+            beta = 1.0
+        else:
+            alpha = float(PROTOCOL_ENERGY_ALPHA.get(p, 1.0))
+            beta = float(PROTOCOL_CPU_BETA.get(p, 1.0))
 
         round_start_pattern = re.compile(r"starting training for round\s+(\d+)", re.IGNORECASE)
         send_size_pattern = re.compile(
@@ -1789,8 +1804,11 @@ class ExperimentRunner:
                 series = []
                 for rnd in rounds:
                     bits_tx = bytes_sent[rnd] * 8
-                    e_radio = (k_tx * bits_tx) + E_fixed
-                    e_cpu = P_CPU_MAX * cpu_util_fraction * training_times.get(rnd, 0.0)
+                    # bits_rx unknown from logs; use 0 as approximation (same as _estimate_battery_model_series_from_logs)
+                    bits_rx = 0
+                    e_radio_baseline = k_tx * bits_tx + k_rx * bits_rx + E_fixed
+                    e_radio = alpha * e_radio_baseline
+                    e_cpu = P_CPU_MAX * cpu_util_fraction * training_times.get(rnd, 0.0) * beta
                     e_total = e_radio + e_cpu
                     cumulative += e_total / BATTERY_CAP_J
                     series.append(cumulative)
@@ -1878,8 +1896,88 @@ class ExperimentRunner:
                 out.append(sum(vals) / len(vals))
         return out
 
+    def _cpu_memory_series_from_jsonl(self, exp_dir: str) -> Dict[str, List[float]]:
+        """Read per-round average CPU% and memory% from client_fl_metrics JSONL files.
+
+        Returns a dict with keys ``cpu_percent`` and ``memory_percent``, each a list indexed
+        by round (1-based, same convention as battery / accuracy series).  Returns empty lists
+        when no usable data is found.
+        """
+        path_lower = exp_dir.lower().replace(os.sep, "/")
+        if "mentalstate" in path_lower or "mental_state" in path_lower:
+            use_case_filter = "mental_state"
+        elif "temperature" in path_lower:
+            use_case_filter = "temperature"
+        elif "emotion" in path_lower:
+            use_case_filter = "emotion"
+        else:
+            use_case_filter = None
+
+        roots = [
+            exp_dir,
+            os.path.join(os.path.dirname(exp_dir), "shared_data"),
+            str(_REPO_ROOT / "shared_data"),
+        ]
+        files: List[str] = []
+        for r in roots:
+            if r and os.path.isdir(r):
+                files.extend(glob.glob(os.path.join(r, "client_fl_metrics_*_client*.jsonl")))
+        if use_case_filter:
+            files = [
+                fp for fp in files
+                if os.path.basename(fp).startswith(f"client_fl_metrics_{use_case_filter}_")
+            ]
+        if not files:
+            return {"cpu_percent": [], "memory_percent": []}
+
+        cpu_by_round: Dict[int, List[float]] = {}
+        mem_by_round: Dict[int, List[float]] = {}
+        for fp in files:
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        rec = json.loads(line)
+                        rnd = int(rec.get("round") or 0)
+                        if rnd <= 0:
+                            continue
+                        cpu = rec.get("cpu_percent")
+                        mem = rec.get("memory_percent")
+                        if cpu is not None:
+                            try:
+                                cpu_by_round.setdefault(rnd, []).append(float(cpu))
+                            except (TypeError, ValueError):
+                                pass
+                        if mem is not None:
+                            try:
+                                mem_by_round.setdefault(rnd, []).append(float(mem))
+                            except (TypeError, ValueError):
+                                pass
+            except Exception:
+                continue
+
+        def _avg_series(by_round: Dict[int, List[float]]) -> List[float]:
+            if not by_round:
+                return []
+            max_r = max(by_round.keys())
+            out: List[float] = []
+            for r in range(1, max_r + 1):
+                vals = by_round.get(r)
+                if vals:
+                    out.append(sum(vals) / len(vals))
+            return out
+
+        return {
+            "cpu_percent": _avg_series(cpu_by_round),
+            "memory_percent": _avg_series(mem_by_round),
+        }
+
     def _estimate_battery_model_series_from_logs(self, exp_dir: str, protocol: str) -> List[float]:
-        """Like _estimate_battery_series_from_logs but applies PROTOCOL_ENERGY_ALPHA / PROTOCOL_CPU_BETA."""
+        """Log-based fallback for battery_model_consumption, used when JSONL data is unavailable.
+
+        Applies PROTOCOL_ENERGY_ALPHA / PROTOCOL_CPU_BETA — consistent with _estimate_battery_series_from_logs."""
         p = (protocol or "mqtt").strip().lower()
         # For rl_unified/unified the protocol is dynamically selected each round, so we use
         # the neutral baseline multipliers (alpha=1.0, beta=1.0) to avoid biasing the estimate
@@ -2097,7 +2195,7 @@ class ExperimentRunner:
         battery_series = training.get("battery_consumption", []) or training.get("battery_soc", []) or training.get("avg_battery_soc", [])
         battery_title = "Battery Consumption / SoC per Round"
         if not battery_series:
-            battery_series = self._estimate_battery_series_from_logs(exp_dir)
+            battery_series = self._estimate_battery_series_from_logs(exp_dir, protocol=protocol)
             if battery_series:
                 battery_title = "Estimated Battery Consumption per Round"
         if rounds and battery_series and len(battery_series) != len(rounds):
@@ -2115,6 +2213,53 @@ class ExperimentRunner:
             ax.grid(True, alpha=0.3)
             fig.tight_layout()
             fig.savefig(os.path.join(exp_dir, "battery_consumption_per_round.png"), dpi=180, bbox_inches="tight")
+            plt.close(fig)
+
+        # CPU utilisation and memory consumption per round from client JSONL
+        cpu_mem = self._cpu_memory_series_from_jsonl(exp_dir)
+        cpu_series = (
+            training.get("avg_cpu_percent", []) or cpu_mem.get("cpu_percent", [])
+        )
+        mem_series = (
+            training.get("avg_memory_percent", []) or cpu_mem.get("memory_percent", [])
+        )
+
+        def _align(series: List[float], ref: List) -> List[float]:
+            if not series or not ref:
+                return list(series)
+            n = len(ref)
+            if len(series) > n:
+                return series[:n]
+            if len(series) < n:
+                return list(series) + [series[-1]] * (n - len(series))
+            return list(series)
+
+        cpu_series = _align(cpu_series, rounds)
+        mem_series = _align(mem_series, rounds)
+
+        if rounds and (cpu_series or mem_series):
+            n_plots = int(bool(cpu_series)) + int(bool(mem_series))
+            fig, axes = plt.subplots(1, n_plots, figsize=(7 * n_plots, 4.5))
+            if n_plots == 1:
+                axes = [axes]
+            ax_idx = 0
+            if cpu_series and len(cpu_series) == len(rounds):
+                axes[ax_idx].plot(rounds, cpu_series, marker="o", linewidth=2, color="tab:orange")
+                axes[ax_idx].set_title("Avg CPU Utilization per Round")
+                axes[ax_idx].set_xlabel("Round")
+                axes[ax_idx].set_ylabel("CPU (%)")
+                axes[ax_idx].set_ylim(0, 100)
+                axes[ax_idx].grid(True, alpha=0.3)
+                ax_idx += 1
+            if mem_series and len(mem_series) == len(rounds):
+                axes[ax_idx].plot(rounds, mem_series, marker="s", linewidth=2, color="tab:purple")
+                axes[ax_idx].set_title("Avg Memory Usage per Round")
+                axes[ax_idx].set_xlabel("Round")
+                axes[ax_idx].set_ylabel("Memory (%)")
+                axes[ax_idx].set_ylim(0, 100)
+                axes[ax_idx].grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(os.path.join(exp_dir, "cpu_memory_per_round.png"), dpi=180, bbox_inches="tight")
             plt.close(fig)
 
     def _ensure_battery_plot_alias(self, exp_dir: str):
@@ -2146,7 +2291,7 @@ class ExperimentRunner:
         )
         return obj
 
-    def _ensure_training_includes_battery_series(self, exp_dir: str, training: Optional[Dict]) -> Optional[Dict]:
+    def _ensure_training_includes_battery_series(self, exp_dir: str, training: Optional[Dict], protocol: str = "") -> Optional[Dict]:
         """If training dict has rounds but no battery series, estimate from client logs and attach."""
         if not training or not isinstance(training, dict):
             return training
@@ -2161,7 +2306,7 @@ class ExperimentRunner:
                 break
         if has_battery:
             return training
-        est = self._estimate_battery_series_from_logs(exp_dir)
+        est = self._estimate_battery_series_from_logs(exp_dir, protocol=protocol)
         if not est:
             return training
         n = len(rounds)
@@ -2205,6 +2350,35 @@ class ExperimentRunner:
         out["battery_model_consumption_source"] = source
         return out
 
+    def _ensure_training_includes_cpu_memory_series(
+        self, exp_dir: str, training: Optional[Dict]
+    ) -> Optional[Dict]:
+        """Attach avg_cpu_percent and avg_memory_percent series from client JSONL when not already present."""
+        if not training or not isinstance(training, dict):
+            return training
+        rounds = training.get("rounds", []) or []
+        if not rounds:
+            return training
+        n = len(rounds)
+        needs_cpu = not isinstance(training.get("avg_cpu_percent"), (list, tuple)) or len(training.get("avg_cpu_percent", [])) == 0
+        needs_mem = not isinstance(training.get("avg_memory_percent"), (list, tuple)) or len(training.get("avg_memory_percent", [])) == 0
+        if not needs_cpu and not needs_mem:
+            return training
+
+        cpu_mem = self._cpu_memory_series_from_jsonl(exp_dir)
+        out = dict(training)
+        if needs_cpu and cpu_mem.get("cpu_percent"):
+            s = cpu_mem["cpu_percent"]
+            s = s[:n] if len(s) > n else (list(s) + [s[-1]] * (n - len(s)) if len(s) < n else s)
+            out["avg_cpu_percent"] = s
+            out["avg_cpu_percent_source"] = "client_metrics_jsonl"
+        if needs_mem and cpu_mem.get("memory_percent"):
+            s = cpu_mem["memory_percent"]
+            s = s[:n] if len(s) > n else (list(s) + [s[-1]] * (n - len(s)) if len(s) < n else s)
+            out["avg_memory_percent"] = s
+            out["avg_memory_percent_source"] = "client_metrics_jsonl"
+        return out
+
     def _finalize_experiment_artifacts(
         self,
         server_container: Optional[str],
@@ -2216,8 +2390,9 @@ class ExperimentRunner:
         if server_container:
             self._copy_server_plots_to_experiment_folder(server_container, protocol, exp_dir, scenario=scenario)
         training = self._resolve_training_results(exp_dir, protocol)
-        training = self._ensure_training_includes_battery_series(exp_dir, training)
+        training = self._ensure_training_includes_battery_series(exp_dir, training, protocol=protocol)
         training = self._ensure_training_includes_battery_model_series(exp_dir, protocol, training)
+        training = self._ensure_training_includes_cpu_memory_series(exp_dir, training)
         self._persist_training_results(exp_dir, protocol, training)
         self._generate_standard_plots(protocol, exp_dir, training)
         self._ensure_battery_plot_alias(exp_dir)

@@ -10,6 +10,8 @@ Every record is normalized to include:
     battery_consumption_joules_round / _cumulative
   - total_fl_wall_time_sec (this round), total_fl_cumulative_wall_time_sec (train+comm, summed),
     total_fl_cumulative_training_time_sec and total_fl_training_time_sec (local training only, summed)
+  - cpu_percent (host CPU % sampled at log time via psutil, or caller-supplied)
+  - memory_percent (host RAM % sampled at log time via psutil, or caller-supplied)
 
 Environment:
   CLIENT_METRICS_LOG — set to 0/false/no to disable
@@ -24,6 +26,13 @@ import os
 import re
 import time
 from typing import Any, Dict, Optional, Tuple
+
+try:
+    import psutil as _psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _psutil = None  # type: ignore[assignment]
+    _HAS_PSUTIL = False
 
 # Per (use_case, client_id) running totals in the client process.
 _cumulative_wall_sec: Dict[Tuple[str, int], float] = {}
@@ -156,6 +165,19 @@ def _normalize_metrics_record(
             out["battery_soc_before"] = float(out["battery_soc_before"])
         except (TypeError, ValueError):
             out.pop("battery_soc_before", None)
+
+    # CPU and memory: use caller-supplied values if present, otherwise sample now via psutil.
+    # interval=0.0 returns the non-blocking cached reading — fast enough for per-round logging.
+    if out.get("cpu_percent") is None and _HAS_PSUTIL:
+        try:
+            out["cpu_percent"] = float(_psutil.cpu_percent(interval=0.0))
+        except Exception:
+            pass
+    if out.get("memory_percent") is None and _HAS_PSUTIL:
+        try:
+            out["memory_percent"] = float(_psutil.virtual_memory().percent)
+        except Exception:
+            pass
 
     return out
 

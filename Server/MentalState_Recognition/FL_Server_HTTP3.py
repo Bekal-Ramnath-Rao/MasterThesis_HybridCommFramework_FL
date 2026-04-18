@@ -329,7 +329,8 @@ class FederatedLearningServer:
         self.num_clients = min_clients  # Start with minimum, will update as clients join
         self.num_rounds = num_rounds
         self.current_round = 0
-        self.registered_clients = {}  # Maps client_id to protocol reference
+        # Maps client_id -> set of active protocol references (handles duplicate WSL2 QUIC connections)
+        self.registered_clients = {}
         self.active_clients = set()
         self.client_updates = {}
         self.client_metrics = {}
@@ -400,45 +401,65 @@ class FederatedLearningServer:
         return weights
     
     async def send_message(self, client_id, message):
-        """Send message to client via HTTP/3 stream with improved transmission for poor networks"""
-        if client_id in self.registered_clients:
-            protocol = self.registered_clients[client_id]
-            # Ensure HTTP connection is initialized
+        """Send message to all registered protocols for a client (handles duplicate WSL2 connections)."""
+        if client_id not in self.registered_clients or not self.registered_clients[client_id]:
+            print(f"[ERROR] Client {client_id} not in registered_clients. Available: {list(self.registered_clients.keys())}")
+            return
+
+        payload = json.dumps(message).encode('utf-8')
+        headers = [
+            (b":status", b"200"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+        ]
+
+        protocols = list(self.registered_clients[client_id])
+        dead_protocols = set()
+
+        for protocol in protocols:
             if protocol._http is None:
-                protocol._http = H3Connection(protocol._quic)
-            
-            # Get next available stream ID (bidirectional for server push)
-            stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
-            
-            # Prepare JSON payload
-            payload = json.dumps(message).encode('utf-8')
-            
-            # Send headers (server push)
-            headers = [
-                (b":status", b"200"),
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(payload)).encode()),
-            ]
-            protocol._http.send_headers(stream_id=stream_id, headers=headers)
-            protocol._http.send_data(stream_id=stream_id, data=payload, end_stream=True)
-            protocol.transmit()
-            
-            msg_type = message.get('type')
-            msg_size_mb = len(payload) / (1024 * 1024)
-            print(f"Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(payload)} bytes = {msg_size_mb:.2f} MB)")
-            
-            # For large payloads, flush send buffer across multiple flow-control windows
-            if len(payload) > 1_000_000:  # > 1 MB
-                for _ in range(5):
-                    await asyncio.sleep(0.3)
-                    protocol.transmit()
-            else:
-                await asyncio.sleep(0.05)
+                try:
+                    protocol._http = H3Connection(protocol._quic)
+                except Exception:
+                    dead_protocols.add(protocol)
+                    continue
+
+            try:
+                stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
+            except Exception as e:
+                print(f"[ERROR] Failed to get stream ID for client {client_id}: {e}")
+                dead_protocols.add(protocol)
+                continue
+
+            try:
+                protocol._http.send_headers(stream_id=stream_id, headers=headers)
+                protocol._http.send_data(stream_id=stream_id, data=payload, end_stream=True)
+                protocol.transmit()
+                msg_type = message.get('type')
+                msg_size_mb = len(payload) / (1024 * 1024)
+                print(f"Sent message type '{msg_type}' to client {client_id} on stream {stream_id} ({len(payload)} bytes = {msg_size_mb:.2f} MB)")
+            except Exception as e:
+                print(f"[ERROR] Failed to send on protocol for client {client_id}: {e}")
+                dead_protocols.add(protocol)
+                continue
+
+        if dead_protocols:
+            self.registered_clients[client_id] -= dead_protocols
+
+        if len(payload) > 1_000_000:
+            for _ in range(10):
+                await asyncio.sleep(0.3)
+                for protocol in list(self.registered_clients.get(client_id, set())):
+                    try:
+                        protocol.transmit()
+                    except Exception:
+                        pass
+        else:
+            await asyncio.sleep(0.05)
     
     async def broadcast_message(self, message):
-        """Broadcast message to all registered clients"""
-        msg_type = message.get('type')
-        for client_id in self.registered_clients.keys():
+        """Broadcast message to all registered clients."""
+        for client_id in list(self.registered_clients.keys()):
             await self.send_message(client_id, message)
     
     async def handle_message(self, message, protocol):
@@ -459,16 +480,35 @@ class FederatedLearningServer:
             traceback.print_exc()
     
     async def handle_client_registration(self, message, protocol):
-        """Handle client registration"""
+        """Handle client registration.
+
+        Stores every distinct protocol object in a *set* per client_id so that
+        WSL2 / NAT environments that create duplicate QUIC connections for the
+        same logical client still receive downlink messages regardless of which
+        underlying connection is live.
+        """
         client_id = message['client_id']
-        self.registered_clients[client_id] = protocol  # Store protocol reference
+
+        if client_id not in self.registered_clients:
+            self.registered_clients[client_id] = set()
+
+        existing = self.registered_clients[client_id]
+        if protocol not in existing:
+            if existing:
+                print(
+                    f"[HTTP/3] Client {client_id} registered on an additional QUIC connection "
+                    f"(total protocols for this client: {len(existing) + 1}). "
+                    f"All connections will receive downlink messages."
+                )
+            existing.add(protocol)
+
         self.active_clients.add(client_id)
         print(f"Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients} expected, min: {self.min_clients})")
-        
+
         # Update total client count if more clients join
         if len(self.registered_clients) > self.num_clients:
             self.update_client_count(len(self.registered_clients))
-        
+
         # Check if this is a late-joining client
         if self.training_started:
             print(f"[LATE JOIN] Client {client_id} joining during round {self.current_round}")
@@ -477,13 +517,15 @@ class FederatedLearningServer:
             if self.global_weights is not None:
                 self.send_current_model_to_client(client_id)
             return
-        
+
         if len(self.registered_clients) >= self.min_clients:
+            # Set the flag BEFORE the async distribute call to prevent a concurrent
+            # re-registration from triggering a second distribution round.
+            self.training_started = True
             print("\nAll clients registered. Distributing initial global model...\n")
+            self.start_time = time.time()
             await asyncio.sleep(2)
             await self.distribute_initial_model()
-            self.start_time = time.time()
-            self.training_started = True
             print(f"Training started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     
     async def mark_client_converged(self, client_id):
@@ -921,9 +963,10 @@ async def main():
     configuration = QuicConfiguration(
         is_client=False,
         alpn_protocols=H3_ALPN,
-        # Large windows so the full model can be sent without many MAX_DATA round-trips
-        max_stream_data=16 * 1024,  # 16 KB per stream
-        max_data=32 * 1024,  # 32 KB total connection
+        # Large windows so the full model payload fits in one flow-control window.
+        # 16/32 KB stalled WSL2 clients that needed thousands of MAX_DATA round-trips.
+        max_stream_data=32 * 1024 * 1024,   # 32 MB per stream
+        max_data=128 * 1024 * 1024,         # 128 MB connection total
         # FAIR CONFIG: Timeout 600s for very_poor network scenarios
         idle_timeout=600.0,  # 10 minutes
         max_datagram_frame_size=65536,  # 64 KB frames
