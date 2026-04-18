@@ -629,6 +629,11 @@ class FederatedLearningClient:
             'metrics': metrics_dict
         })
         uplink_comm_sec = time.time() - comm_start
+        # After the client has uploaded its local update, it must wait for the server
+        # to return the AGGREGATED global model before starting the next round.
+        # Clearing this event ensures handle_start_training correctly waits for the
+        # new model (instead of reusing the initial round-0 model).
+        self.model_ready.clear()
         append_client_fl_metrics_record(
             self.client_id,
             {

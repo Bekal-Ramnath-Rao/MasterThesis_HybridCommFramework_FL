@@ -243,6 +243,10 @@ class FederatedLearningClient:
         self.last_global_round = -1
         self.last_training_round = -1
         self.pending_start_training_round = None
+        # Mirror of pending_start_training_round: holds a round number for which the server
+        # sent start_evaluation but the aggregated global model hasn't arrived yet. When the
+        # model finally arrives, handle_global_model kicks off the deferred evaluation.
+        self.pending_start_evaluation_round = None
         self.training_config = {"batch_size": 16, "local_epochs": 20}
         self.best_loss = float('inf')
         self.rounds_without_improvement = 0
@@ -571,6 +575,18 @@ class FederatedLearningClient:
             self.pending_start_training_round = None
             await self._start_training_for_round(pending_round)
 
+        # If start_evaluation arrived before this aggregated model (possible when the
+        # tiny control message overtakes the large model on a different stream), run
+        # the deferred evaluation now.
+        if self.pending_start_evaluation_round is not None and self.model_ready.is_set():
+            pending_eval_round = self.pending_start_evaluation_round
+            self.pending_start_evaluation_round = None
+            if pending_eval_round == self.current_round:
+                print(f"Client {self.client_id} running deferred evaluation for round {pending_eval_round} now that global model has arrived")
+                await self.evaluate_model()
+                self.current_round = pending_eval_round + 1
+                print(f"Client {self.client_id} ready for next round {self.current_round}")
+
     async def _training_runner(self, round_num):
         async with self.training_lock:
             self.training_in_progress = True
@@ -623,22 +639,27 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} round mismatch - received signal for round {round_num}, currently at {self.current_round}")
     
     async def handle_start_evaluation(self, message):
-        """Start evaluation when server signals"""
+        """Start evaluation when server signals.
+
+        The aggregated global model and the start_evaluation control message are
+        two separate sends over QUIC and may arrive out of order (especially on
+        WSL2 / NAT where the small control packet can overtake the multi-MB
+        model stream). If the new model hasn't arrived yet, store the round and
+        let handle_global_model run the deferred evaluation when it does.
+        """
         round_num = message['round']
 
-        # If the updated global model hasn't arrived yet, defer evaluation.
-        # Do NOT await model_ready while holding _inbound_msg_lock (deadlock risk).
         if not self.model_ready.is_set():
-            print(f"Client {self.client_id}: model not ready for evaluation round {round_num}, deferring...")
-            # model_ready is set (and never cleared) once the very first global model
-            # arrives, so in practice this branch should never trigger after round 1.
+            print(f"Client {self.client_id}: aggregated global model not yet received; "
+                  f"deferring start_evaluation for round {round_num} "
+                  f"(will run automatically when model arrives)")
+            self.pending_start_evaluation_round = round_num
             return
 
         if round_num == self.current_round:
             print(f"Client {self.client_id} starting evaluation for round {round_num}...")
             await self.evaluate_model()
             self.current_round = round_num + 1
-            # Don't clear model_ready - the model is still valid for next round
             print(f"Client {self.client_id} ready for next round {self.current_round}")
         else:
             print(f"Client {self.client_id} skipping evaluation signal for round {round_num} (current: {self.current_round})")
@@ -736,6 +757,12 @@ class FederatedLearningClient:
         comm_start = time.time()
         sent_payload_bytes = await self._send_update_with_chunking(update_message)
         communication_time = time.time() - comm_start
+        # After the client has uploaded its local update, it must wait for the server
+        # to return the AGGREGATED global model before evaluating or starting the next
+        # round. Clearing this event ensures handle_start_evaluation / handle_start_training
+        # correctly defer until the new model actually arrives (instead of reusing the
+        # initial round-0 model that was set at startup).
+        self.model_ready.clear()
         self.battery_model.update(
             sent_payload_bytes, self._last_downlink_model_bytes, training_time, communication_time
         )

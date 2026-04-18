@@ -144,6 +144,13 @@ class FederatedLearningClient:
         self.stream_id = 0
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
+        # Synchronization to prevent evaluating / starting next round before the
+        # server's aggregated global model for the current round has arrived.
+        # (Under HTTP/3 the small control message can overtake the multi-MB
+        # global-model stream, especially on WSL2 / remote clients.)
+        self.model_ready = asyncio.Event()
+        self.pending_start_training_round = None
+        self.pending_start_evaluation_round = None
         
         # Prepare data and model
         self.prepare_data_and_model(dataframe)
@@ -323,21 +330,51 @@ class FederatedLearningClient:
             self.model.set_weights(weights)
             print(f"Client {self.client_id} model initialized with server weights")
             self.current_round = 0
+            self.model_ready.set()
         else:
             # Updated model after aggregation - don't change current_round
             # as it was already updated by handle_start_evaluation
             self.model.set_weights(weights)
             print(f"Client {self.client_id} received global model for round {round_num}")
+            self.model_ready.set()
+
+        # Kick off any control messages that arrived before this aggregated model.
+        if self.pending_start_training_round is not None and self.model_ready.is_set():
+            pending_round = self.pending_start_training_round
+            self.pending_start_training_round = None
+            print(f"Client {self.client_id} running deferred start_training for round {pending_round} now that global model has arrived")
+            if self.current_round == 0 and pending_round == 1:
+                self.current_round = pending_round
+                await self.train_local_model()
+            elif pending_round == self.current_round:
+                await self.train_local_model()
+
+        if self.pending_start_evaluation_round is not None and self.model_ready.is_set():
+            pending_eval_round = self.pending_start_evaluation_round
+            self.pending_start_evaluation_round = None
+            if pending_eval_round == self.current_round:
+                print(f"Client {self.client_id} running deferred evaluation for round {pending_eval_round} now that global model has arrived")
+                await self.evaluate_model()
+                self.current_round = pending_eval_round + 1
+                print(f"Client {self.client_id} ready for next round {self.current_round}")
     
     async def handle_start_training(self, message):
-        """Start local training when server signals"""
+        """Start local training when server signals.
+
+        The aggregated global model and the start_training control message are
+        two separate sends over QUIC and may arrive out of order. If the new
+        model hasn't arrived yet, store the round and let handle_global_model
+        run the deferred training when it does.
+        """
         round_num = message['round']
-        
-        # Ensure model is initialized before training
-        if self.model is None:
-            print(f"Client {self.client_id} waiting for global model before training...")
+
+        if self.model is None or not self.model_ready.is_set():
+            print(f"Client {self.client_id}: aggregated global model not yet received; "
+                  f"deferring start_training for round {round_num} "
+                  f"(will start automatically when model arrives)")
+            self.pending_start_training_round = round_num
             return
-        
+
         if self.current_round == 0 and round_num == 1:
             self.current_round = round_num
             print(f"\nClient {self.client_id} starting training for round {round_num} with initial global model...")
@@ -349,9 +386,21 @@ class FederatedLearningClient:
             print(f"Client {self.client_id} round mismatch - received signal for round {round_num}, currently at {self.current_round}")
     
     async def handle_start_evaluation(self, message):
-        """Start evaluation when server signals"""
+        """Start evaluation when server signals.
+
+        Defer evaluation until the aggregated global model for this round has
+        arrived; otherwise we would evaluate the client's own locally-trained
+        weights instead of the server's aggregated model.
+        """
         round_num = message['round']
-        
+
+        if not self.model_ready.is_set():
+            print(f"Client {self.client_id}: aggregated global model not yet received; "
+                  f"deferring start_evaluation for round {round_num} "
+                  f"(will run automatically when model arrives)")
+            self.pending_start_evaluation_round = round_num
+            return
+
         if round_num == self.current_round:
             print(f"Client {self.client_id} starting evaluation for round {round_num}...")
             await self.evaluate_model()
@@ -485,6 +534,9 @@ class FederatedLearningClient:
         comm_start = time.time()
         await self.send_message(update_message)
         communication_time = time.time() - comm_start
+        # After sending the update, wait for the server's aggregated model
+        # before evaluating or starting the next round.
+        self.model_ready.clear()
         self._last_training_time_sec = training_time
         self._last_uplink_model_comm_sec = communication_time
         print(f"Client {self.client_id} sent model update for round {self.current_round}")
