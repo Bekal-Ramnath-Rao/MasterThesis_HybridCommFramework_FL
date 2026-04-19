@@ -12,6 +12,16 @@ from typing import Dict, Optional
 import json
 
 
+def _parse_dev_from_ip_route_text(text: str) -> Optional[str]:
+    for line in (text or "").strip().splitlines():
+        parts = line.split()
+        if "dev" in parts:
+            idx = parts.index("dev")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    return None
+
+
 class DynamicNetworkController:
     """
     Controller for dynamically changing network conditions in Docker containers
@@ -66,18 +76,70 @@ class DynamicNetworkController:
         'high': ['good', 'poor', 'moderate', 'excellent']
     }
     
-    def __init__(self, container_prefix: str = "fl-client"):
+    def __init__(self, container_prefix: str = "fl-client", peer_host_or_ip: Optional[str] = None):
         """
         Initialize Dynamic Network Controller
         
         Args:
             container_prefix: Prefix for Docker container names to apply changes
+            peer_host_or_ip: FL server host/IP used to pick container iface via `ip route get`
+                (defaults: FL_TC_PEER, NETWORK_TC_PEER_SERVER, GRPC_HOST, MQTT_BROKER, DDS_PEER_SERVER)
         """
         self.container_prefix = container_prefix
+        self.peer_host_or_ip = (peer_host_or_ip or "").strip() or (
+            os.getenv("FL_TC_PEER", "").strip()
+            or os.getenv("NETWORK_TC_PEER_SERVER", "").strip()
+            or os.getenv("GRPC_HOST", "").strip()
+            or os.getenv("MQTT_BROKER", "").strip()
+            or os.getenv("DDS_PEER_SERVER", "").strip()
+        )
         self.current_scenario = 'moderate'
         self.mobility_pattern = None
         self.mobility_index = 0
-        
+
+    def _docker_exec_ip(self, container_name: str, ip_args: list) -> Optional[str]:
+        try:
+            r = subprocess.run(
+                ["docker", "exec", container_name, "ip"] + ip_args,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if r.returncode == 0:
+                return _parse_dev_from_ip_route_text(r.stdout)
+        except (subprocess.SubprocessError, FileNotFoundError, OSError, ValueError):
+            pass
+        return None
+
+    def _tc_netdev_for_container(self, container_name: str) -> str:
+        """Iface inside container (host-network clients may use enp*, not eth0)."""
+        if self.peer_host_or_ip:
+            dev = self._docker_exec_ip(container_name, ["-4", "route", "get", self.peer_host_or_ip])
+            if dev:
+                return dev
+        dev = self._docker_exec_ip(container_name, ["route", "show", "default"])
+        if dev:
+            return dev
+        try:
+            r = subprocess.run(
+                ["docker", "exec", container_name, "ip", "-o", "link", "show"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        iface = parts[1].rstrip(":")
+                        if iface and iface != "lo":
+                            return iface
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            pass
+        return "eth0"
+
     def get_container_names(self) -> list:
         """Get list of container names matching prefix"""
         try:
@@ -118,10 +180,11 @@ class DynamicNetworkController:
             True if successful, False otherwise
         """
         try:
+            dev = self._tc_netdev_for_container(container_name)
             # Clear existing tc rules
             clear_cmd = [
                 'docker', 'exec', container_name,
-                'tc', 'qdisc', 'del', 'dev', 'eth0', 'root'
+                'tc', 'qdisc', 'del', 'dev', dev, 'root'
             ]
             subprocess.run(clear_cmd, capture_output=True, stderr=subprocess.DEVNULL)
             
@@ -132,7 +195,7 @@ class DynamicNetworkController:
             # and netem for latency, jitter, and packet loss
             tc_cmd = [
                 'docker', 'exec', container_name,
-                'tc', 'qdisc', 'add', 'dev', 'eth0', 'root', 'handle', '1:',
+                'tc', 'qdisc', 'add', 'dev', dev, 'root', 'handle', '1:',
                 'tbf', 'rate', f'{bandwidth_kbps}kbit',
                 'burst', '32kbit',
                 'latency', '400ms'
@@ -142,7 +205,7 @@ class DynamicNetworkController:
             # Add netem for latency, jitter, and packet loss
             netem_cmd = [
                 'docker', 'exec', container_name,
-                'tc', 'qdisc', 'add', 'dev', 'eth0', 'parent', '1:1', 'handle', '10:',
+                'tc', 'qdisc', 'add', 'dev', dev, 'parent', '1:1', 'handle', '10:',
                 'netem',
                 'delay', f'{latency_ms}ms', f'{jitter_ms}ms',
                 'loss', f'{packet_loss}%'
@@ -223,9 +286,10 @@ class DynamicNetworkController:
         success = True
         for container in containers:
             try:
+                dev = self._tc_netdev_for_container(container)
                 clear_cmd = [
                     'docker', 'exec', container,
-                    'tc', 'qdisc', 'del', 'dev', 'eth0', 'root'
+                    'tc', 'qdisc', 'del', 'dev', dev, 'root'
                 ]
                 subprocess.run(clear_cmd, capture_output=True, check=True)
                 print(f"[Network Controller] Cleared conditions from {container}")
@@ -347,10 +411,15 @@ def main():
     parser.add_argument('--jitter', type=float, default=10, help='Jitter in ms')
     parser.add_argument('--bandwidth', type=float, default=20, help='Bandwidth in Mbps')
     parser.add_argument('--loss', type=float, default=0.5, help='Packet loss percentage')
+    parser.add_argument(
+        '--peer',
+        default=None,
+        help='Server host/IP for tc iface detection (else FL_TC_PEER / GRPC_HOST / MQTT_BROKER / ...)',
+    )
     
     args = parser.parse_args()
     
-    controller = DynamicNetworkController(container_prefix=args.prefix)
+    controller = DynamicNetworkController(container_prefix=args.prefix, peer_host_or_ip=args.peer)
     
     if args.clear:
         controller.clear_network_conditions()

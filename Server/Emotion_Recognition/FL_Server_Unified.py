@@ -171,6 +171,16 @@ if _utilities_path not in sys.path:
 
 from packet_logger import init_db, log_sent_packet, log_received_packet
 from experiment_results_path import get_experiment_results_dir
+try:
+    from fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+except ModuleNotFoundError:
+    from scripts.utilities.fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
 from battery_results_agg import avg_battery_model_drain_fraction
 
 # Add Compression_Technique to path
@@ -2575,6 +2585,7 @@ class UnifiedFederatedLearningServer:
             results['convergence_time_seconds'] = None
             results['convergence_time_minutes'] = None
 
+        merge_cpu_memory_into_results(results, "emotion")
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         results_file = results_dir / f"unified_results_{timestamp}.json"
 
@@ -2641,6 +2652,13 @@ class UnifiedFederatedLearningServer:
         fig3.savefig(results_dir / 'unified_training_metrics.png', dpi=300, bbox_inches='tight')
         plt.close(fig3)
         print(f"Results plot saved to {results_dir / 'unified_training_metrics.png'}")
+        plot_cpu_memory_for_server_rounds(
+            results_dir,
+            "unified_cpu_memory_per_round.png",
+            self.ROUNDS,
+            "emotion",
+            title="Unified RL (emotion): avg client CPU and RAM per round",
+        )
 
     def run(self):
         """Run unified server (all protocols)"""

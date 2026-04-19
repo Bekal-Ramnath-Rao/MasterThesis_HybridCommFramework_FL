@@ -13,6 +13,94 @@ from typing import Dict, Optional
 from enum import Enum
 
 
+TC_PEER_ENV_KEYS = (
+    "FL_TC_PEER",
+    "NETWORK_TC_PEER_SERVER",
+    "GRPC_HOST",
+    "MQTT_BROKER",
+    "DDS_PEER_SERVER",
+    "HTTP3_HOST",
+    "QUIC_HOST",
+    "AMQP_HOST",
+    "AMQP_BROKER",
+)
+
+
+def _parse_dev_from_ip_route_text(text: str) -> Optional[str]:
+    for line in (text or "").strip().splitlines():
+        parts = line.split()
+        if "dev" in parts:
+            idx = parts.index("dev")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    return None
+
+
+def _tc_netdev_for_peer(host_or_ip: Optional[str]) -> str:
+    """
+    Pick the host interface for tc: route toward peer, else default route,
+    else first non-loopback from `ip -o link`, else eth0.
+    """
+    if host_or_ip:
+        try:
+            r = subprocess.run(
+                ["ip", "-4", "route", "get", host_or_ip],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                check=False,
+            )
+            if r.returncode == 0:
+                dev = _parse_dev_from_ip_route_text(r.stdout)
+                if dev:
+                    return dev
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            pass
+
+    try:
+        r = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        if r.returncode == 0:
+            dev = _parse_dev_from_ip_route_text(r.stdout)
+            if dev:
+                return dev
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        pass
+
+    try:
+        r = subprocess.run(
+            ["ip", "-o", "link", "show"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    iface = parts[1].rstrip(":")
+                    if iface and iface != "lo":
+                        return iface
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        pass
+
+    return "eth0"
+
+
+def _resolve_tc_peer_from_env() -> Optional[str]:
+    for key in TC_PEER_ENV_KEYS:
+        val = os.getenv(key, "").strip()
+        if val:
+            return val
+    return None
+
+
 class ExecutionMode(Enum):
     """Execution environment"""
     DOCKER = "docker"
@@ -89,9 +177,10 @@ class NetworkConditionManager:
         }
     }
     
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, peer_host_or_ip: Optional[str] = None):
         self.verbose = verbose
         self.execution_mode = self._detect_execution_mode()
+        self.peer_host_or_ip = (peer_host_or_ip or "").strip() or _resolve_tc_peer_from_env()
         self.interface = self._detect_network_interface()
         self.applied = False
         
@@ -119,10 +208,9 @@ class NetworkConditionManager:
     def _detect_network_interface(self) -> str:
         """Detect the network interface to apply conditions to"""
         if self.execution_mode == ExecutionMode.DOCKER:
-            return "eth0"  # Default Docker interface
-        else:
-            # For local execution, use loopback interface
-            return "lo"
+            return "eth0"  # Default Docker bridge interface inside container
+        # Native host: derive iface toward FL server (same env vars as FL clients), not hardcoded eth0
+        return _tc_netdev_for_peer(self.peer_host_or_ip)
     
     def _check_tc_available(self) -> bool:
         """Check if tc (traffic control) command is available"""
@@ -300,6 +388,8 @@ class NetworkConditionManager:
         Environment Variables:
             NETWORK_CONDITION: Name of predefined condition (excellent, good, moderate, poor, very_poor, satellite, none)
             APPLY_NETWORK_CONDITION: Set to "true" to enable (default: false)
+            FL_TC_PEER / NETWORK_TC_PEER_SERVER (optional): Peer host/IP for iface selection via ip route (native host).
+            Same fallbacks as FL clients: GRPC_HOST, MQTT_BROKER, DDS_PEER_SERVER, ...
         
         Returns:
             NetworkConditionManager instance if enabled, None otherwise

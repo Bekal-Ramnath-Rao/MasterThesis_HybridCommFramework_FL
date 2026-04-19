@@ -52,6 +52,7 @@ COPY config/dds_distributed_env.sh /app/config/dds_distributed_env.sh
 RUN mkdir -p /app/scripts/utilities
 COPY scripts/utilities/packet_logger.py /app/scripts/utilities/
 COPY scripts/utilities/experiment_results_path.py /app/scripts/utilities/
+COPY scripts/utilities/fl_training_results_cpu_memory.py /app/scripts/utilities/
 COPY scripts/dds_discovery_server.py ./scripts/
 COPY Server/ ./Server/
 
@@ -80,5 +81,6 @@ ENV DDS_PEER_CLIENT2=129.69.102.173
 # DDS: 7400 (default)
 EXPOSE 1883 5672 50051 4433 7400
 
-# Default command - can be overridden in docker-compose
-CMD ["python", "-u", "Server/Emotion_Recognition/FL_Server_MQTT.py"]
+# Default command - MUST be overridden by docker-compose command: field.
+# Fails loudly if USE_CASE is not set so misconfigured compose files are caught early.
+CMD ["sh", "-c", "echo '[ERROR] No command specified in docker-compose. Set USE_CASE and add a command: entry.' && exit 1"]

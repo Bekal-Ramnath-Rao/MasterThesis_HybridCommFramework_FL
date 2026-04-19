@@ -42,7 +42,7 @@ services:
     environment:
       - MQTT_BROKER=mqtt-broker-temp
       - MQTT_PORT=1883
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -73,7 +73,7 @@ services:
       - MQTT_BROKER=mqtt-broker-temp
       - MQTT_PORT=1883
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -100,7 +100,34 @@ services:
       - MQTT_BROKER=mqtt-broker-temp
       - MQTT_PORT=1883
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+    networks:
+      - fl-mqtt-network-temp
+
+  # MQTT FL Client 3 (Temperature Regulation)
+  fl-client-mqtt-temp-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-mqtt-temp-3
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - mqtt-broker-temp
+      - fl-server-mqtt-temp
+    environment:
+      - MQTT_BROKER=mqtt-broker-temp
+      - MQTT_PORT=1883
+      - CLIENT_ID=3
+      - NUM_CLIENTS=3
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -150,7 +177,7 @@ services:
     environment:
       - AMQP_HOST=rabbitmq-temp
       - AMQP_PORT=5672
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -180,7 +207,7 @@ services:
       - AMQP_HOST=rabbitmq-temp
       - AMQP_PORT=5672
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -206,7 +233,33 @@ services:
       - AMQP_HOST=rabbitmq-temp
       - AMQP_PORT=5672
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+    networks:
+      - fl-amqp-network-temp
+
+  # AMQP FL Client 3 (Temperature Regulation)
+  fl-client-amqp-temp-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-amqp-temp-3
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-amqp-temp
+    environment:
+      - AMQP_HOST=rabbitmq-temp
+      - AMQP_PORT=5672
+      - CLIENT_ID=3
+      - NUM_CLIENTS=3
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -234,7 +287,7 @@ services:
       - "50052:50051"
     environment:
       - GRPC_PORT=50051
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -264,7 +317,7 @@ services:
       - GRPC_HOST=fl-server-grpc-temp
       - GRPC_PORT=50051
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -291,7 +344,34 @@ services:
       - GRPC_HOST=fl-server-grpc-temp
       - GRPC_PORT=50051
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../certs:/app/certs
+    networks:
+      - fl-grpc-network-temp
+
+  # gRPC FL Client 3 (Temperature Regulation)
+  fl-client-grpc-temp-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-grpc-temp-3
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-grpc-temp
+    environment:
+      - GRPC_HOST=fl-server-grpc-temp
+      - GRPC_PORT=50051
+      - CLIENT_ID=3
+      - NUM_CLIENTS=3
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -321,7 +401,7 @@ services:
     environment:
       - QUIC_HOST=0.0.0.0
       - QUIC_PORT=4433
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -352,7 +432,7 @@ services:
       - QUIC_HOST=fl-server-quic-temp
       - QUIC_PORT=4433
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -379,7 +459,34 @@ services:
       - QUIC_HOST=fl-server-quic-temp
       - QUIC_PORT=4433
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../certs:/app/certs
+    networks:
+      - fl-quic-network-temp
+
+  # QUIC FL Client 3 (Temperature Regulation)
+  fl-client-quic-temp-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-quic-temp-3
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-quic-temp
+    environment:
+      - QUIC_HOST=fl-server-quic-temp
+      - QUIC_PORT=4433
+      - CLIENT_ID=3
+      - NUM_CLIENTS=3
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -409,7 +516,7 @@ services:
     environment:
       - HTTP3_HOST=0.0.0.0
       - HTTP3_PORT=4434
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -441,7 +548,7 @@ services:
       - HTTP3_HOST=fl-server-http3-temp
       - HTTP3_PORT=4434
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -469,7 +576,35 @@ services:
       - HTTP3_HOST=fl-server-http3-temp
       - HTTP3_PORT=4434
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_HTTP3.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+      - ../certs:/app/certs:ro
+    networks:
+      - fl-http3-network-temp
+    # GPU reservations moved to overlay file
+
+  # HTTP/3 FL Client 3 (Temperature Regulation)
+  fl-client-http3-temp-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-http3-temp-3
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-http3-temp
+    environment:
+      - HTTP3_HOST=fl-server-http3-temp
+      - HTTP3_PORT=4434
+      - CLIENT_ID=3
+      - NUM_CLIENTS=3
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -498,7 +633,7 @@ services:
       - NET_ADMIN
     environment:
       - DDS_DOMAIN_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -527,7 +662,7 @@ services:
     environment:
       - DDS_DOMAIN_ID=2
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
@@ -552,7 +687,32 @@ services:
     environment:
       - DDS_DOMAIN_ID=2
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset
+    networks:
+      - fl-dds-network-temp
+
+  # DDS FL Client 3 (Temperature Regulation)
+  fl-client-dds-temp-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-dds-temp-3
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-dds-temp
+    environment:
+      - DDS_DOMAIN_ID=2
+      - CLIENT_ID=3
+      - NUM_CLIENTS=3
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}

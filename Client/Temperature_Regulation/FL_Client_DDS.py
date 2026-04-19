@@ -59,6 +59,10 @@ for _p in (_utilities_path, _project_root):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+_client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _client_dir not in sys.path:
+    sys.path.insert(0, _client_dir)
+from battery_model import BatteryModel
 
 from cyclonedds.topic import Topic
 from cyclonedds.sub import DataReader
@@ -205,10 +209,13 @@ class FederatedLearningClient:
         self.has_converged = False
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
+        self._last_downlink_model_bytes = 0
+        self.battery_model = BatteryModel(protocol="dds")
         
         # Chunk reassembly buffers
         self.global_model_chunks = {}  # {chunk_id: payload}
         self.global_model_metadata = {}  # {round, total_chunks, model_config_json}
+        self._global_model_updated_for_round = -1  # tracks last round for which model was received
         
         # DDS entities
         self.participant = None
@@ -327,8 +334,15 @@ class FederatedLearningClient:
 
         # Best effort QoS for large data transfers (model chunks)
         best_effort_qos = Qos(
-            Policy.Reliability.BestEffort(),
+            Policy.Reliability.BestEffort,
             Policy.History.KeepLast(1),
+        )
+
+        # Dedicated QoS for chunked model transfer (Reliable + TransientLocal for guaranteed delivery)
+        chunk_qos = Qos(
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.History.KeepLast(2048),
+            Policy.Durability.TransientLocal,
         )
         
         # Create topics
@@ -346,17 +360,17 @@ class FederatedLearningClient:
         # Use Reliable QoS for config and commands (critical control messages)
         self.readers['config'] = DataReader(self.participant, topic_config, qos=reliable_qos)
         self.readers['command'] = DataReader(self.participant, topic_command, qos=reliable_qos)
-        # Use BestEffort for chunked model data
+        # Use chunk_qos (Reliable+TransientLocal) for chunked model data; BestEffort for status
         self.readers['global_model'] = DataReader(self.participant, topic_global_model, qos=best_effort_qos)
-        self.readers['global_model_chunk'] = DataReader(self.participant, topic_global_model_chunk, qos=best_effort_qos)
+        self.readers['global_model_chunk'] = DataReader(self.participant, topic_global_model_chunk, qos=chunk_qos)
         self.readers['status'] = DataReader(self.participant, topic_status, qos=best_effort_qos)
         
         # Create writers (for sending to server)
         # Use Reliable QoS for registration (critical to ensure server receives it)
         self.writers['registration'] = DataWriter(self.participant, topic_registration, qos=reliable_qos)
-        # Use BestEffort for chunked data and metrics
+        # Use chunk_qos (Reliable+TransientLocal) for model update chunks; BestEffort for metrics
         self.writers['model_update'] = DataWriter(self.participant, topic_model_update, qos=best_effort_qos)
-        self.writers['model_update_chunk'] = DataWriter(self.participant, topic_model_update_chunk, qos=best_effort_qos)
+        self.writers['model_update_chunk'] = DataWriter(self.participant, topic_model_update_chunk, qos=chunk_qos)
         self.writers['metrics'] = DataWriter(self.participant, topic_metrics, qos=best_effort_qos)
 
         print(f"Client {self.client_id} DDS setup complete (Reliable QoS for control, BestEffort for data)")
@@ -482,6 +496,7 @@ class FederatedLearningClient:
             # Check if all chunks received
             if len(self.global_model_chunks) == total_chunks:
                 print(f"Client {self.client_id}: All chunks received, reassembling...")
+                self._last_downlink_model_bytes = sum(len(p) for p in self.global_model_chunks.values())
                 
                 # Reassemble chunks in order
                 reassembled_data = []
@@ -558,6 +573,9 @@ class FederatedLearningClient:
                         self.model.set_weights(weights)
                         print(f"Client {self.client_id} received global model for round {self.current_round}")
                         
+                        # Signal wait_for_global_model that model is ready
+                        self._global_model_updated_for_round = round_num
+                        
                         # Evaluate immediately after receiving global model
                         print(f"Client {self.client_id} starting evaluation for round {self.current_round}...")
                         self.evaluate_model()
@@ -630,29 +648,24 @@ class FederatedLearningClient:
         self.wait_for_global_model()
     
     def wait_for_global_model(self):
-        """Actively wait for global model after training (no timeout)"""
+        """Actively wait for global model after training (no timeout).
+        
+        Polls check_global_model() (chunked DDS topic) instead of the legacy
+        non-chunked reader so that models sent in chunks are properly received.
+        """
         check_count = 0
         
         while True:  # Wait indefinitely for global model
-            samples = self.readers['global_model'].take()
+            self.check_global_model()
             check_count += 1
             
             if check_count % 50 == 0:  # Log every 5 seconds
                 print(f"Client {self.client_id} still waiting... (checked {check_count} times)")
             
-            for sample in samples:
-                if sample:
-                    print(f"Client {self.client_id} received sample for round {sample.round} (expecting {self.current_round})")
-                    if sample.round == self.current_round:
-                        # Update local model with global weights
-                        weights = self.deserialize_weights(sample.weights)
-                        self.model.set_weights(weights)
-                        print(f"Client {self.client_id} received global model for round {self.current_round}")
-                        
-                        # Evaluate immediately
-                        print(f"Client {self.client_id} starting evaluation for round {self.current_round}...")
-                        self.evaluate_model()
-                        return
+            # check_global_model sets this flag after applying the aggregated model
+            if self._global_model_updated_for_round >= self.current_round:
+                return
+            
             time.sleep(0.1)
     
     def evaluate_model(self):
@@ -679,7 +692,7 @@ class FederatedLearningClient:
             mae=float(mae),
             mape=float(mape),
             client_converged=client_converged,
-            battery_soc=1.0,
+            battery_soc=float(self.battery_model.battery_soc),
             training_time_sec=tt,
             round_time_sec=tt + ul,
             uplink_model_comm_sec=ul,
@@ -689,6 +702,13 @@ class FederatedLearningClient:
         _mt0 = time.time()
         result = self.writers['metrics'].write(metrics)
         _uplink_metrics_sec = time.time() - _mt0
+        _bytes_sent_metrics = len(bytes(metrics.loss.hex() if hasattr(metrics.loss, 'hex') else str(metrics.loss), 'utf-8')) if False else 64
+        self.battery_model.update(
+            _bytes_sent_metrics,
+            self._last_downlink_model_bytes,
+            self._last_training_time_sec,
+            float(self._last_uplink_model_comm_sec) + _uplink_metrics_sec,
+        )
         
         # Wait to ensure message is sent
         time.sleep(0.5)
@@ -709,8 +729,9 @@ class FederatedLearningClient:
                     + self._last_uplink_model_comm_sec
                     + _uplink_metrics_sec
                 ),
-                "battery_energy_joules": 0.0,
-                "battery_soc_after": 1.0,
+                "battery_energy_joules": float(self.battery_model.last_energy_j),
+                "battery_soc_after": float(self.battery_model.battery_soc),
+                "cumulative_battery_energy_joules": float(self.battery_model.cumulative_energy_j),
             },
             use_case=use_case_from_env("temperature"),
             protocol="dds",

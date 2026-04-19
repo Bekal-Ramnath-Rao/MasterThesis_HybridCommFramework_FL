@@ -19,11 +19,11 @@ if _xla_flags:
     else:
         os.environ.pop("XLA_FLAGS", None)
 from aioquic.asyncio import connect
-from aioquic.http3.configuration import Http3Configuration
-from aioquic.http3.events import Http3Event, StreamReset, StreamDataReceived
+from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.events import StreamReset
 from aioquic.h3.connection import H3_ALPN, H3Connection
 from aioquic.h3.events import DataReceived, HeadersReceived, H3Event
-from aioquic.asyncio.protocol import Http3ConnectionProtocol
+from aioquic.asyncio.protocol import QuicConnectionProtocol
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -39,6 +39,10 @@ _utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+_client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _client_dir not in sys.path:
+    sys.path.insert(0, _client_dir)
+from battery_model import BatteryModel
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
@@ -75,36 +79,46 @@ MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
 
-class FederatedLearningClientProtocol(Http3ConnectionProtocol):
+class FederatedLearningClientProtocol(QuicConnectionProtocol):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.client = None
         self.stream_id = None
         self._stream_buffers = {}  # Buffer for incomplete messages
-    
-    def http3_event_received(self, event: Http3Event):
-        if isinstance(event, StreamDataReceived):
-            # Get or create buffer for this stream
-            if event.stream_id not in self._stream_buffers:
-                self._stream_buffers[event.stream_id] = b''
-            
-            # Append new data to buffer
-            self._stream_buffers[event.stream_id] += event.data
-            
-            # Send flow control updates to allow more data (critical for poor networks)
+        self._http = None  # H3Connection instance (lazily created)
+
+    def quic_event_received(self, event):
+        """Route QUIC-level events into the H3 layer."""
+        if self._http is None:
+            self._http = H3Connection(self._quic)
+        for h3_event in self._http.handle_event(event):
+            self.http3_event_received(h3_event)
+
+    def http3_event_received(self, event: H3Event):
+        if isinstance(event, HeadersReceived):
+            # Initialize buffer for this incoming stream (server→client response/push)
+            stream_id = event.stream_id
+            if stream_id not in self._stream_buffers:
+                self._stream_buffers[stream_id] = b''
+
+        elif isinstance(event, DataReceived):
+            stream_id = event.stream_id
+            if stream_id not in self._stream_buffers:
+                self._stream_buffers[stream_id] = b''
+
+            self._stream_buffers[stream_id] += event.data
             self.transmit()
-            
-            # Try to decode complete messages (delimited by newline)
-            while b'\n' in self._stream_buffers[event.stream_id]:
-                message_data, self._stream_buffers[event.stream_id] = self._stream_buffers[event.stream_id].split(b'\n', 1)
-                if message_data:
+
+            # Process once the stream is complete (server uses end_stream=True)
+            if event.stream_ended:
+                raw = self._stream_buffers.pop(stream_id, b'')
+                if raw:
                     try:
-                        data = message_data.decode('utf-8')
-                        message = json.loads(data)
+                        message = json.loads(raw.decode('utf-8'))
                         if self.client:
                             asyncio.create_task(self.client.handle_message(message))
                     except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                        print(f"Error decoding message: {e}")
+                        print(f"Error decoding message on stream {stream_id}: {e}")
 
 
 class FederatedLearningClient:
@@ -144,6 +158,8 @@ class FederatedLearningClient:
         self.stream_id = 0
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
+        self._last_downlink_model_bytes = 0
+        self.battery_model = BatteryModel(protocol="http3")
         # Synchronization to prevent evaluating / starting next round before the
         # server's aggregated global model for the current round has arrived.
         # (Under HTTP/3 the small control message can overtake the multi-MB
@@ -264,6 +280,7 @@ class FederatedLearningClient:
     async def handle_global_model(self, message):
         """Receive and set global model weights and architecture from server"""
         round_num = message['round']
+        self._last_downlink_model_bytes = len(json.dumps(message).encode('utf-8'))
         
         # Decompress/deserialize weights.
         # If both pruning and quantization are enabled, server should send quantized payload that already reflects pruning,
@@ -576,7 +593,9 @@ class FederatedLearningClient:
             "loss": float(loss),
             "mse": float(mse),
             "mae": float(mae),
-            "mape": float(mape)
+            "mape": float(mape),
+            "battery_soc": float(self.battery_model.battery_soc),
+            "cumulative_energy_j": float(self.battery_model.cumulative_energy_j),
         }
         if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             metrics_dict["client_converged"] = 1.0
@@ -592,6 +611,13 @@ class FederatedLearningClient:
         _mt0 = time.time()
         await self.send_message(metrics_message)
         _uplink_metrics_sec = time.time() - _mt0
+        _bytes_sent_metrics = len(json.dumps(metrics_message).encode('utf-8'))
+        self.battery_model.update(
+            _bytes_sent_metrics,
+            self._last_downlink_model_bytes,
+            self._last_training_time_sec,
+            float(self._last_uplink_model_comm_sec) + _uplink_metrics_sec,
+        )
         append_client_fl_metrics_record(
             self.client_id,
             {
@@ -609,8 +635,9 @@ class FederatedLearningClient:
                     + self._last_uplink_model_comm_sec
                     + _uplink_metrics_sec
                 ),
-                "battery_energy_joules": 0.0,
-                "battery_soc_after": 1.0,
+                "battery_energy_joules": float(self.battery_model.last_energy_j),
+                "battery_soc_after": float(self.battery_model.battery_soc),
+                "cumulative_battery_energy_joules": float(self.battery_model.cumulative_energy_j),
             },
             use_case=use_case_from_env("temperature"),
             protocol="http3",
@@ -625,7 +652,7 @@ class FederatedLearningClient:
     
     async def start(self):
         """Connect to HTTP/3 server and start client"""
-        configuration = Http3Configuration(
+        configuration = QuicConfiguration(
             is_client=True,
             alpn_protocols=H3_ALPN,
             # Large windows so the server's aggregated model arrives without
@@ -633,7 +660,7 @@ class FederatedLearningClient:
             max_stream_data=32 * 1024 * 1024,   # 32 MB per stream
             max_data=128 * 1024 * 1024,         # 128 MB connection total
             idle_timeout=3600.0,  # 60 minutes idle timeout
-            max_datagram_frame_size=65536,  # Larger frame size for better throughput
+            max_datagram_frame_size=16 * 1024,  # 16 KB QUIC datagram frame limit (HTTP/3 constraint)
             initial_rtt=0.15,  # 150ms (account for 100ms latency + jitter)
         )
         

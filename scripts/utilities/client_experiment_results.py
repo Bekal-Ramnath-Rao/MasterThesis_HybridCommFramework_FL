@@ -1,7 +1,8 @@
 """
 Per-client training summary (JSON + plots) under the same tree as server results:
 
-  {EXPERIMENT_RESULTS_ROOT or <project>/experiment_results}/{use_case}/{protocol}/{NETWORK_SCENARIO}/
+  {EXPERIMENT_RESULTS_ROOT or <project>/experiment_results}/{use_case}_{timestamp}/{protocol}/{NETWORK_SCENARIO}/
+  (or legacy flat layout when EXPERIMENT_LEGACY_RESULTS_LAYOUT=1)
 
 Example (Docker compose): host ``experiment_results/`` is usually mounted at ``/app/results``, so paths look like
 ``/app/results/emotion/mqtt/default/``. The distributed GUI may mount the same folder at ``/app/experiment_results``.

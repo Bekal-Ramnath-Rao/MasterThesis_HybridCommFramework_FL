@@ -10,7 +10,8 @@ Where each protocol_scenario subfolder typically contains:
   - server_logs.txt (optional, used as fallback for model size / payload bytes)
 
 Outputs:
-  - combined_metrics_grid.png (single figure with subplots)
+  - combined_metrics_grid.png (single figure with subplots; includes CPU/RAM when present in JSON)
+  - combined_cpu_memory.png (avg client CPU % and RAM % vs round, when training_results contain series)
   - combined_fl_rounds_bar.png (bar chart)
   - combined_convergence_time_bar.png (bar chart)
   - combined_model_size_bar.png (bar chart, if available)
@@ -19,9 +20,10 @@ Outputs:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,6 +41,9 @@ class RunMetrics:
     convergence_time_seconds: Optional[float]
     model_size_bytes: Optional[float]  # best-effort estimate
     source_dir: Path
+    # Aligned to ``rounds`` (from ``avg_cpu_percent`` / ``avg_memory_percent`` in training JSON); NaN gaps.
+    cpu_percent: List[float] = field(default_factory=list)
+    memory_percent: List[float] = field(default_factory=list)
 
 
 def _safe_read_json(path: Path) -> Dict[str, Any]:
@@ -46,6 +51,63 @@ def _safe_read_json(path: Path) -> Dict[str, Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _align_metrics_series(n_rounds: int, raw: Any) -> List[float]:
+    """Pad / truncate ``avg_cpu_percent``-style lists to ``n_rounds`` floats; missing → NaN."""
+    if n_rounds <= 0:
+        return []
+    if not isinstance(raw, list) or not raw:
+        return [float("nan")] * n_rounds
+    out: List[float] = []
+    for i in range(n_rounds):
+        if i >= len(raw):
+            out.append(float("nan"))
+            continue
+        v = raw[i]
+        if v is None:
+            out.append(float("nan"))
+            continue
+        try:
+            fv = float(v)
+            out.append(fv if math.isfinite(fv) else float("nan"))
+        except (TypeError, ValueError):
+            out.append(float("nan"))
+    return out
+
+
+def _series_has_finite(values: List[float]) -> bool:
+    return any(math.isfinite(v) for v in values)
+
+
+def _plot_cpu_memory_curves(ax_cpu: Any, ax_ram: Any, runs: List[RunMetrics]) -> bool:
+    """Plot avg CPU (left axis) and RAM % (right) for each run; return True if any curve was drawn."""
+    drew = False
+    for r in runs:
+        if not r.rounds:
+            continue
+        n = len(r.rounds)
+        cpu_s = (r.cpu_percent + [float("nan")] * n)[:n]
+        mem_s = (r.memory_percent + [float("nan")] * n)[:n]
+        if not _series_has_finite(cpu_s) and not _series_has_finite(mem_s):
+            continue
+        if _series_has_finite(cpu_s):
+            ax_cpu.plot(r.rounds, cpu_s, marker="o", linewidth=2, label=f"{r.label} (CPU %)")
+            drew = True
+        if _series_has_finite(mem_s):
+            ax_ram.plot(r.rounds, mem_s, marker="s", linewidth=2, linestyle="--", label=f"{r.label} (RAM %)")
+            drew = True
+    ax_cpu.set_xlabel("Round")
+    ax_cpu.set_ylabel("Avg CPU (%)", color="#c73e1d")
+    ax_cpu.tick_params(axis="y", labelcolor="#c73e1d")
+    ax_ram.set_ylabel("Avg memory (%)", color="#3a7ca5")
+    ax_ram.tick_params(axis="y", labelcolor="#3a7ca5")
+    ax_cpu.grid(True, alpha=0.25)
+    h1, l1 = ax_cpu.get_legend_handles_labels()
+    h2, l2 = ax_ram.get_legend_handles_labels()
+    if h1 or h2:
+        ax_cpu.legend(h1 + h2, l1 + l2, fontsize=7, loc="upper left", ncol=2)
+    return drew
 
 
 def _extract_protocol_and_scenario(folder_name: str) -> Tuple[str, str]:
@@ -114,6 +176,9 @@ def load_runs(experiment_folder: Path) -> List[RunMetrics]:
         loss = [float(x) for x in (data.get("loss") or []) if isinstance(x, (int, float, str))]
         accuracy = [float(x) for x in (data.get("accuracy") or []) if isinstance(x, (int, float, str))]
         battery = [float(x) for x in (data.get("battery_consumption") or []) if isinstance(x, (int, float, str))]
+        n_r = len(rounds)
+        cpu_aligned = _align_metrics_series(n_r, data.get("avg_cpu_percent"))
+        mem_aligned = _align_metrics_series(n_r, data.get("avg_memory_percent"))
 
         total_rounds = data.get("total_rounds")
         if total_rounds is None and rounds:
@@ -160,6 +225,8 @@ def load_runs(experiment_folder: Path) -> List[RunMetrics]:
                 convergence_time_seconds=conv_sec,
                 model_size_bytes=model_size_bytes,
                 source_dir=child,
+                cpu_percent=cpu_aligned,
+                memory_percent=mem_aligned,
             )
         )
 
@@ -199,6 +266,10 @@ def plot_combined(
 
     labels = [r.label for r in runs]
     x = list(range(len(runs)))
+
+    have_cpu_mem = any(
+        _series_has_finite(r.cpu_percent) or _series_has_finite(r.memory_percent) for r in runs
+    )
 
     fl_rounds = [r.total_rounds if r.total_rounds is not None else 0 for r in runs]
     conv_secs = [r.convergence_time_seconds if r.convergence_time_seconds is not None else 0.0 for r in runs]
@@ -253,10 +324,27 @@ def plot_combined(
         if not show:
             plt.close(fig_m)
 
+    if have_cpu_mem:
+        fig_cm, ax_cpu = plt.subplots(figsize=(max(8, len(runs) * 1.4), 4.5))
+        ax_ram = ax_cpu.twinx()
+        _plot_cpu_memory_curves(ax_cpu, ax_ram, runs)
+        ax_cpu.set_title("Average client CPU and RAM vs round (from training_results JSON)")
+        fig_cm.tight_layout()
+        if save:
+            p_cm = experiment_folder / "combined_cpu_memory.png"
+            fig_cm.savefig(p_cm, dpi=300, bbox_inches="tight")
+            out_files["cpu_memory"] = p_cm
+        if not show:
+            plt.close(fig_cm)
+
     # --- Optional: all-in-one figure ---
     if single_figure:
-        fig = plt.figure(figsize=(14, 10))
-        gs = fig.add_gridspec(3, 2, height_ratios=[1.1, 1.1, 1.0])
+        if have_cpu_mem:
+            fig = plt.figure(figsize=(14, 12))
+            gs = fig.add_gridspec(4, 2, height_ratios=[1.05, 1.05, 0.95, 0.88])
+        else:
+            fig = plt.figure(figsize=(14, 10))
+            gs = fig.add_gridspec(3, 2, height_ratios=[1.1, 1.1, 1.0])
 
         ax_bat = fig.add_subplot(gs[0, 0])
         ax_acc = fig.add_subplot(gs[0, 1])
@@ -334,6 +422,12 @@ def plot_combined(
         ax_conv.set_xticks(x)
         ax_conv.set_xticklabels(labels, rotation=25, ha="right", fontsize=8)
         ax_conv.grid(True, axis="y", alpha=0.25)
+
+        if have_cpu_mem:
+            ax_cm = fig.add_subplot(gs[3, :])
+            ax_cm_ram = ax_cm.twinx()
+            _plot_cpu_memory_curves(ax_cm, ax_cm_ram, runs)
+            ax_cm.set_title("Avg client CPU / RAM (from merged client metrics in training_results JSON)")
 
         fig.suptitle(f"Combined Results: {experiment_folder.name}", fontsize=14, y=0.995)
         fig.tight_layout(rect=[0, 0, 1, 0.98])

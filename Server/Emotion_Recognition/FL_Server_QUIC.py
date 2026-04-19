@@ -24,6 +24,16 @@ _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from experiment_results_path import get_experiment_results_dir
+try:
+    from fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+except ModuleNotFoundError:
+    from scripts.utilities.fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
 from battery_results_agg import avg_battery_model_drain_fraction
 
 # Add Compression_Technique to path
@@ -719,6 +729,13 @@ class FederatedLearningServer:
         ax3b.plot(rounds, self.ACCURACY, marker='s', linewidth=2, markersize=8, color='green'); ax3b.set_xlabel('Round'); ax3b.set_ylabel('Accuracy'); ax3b.set_title('QUIC: Accuracy over Rounds'); ax3b.grid(True, alpha=0.3)
         fig3.tight_layout(); fig3.savefig(results_dir / 'quic_training_metrics.png', dpi=300, bbox_inches='tight'); plt.close(fig3)
         print(f"Results plot saved to {results_dir / 'quic_training_metrics.png'}")
+        plot_cpu_memory_for_server_rounds(
+            results_dir,
+            "quic_cpu_memory_per_round.png",
+            self.ROUNDS,
+            "emotion",
+            title="QUIC (emotion): avg client CPU and RAM per round",
+        )
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1": plt.close('all')
         else: plt.show(block=False)
         print("\nPlot closed. Server shutting down...")
@@ -745,7 +762,8 @@ class FederatedLearningServer:
             "final_accuracy": self.ACCURACY[-1] if self.ACCURACY else None,
             "final_loss": self.LOSS[-1] if self.LOSS else None,
         }
-        
+        merge_cpu_memory_into_results(results, "emotion")
+
         results_file = results_dir / 'quic_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)

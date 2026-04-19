@@ -52,7 +52,7 @@ class FederatedLearningStub(object):
                 _registered_method=True)
         self.SendMetrics = channel.unary_unary(
                 '/federated_learning.FederatedLearning/SendMetrics',
-                request_serializer=federated__learning__pb2.Metrics.SerializeToString,
+                request_serializer=federated__learning__pb2.EvaluationMetrics.SerializeToString,
                 response_deserializer=federated__learning__pb2.MetricsResponse.FromString,
                 _registered_method=True)
         self.GetTrainingConfig = channel.unary_unary(
@@ -145,7 +145,7 @@ def add_FederatedLearningServicer_to_server(servicer, server):
             ),
             'SendMetrics': grpc.unary_unary_rpc_method_handler(
                     servicer.SendMetrics,
-                    request_deserializer=federated__learning__pb2.Metrics.FromString,
+                    request_deserializer=federated__learning__pb2.EvaluationMetrics.FromString,
                     response_serializer=federated__learning__pb2.MetricsResponse.SerializeToString,
             ),
             'GetTrainingConfig': grpc.unary_unary_rpc_method_handler(
@@ -271,7 +271,7 @@ class FederatedLearning(object):
             request,
             target,
             '/federated_learning.FederatedLearning/SendMetrics',
-            federated__learning__pb2.Metrics.SerializeToString,
+            federated__learning__pb2.EvaluationMetrics.SerializeToString,
             federated__learning__pb2.MetricsResponse.FromString,
             options,
             channel_credentials,

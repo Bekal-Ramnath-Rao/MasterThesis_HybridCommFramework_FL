@@ -35,8 +35,20 @@ import argparse
 import time
 import json
 import sys
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
+
+
+def _parse_dev_from_ip_route_text(text: str) -> Optional[str]:
+    for line in (text or "").strip().splitlines():
+        parts = line.split()
+        if "dev" in parts:
+            idx = parts.index("dev")
+            if idx + 1 < len(parts):
+                return parts[idx + 1]
+    return None
+
 
 # Predefined network scenarios
 NETWORK_SCENARIOS = {
@@ -76,10 +88,60 @@ NETWORK_SCENARIOS = {
 class NetworkController:
     """Controls network parameters for Docker containers"""
     
-    def __init__(self):
+    def __init__(self, peer_host_or_ip: Optional[str] = None):
+        self.peer_host_or_ip = (peer_host_or_ip or "").strip() or (
+            os.getenv("FL_TC_PEER", "").strip()
+            or os.getenv("NETWORK_TC_PEER_SERVER", "").strip()
+            or os.getenv("GRPC_HOST", "").strip()
+            or os.getenv("MQTT_BROKER", "").strip()
+            or os.getenv("DDS_PEER_SERVER", "").strip()
+        )
         self.running_containers = []
         self.client_containers = []
         self.refresh_containers()
+
+    def _docker_exec_ip(self, container_name: str, ip_args: List[str]) -> Optional[str]:
+        try:
+            r = subprocess.run(
+                ["docker", "exec", container_name, "ip"] + ip_args,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if r.returncode == 0:
+                return _parse_dev_from_ip_route_text(r.stdout)
+        except (subprocess.SubprocessError, FileNotFoundError, OSError, ValueError):
+            pass
+        return None
+
+    def _tc_netdev_for_container(self, container_name: str) -> str:
+        """Iface inside container (host-network clients often use enp*, not eth0)."""
+        if self.peer_host_or_ip:
+            dev = self._docker_exec_ip(container_name, ["-4", "route", "get", self.peer_host_or_ip])
+            if dev:
+                return dev
+        dev = self._docker_exec_ip(container_name, ["route", "show", "default"])
+        if dev:
+            return dev
+        try:
+            r = subprocess.run(
+                ["docker", "exec", container_name, "ip", "-o", "link", "show"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        iface = parts[1].rstrip(":")
+                        if iface and iface != "lo":
+                            return iface
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            pass
+        return "eth0"
     
     def refresh_containers(self):
         """Get list of running Docker containers"""
@@ -128,11 +190,12 @@ class NetworkController:
     def clear_network_rules(self, container_name: str) -> bool:
         """Clear existing tc rules from a container"""
         try:
+            dev = self._tc_netdev_for_container(container_name)
             # Try to delete root qdisc with retry logic
             max_attempts = 5
             for attempt in range(max_attempts):
                 result = subprocess.run(
-                    ['docker', 'exec', container_name, 'tc', 'qdisc', 'del', 'dev', 'eth0', 'root'],
+                    ['docker', 'exec', container_name, 'tc', 'qdisc', 'del', 'dev', dev, 'root'],
                     capture_output=True,
                     stderr=subprocess.PIPE,
                     text=True
@@ -154,7 +217,8 @@ class NetworkController:
         try:
             # First clear existing rules - this includes a wait period
             self.clear_network_rules(container_name)
-            
+            dev = self._tc_netdev_for_container(container_name)
+
             # Build tc command
             latency = params.get('latency', '0ms')
             bandwidth = params.get('bandwidth', '100mbit')
@@ -170,7 +234,7 @@ class NetworkController:
                 # Use replace instead of add to handle existing rules
                 cmd = [
                     'docker', 'exec', container_name,
-                    'tc', 'qdisc', 'replace', 'dev', 'eth0', 'root',
+                    'tc', 'qdisc', 'replace', 'dev', dev, 'root',
                     'handle', '1:', 'tbf',
                     'rate', bandwidth,
                     'burst', '32kbit',
@@ -187,7 +251,7 @@ class NetworkController:
                 # Add netem qdisc as child
                 netem_cmd = [
                     'docker', 'exec', container_name,
-                    'tc', 'qdisc', 'replace', 'dev', 'eth0', 'parent', '1:1',
+                    'tc', 'qdisc', 'replace', 'dev', dev, 'parent', '1:1',
                     'handle', '10:', 'netem'
                 ]
                 
@@ -210,7 +274,7 @@ class NetworkController:
                 # Only netem parameters (no bandwidth control)
                 netem_cmd = [
                     'docker', 'exec', container_name,
-                    'tc', 'qdisc', 'replace', 'dev', 'eth0', 'root',
+                    'tc', 'qdisc', 'replace', 'dev', dev, 'root',
                     'netem'
                 ]
                 
@@ -231,7 +295,7 @@ class NetworkController:
                 # Only bandwidth control
                 cmd = [
                     'docker', 'exec', container_name,
-                    'tc', 'qdisc', 'replace', 'dev', 'eth0', 'root',
+                    'tc', 'qdisc', 'replace', 'dev', dev, 'root',
                     'tbf',
                     'rate', bandwidth,
                     'burst', '32kbit',
@@ -252,8 +316,9 @@ class NetworkController:
     def show_current_rules(self, container_name: str):
         """Display current tc rules for a container"""
         try:
+            dev = self._tc_netdev_for_container(container_name)
             result = subprocess.run(
-                ['docker', 'exec', container_name, 'tc', 'qdisc', 'show', 'dev', 'eth0'],
+                ['docker', 'exec', container_name, 'tc', 'qdisc', 'show', 'dev', dev],
                 capture_output=True,
                 text=True,
                 check=True
@@ -318,8 +383,9 @@ class NetworkController:
     def get_current_params(self, container_name: str) -> Dict:
         """Extract current network parameters from tc rules"""
         try:
+            dev = self._tc_netdev_for_container(container_name)
             result = subprocess.run(
-                ['docker', 'exec', container_name, 'tc', 'qdisc', 'show', 'dev', 'eth0'],
+                ['docker', 'exec', container_name, 'tc', 'qdisc', 'show', 'dev', dev],
                 capture_output=True,
                 text=True,
                 check=True

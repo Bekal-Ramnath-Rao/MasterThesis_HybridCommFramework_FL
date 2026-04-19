@@ -163,11 +163,18 @@ class ExperimentRunner:
         # Build descriptive folder name
         if baseline_mode:
             # Baseline results go to dedicated baseline folder
-            folder_name = use_case
+            _uc_b = (use_case or "emotion").lower()
+            if _uc_b == "mentalstate":
+                _uc_b = "mental_state"
+            folder_name = _uc_b
             self.results_dir = project_root / "experiment_results_baseline" / folder_name
         else:
             # Regular experiments
-            folder_parts = [use_case]
+            # Canonical use_case token in folder names (matches server ``get_experiment_results_dir``).
+            _uc_folder = (use_case or "emotion").lower()
+            if _uc_folder == "mentalstate":
+                _uc_folder = "mental_state"
+            folder_parts = [_uc_folder]
             if use_quantization:
                 folder_parts.append("quantized")
                 if quantization_params.get('QUANTIZATION_BITS'):
@@ -195,7 +202,13 @@ class ExperimentRunner:
         
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.results_dir = str(self.results_dir)
-        
+        # Align in-container writes (``get_experiment_results_dir``) with this run's host folder.
+        if "experiment_results_baseline" not in self.results_dir.replace("\\", "/"):
+            os.environ.setdefault(
+                "EXPERIMENT_RESULTS_RUN_SEGMENT",
+                os.path.basename(self.results_dir),
+            )
+
         # Initialize congestion manager if enabled
         self.congestion_manager = None
         if enable_congestion:
@@ -315,6 +328,21 @@ class ExperimentRunner:
         _ms_mqtt_broker = "mqtt-broker" if _ms_new_naming else "mqtt-broker-mental"
         _ms_amqp_broker = "amqp-broker" if _ms_new_naming else "rabbitmq-mental"
 
+        # gpu-isolated and macvlan compose files use -temperature suffix with plain broker names;
+        # host-network compose uses -temp suffix with plain broker names;
+        # standard bridge compose uses -temp suffix with fl- prefixed broker names.
+        _temp_new_naming = enable_gpu or self.network_mode == "host_macvlan"
+        _temp = "temperature" if _temp_new_naming else "temp"
+        if _temp_new_naming:
+            _temp_mqtt_broker = "mqtt-broker-temperature"
+            _temp_amqp_broker = "amqp-broker-temperature"
+        elif self.network_mode == "host":
+            _temp_mqtt_broker = "mqtt-broker-temp"
+            _temp_amqp_broker = "rabbitmq-temp"
+        else:
+            _temp_mqtt_broker = "fl-mqtt-broker-temp"
+            _temp_amqp_broker = "fl-rabbitmq-temp"
+
         self.service_patterns = {
             "emotion": {
                 "mqtt": [broker_mqtt, "fl-server-mqtt-emotion", "fl-client-mqtt-emotion-1", "fl-client-mqtt-emotion-2", "fl-client-mqtt-emotion-3"],
@@ -335,13 +363,13 @@ class ExperimentRunner:
                 "rl_unified": ["fl-server-unified-mentalstate", "fl-client-unified-mentalstate-1", "fl-client-unified-mentalstate-2"]
             },
             "temperature": {
-                "mqtt": ["mqtt-broker-temp", "fl-server-mqtt-temp", "fl-client-mqtt-temp-1", "fl-client-mqtt-temp-2"],
-                "amqp": ["rabbitmq-temp", "fl-server-amqp-temp", "fl-client-amqp-temp-1", "fl-client-amqp-temp-2"],
-                "grpc": ["fl-server-grpc-temp", "fl-client-grpc-temp-1", "fl-client-grpc-temp-2"],
-                "quic": ["fl-server-quic-temp", "fl-client-quic-temp-1", "fl-client-quic-temp-2"],
-                "http3": ["fl-server-http3-temp", "fl-client-http3-temp-1", "fl-client-http3-temp-2"],
-                "dds": ["fl-server-dds-temp", "fl-client-dds-temp-1", "fl-client-dds-temp-2"],
-                "rl_unified": ["fl-server-unified-temp", "fl-client-unified-temp-1", "fl-client-unified-temp-2"]
+                "mqtt": [_temp_mqtt_broker, f"fl-server-mqtt-{_temp}", f"fl-client-mqtt-{_temp}-1", f"fl-client-mqtt-{_temp}-2"],
+                "amqp": [_temp_amqp_broker, f"fl-server-amqp-{_temp}", f"fl-client-amqp-{_temp}-1", f"fl-client-amqp-{_temp}-2"],
+                "grpc": [f"fl-server-grpc-{_temp}", f"fl-client-grpc-{_temp}-1", f"fl-client-grpc-{_temp}-2"],
+                "quic": [f"fl-server-quic-{_temp}", f"fl-client-quic-{_temp}-1", f"fl-client-quic-{_temp}-2"],
+                "http3": [f"fl-server-http3-{_temp}", f"fl-client-http3-{_temp}-1", f"fl-client-http3-{_temp}-2"],
+                "dds": [f"fl-server-dds-{_temp}", f"fl-client-dds-{_temp}-1", f"fl-client-dds-{_temp}-2"],
+                "rl_unified": [f"fl-server-unified-{_temp}", f"fl-client-unified-{_temp}-1", f"fl-client-unified-{_temp}-2"]
             }
         }
     
@@ -386,11 +414,19 @@ class ExperimentRunner:
     def _rl_unified_training_results_paths_in_container(self, scenario: Optional[str]) -> List[str]:
         """In-container paths for unified server snapshot JSON (stable filename for the experiment runner)."""
         uc = self._experiment_use_case_results_name()
+        ucl = (self.use_case or "emotion").lower()
+        run_seg = os.environ.get("EXPERIMENT_RESULTS_RUN_SEGMENT", "").strip()
         scen = (scenario or "default").strip() or "default"
         paths: List[str] = []
         for base in ("/app/results", "/app/experiment_results"):
+            if run_seg:
+                paths.append(f"{base}/{run_seg}/unified/{scen}/rl_unified_training_results.json")
+                paths.append(f"{base}/{run_seg}/unified/default/rl_unified_training_results.json")
             paths.append(f"{base}/{uc}/unified/{scen}/rl_unified_training_results.json")
             paths.append(f"{base}/{uc}/unified/default/rl_unified_training_results.json")
+            if ucl != uc:
+                paths.append(f"{base}/{ucl}/unified/{scen}/rl_unified_training_results.json")
+                paths.append(f"{base}/{ucl}/unified/default/rl_unified_training_results.json")
         return paths
 
     def _running_docker_container_names(self) -> set:
@@ -418,34 +454,57 @@ class ExperimentRunner:
         beyond the .dockerignore fix that prevents stale files from being baked into images.
         """
         use_case_lc = self.use_case.lower()
+        use_case_res = self._experiment_use_case_results_name()
         scenario_norm = (scenario or "default").strip() or "default"
+        run_seg = os.environ.get("EXPERIMENT_RESULTS_RUN_SEGMENT", "").strip()
 
         if protocol == "rl_unified":
             # rl_unified server mounts ../experiment_results → /app/results in container.
-            # Results are written to /app/results/{use_case}/unified/{scenario}/ and
-            # /app/results/{use_case}/unified/default/ (fallback when NETWORK_SCENARIO unset).
-            # Files are created by the Docker container as root, so a sudo fallback is needed.
+            # Results are written under .../unified/{network_scenario}/rl_unified_training_results.json.
+            # When the GUI runs multiple scenarios in one batch, a finished scenario (e.g. excellent)
+            # must not leave a snapshot that wait_for_completion mistakes for the *next* scenario.
+            # So remove runner snapshots under every unified/* subdir for this use case's run segments.
             base = self.project_root / "experiment_results"
-            subdirs_to_clean = {scenario_norm, "default"}
             filenames = ["rl_unified_training_results.json", "rl_unified_training_results.csv"]
             import subprocess as _sp
-            for subdir in subdirs_to_clean:
-                for fname in filenames:
-                    stale = base / use_case_lc / "unified" / subdir / fname
-                    if not stale.exists():
-                        continue
+
+            def _rm_stale(stale: Path) -> None:
+                if not stale.exists():
+                    return
+                try:
+                    stale.unlink()
+                    print(f"[INFO] Removed stale results file: {stale}")
+                except PermissionError:
                     try:
-                        stale.unlink()
-                        print(f"[INFO] Removed stale results file: {stale}")
-                    except PermissionError:
-                        # Container writes as root; try sudo (passwordless on this machine)
-                        try:
-                            _sp.run(["sudo", "rm", "-f", str(stale)], check=True, timeout=10)
-                            print(f"[INFO] Removed stale results file (sudo): {stale}")
-                        except Exception as e2:
-                            print(f"[WARN] Could not remove stale file {stale}: {e2}")
-                    except OSError as e:
-                        print(f"[WARN] Could not remove stale file {stale}: {e}")
+                        _sp.run(["sudo", "rm", "-f", str(stale)], check=True, timeout=10)
+                        print(f"[INFO] Removed stale results file (sudo): {stale}")
+                    except Exception as e2:
+                        print(f"[WARN] Could not remove stale file {stale}: {e2}")
+                except OSError as e:
+                    print(f"[WARN] Could not remove stale file {stale}: {e}")
+
+            segs: List[str] = []
+            if run_seg:
+                segs.append(run_seg)
+            segs.append(use_case_res)
+            if use_case_lc != use_case_res:
+                segs.append(use_case_lc)
+            seen_seg: set = set()
+            for seg in segs:
+                if not seg or seg in seen_seg:
+                    continue
+                seen_seg.add(seg)
+                unified_root = base / seg / "unified"
+                if not unified_root.is_dir():
+                    continue
+                try:
+                    for child in unified_root.iterdir():
+                        if not child.is_dir():
+                            continue
+                        for fname in filenames:
+                            _rm_stale(child / fname)
+                except OSError as e:
+                    print(f"[WARN] Could not scan {unified_root}: {e}")
 
     def _running_fl_client_containers(self, protocol: str) -> List[str]:
         """Client service names from the protocol list that are actually running (e.g. RL single-client)."""
@@ -1029,6 +1088,14 @@ class ExperimentRunner:
         else:
             base_scenario = scenario
 
+        try:
+            _sd = Path(__file__).parent.parent / "shared_data"
+            _sd.mkdir(exist_ok=True)
+            _tag = (base_scenario or "default").strip().lower() or "default"
+            (_sd / "current_rl_network_scenario.txt").write_text(f"scenario={_tag}\n", encoding="utf-8")
+        except Exception as _e:
+            print(f"[RL] Warning: could not write current_rl_network_scenario.txt ({_e})")
+
         if base_scenario not in sim.NETWORK_SCENARIOS:
             print(f"[WARNING] Unknown scenario: {base_scenario}, skipping network simulation")
             return True
@@ -1112,7 +1179,10 @@ class ExperimentRunner:
             "Training completed",
             "All rounds completed",
             "Converged",
+            "CONVERGENCE ACHIEVED",  # temperature / mental unified servers
+            "COMPLETED",  # e.g. "COMPLETED N ROUNDS"
             "Results saved to",
+            "Experiment runner snapshot",  # temperature unified save_results()
             "Experiment finished",
         ]
 
@@ -1214,14 +1284,24 @@ class ExperimentRunner:
             # into the Docker image from a previous run (COPY Server/ ./Server/ in Dockerfile).
             # Always check the actively-written new paths FIRST to avoid stale-file false positives.
             expected_json = f"{protocol}_training_results.json"
-            use_case_lc = self.use_case.lower()  # e.g. "emotion"
+            use_case_lc = self.use_case.lower()  # e.g. "emotion" or "mentalstate"
+            use_case_res = self._experiment_use_case_results_name()
             scenario_norm = (scenario or "default").lower()
+            run_seg = os.environ.get("EXPERIMENT_RESULTS_RUN_SEGMENT", "").strip()
             new_paths = []
             for base in ("/app/results", "/app/experiment_results"):
                 for scen in (scenario_norm, "default"):
-                    p = f"{base}/{use_case_lc}/{protocol}/{scen}/{expected_json}"
+                    if run_seg:
+                        p = f"{base}/{run_seg}/{protocol}/{scen}/{expected_json}"
+                        if p not in new_paths:
+                            new_paths.append(p)
+                    p = f"{base}/{use_case_res}/{protocol}/{scen}/{expected_json}"
                     if p not in new_paths:
                         new_paths.append(p)
+                    if use_case_lc != use_case_res:
+                        p = f"{base}/{use_case_lc}/{protocol}/{scen}/{expected_json}"
+                        if p not in new_paths:
+                            new_paths.append(p)
             legacy_path = f"/app/Server/{self.use_case_dir}/results/{expected_json}"
             cat_paths = new_paths + [legacy_path]
             if protocol == "rl_unified":
@@ -1353,7 +1433,9 @@ class ExperimentRunner:
             result_files.append("pruning_metrics.json")
 
         use_case_lc = self.use_case.lower()
+        use_case_res = self._experiment_use_case_results_name()
         scenario_norm = (scenario or "default").lower()
+        run_seg = os.environ.get("EXPERIMENT_RESULTS_RUN_SEGMENT", "").strip()
 
         for result_file in result_files:
             dest = os.path.join(exp_dir, result_file)
@@ -1362,10 +1444,18 @@ class ExperimentRunner:
             # then fall back to the legacy path. This avoids collecting stale baked-in files.
             for base in ("/app/results", "/app/experiment_results"):
                 for scen in (scenario_norm, "default"):
-                    src = f"{server_container}:{base}/{use_case_lc}/{protocol}/{scen}/{result_file}"
-                    r = self.run_command(["docker", "cp", src, dest], check=False)
-                    if r.returncode == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0:
-                        copied = True
+                    srcs = []
+                    if run_seg:
+                        srcs.append(f"{server_container}:{base}/{run_seg}/{protocol}/{scen}/{result_file}")
+                    srcs.append(f"{server_container}:{base}/{use_case_res}/{protocol}/{scen}/{result_file}")
+                    if use_case_lc != use_case_res:
+                        srcs.append(f"{server_container}:{base}/{use_case_lc}/{protocol}/{scen}/{result_file}")
+                    for src in srcs:
+                        r = self.run_command(["docker", "cp", src, dest], check=False)
+                        if r.returncode == 0 and os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                            copied = True
+                            break
+                    if copied:
                         break
                 if copied:
                     break

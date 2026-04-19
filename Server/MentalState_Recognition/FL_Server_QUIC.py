@@ -28,6 +28,16 @@ _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from experiment_results_path import get_experiment_results_dir
+try:
+    from fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+except ModuleNotFoundError:
+    from scripts.utilities.fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
 
 # Add Compression_Technique to path for optional quantization support
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -690,12 +700,21 @@ class FederatedLearningServer:
             "num_clients": self.num_clients,
             "num_rounds": self.num_rounds
         }
+        merge_cpu_memory_into_results(results, "mental_state")
 
         results_dir = get_experiment_results_dir("mental_state", "quic")
         results_file = results_dir / "quic_training_results.json"
 
         with open(results_file, "w") as f:
             json.dump(results, f, indent=2)
+
+        plot_cpu_memory_for_server_rounds(
+            results_dir,
+            "quic_cpu_memory_per_round.png",
+            self.ROUNDS,
+            "mental_state",
+            title="QUIC (mental_state): avg client CPU and RAM per round",
+        )
 
         print(f"\n[RESULTS] Saved to {results_file}")
         print(f"[RESULTS] Best accuracy: {results['best_accuracy']:.6f} at round {results['best_round']}")

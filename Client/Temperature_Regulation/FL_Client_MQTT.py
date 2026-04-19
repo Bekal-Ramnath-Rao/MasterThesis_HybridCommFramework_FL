@@ -54,6 +54,10 @@ _utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+_client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _client_dir not in sys.path:
+    sys.path.insert(0, _client_dir)
+from battery_model import BatteryModel
 try:
     from pruning_client import ModelPruning, PruningConfig
     PRUNING_AVAILABLE = True
@@ -78,8 +82,12 @@ CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
 
+# Payload size limit: 128 KB (MQTT protocol constraint)
+MAX_PAYLOAD_MQTT = 128 * 1024  # 128 KB
+
 # MQTT Topics
 TOPIC_GLOBAL_MODEL = "fl/global_model"
+TOPIC_GLOBAL_MODEL_CHUNK = "fl/global_model_chunk"  # chunked delivery for large payloads
 TOPIC_CLIENT_UPDATE = f"fl/client/{CLIENT_ID}/update"
 TOPIC_CLIENT_METRICS = f"fl/client/{CLIENT_ID}/metrics"
 TOPIC_TRAINING_CONFIG = "fl/training_config"
@@ -127,6 +135,9 @@ class FederatedLearningClient:
         self.has_converged = False
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
+        self._last_downlink_model_bytes = 0
+        self.battery_model = BatteryModel(protocol="mqtt")
+        self._chunk_buffer = {}  # {total_chunks: int, chunks: dict[int, bytes]}
         
         # Initialize MQTT client
         self.mqtt_client = mqtt.Client(client_id=f"fl_client_{client_id}")
@@ -212,6 +223,9 @@ class FederatedLearningClient:
             
             result5, mid5 = self.mqtt_client.subscribe(TOPIC_TRAINING_COMPLETE)
             print(f"  Subscribed to fl/training_complete (QoS 1) - Result: {result5}")
+
+            result6, mid6 = self.mqtt_client.subscribe(TOPIC_GLOBAL_MODEL_CHUNK)
+            print(f"  Subscribed to {TOPIC_GLOBAL_MODEL_CHUNK} - Result: {result6}")
             
             # Send registration message
             self.mqtt_client.publish("fl/client_register", 
@@ -225,6 +239,8 @@ class FederatedLearningClient:
         try:
             if msg.topic == TOPIC_GLOBAL_MODEL:
                 self.handle_global_model(msg.payload)
+            elif msg.topic == TOPIC_GLOBAL_MODEL_CHUNK:
+                self.handle_global_model_chunk(msg.payload)
             elif msg.topic == TOPIC_TRAINING_CONFIG:
                 self.handle_training_config(msg.payload)
             elif msg.topic == TOPIC_START_TRAINING:
@@ -259,8 +275,28 @@ class FederatedLearningClient:
         self.mqtt_client.disconnect()
         print(f"Client {self.client_id} disconnected successfully.")
     
+    def handle_global_model_chunk(self, raw):
+        """Accumulate MQTT global-model chunks and reassemble into a single payload."""
+        try:
+            envelope = json.loads(raw.decode())
+            idx = envelope['chunk_index']
+            total = envelope['total_chunks']
+            chunk_bytes = base64.b64decode(envelope['data'])
+            if 'total_chunks' not in self._chunk_buffer or self._chunk_buffer.get('total_chunks') != total:
+                self._chunk_buffer = {'total_chunks': total, 'chunks': {}}
+            self._chunk_buffer['chunks'][idx] = chunk_bytes
+            print(f"[MQTT] Received chunk {idx+1}/{total} for global model")
+            if len(self._chunk_buffer['chunks']) == total:
+                payload = b''.join(self._chunk_buffer['chunks'][i] for i in range(total))
+                self._chunk_buffer = {}
+                print(f"[MQTT] All {total} chunks received — reassembled {len(payload)} B")
+                self.handle_global_model(payload)
+        except Exception as e:
+            print(f"Client {self.client_id} error handling model chunk: {e}")
+
     def handle_global_model(self, payload):
         """Receive and set global model weights and architecture from server"""
+        self._last_downlink_model_bytes = len(payload)
         data = json.loads(payload.decode())
         round_num = data['round']
         # Check if weights are pruned-compressed
@@ -507,7 +543,9 @@ class FederatedLearningClient:
             "loss": float(loss),
             "mse": float(mse),
             "mae": float(mae),
-            "mape": float(mape)
+            "mape": float(mape),
+            "battery_soc": float(self.battery_model.battery_soc),
+            "cumulative_energy_j": float(self.battery_model.cumulative_energy_j),
         }
         if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             metrics_dict["client_converged"] = 1.0
@@ -523,6 +561,13 @@ class FederatedLearningClient:
         _mt0 = time.time()
         self.mqtt_client.publish(TOPIC_CLIENT_METRICS, _mp)
         _uplink_metrics_sec = time.time() - _mt0
+        _bytes_sent_metrics = len(_mp.encode())
+        self.battery_model.update(
+            _bytes_sent_metrics,
+            self._last_downlink_model_bytes,
+            self._last_training_time_sec,
+            float(self._last_uplink_model_comm_sec) + _uplink_metrics_sec,
+        )
         append_client_fl_metrics_record(
             self.client_id,
             {
@@ -540,8 +585,9 @@ class FederatedLearningClient:
                     + self._last_uplink_model_comm_sec
                     + _uplink_metrics_sec
                 ),
-                "battery_energy_joules": 0.0,
-                "battery_soc_after": 1.0,
+                "battery_energy_joules": float(self.battery_model.last_energy_j),
+                "battery_soc_after": float(self.battery_model.battery_soc),
+                "cumulative_battery_energy_joules": float(self.battery_model.cumulative_energy_j),
             },
             use_case=use_case_from_env("temperature"),
             protocol="mqtt",

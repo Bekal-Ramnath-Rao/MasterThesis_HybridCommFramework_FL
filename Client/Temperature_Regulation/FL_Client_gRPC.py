@@ -71,10 +71,20 @@ _utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+_client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _client_dir not in sys.path:
+    sys.path.insert(0, _client_dir)
+from battery_model import BatteryModel
 
 # gRPC Configuration
 GRPC_HOST = os.getenv("GRPC_HOST", "localhost")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
+# Payload size limit: 4 MB (gRPC protocol constraint)
+MAX_PAYLOAD_GRPC = 4 * 1024 * 1024  # 4 MB
+GRPC_OPTIONS = [
+    ('grpc.max_send_message_length', MAX_PAYLOAD_GRPC),
+    ('grpc.max_receive_message_length', MAX_PAYLOAD_GRPC),
+]
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "2"))
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -127,6 +137,8 @@ class FederatedLearningClient:
         self.has_converged = False
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
+        self._last_downlink_model_bytes = 0
+        self.battery_model = BatteryModel(protocol="grpc")
         
         # Prepare data and model
         self.prepare_data_and_model(dataframe)
@@ -183,7 +195,7 @@ class FederatedLearningClient:
         for attempt in range(max_retries):
             try:
                 print(f"Attempting to connect to gRPC server at {GRPC_HOST}:{GRPC_PORT}...")
-                self.channel = grpc.insecure_channel(f'{GRPC_HOST}:{GRPC_PORT}')
+                self.channel = grpc.insecure_channel(f'{GRPC_HOST}:{GRPC_PORT}', options=GRPC_OPTIONS)
                 self.stub = federated_learning_pb2_grpc.FederatedLearningStub(self.channel)
                 
                 # Test connection by registering
@@ -241,6 +253,7 @@ class FederatedLearningClient:
                     if global_model.round == 0:
                         # Initial model - build architecture from server config
                         print(f"Client {self.client_id} received initial global model from server")
+                        self._last_downlink_model_bytes = len(global_model.weights)
                         
                         # Parse model config if available
                         if global_model.model_config:
@@ -309,6 +322,7 @@ class FederatedLearningClient:
                                 weights = candidate
                         except Exception:
                             weights = pickle.loads(global_model.weights)
+                        self._last_downlink_model_bytes = len(global_model.weights)
                         self.model.set_weights(weights)
                         print(f"Client {self.client_id} received global model for round {global_model.round}")
                         self.current_round = global_model.round
@@ -516,12 +530,20 @@ class FederatedLearningClient:
                     'mape': float(mape),
                     'training_time_sec': float(self._last_training_time_sec),
                     'uplink_model_comm_sec': float(self._last_uplink_model_comm_sec),
-                    'battery_soc': 1.0,
+                    'battery_soc': float(self.battery_model.battery_soc),
                 }
             )
         )
         _uplink_metrics_sec = time.time() - _mt0
-        
+        _bytes_sent_metrics = len(federated_learning_pb2.EvaluationMetrics(
+            client_id=self.client_id, round=self.current_round,
+            num_samples=len(self.x_test), metrics={}).SerializeToString())
+        self.battery_model.update(
+            _bytes_sent_metrics,
+            self._last_downlink_model_bytes,
+            self._last_training_time_sec,
+            float(self._last_uplink_model_comm_sec) + _uplink_metrics_sec,
+        )
         if response.success:
             append_client_fl_metrics_record(
                 self.client_id,
@@ -540,8 +562,9 @@ class FederatedLearningClient:
                         + self._last_uplink_model_comm_sec
                         + _uplink_metrics_sec
                     ),
-                    "battery_energy_joules": 0.0,
-                    "battery_soc_after": 1.0,
+                    "battery_energy_joules": float(self.battery_model.last_energy_j),
+                    "battery_soc_after": float(self.battery_model.battery_soc),
+                    "cumulative_battery_energy_joules": float(self.battery_model.cumulative_energy_j),
                 },
                 use_case=use_case_from_env("temperature"),
                 protocol="grpc",

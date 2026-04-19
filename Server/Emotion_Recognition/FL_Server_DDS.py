@@ -55,18 +55,18 @@ else:
 _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
-try:
-    from experiment_results_path import get_experiment_results_dir
-except ModuleNotFoundError:
-    def get_experiment_results_dir(use_case: str, protocol: str, scenario: str = None) -> Path:
-        if scenario is None:
-            scenario = os.getenv("NETWORK_SCENARIO", "default").strip() or "default"
-        root = Path("/app") if os.path.exists("/app") else Path(_project_root)
-        path = root / "experiment_results" / use_case / protocol / scenario
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
+from experiment_results_path import get_experiment_results_dir
 from battery_results_agg import avg_battery_model_drain_fraction
+try:
+    from fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+except ModuleNotFoundError:
+    from scripts.utilities.fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -1205,6 +1205,13 @@ class FederatedLearningServer:
         ax3b.plot(rounds, self.ACCURACY, 'g-', marker='o'); ax3b.set_xlabel('Round'); ax3b.set_ylabel('Accuracy'); ax3b.set_title('DDS: Accuracy over Rounds'); ax3b.grid(True)
         fig3.tight_layout(); fig3.savefig(results_dir / 'dds_training_metrics.png', dpi=300, bbox_inches='tight'); plt.close(fig3)
         print(f"Training metrics plot saved to {results_dir / 'dds_training_metrics.png'}")
+        plot_cpu_memory_for_server_rounds(
+            results_dir,
+            "dds_cpu_memory_per_round.png",
+            self.ROUNDS,
+            "emotion",
+            title="DDS (emotion): avg client CPU and RAM per round",
+        )
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
             plt.close()
         else:
@@ -1238,7 +1245,8 @@ class FederatedLearningServer:
                 'convergence_patience': CONVERGENCE_PATIENCE
             }
         }
-        
+        merge_cpu_memory_into_results(results, "emotion")
+
         results_file = results_dir / 'dds_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=4)

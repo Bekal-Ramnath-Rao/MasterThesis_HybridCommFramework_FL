@@ -579,12 +579,13 @@ class NetworkSimulator:
             print(f"Applying network conditions to: {container_name}")
             print(f"{'='*60}")
             
-            # With network_mode: host, container shares host network; no per-container eth0/tc
+            # With network_mode: host, container shares host network; apply tc on the host interface
             if self.is_host_network_mode(container_name):
                 print(f"[INFO] Container {container_name} uses network_mode: host.")
-                print(f"[INFO] Skipping tc (no per-container interface); scenario is nominal only.")
+                print(f"[INFO] Applying tc on host interface (shared by all host-network containers).")
+                result = self.apply_network_conditions_host(conditions)
                 print(f"{'='*60}\n")
-                return True
+                return result
 
             # Check if tc command is available
             if not self.check_tc_available(container_name):
@@ -724,6 +725,11 @@ class NetworkSimulator:
     
     def reset_container_network(self, container_name: str):
         """Reset network conditions on a container (egress and ingress)."""
+        # For host-network containers, reset the host interface tc rules instead
+        if self.is_host_network_mode(container_name):
+            self.log(f"Container {container_name} uses network_mode: host — resetting host interface tc.")
+            self.reset_host_network()
+            return
         try:
             interface = self.get_container_interface(container_name)
             # Delete ingress and IFB first, then egress

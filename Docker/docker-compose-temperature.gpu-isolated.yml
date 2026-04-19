@@ -5,7 +5,7 @@
 # Note: Uses Docker Compose V2 syntax (no version: field)
 
 services:
-  mqtt-broker:
+  mqtt-broker-temperature:
     image: eclipse-mosquitto:latest
     ports:
       - "31883:1883"
@@ -27,7 +27,7 @@ services:
     environment:
       - PROTOCOL=MQTT
       - USE_CASE=temperature
-      - MQTT_BROKER=mqtt-broker
+      - MQTT_BROKER=mqtt-broker-temperature
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -38,10 +38,13 @@ services:
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.4
     depends_on:
-      - mqtt-broker
+      - mqtt-broker-temperature
+    cap_add:
+      - NET_ADMIN
     networks:
       - temperature_network
     container_name: fl-server-mqtt-temperature
+    command: python -u Server/Temperature_Regulation/FL_Server_MQTT.py
     deploy:
       resources:
         reservations:
@@ -56,22 +59,25 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=MQTT
       - USE_CASE=temperature
-      - MQTT_BROKER=mqtt-broker
+      - MQTT_BROKER=mqtt-broker-temperature
       - CUDA_VISIBLE_DEVICES=0
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
     depends_on:
-      - mqtt-broker
+      - mqtt-broker-temperature
       - fl-server-mqtt-temperature
+    cap_add:
+      - NET_ADMIN
     networks:
       - temperature_network
     container_name: fl-client-mqtt-temperature-1
+    command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
     deploy:
       resources:
         reservations:
@@ -79,6 +85,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
 
   fl-client-mqtt-temperature-2:
     build:
@@ -86,22 +94,25 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=MQTT
       - USE_CASE=temperature
-      - MQTT_BROKER=mqtt-broker
+      - MQTT_BROKER=mqtt-broker-temperature
       - CUDA_VISIBLE_DEVICES=1
       - GPU_DEVICE_ID=1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
     depends_on:
-      - mqtt-broker
+      - mqtt-broker-temperature
       - fl-server-mqtt-temperature
+    cap_add:
+      - NET_ADMIN
     networks:
       - temperature_network
     container_name: fl-client-mqtt-temperature-2
+    command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
     deploy:
       resources:
         reservations:
@@ -109,12 +120,49 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['1']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
+
+  fl-client-mqtt-temperature-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=3
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - PROTOCOL=MQTT
+      - USE_CASE=temperature
+      - MQTT_BROKER=mqtt-broker-temperature
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - mqtt-broker-temperature
+      - fl-server-mqtt-temperature
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - temperature_network
+    container_name: fl-client-mqtt-temperature-3
+    command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
 
   # ============================================================================
   # AMQP Protocol Services
   # ============================================================================
   
-  amqp-broker:
+  amqp-broker-temperature:
     image: rabbitmq:3.12-management
     environment:
       - RABBITMQ_DEFAULT_USER=guest
@@ -125,6 +173,11 @@ services:
     networks:
       - temperature_network
     container_name: amqp-broker-temperature
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   fl-server-amqp-temperature:
     build:
@@ -133,7 +186,10 @@ services:
     environment:
       - PROTOCOL=AMQP
       - USE_CASE=temperature
-      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - AMQP_HOST=amqp-broker-temperature
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -144,10 +200,14 @@ services:
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.4
     depends_on:
-      - amqp-broker
+      amqp-broker-temperature:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
     networks:
       - temperature_network
     container_name: fl-server-amqp-temperature
+    command: python -u Server/Temperature_Regulation/FL_Server_AMQP.py
     deploy:
       resources:
         reservations:
@@ -162,22 +222,28 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=AMQP
       - USE_CASE=temperature
-      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - AMQP_HOST=amqp-broker-temperature
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
       - CUDA_VISIBLE_DEVICES=0
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
     depends_on:
-      - amqp-broker
+      - amqp-broker-temperature
       - fl-server-amqp-temperature
+    cap_add:
+      - NET_ADMIN
     networks:
       - temperature_network
     container_name: fl-client-amqp-temperature-1
+    command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
     deploy:
       resources:
         reservations:
@@ -185,6 +251,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
 
   fl-client-amqp-temperature-2:
     build:
@@ -192,22 +260,28 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=AMQP
       - USE_CASE=temperature
-      - AMQP_BROKER=amqp://guest:guest@amqp-broker:5672/
+      - AMQP_HOST=amqp-broker-temperature
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
       - CUDA_VISIBLE_DEVICES=1
       - GPU_DEVICE_ID=1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
     depends_on:
-      - amqp-broker
+      - amqp-broker-temperature
       - fl-server-amqp-temperature
+    cap_add:
+      - NET_ADMIN
     networks:
       - temperature_network
     container_name: fl-client-amqp-temperature-2
+    command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
     deploy:
       resources:
         reservations:
@@ -215,6 +289,46 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['1']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
+
+  fl-client-amqp-temperature-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=3
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - PROTOCOL=AMQP
+      - USE_CASE=temperature
+      - AMQP_HOST=amqp-broker-temperature
+      - AMQP_PORT=5672
+      - AMQP_USER=guest
+      - AMQP_PASSWORD=guest
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - amqp-broker-temperature
+      - fl-server-amqp-temperature
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - temperature_network
+    container_name: fl-client-amqp-temperature-3
+    command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
 
   # ============================================================================
   # gRPC Protocol Services
@@ -239,9 +353,12 @@ services:
       - TF_GPU_MEMORY_FRACTION=0.4
     ports:
       - "50051:50051"
+    cap_add:
+      - NET_ADMIN
     networks:
       - temperature_network
     container_name: fl-server-grpc-temperature
+    command: python -u Server/Temperature_Regulation/FL_Server_gRPC.py
     deploy:
       resources:
         reservations:
@@ -256,21 +373,25 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=gRPC
       - USE_CASE=temperature
-      - GRPC_SERVER=fl-server-grpc-temperature:50051
+      - GRPC_HOST=fl-server-grpc-temperature
+      - GRPC_PORT=50051
       - CUDA_VISIBLE_DEVICES=0
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
     depends_on:
       - fl-server-grpc-temperature
+    cap_add:
+      - NET_ADMIN
     networks:
       - temperature_network
     container_name: fl-client-grpc-temperature-1
+    command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
     deploy:
       resources:
         reservations:
@@ -278,6 +399,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
 
   fl-client-grpc-temperature-2:
     build:
@@ -285,21 +408,25 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=gRPC
       - USE_CASE=temperature
-      - GRPC_SERVER=fl-server-grpc-temperature:50051
+      - GRPC_HOST=fl-server-grpc-temperature
+      - GRPC_PORT=50051
       - CUDA_VISIBLE_DEVICES=1
       - GPU_DEVICE_ID=1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
     depends_on:
       - fl-server-grpc-temperature
+    cap_add:
+      - NET_ADMIN
     networks:
       - temperature_network
     container_name: fl-client-grpc-temperature-2
+    command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
     deploy:
       resources:
         reservations:
@@ -307,6 +434,43 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['1']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
+
+  fl-client-grpc-temperature-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=3
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - PROTOCOL=gRPC
+      - USE_CASE=temperature
+      - GRPC_HOST=fl-server-grpc-temperature
+      - GRPC_PORT=50051
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-grpc-temperature
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - temperature_network
+    container_name: fl-client-grpc-temperature-3
+    command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
 
   # ============================================================================
   # QUIC Protocol Services
@@ -331,9 +495,12 @@ services:
       - TF_GPU_MEMORY_FRACTION=0.4
     ports:
       - "4433:4433/udp"
+    cap_add:
+      - NET_ADMIN
     networks:
       - temperature_network
     container_name: fl-server-quic-temperature
+    command: python -u Server/Temperature_Regulation/FL_Server_QUIC.py
     deploy:
       resources:
         reservations:
@@ -348,21 +515,25 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=QUIC
       - USE_CASE=temperature
-      - QUIC_SERVER=fl-server-quic-temperature:4433
+      - QUIC_HOST=fl-server-quic-temperature
+      - QUIC_PORT=4433
       - CUDA_VISIBLE_DEVICES=0
       - GPU_DEVICE_ID=0
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
     depends_on:
       - fl-server-quic-temperature
+    cap_add:
+      - NET_ADMIN
     networks:
       - temperature_network
     container_name: fl-client-quic-temperature-1
+    command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
     deploy:
       resources:
         reservations:
@@ -370,6 +541,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
 
   fl-client-quic-temperature-2:
     build:
@@ -377,21 +550,25 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=QUIC
       - USE_CASE=temperature
-      - QUIC_SERVER=fl-server-quic-temperature:4433
+      - QUIC_HOST=fl-server-quic-temperature
+      - QUIC_PORT=4433
       - CUDA_VISIBLE_DEVICES=1
       - GPU_DEVICE_ID=1
       - TF_FORCE_GPU_ALLOW_GROWTH=true
       - TF_GPU_MEMORY_FRACTION=0.9
     depends_on:
       - fl-server-quic-temperature
+    cap_add:
+      - NET_ADMIN
     networks:
       - temperature_network
     container_name: fl-client-quic-temperature-2
+    command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
     deploy:
       resources:
         reservations:
@@ -399,6 +576,43 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['1']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
+
+  fl-client-quic-temperature-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=3
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - PROTOCOL=QUIC
+      - USE_CASE=temperature
+      - QUIC_HOST=fl-server-quic-temperature
+      - QUIC_PORT=4433
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-quic-temperature
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - temperature_network
+    container_name: fl-client-quic-temperature-3
+    command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
 
   # ============================================================================
   # HTTP/3 Protocol Services
@@ -444,7 +658,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=HTTP3
@@ -475,6 +689,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
 
   fl-client-http3-temperature-2:
     build:
@@ -482,7 +698,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=HTTP3
@@ -513,6 +729,48 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['1']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
+
+  fl-client-http3-temperature-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=3
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - PROTOCOL=HTTP3
+      - USE_CASE=temperature
+      - HTTP3_HOST=fl-server-http3-temperature
+      - HTTP3_PORT=4434
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-parameter_quantization}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_SYMMETRIC=${QUANTIZATION_SYMMETRIC:-true}
+      - QUANTIZATION_PER_CHANNEL=${QUANTIZATION_PER_CHANNEL:-false}
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - fl-server-http3-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-http3-temperature-3
+    command: python -u Client/Temperature_Regulation/FL_Client_HTTP3.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
 
   # ============================================================================
   # DDS Protocol Services
@@ -537,6 +795,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-server-dds-temperature
+    command: python -u Server/Temperature_Regulation/FL_Server_DDS.py
     cap_add:
       - NET_ADMIN
     deploy:
@@ -553,7 +812,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=DDS
@@ -567,6 +826,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-dds-temperature-1
+    command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
     cap_add:
       - NET_ADMIN
     deploy:
@@ -576,6 +836,8 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
 
   fl-client-dds-temperature-2:
     build:
@@ -583,7 +845,7 @@ services:
       dockerfile: Client/Dockerfile
     environment:
       - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - PROTOCOL=DDS
@@ -597,6 +859,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-dds-temperature-2
+    command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
     cap_add:
       - NET_ADMIN
     deploy:
@@ -606,6 +869,41 @@ services:
             - capabilities: [gpu]
               driver: nvidia
               device_ids: ['1']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
+
+  fl-client-dds-temperature-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    environment:
+      - CLIENT_ID=3
+      - NUM_CLIENTS=${NUM_CLIENTS:-3}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - PROTOCOL=DDS
+      - USE_CASE=temperature
+      - CUDA_VISIBLE_DEVICES=0
+      - GPU_DEVICE_ID=0
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - TF_GPU_MEMORY_FRACTION=0.9
+    depends_on:
+      - fl-server-dds-temperature
+    networks:
+      - temperature_network
+    container_name: fl-client-dds-temperature-3
+    command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
+    cap_add:
+      - NET_ADMIN
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              driver: nvidia
+              device_ids: ['0']
+    volumes:
+      - ../Client/Temperature_Regulation/Dataset:/app/Client/Temperature_Regulation/Dataset:ro
 
 networks:
   temperature_network:

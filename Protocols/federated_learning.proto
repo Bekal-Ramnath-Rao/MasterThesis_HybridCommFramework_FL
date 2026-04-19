@@ -14,7 +14,7 @@ service FederatedLearning {
     rpc SendModelUpdate(ModelUpdate) returns (UpdateResponse);
     
     // Client sends evaluation metrics to server
-    rpc SendMetrics(Metrics) returns (MetricsResponse);
+    rpc SendMetrics(EvaluationMetrics) returns (MetricsResponse);
     
     // Get training configuration
     rpc GetTrainingConfig(ConfigRequest) returns (TrainingConfig);

@@ -40,6 +40,17 @@ try:
 except ModuleNotFoundError:
     from scripts.utilities.experiment_results_path import get_experiment_results_dir
 
+try:
+    from fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+except ModuleNotFoundError:
+    from scripts.utilities.fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
@@ -1066,6 +1077,13 @@ class FederatedLearningServer:
         fig3.tight_layout()
         fig3.savefig(results_dir / 'mqtt_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'mqtt_training_metrics.png'}")
+        plot_cpu_memory_for_server_rounds(
+            results_dir,
+            "mqtt_cpu_memory_per_round.png",
+            self.ROUNDS,
+            "emotion",
+            title="MQTT (emotion): avg client CPU and RAM per round",
+        )
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
             plt.close('all')
         else:
@@ -1099,7 +1117,8 @@ class FederatedLearningServer:
             "final_accuracy": self.ACCURACY[-1] if self.ACCURACY else None,
             "final_loss": self.LOSS[-1] if self.LOSS else None
         }
-        
+        merge_cpu_memory_into_results(results, "emotion")
+
         results_file = results_dir / 'mqtt_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)

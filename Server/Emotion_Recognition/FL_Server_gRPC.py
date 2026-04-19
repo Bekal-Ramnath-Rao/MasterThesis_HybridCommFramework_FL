@@ -24,6 +24,16 @@ _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from experiment_results_path import get_experiment_results_dir
+try:
+    from fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+except ModuleNotFoundError:
+    from scripts.utilities.fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
 from battery_results_agg import avg_battery_model_drain_fraction
 
 # Add Compression_Technique to path
@@ -713,7 +723,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             'num_clients': self.num_clients,
             'config': self.training_config
         }
-        
+        merge_cpu_memory_into_results(results, "emotion")
+
         # Create results directory if it doesn't exist
         results_dir = get_experiment_results_dir("emotion", "grpc")
         
@@ -781,6 +792,13 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         fig3.savefig(filepath, dpi=300, bbox_inches='tight')
         plt.close(fig3)
         print(f"Plot saved to {filepath}")
+        plot_cpu_memory_for_server_rounds(
+            results_dir,
+            "grpc_cpu_memory_per_round.png",
+            self.ROUNDS,
+            "emotion",
+            title="gRPC (emotion): avg client CPU and RAM per round",
+        )
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
             plt.close('all')
         else:

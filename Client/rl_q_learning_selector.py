@@ -1037,9 +1037,14 @@ class QLearningProtocolSelector:
         # Store reward
         self.reward_history.append(reward)
         
-        # Track protocol success/failure
+        # Track protocol success/failure (prefer FL success flag from calculate_reward breakdown)
         protocol = self.PROTOCOLS[action_idx]
-        if reward > 0:
+        br = self._last_reward_breakdown if isinstance(self._last_reward_breakdown, dict) else {}
+        if "success" in br:
+            ok = bool(br["success"])
+        else:
+            ok = reward > 0
+        if ok:
             self.protocol_success[protocol] += 1
         else:
             self.protocol_failures[protocol] += 1

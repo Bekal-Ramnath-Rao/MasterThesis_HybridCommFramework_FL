@@ -37,6 +37,10 @@ _utilities_path = os.path.join(_project_root, 'scripts', 'utilities')
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
+_client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _client_dir not in sys.path:
+    sys.path.insert(0, _client_dir)
+from battery_model import BatteryModel
 
 # GPU Configuration - Must be done BEFORE TensorFlow import
 # Get GPU device ID from environment variable (set by docker for multi-GPU isolation)
@@ -142,6 +146,8 @@ class FederatedLearningClient:
         self.stream_id = 0
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
+        self._last_downlink_model_bytes = 0
+        self.battery_model = BatteryModel(protocol="quic")
         
         # Prepare data and model
         self.prepare_data_and_model(dataframe)
@@ -237,6 +243,7 @@ class FederatedLearningClient:
         """Receive and set global model weights and architecture from server"""
         round_num = message['round']
         encoded_weights = message['weights']
+        self._last_downlink_model_bytes = len(json.dumps(message).encode('utf-8'))
         
         if 'quantized_data' in message and self.quantizer is not None:
             compressed_data = pickle.loads(base64.b64decode(message['quantized_data']))
@@ -461,7 +468,9 @@ class FederatedLearningClient:
             "loss": float(loss),
             "mse": float(mse),
             "mae": float(mae),
-            "mape": float(mape)
+            "mape": float(mape),
+            "battery_soc": float(self.battery_model.battery_soc),
+            "cumulative_energy_j": float(self.battery_model.cumulative_energy_j),
         }
         if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             metrics_dict["client_converged"] = 1.0
@@ -477,6 +486,13 @@ class FederatedLearningClient:
         _mt0 = time.time()
         await self.send_message(metrics_message)
         _uplink_metrics_sec = time.time() - _mt0
+        _bytes_sent_metrics = len(json.dumps(metrics_message).encode('utf-8'))
+        self.battery_model.update(
+            _bytes_sent_metrics,
+            self._last_downlink_model_bytes,
+            self._last_training_time_sec,
+            float(self._last_uplink_model_comm_sec) + _uplink_metrics_sec,
+        )
         append_client_fl_metrics_record(
             self.client_id,
             {
@@ -494,8 +510,9 @@ class FederatedLearningClient:
                     + self._last_uplink_model_comm_sec
                     + _uplink_metrics_sec
                 ),
-                "battery_energy_joules": 0.0,
-                "battery_soc_after": 1.0,
+                "battery_energy_joules": float(self.battery_model.last_energy_j),
+                "battery_soc_after": float(self.battery_model.battery_soc),
+                "cumulative_battery_energy_joules": float(self.battery_model.cumulative_energy_j),
             },
             use_case=use_case_from_env("temperature"),
             protocol="quic",

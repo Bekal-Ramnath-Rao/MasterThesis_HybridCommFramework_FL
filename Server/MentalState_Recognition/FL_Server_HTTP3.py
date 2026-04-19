@@ -23,6 +23,16 @@ _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from experiment_results_path import get_experiment_results_dir
+try:
+    from fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+except ModuleNotFoundError:
+    from scripts.utilities.fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -891,6 +901,13 @@ class FederatedLearningServer:
         results_dir = get_experiment_results_dir("mental_state", "http3")
         plt.savefig(results_dir / 'http3_training_metrics.png', dpi=300, bbox_inches='tight')
         print(f"Results plot saved to {results_dir / 'http3_training_metrics.png'}")
+        plot_cpu_memory_for_server_rounds(
+            results_dir,
+            "http3_cpu_memory_per_round.png",
+            self.ROUNDS,
+            "mental_state",
+            title="HTTP/3 (mental_state): avg client CPU and RAM per round",
+        )
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
             plt.close()
         else:
@@ -915,7 +932,8 @@ class FederatedLearningServer:
             "num_clients": self.num_clients,
             "converged": self.converged
         }
-        
+        merge_cpu_memory_into_results(results, "mental_state")
+
         results_file = results_dir / 'http3_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)

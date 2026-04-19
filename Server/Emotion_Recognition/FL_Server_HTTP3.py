@@ -23,17 +23,17 @@ else:
 _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
+from experiment_results_path import get_experiment_results_dir
 try:
-    from experiment_results_path import get_experiment_results_dir
+    from fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
 except ModuleNotFoundError:
-    def get_experiment_results_dir(use_case: str, protocol: str, scenario: str = None) -> Path:
-        if scenario is None:
-            scenario = os.getenv("NETWORK_SCENARIO", "default").strip() or "default"
-        root = Path("/app") if os.path.exists("/app") else Path(_project_root)
-        path = root / "experiment_results" / use_case / protocol / scenario
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
+    from scripts.utilities.fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
 from battery_results_agg import avg_battery_model_drain_fraction
 
 # Add Compression_Technique to path
@@ -998,6 +998,13 @@ class FederatedLearningServer:
         ax3b.plot(rounds, self.ACCURACY, marker='s', linewidth=2, markersize=8, color='green'); ax3b.set_xlabel('Round'); ax3b.set_ylabel('Accuracy'); ax3b.set_title('HTTP/3: Accuracy over Rounds'); ax3b.grid(True, alpha=0.3)
         fig3.tight_layout(); fig3.savefig(results_dir / 'http3_training_metrics.png', dpi=300, bbox_inches='tight'); plt.close(fig3)
         print(f"Results plot saved to {results_dir / 'http3_training_metrics.png'}")
+        plot_cpu_memory_for_server_rounds(
+            results_dir,
+            "http3_cpu_memory_per_round.png",
+            self.ROUNDS,
+            "emotion",
+            title="HTTP/3 (emotion): avg client CPU and RAM per round",
+        )
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1": plt.close('all')
         else: plt.show(block=False)
         print("\nPlot closed. Server shutting down...")
@@ -1024,7 +1031,8 @@ class FederatedLearningServer:
             "final_accuracy": self.ACCURACY[-1] if self.ACCURACY else None,
             "final_loss": self.LOSS[-1] if self.LOSS else None,
         }
-        
+        merge_cpu_memory_into_results(results, "emotion")
+
         results_file = results_dir / 'http3_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)

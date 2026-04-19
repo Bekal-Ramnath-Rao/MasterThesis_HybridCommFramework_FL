@@ -1114,7 +1114,19 @@ class NativeExperimentRunner:
             except Exception as e:
                 print(f"[Q-Learning] ✗ Warning: Could not create reset flag file: {e}")
                 print(f"[Q-Learning]   Epsilon behavior may not work as expected")
-            
+
+            # Always update current_rl_network_scenario.txt so the client resolves the
+            # correct scenario when multiple scenarios are run in sequence.  This file is
+            # read with higher priority than the env-var NETWORK_SCENARIO and
+            # reset_epsilon_flag.txt by FL_Client_Unified._resolved_rl_network_scenario_label(),
+            # so without this update the stale scenario from the previous run persists.
+            scenario_file = shared_data_path / "current_rl_network_scenario.txt"
+            try:
+                scenario_file.write_text(f"scenario={self.scenario}\n", encoding="utf-8")
+                print(f"[Q-Learning] ✓ Updated current_rl_network_scenario.txt → scenario={self.scenario}")
+            except Exception as _e:
+                print(f"[Q-Learning] ✗ Warning: Could not write current_rl_network_scenario.txt: {_e}")
+
             print(f"{'='*70}\n")
 
         exit_code = 0

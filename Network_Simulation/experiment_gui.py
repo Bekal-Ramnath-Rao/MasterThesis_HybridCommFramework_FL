@@ -2153,7 +2153,11 @@ class FLExperimentGUI(QMainWindow):
 
         self.combine_plots_btn = QPushButton("🧩 Combine Plots")
         self.combine_plots_btn.setStyleSheet("padding: 6px 12px; font-weight: bold;")
-        self.combine_plots_btn.setToolTip("Generate combined plots (battery/accuracy/loss/model size + bar charts for rounds and convergence time). Saves PNGs to the selected experiment folder.")
+        self.combine_plots_btn.setToolTip(
+            "Generate combined plots (battery, accuracy, loss, model size, avg client CPU/RAM when present in "
+            "*_training_results.json, plus bar charts). Saves PNGs under the selected experiment_results folder; "
+            "per-protocol CPU/RAM charts may also exist as *_cpu_memory_per_round.png next to each training JSON."
+        )
         self.combine_plots_btn.clicked.connect(self.generate_combined_experiment_plots)
         exp_result_controls.addWidget(self.combine_plots_btn)
 

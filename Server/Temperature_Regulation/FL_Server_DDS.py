@@ -56,6 +56,17 @@ _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from experiment_results_path import get_experiment_results_dir
+try:
+    from fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+except ModuleNotFoundError:
+    from scripts.utilities.fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+from battery_results_agg import avg_battery_model_drain_fraction
 
 # Chunking configuration for large messages
 CHUNK_SIZE = 64 * 1024  # 64KB chunks for better DDS performance in poor networks
@@ -179,6 +190,10 @@ class FederatedLearningServer:
         self.ROUNDS = []
         self.AVG_TRAINING_TIME_SEC = []
         self.AVG_BATTERY_SOC = []
+        self.BATTERY_CONSUMPTION = []
+        self.BATTERY_MODEL_CONSUMPTION = []
+        self.ROUND_TIMES = []
+        self.round_start_time = None
         
         # Convergence tracking
         self.best_loss = float('inf')
@@ -206,8 +221,8 @@ class FederatedLearningServer:
         
         # Training configuration
         self.training_config = {
-            "batch_size": 32,
-            "local_epochs": 5
+            "batch_size": 16,
+            "local_epochs": 20
         }
         
         # Status flags
@@ -250,12 +265,31 @@ class FederatedLearningServer:
         return list(buf.getvalue())
 
     def deserialize_weights(self, serialized_weights):
-        """Deserialize model weights received from DDS."""
+        """Deserialize model weights received from DDS.
+        
+        Supports both numpy npz format (primary) and pickle format (fallback),
+        to handle cases where the client has compression/quantization enabled
+        even when the server does not.
+        """
         import io
         import numpy as np
         buf = io.BytesIO(bytes(serialized_weights))
-        loaded = np.load(buf, allow_pickle=False)
-        return [loaded[f'arr_{i}'] for i in range(len(loaded.files))]
+        try:
+            loaded = np.load(buf, allow_pickle=False)
+            return [loaded[f'arr_{i}'] for i in range(len(loaded.files))]
+        except ValueError:
+            # Fallback: client may have sent pickle-serialized weights
+            # (e.g. client quantizer/compressor enabled, server quantization disabled)
+            import pickle
+            buf.seek(0)
+            data = pickle.loads(buf.read())
+            # If data is already a list/tuple of arrays, return directly
+            if isinstance(data, (list, tuple)) and all(isinstance(w, np.ndarray) for w in data):
+                return list(data)
+            # If data is a compressed/quantized dict, attempt to extract raw arrays
+            if isinstance(data, dict) and 'weights' in data:
+                return list(data['weights'])
+            raise TypeError(f"Server: Cannot deserialize client weights - unexpected format: {type(data)}")
     
     def split_into_chunks(self, data):
         """Split serialized data into chunks of CHUNK_SIZE"""
@@ -301,8 +335,15 @@ class FederatedLearningServer:
 
         # Best effort QoS for large data transfers (model chunks)
         best_effort_qos = Qos(
-            Policy.Reliability.BestEffort(),
+            Policy.Reliability.BestEffort,
             Policy.History.KeepLast(1),
+        )
+
+        # Dedicated QoS for chunked model transfer (Reliable + TransientLocal for guaranteed delivery)
+        chunk_qos = Qos(
+            Policy.Reliability.Reliable(max_blocking_time=duration(seconds=1)),
+            Policy.History.KeepLast(2048),
+            Policy.Durability.TransientLocal,
         )
         
         # Create topics
@@ -319,18 +360,18 @@ class FederatedLearningServer:
         # Create readers (for receiving from clients)
         # Use Reliable QoS for registration to ensure delivery despite discovery delays
         self.readers['registration'] = DataReader(self.participant, topic_registration, qos=reliable_qos)
-        # Use BestEffort for chunked data (many small messages, retransmission handled by chunking)
+        # Use BestEffort for non-critical data; chunk_qos (Reliable+TransientLocal) for model chunks
         self.readers['model_update'] = DataReader(self.participant, topic_model_update, qos=best_effort_qos)
-        self.readers['model_update_chunk'] = DataReader(self.participant, topic_model_update_chunk, qos=best_effort_qos)
+        self.readers['model_update_chunk'] = DataReader(self.participant, topic_model_update_chunk, qos=chunk_qos)
         self.readers['metrics'] = DataReader(self.participant, topic_metrics, qos=best_effort_qos)
         
         # Create writers (for sending to clients)
         # Use Reliable QoS for config and commands (critical control messages)
         self.writers['config'] = DataWriter(self.participant, topic_config, qos=reliable_qos)
         self.writers['command'] = DataWriter(self.participant, topic_command, qos=reliable_qos)
-        # Use BestEffort for large model data and chunked transfers
+        # Use chunk_qos (Reliable+TransientLocal) for model chunks; BestEffort for status
         self.writers['global_model'] = DataWriter(self.participant, topic_global_model, qos=best_effort_qos)
-        self.writers['global_model_chunk'] = DataWriter(self.participant, topic_global_model_chunk, qos=best_effort_qos)
+        self.writers['global_model_chunk'] = DataWriter(self.participant, topic_global_model_chunk, qos=chunk_qos)
         self.writers['status'] = DataWriter(self.participant, topic_status, qos=best_effort_qos)
         
         print("DDS setup complete (Reliable QoS for control, BestEffort for data chunks)\n")
@@ -516,6 +557,7 @@ class FederatedLearningServer:
         print(f"{'='*70}\n")
         
         # Send training command to start first round with retry for poor network conditions
+        self.round_start_time = time.time()
         command = TrainingCommand(
             round=self.current_round,
             start_training=True,
@@ -596,9 +638,27 @@ class FederatedLearningServer:
                                 print(f"Server: Failed to decompress from client {client_id}, falling back: {e}")
                                 weights = self.deserialize_weights(reassembled_data)
                         else:
-                            weights = self.deserialize_weights(reassembled_data)
+                            try:
+                                weights = self.deserialize_weights(reassembled_data)
+                            except Exception as e:
+                                print(f"Server: deserialize_weights failed for client {client_id}: {e}")
+                                # Last-resort: try raw pickle (client sent compressed dict)
+                                compressed_data = pickle.loads(bytes(reassembled_data))
+                                metadata = self.model_update_metadata[client_id]
+                                self.client_updates[client_id] = {
+                                    'compressed_data': compressed_data,
+                                    'num_samples': metadata['num_samples'],
+                                    'metrics': {
+                                        'loss': metadata['loss'],
+                                        'mse': metadata['mse'],
+                                        'mae': metadata['mae'],
+                                        'mape': metadata['mape']
+                                    }
+                                }
+                                print(f"Server: Stored raw pickled update from client {client_id} (no quantization handler)")
+                                weights = None
                         
-                        if self.quantization_handler is None:
+                        if self.quantization_handler is None and weights is not None:
                             metadata = self.model_update_metadata[client_id]
                             self.client_updates[client_id] = {
                                 'weights': weights,
@@ -715,6 +775,20 @@ class FederatedLearningServer:
             self.evaluation_phase = True
             return
         
+        # If any client update has 'compressed_data' but no 'weights' (mismatch: client has
+        # quantization enabled, server does not), dequantize on-the-fly before FedAvg.
+        for cid, update in self.client_updates.items():
+            if 'weights' not in update and 'compressed_data' in update:
+                try:
+                    _tmp_handler = ServerQuantizationHandler(QuantizationConfig())
+                    float_weights = _tmp_handler.decompress_client_update(update['compressed_data'])
+                    update['weights'] = float_weights
+                    print(f"Server: Dequantized update from client {cid} (client had compression enabled, server does not)")
+                except Exception as e:
+                    print(f"Server: ERROR dequantizing update from client {cid}: {e}")
+                    # Skip this client update to avoid crashing aggregation
+                    update['weights'] = self.global_weights  # fall back to current global weights
+
         # Calculate total samples
         total_samples = sum(update['num_samples'] 
                           for update in self.client_updates.values())
@@ -859,6 +933,10 @@ class FederatedLearningServer:
         avg_soc = sum(socs) / len(socs) if socs else 1.0
         self.AVG_TRAINING_TIME_SEC.append(float(avg_training_time))
         self.AVG_BATTERY_SOC.append(float(avg_soc))
+        self.BATTERY_CONSUMPTION.append(1.0 - avg_soc)
+        self.BATTERY_MODEL_CONSUMPTION.append(avg_battery_model_drain_fraction(self.client_metrics))
+        if getattr(self, 'round_start_time', None) is not None:
+            self.ROUND_TIMES.append(time.time() - self.round_start_time)
         
         # Store metrics
         self.MSE.append(aggregated_mse)
@@ -936,6 +1014,7 @@ class FederatedLearningServer:
             time.sleep(2)
             
             # Send training command for next round with retry
+            self.round_start_time = time.time()
             command = TrainingCommand(
                 round=self.current_round,
                 start_training=True,
@@ -999,43 +1078,63 @@ class FederatedLearningServer:
             return False
     
     def plot_results(self):
-        """Plot training metrics"""
-        plt.figure(figsize=(15, 5))
-        
-        plt.subplot(1, 4, 1)
-        plt.plot(self.ROUNDS, self.LOSS, 'b-', marker='o')
-        plt.xlabel('Round')
-        plt.ylabel('Loss')
-        plt.title('Training Loss')
-        plt.grid(True)
-        
-        plt.subplot(1, 4, 2)
-        plt.plot(self.ROUNDS, self.MSE, 'r-', marker='o')
-        plt.xlabel('Round')
-        plt.ylabel('MSE')
-        plt.title('Mean Squared Error')
-        plt.grid(True)
-        
-        plt.subplot(1, 4, 3)
-        plt.plot(self.ROUNDS, self.MAE, 'g-', marker='o')
-        plt.xlabel('Round')
-        plt.ylabel('MAE')
-        plt.title('Mean Absolute Error')
-        plt.grid(True)
-        
-        plt.subplot(1, 4, 4)
-        plt.plot(self.ROUNDS, self.MAPE, 'm-', marker='o')
-        plt.xlabel('Round')
-        plt.ylabel('MAPE')
-        plt.title('Mean Absolute Percentage Error')
-        plt.grid(True)
-        
-        plt.tight_layout()
-        
-        # Save plot
+        """Plot battery consumption, round/convergence time, loss, and regression metrics."""
         results_dir = get_experiment_results_dir("temperature", "dds")
-        plt.savefig(results_dir / 'dds_training_metrics.png', dpi=300, bbox_inches='tight')
-        print(f"Training metrics plot saved to {results_dir / 'dds_training_metrics.png'}")
+        rounds = self.ROUNDS
+        n = len(rounds)
+        conv_time = self.convergence_time if self.convergence_time is not None else (
+            time.time() - self.start_time if self.start_time else 0)
+
+        fig1, ax1 = plt.subplots(figsize=(7, 4))
+        bc = (self.BATTERY_CONSUMPTION + [0.0] * max(0, n - len(self.BATTERY_CONSUMPTION)))[:n] \
+            if getattr(self, 'BATTERY_CONSUMPTION', []) else [0.0] * n
+        if bc:
+            ax1.plot(rounds, [c * 100 for c in bc], marker='o', linewidth=2, markersize=6, color='#2e86ab')
+        ax1.set_xlabel('Round'); ax1.set_ylabel('Battery consumption (%)')
+        ax1.set_title('DDS (temperature): Battery consumption over FL rounds')
+        ax1.grid(True, alpha=0.3)
+        fig1.tight_layout(); fig1.savefig(results_dir / 'dds_battery_consumption.png', dpi=300, bbox_inches='tight'); plt.close(fig1)
+
+        fig2, ax2 = plt.subplots(figsize=(7, 4))
+        rt = (self.ROUND_TIMES + [0.0] * max(0, n - len(self.ROUND_TIMES)))[:n] \
+            if getattr(self, 'ROUND_TIMES', []) else [0.0] * n
+        if rt:
+            ax2.bar(rounds, rt, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        ax2.axhline(y=conv_time, color='#f18f01', linestyle='--', linewidth=2,
+                    label=f'Total convergence: {conv_time:.1f} s')
+        ax2.set_xlabel('Round'); ax2.set_ylabel('Time (s)')
+        ax2.set_title('DDS (temperature): Time per round and convergence')
+        ax2.legend(); ax2.grid(True, alpha=0.3)
+        fig2.tight_layout(); fig2.savefig(results_dir / 'dds_round_and_convergence_time.png', dpi=300, bbox_inches='tight'); plt.close(fig2)
+
+        fig3, ax3 = plt.subplots(figsize=(7, 4))
+        ax3.plot(rounds, self.LOSS, 'b-', marker='o', linewidth=2, markersize=6)
+        ax3.set_xlabel('Round'); ax3.set_ylabel('Loss (MSE)')
+        ax3.set_title('DDS (temperature): Loss over FL Rounds')
+        ax3.grid(True, alpha=0.3)
+        fig3.tight_layout(); fig3.savefig(results_dir / 'dds_loss.png', dpi=300, bbox_inches='tight'); plt.close(fig3)
+
+        fig4, axes = plt.subplots(1, 3, figsize=(17, 5))
+        axes[0].plot(rounds, self.MSE, marker='o', linewidth=2, markersize=8)
+        axes[0].set_xlabel('Round'); axes[0].set_ylabel('MSE')
+        axes[0].set_title('DDS (temperature): MSE over Rounds'); axes[0].grid(True, alpha=0.3)
+        axes[1].plot(rounds, self.MAE, marker='s', linewidth=2, markersize=8, color='orange')
+        axes[1].set_xlabel('Round'); axes[1].set_ylabel('MAE')
+        axes[1].set_title('DDS (temperature): MAE over Rounds'); axes[1].grid(True, alpha=0.3)
+        axes[2].plot(rounds, self.MAPE, marker='^', linewidth=2, markersize=8, color='green')
+        axes[2].set_xlabel('Round'); axes[2].set_ylabel('MAPE (%)')
+        axes[2].set_title('DDS (temperature): MAPE over Rounds'); axes[2].grid(True, alpha=0.3)
+        fig4.tight_layout()
+        fig4.savefig(results_dir / 'dds_training_metrics.png', dpi=300, bbox_inches='tight')
+        plt.close(fig4)
+        print(f"Results plots saved to {results_dir}")
+        plot_cpu_memory_for_server_rounds(
+            results_dir,
+            "dds_cpu_memory_per_round.png",
+            self.ROUNDS,
+            "temperature",
+            title="DDS (temperature): avg client CPU and RAM per round",
+        )
         if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
             plt.close()
         else:
@@ -1044,39 +1143,41 @@ class FederatedLearningServer:
         print("\nPlot closed. Training complete.")
     
     def save_results(self):
-        """Save training results to CSV"""
+        """Save training results to JSON"""
         results_dir = get_experiment_results_dir("temperature", "dds")
         
-        n = len(self.ROUNDS)
-        ats = getattr(self, 'AVG_TRAINING_TIME_SEC', [])
-        absoc = getattr(self, 'AVG_BATTERY_SOC', [])
-        results_df = pd.DataFrame({
-            'Round': self.ROUNDS,
-            'Loss': self.LOSS,
-            'MSE': self.MSE,
-            'MAE': self.MAE,
-            'MAPE': self.MAPE,
-            'AvgTrainingTimeSec': (ats + [None] * n)[:n],
-            'AvgBatterySoC': (absoc + [None] * n)[:n],
-        })
-        
-        # Add summary row with convergence time
-        summary_df = pd.DataFrame([{
-            'Round': 'SUMMARY',
-            'Loss': self.LOSS[-1] if self.LOSS else None,
-            'MSE': self.MSE[-1] if self.MSE else None,
-            'MAE': self.MAE[-1] if self.MAE else None,
-            'MAPE': self.MAPE[-1] if self.MAPE else None
-        }])
-        summary_df['Total Rounds'] = len(self.ROUNDS)
-        summary_df['Num Clients'] = self.num_clients
-        summary_df['Convergence Time (seconds)'] = self.convergence_time
-        summary_df['Convergence Time (minutes)'] = self.convergence_time / 60 if self.convergence_time else None
-        
-        results_df = pd.concat([results_df, summary_df], ignore_index=True)
-        
-        results_file = results_dir / 'dds_training_results.csv'
-        results_df.to_csv(results_file, index=False)
+        results = {
+            "rounds": self.ROUNDS,
+            "loss": self.LOSS,
+            "mse": self.MSE,
+            "mae": self.MAE,
+            "mape": self.MAPE,
+            "accuracy": [max(0.0, 1.0 - v) for v in self.MSE],
+            "battery_consumption": getattr(self, 'BATTERY_CONSUMPTION', []),
+            "battery_model_consumption": getattr(self, 'BATTERY_MODEL_CONSUMPTION', []),
+            "battery_model_consumption_source": "client_battery_model",
+            "round_times_seconds": getattr(self, 'ROUND_TIMES', []),
+            "avg_training_time_sec": getattr(self, 'AVG_TRAINING_TIME_SEC', []),
+            "avg_battery_soc": getattr(self, 'AVG_BATTERY_SOC', []),
+            "convergence_time_seconds": self.convergence_time,
+            "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
+            "total_rounds": len(self.ROUNDS),
+            "num_clients": self.num_clients,
+            "summary": {
+                "total_rounds": len(self.ROUNDS),
+                "num_clients": self.num_clients,
+                "final_loss": self.LOSS[-1] if self.LOSS else None,
+                "final_mse": self.MSE[-1] if self.MSE else None,
+                "convergence_time_seconds": self.convergence_time,
+                "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
+                "converged": self.converged,
+            }
+        }
+        merge_cpu_memory_into_results(results, "temperature")
+
+        results_file = results_dir / 'dds_training_results.json'
+        with open(results_file, 'w') as f:
+            json.dump(results, f, indent=2)
         print(f"Training results saved to {results_file}")
     
     def cleanup(self):

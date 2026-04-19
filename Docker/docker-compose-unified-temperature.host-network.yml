@@ -29,12 +29,12 @@ services:
     container_name: fl-server-unified-temperature
     environment:
       - NODE_TYPE=server
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
-      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MIN_CLIENTS=${MIN_CLIENTS:-3}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
       - MQTT_BROKER=127.0.0.1
       - AMQP_BROKER=127.0.0.1
@@ -79,7 +79,7 @@ services:
     environment:
       - NODE_TYPE=client
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=3
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -129,11 +129,25 @@ services:
       context: ..
       dockerfile: Client/Dockerfile
     network_mode: host
-    container_name: fl-client-unified-temperature-2
+    command: python3 Client/Temperature_Regulation/FL_Client_Unified.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+
+  fl-client-unified-temperature-3:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    network_mode: host
+    container_name: fl-client-unified-temperature-3
     environment:
       - NODE_TYPE=client
-      - CLIENT_ID=2
-      - NUM_CLIENTS=2
+      - CLIENT_ID=3
+      - NUM_CLIENTS=3
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}

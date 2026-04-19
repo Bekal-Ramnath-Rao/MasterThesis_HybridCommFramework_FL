@@ -1,54 +1,73 @@
+# Unified Mental State Recognition FL — Docker with network_mode: host on all services.
+#
+# Mirrors docker-compose-unified-emotion.yml design:
+# - network_mode: host eliminates port-binding conflicts (e.g. with a native rabbitmq-server)
+#   and allows CycloneDDS RTPS ephemeral UDP ports to reach all participants.
+# - Brokers listen on the host: MQTT 1883, AMQP 5672 (and 15672 for Rabbit UI).
+#   Server binds gRPC 50051, QUIC 4433, HTTP3 4434 on all interfaces.
+# - Before running: ensure no native rabbitmq-server or mosquitto is occupying ports 5672/1883.
+#   (sudo systemctl stop rabbitmq-server mosquitto)
+
 services:
   # ============================================================================
   # BROKERS - Required for MQTT and AMQP protocols
   # ============================================================================
-  
+
   mqtt-broker-unified:
     image: eclipse-mosquitto:latest
     container_name: mqtt-broker-unified
-    ports:
-      - "1883:1883"
-      - "9001:9001"
+    network_mode: host
     volumes:
       - ./mqtt-config:/mosquitto/config
-    networks:
-      - fl-network
     command: mosquitto -c /mosquitto/config/mosquitto.conf
-  
+
   amqp-broker-unified:
     image: rabbitmq:3-management
     container_name: amqp-broker-unified
-    ports:
-      - "5672:5672"
-      - "15672:15672"
+    network_mode: host
     environment:
       - RABBITMQ_DEFAULT_USER=guest
       - RABBITMQ_DEFAULT_PASS=guest
-    networks:
-      - fl-network
-  
+      - RABBITMQ_NODENAME=rabbit@localhost
+      - RABBITMQ_ERLANG_COOKIE=fl_experiment_cookie
+      - RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=-setcookie fl_experiment_cookie
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/5672"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 90s
+
   # ============================================================================
   # UNIFIED FL SERVER - Handles all 5 protocols simultaneously
   # ============================================================================
-  
+
   fl-server-unified-mentalstate:
     build:
       context: ..
       dockerfile: Server/Dockerfile
     container_name: fl-server-unified-mentalstate
+    network_mode: host
     environment:
       - NODE_TYPE=server
-      - NUM_CLIENTS=2
+      - USE_CASE=mentalstate
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
       - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
       - MIN_CLIENTS=${MIN_CLIENTS:-2}
       - MAX_CLIENTS=${MAX_CLIENTS:-100}
-      - MQTT_BROKER=mqtt-broker-unified
-      - AMQP_BROKER=amqp-broker-unified
+      - MQTT_BROKER=127.0.0.1
+      - AMQP_BROKER=127.0.0.1
+      - AMQP_HOST=127.0.0.1
+      - GRPC_HOST=0.0.0.0
       - GRPC_PORT=50051
       - GRPC_MAX_MESSAGE_BYTES=67108864
+      - QUIC_HOST=0.0.0.0
+      - QUIC_PORT=4433
+      - HTTP3_HOST=0.0.0.0
+      - HTTP3_PORT=4434
       - CONVERGENCE_THRESHOLD=0.001
       - CONVERGENCE_PATIENCE=2
       - MIN_ROUNDS=3
@@ -59,11 +78,12 @@ services:
       - ../Server/MentalState_Recognition:/app/Server/MentalState_Recognition
       - ../experiment_results:/app/results
       - ../shared_data:/shared_data
-    networks:
-      - fl-network
+      - ../certs:/app/certs:ro
     depends_on:
-      - mqtt-broker-unified
-      - amqp-broker-unified
+      mqtt-broker-unified:
+        condition: service_started
+      amqp-broker-unified:
+        condition: service_healthy
     cap_add:
       - NET_ADMIN
     command: python3 Server/MentalState_Recognition/FL_Server_Unified.py
@@ -74,20 +94,22 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-  
+
   # ============================================================================
   # UNIFIED FL CLIENTS - Use RL to select best protocol dynamically
   # ============================================================================
-  
+
   fl-client-unified-mentalstate-1:
     build:
       context: ..
       dockerfile: Client/Dockerfile
     container_name: fl-client-unified-mentalstate-1
+    network_mode: host
     environment:
       - NODE_TYPE=client
+      - USE_CASE=mentalstate
       - CLIENT_ID=1
-      - NUM_CLIENTS=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
       - NUM_ROUNDS=${NUM_ROUNDS:-1000}
       - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
       - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
@@ -100,76 +122,37 @@ services:
       - USE_RL_EXPLORATION=${USE_RL_EXPLORATION:-true}
       - Q_CONVERGENCE_THRESHOLD=${Q_CONVERGENCE_THRESHOLD:-0.01}
       - Q_CONVERGENCE_PATIENCE=${Q_CONVERGENCE_PATIENCE:-5}
+      - RL_BOUNDARY_PIPELINE=${RL_BOUNDARY_PIPELINE:-true}
+      - RL_PHASE0_ROUNDS=${RL_PHASE0_ROUNDS:-20}
+      - RL_QTABLE_MERGE=${RL_QTABLE_MERGE:-false}
+      - RL_QTABLE_OVERLAY_SCENARIOS=${RL_QTABLE_OVERLAY_SCENARIOS:-}
       - DEFAULT_PROTOCOL=mqtt
-      - MQTT_BROKER=mqtt-broker-unified
-      - AMQP_BROKER=amqp-broker-unified
-      - GRPC_HOST=fl-server-unified-mentalstate
+      - MQTT_BROKER=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - AMQP_BROKER=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - AMQP_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - GRPC_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
       - GRPC_PORT=50051
       - GRPC_MAX_MESSAGE_BYTES=67108864
+      - QUIC_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - QUIC_PORT=4433
+      - HTTP3_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - HTTP3_PORT=4434
       - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
       - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
       - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
     volumes:
       - ../Client/MentalState_Recognition:/app/Client/MentalState_Recognition
+      - ../Network_Simulation:/app/Network_Simulation:ro
       - ../experiment_results:/app/results
       - ../shared_data:/shared_data
-    networks:
-      - fl-network
+      - ../certs:/app/certs:ro
     depends_on:
-      - fl-server-unified-mentalstate
-      - mqtt-broker-unified
-      - amqp-broker-unified
-    cap_add:
-      - NET_ADMIN
-    command: python3 Client/MentalState_Recognition/FL_Client_Unified.py
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-  
-  fl-client-unified-mentalstate-2:
-    build:
-      context: ..
-      dockerfile: Client/Dockerfile
-    container_name: fl-client-unified-mentalstate-2
-    environment:
-      - NODE_TYPE=client
-      - CLIENT_ID=2
-      - NUM_CLIENTS=2
-      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
-      - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
-      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
-      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
-      - MIN_CLIENTS=${MIN_CLIENTS:-2}
-      - MAX_CLIENTS=${MAX_CLIENTS:-100}
-      - USE_RL_SELECTION=true
-      - USE_COMMUNICATION_MODEL_REWARD=${USE_COMMUNICATION_MODEL_REWARD:-true}
-      - USE_QL_CONVERGENCE=${USE_QL_CONVERGENCE:-false}
-      - USE_RL_EXPLORATION=${USE_RL_EXPLORATION:-true}
-      - Q_CONVERGENCE_THRESHOLD=${Q_CONVERGENCE_THRESHOLD:-0.01}
-      - Q_CONVERGENCE_PATIENCE=${Q_CONVERGENCE_PATIENCE:-5}
-      - DEFAULT_PROTOCOL=mqtt
-      - MQTT_BROKER=mqtt-broker-unified
-      - AMQP_BROKER=amqp-broker-unified
-      - GRPC_HOST=fl-server-unified-mentalstate
-      - GRPC_PORT=50051
-      - GRPC_MAX_MESSAGE_BYTES=67108864
-      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
-      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
-      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
-    volumes:
-      - ../Client/MentalState_Recognition:/app/Client/MentalState_Recognition
-      - ../experiment_results:/app/results
-      - ../shared_data:/shared_data
-    networks:
-      - fl-network
-    depends_on:
-      - fl-server-unified-mentalstate
-      - mqtt-broker-unified
-      - amqp-broker-unified
+      fl-server-unified-mentalstate:
+        condition: service_started
+      mqtt-broker-unified:
+        condition: service_started
+      amqp-broker-unified:
+        condition: service_healthy
     cap_add:
       - NET_ADMIN
     command: python3 Client/MentalState_Recognition/FL_Client_Unified.py
@@ -181,6 +164,67 @@ services:
               count: all
               capabilities: [gpu]
 
-networks:
-  fl-network:
-    driver: bridge
+  fl-client-unified-mentalstate-2:
+    build:
+      context: ..
+      dockerfile: Client/Dockerfile
+    container_name: fl-client-unified-mentalstate-2
+    network_mode: host
+    environment:
+      - NODE_TYPE=client
+      - USE_CASE=mentalstate
+      - CLIENT_ID=2
+      - NUM_CLIENTS=${NUM_CLIENTS:-2}
+      - NUM_ROUNDS=${NUM_ROUNDS:-1000}
+      - NETWORK_SCENARIO=${NETWORK_SCENARIO:-default}
+      - STOP_ON_CLIENT_CONVERGENCE=${STOP_ON_CLIENT_CONVERGENCE:-true}
+      - TRAINING_TERMINATION_MODE=${TRAINING_TERMINATION_MODE:-}
+      - MIN_CLIENTS=${MIN_CLIENTS:-2}
+      - MAX_CLIENTS=${MAX_CLIENTS:-100}
+      - USE_RL_SELECTION=true
+      - USE_COMMUNICATION_MODEL_REWARD=${USE_COMMUNICATION_MODEL_REWARD:-true}
+      - USE_QL_CONVERGENCE=${USE_QL_CONVERGENCE:-false}
+      - USE_RL_EXPLORATION=${USE_RL_EXPLORATION:-true}
+      - Q_CONVERGENCE_THRESHOLD=${Q_CONVERGENCE_THRESHOLD:-0.01}
+      - Q_CONVERGENCE_PATIENCE=${Q_CONVERGENCE_PATIENCE:-5}
+      - RL_BOUNDARY_PIPELINE=${RL_BOUNDARY_PIPELINE:-true}
+      - RL_PHASE0_ROUNDS=${RL_PHASE0_ROUNDS:-20}
+      - RL_QTABLE_MERGE=${RL_QTABLE_MERGE:-false}
+      - RL_QTABLE_OVERLAY_SCENARIOS=${RL_QTABLE_OVERLAY_SCENARIOS:-}
+      - DEFAULT_PROTOCOL=mqtt
+      - MQTT_BROKER=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - AMQP_BROKER=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - AMQP_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - GRPC_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - GRPC_PORT=50051
+      - GRPC_MAX_MESSAGE_BYTES=67108864
+      - QUIC_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - QUIC_PORT=4433
+      - HTTP3_HOST=${UNIFIED_FL_SERVER_HOST:-127.0.0.1}
+      - HTTP3_PORT=4434
+      - USE_QUANTIZATION=${USE_QUANTIZATION:-false}
+      - QUANTIZATION_BITS=${QUANTIZATION_BITS:-8}
+      - QUANTIZATION_STRATEGY=${QUANTIZATION_STRATEGY:-ptq}
+    volumes:
+      - ../Client/MentalState_Recognition:/app/Client/MentalState_Recognition
+      - ../Network_Simulation:/app/Network_Simulation:ro
+      - ../experiment_results:/app/results
+      - ../shared_data:/shared_data
+      - ../certs:/app/certs:ro
+    depends_on:
+      fl-server-unified-mentalstate:
+        condition: service_started
+      mqtt-broker-unified:
+        condition: service_started
+      amqp-broker-unified:
+        condition: service_healthy
+    cap_add:
+      - NET_ADMIN
+    command: python3 Client/MentalState_Recognition/FL_Client_Unified.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

@@ -43,6 +43,12 @@ import federated_learning_pb2_grpc
 # Server Configuration
 GRPC_HOST = os.getenv("GRPC_HOST", "0.0.0.0")
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
+# Payload size limit: 4 MB (gRPC protocol constraint)
+MAX_PAYLOAD_GRPC = 4 * 1024 * 1024  # 4 MB
+GRPC_OPTIONS = [
+    ('grpc.max_send_message_length', MAX_PAYLOAD_GRPC),
+    ('grpc.max_receive_message_length', MAX_PAYLOAD_GRPC),
+]
 # Dynamic client configuration
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
@@ -58,6 +64,17 @@ _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from experiment_results_path import get_experiment_results_dir
+try:
+    from fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+except ModuleNotFoundError:
+    from scripts.utilities.fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+from battery_results_agg import avg_battery_model_drain_fraction
 
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -89,6 +106,10 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         self.ROUNDS = []
         self.AVG_TRAINING_TIME_SEC = []
         self.AVG_BATTERY_SOC = []
+        self.BATTERY_CONSUMPTION = []
+        self.BATTERY_MODEL_CONSUMPTION = []
+        self.ROUND_TIMES = []
+        self.round_start_time = None
         
         # Convergence tracking
         self.best_loss = float('inf')
@@ -114,8 +135,8 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         
         # Training configuration
         self.training_config = {
-            "batch_size": 32,
-            "local_epochs": 5
+            "batch_size": 16,
+            "local_epochs": 20
         }
         
         # Status flags
@@ -479,6 +500,11 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                     message="Convergence acknowledged"
                 )
             if round_num == self.current_round:
+                if client_id in self.clients_evaluated:
+                    return federated_learning_pb2.MetricsResponse(
+                        success=True,
+                        message="Metrics already received for this round"
+                    )
                 self.client_metrics[client_id] = {
                     'num_samples': request.num_samples,
                     'metrics': metrics
@@ -570,16 +596,16 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
                           for metric in self.client_metrics.values())
         
         # Weighted average of metrics
-        aggregated_mse = sum(metric['metrics']['mse'] * metric['num_samples']
+        aggregated_mse = sum(metric['metrics'].get('mse', 0.0) * metric['num_samples']
                             for metric in self.client_metrics.values()) / total_samples
         
-        aggregated_mae = sum(metric['metrics']['mae'] * metric['num_samples']
+        aggregated_mae = sum(metric['metrics'].get('mae', 0.0) * metric['num_samples']
                             for metric in self.client_metrics.values()) / total_samples
         
-        aggregated_mape = sum(metric['metrics']['mape'] * metric['num_samples']
+        aggregated_mape = sum(metric['metrics'].get('mape', 0.0) * metric['num_samples']
                              for metric in self.client_metrics.values()) / total_samples
         
-        aggregated_loss = sum(metric['metrics']['loss'] * metric['num_samples']
+        aggregated_loss = sum(metric['metrics'].get('loss', 0.0) * metric['num_samples']
                              for metric in self.client_metrics.values()) / total_samples
         
         avg_training_time = (
@@ -595,6 +621,10 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
         avg_soc = sum(socs) / len(socs) if socs else 1.0
         self.AVG_TRAINING_TIME_SEC.append(float(avg_training_time))
         self.AVG_BATTERY_SOC.append(float(avg_soc))
+        self.BATTERY_CONSUMPTION.append(1.0 - avg_soc)
+        self.BATTERY_MODEL_CONSUMPTION.append(avg_battery_model_drain_fraction(self.client_metrics))
+        if getattr(self, 'round_start_time', None) is not None:
+            self.ROUND_TIMES.append(time.time() - self.round_start_time)
         
         # Store metrics
         self.MSE.append(aggregated_mse)
@@ -682,91 +712,121 @@ class FederatedLearningServicer(federated_learning_pb2_grpc.FederatedLearningSer
             return False
     
     def plot_results(self):
-        """Plot training metrics"""
-        plt.figure(figsize=(15, 5))
-        
-        plt.subplot(1, 4, 1)
-        plt.plot(self.ROUNDS, self.LOSS, 'b-', marker='o')
-        plt.xlabel('Round')
-        plt.ylabel('Loss')
-        plt.title('Training Loss')
-        plt.grid(True)
-        
-        plt.subplot(1, 4, 2)
-        plt.plot(self.ROUNDS, self.MSE, 'r-', marker='o')
-        plt.xlabel('Round')
-        plt.ylabel('MSE')
-        plt.title('Mean Squared Error')
-        plt.grid(True)
-        
-        plt.subplot(1, 4, 3)
-        plt.plot(self.ROUNDS, self.MAE, 'g-', marker='o')
-        plt.xlabel('Round')
-        plt.ylabel('MAE')
-        plt.title('Mean Absolute Error')
-        plt.grid(True)
-        
-        plt.subplot(1, 4, 4)
-        plt.plot(self.ROUNDS, self.MAPE, 'm-', marker='o')
-        plt.xlabel('Round')
-        plt.ylabel('MAPE')
-        plt.title('Mean Absolute Percentage Error')
-        plt.grid(True)
-        
-        plt.tight_layout()
-        
-        # Save plot
+        """Plot battery consumption, round/convergence time, loss, and regression metrics."""
         results_dir = get_experiment_results_dir("temperature", "grpc")
-        plt.savefig(results_dir / 'grpc_training_metrics.png', dpi=300, bbox_inches='tight')
-        print(f"Training metrics plot saved to {results_dir / 'grpc_training_metrics.png'}")
-        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
-            plt.close()
-        else:
-            plt.show()
+        rounds = self.ROUNDS
+        n = len(rounds)
+        conv_time = self.convergence_time if self.convergence_time is not None else (
+            time.time() - self.start_time if self.start_time else 0)
 
+        # 1) Battery
+        fig1, ax1 = plt.subplots(figsize=(7, 4))
+        bc = (self.BATTERY_CONSUMPTION + [0.0] * max(0, n - len(self.BATTERY_CONSUMPTION)))[:n] \
+            if getattr(self, 'BATTERY_CONSUMPTION', []) else [0.0] * n
+        if bc:
+            ax1.plot(rounds, [c * 100 for c in bc], marker='o', linewidth=2, markersize=6, color='#2e86ab')
+        ax1.set_xlabel('Round'); ax1.set_ylabel('Battery consumption (%)')
+        ax1.set_title('gRPC (temperature): Battery consumption over FL rounds')
+        ax1.grid(True, alpha=0.3)
+        fig1.tight_layout(); fig1.savefig(results_dir / 'grpc_battery_consumption.png', dpi=300, bbox_inches='tight'); plt.close(fig1)
+
+        # 2) Time per round and convergence
+        fig2, ax2 = plt.subplots(figsize=(7, 4))
+        rt = (self.ROUND_TIMES + [0.0] * max(0, n - len(self.ROUND_TIMES)))[:n] \
+            if getattr(self, 'ROUND_TIMES', []) else [0.0] * n
+        if rt:
+            ax2.bar(rounds, rt, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        ax2.axhline(y=conv_time, color='#f18f01', linestyle='--', linewidth=2,
+                    label=f'Total convergence: {conv_time:.1f} s')
+        ax2.set_xlabel('Round'); ax2.set_ylabel('Time (s)')
+        ax2.set_title('gRPC (temperature): Time per round and convergence')
+        ax2.legend(); ax2.grid(True, alpha=0.3)
+        fig2.tight_layout(); fig2.savefig(results_dir / 'grpc_round_and_convergence_time.png', dpi=300, bbox_inches='tight'); plt.close(fig2)
+
+        # 3) Loss
+        fig3, ax3 = plt.subplots(figsize=(7, 4))
+        ax3.plot(rounds, self.LOSS, 'b-', marker='o', linewidth=2, markersize=6)
+        ax3.set_xlabel('Round'); ax3.set_ylabel('Loss (MSE)')
+        ax3.set_title('gRPC (temperature): Loss over FL Rounds')
+        ax3.grid(True, alpha=0.3)
+        fig3.tight_layout(); fig3.savefig(results_dir / 'grpc_loss.png', dpi=300, bbox_inches='tight'); plt.close(fig3)
+
+        # 4) Regression metrics
+        fig4, axes = plt.subplots(1, 3, figsize=(17, 5))
+        axes[0].plot(rounds, self.MSE, marker='o', linewidth=2, markersize=8)
+        axes[0].set_xlabel('Round'); axes[0].set_ylabel('MSE')
+        axes[0].set_title('gRPC (temperature): MSE over Rounds'); axes[0].grid(True, alpha=0.3)
+        axes[1].plot(rounds, self.MAE, marker='s', linewidth=2, markersize=8, color='orange')
+        axes[1].set_xlabel('Round'); axes[1].set_ylabel('MAE')
+        axes[1].set_title('gRPC (temperature): MAE over Rounds'); axes[1].grid(True, alpha=0.3)
+        axes[2].plot(rounds, self.MAPE, marker='^', linewidth=2, markersize=8, color='green')
+        axes[2].set_xlabel('Round'); axes[2].set_ylabel('MAPE (%)')
+        axes[2].set_title('gRPC (temperature): MAPE over Rounds'); axes[2].grid(True, alpha=0.3)
+        fig4.tight_layout()
+        fig4.savefig(results_dir / 'grpc_training_metrics.png', dpi=300, bbox_inches='tight')
+        plt.close(fig4)
+        print(f"Training metrics plots saved to {results_dir}")
+
+        # 5) CPU and RAM
+        plot_cpu_memory_for_server_rounds(
+            results_dir,
+            "grpc_cpu_memory_per_round.png",
+            self.ROUNDS,
+            "temperature",
+            title="gRPC (temperature): avg client CPU and RAM per round",
+        )
+        if not os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            plt.show(block=False)
         print("\nPlot closed. Training complete.")
     
     def save_results(self):
-        """Save training results to CSV"""
+        """Save training results to JSON"""
         results_dir = get_experiment_results_dir("temperature", "grpc")
-        
-        ats = getattr(self, 'AVG_TRAINING_TIME_SEC', [])
-        absoc = getattr(self, 'AVG_BATTERY_SOC', [])
-        n = len(self.ROUNDS)
-        results_df = pd.DataFrame({
-            'Round': self.ROUNDS,
-            'Loss': self.LOSS,
-            'MSE': self.MSE,
-            'MAE': self.MAE,
-            'MAPE': self.MAPE,
-            'AvgTrainingTimeSec': (ats + [None] * n)[:n],
-            'AvgBatterySoC': (absoc + [None] * n)[:n],
-        })
-        
-        # Add summary row with convergence time
-        summary_df = pd.DataFrame([{
-            'Round': 'SUMMARY',
-            'Loss': self.LOSS[-1] if self.LOSS else None,
-            'MSE': self.MSE[-1] if self.MSE else None,
-            'MAE': self.MAE[-1] if self.MAE else None,
-            'MAPE': self.MAPE[-1] if self.MAPE else None
-        }])
-        summary_df['Total Rounds'] = len(self.ROUNDS)
-        summary_df['Num Clients'] = self.num_clients
-        summary_df['Convergence Time (seconds)'] = self.convergence_time
-        summary_df['Convergence Time (minutes)'] = self.convergence_time / 60 if self.convergence_time else None
-        
-        results_df = pd.concat([results_df, summary_df], ignore_index=True)
-        
-        results_file = results_dir / 'grpc_training_results.csv'
-        results_df.to_csv(results_file, index=False)
+
+        results = {
+            "rounds": self.ROUNDS,
+            "loss": self.LOSS,
+            "mse": self.MSE,
+            "mae": self.MAE,
+            "mape": self.MAPE,
+            "accuracy": [max(0.0, 1.0 - v) for v in self.MSE],
+            "battery_consumption": getattr(self, 'BATTERY_CONSUMPTION', []),
+            "battery_model_consumption": getattr(self, 'BATTERY_MODEL_CONSUMPTION', []),
+            "battery_model_consumption_source": "client_battery_model",
+            "round_times_seconds": getattr(self, 'ROUND_TIMES', []),
+            "avg_training_time_sec": getattr(self, 'AVG_TRAINING_TIME_SEC', []),
+            "avg_battery_soc": getattr(self, 'AVG_BATTERY_SOC', []),
+            "convergence_time_seconds": self.convergence_time,
+            "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
+            "total_rounds": len(self.ROUNDS),
+            "num_clients": self.num_clients,
+            "summary": {
+                "total_rounds": len(self.ROUNDS),
+                "num_clients": self.num_clients,
+                "final_loss": self.LOSS[-1] if self.LOSS else None,
+                "final_mse": self.MSE[-1] if self.MSE else None,
+                "final_mae": self.MAE[-1] if self.MAE else None,
+                "final_mape": self.MAPE[-1] if self.MAPE else None,
+                "convergence_time_seconds": self.convergence_time,
+                "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
+                "converged": self.converged,
+            }
+        }
+        try:
+            merge_cpu_memory_into_results(results, "temperature")
+        except Exception:
+            pass
+
+        results_file = results_dir / 'grpc_training_results.json'
+        with open(results_file, 'w') as f:
+            json.dump(results, f, indent=2)
         print(f"Training results saved to {results_file}")
 
 
 def serve():
     """Start gRPC server"""
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    servicer = FederatedLearningServicer(NUM_CLIENTS, NUM_ROUNDS)
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10), options=GRPC_OPTIONS)
+    servicer = FederatedLearningServicer(MIN_CLIENTS, NUM_ROUNDS, max_clients=MAX_CLIENTS)
     federated_learning_pb2_grpc.add_FederatedLearningServicer_to_server(servicer, server)
     
     server_address = f"{GRPC_HOST}:{GRPC_PORT}"
@@ -776,7 +836,7 @@ def serve():
     print("="*70)
     print("Starting Federated Learning Server (gRPC)")
     print(f"Server Address: {server_address}")
-    print(f"Number of Clients: {NUM_CLIENTS}")
+    print(f"Number of Clients: {MIN_CLIENTS}")
     print(f"Number of Rounds: {NUM_ROUNDS}")
     print("="*70)
     print("\nWaiting for clients to register...\n")

@@ -38,6 +38,8 @@ AMQP_HOST = os.getenv("AMQP_HOST", "localhost")
 AMQP_PORT = int(os.getenv("AMQP_PORT", "5672"))
 AMQP_USER = os.getenv("AMQP_USER", "guest")
 AMQP_PASSWORD = os.getenv("AMQP_PASSWORD", "guest")
+# Payload size limit: 128 KB (AMQP frame_max protocol constraint)
+MAX_PAYLOAD_AMQP = 128 * 1024  # 128 KB
 # Dynamic client configuration
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
 MAX_CLIENTS = int(os.getenv("MAX_CLIENTS", "100"))  # Maximum clients allowed
@@ -53,6 +55,17 @@ _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from experiment_results_path import get_experiment_results_dir
+try:
+    from fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+except ModuleNotFoundError:
+    from scripts.utilities.fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+from battery_results_agg import avg_battery_model_drain_fraction
 
 # Convergence Settings (primary stopping criterion)
 CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
@@ -87,6 +100,10 @@ class FederatedLearningServer:
         self.MAPE = []
         self.LOSS = []
         self.ROUNDS = []
+        self.BATTERY_CONSUMPTION = []
+        self.BATTERY_MODEL_CONSUMPTION = []
+        self.ROUND_TIMES = []
+        self.round_start_time = None
         
         # Convergence tracking
         self.best_loss = float('inf')
@@ -127,8 +144,8 @@ class FederatedLearningServer:
         
         # Training configuration
         self.training_config = {
-            "batch_size": 32,
-            "local_epochs": 5
+            "batch_size": 16,
+            "local_epochs": 20
         }
         
         # AMQP connection
@@ -136,6 +153,36 @@ class FederatedLearningServer:
         self.channel = None
         self.consuming = False
     
+    def publish_chunked_broadcast(self, message_dict):
+        """Publish a broadcast message, splitting into 128 KB chunks if needed."""
+        body = json.dumps(message_dict).encode()
+        if len(body) <= MAX_PAYLOAD_AMQP:
+            self.channel.basic_publish(
+                exchange=EXCHANGE_BROADCAST,
+                routing_key='',
+                body=body,
+                properties=pika.BasicProperties(delivery_mode=2)
+            )
+        else:
+            chunks = [body[i:i + MAX_PAYLOAD_AMQP]
+                      for i in range(0, len(body), MAX_PAYLOAD_AMQP)]
+            total = len(chunks)
+            print(f"[AMQP] Payload {len(body)} B > {MAX_PAYLOAD_AMQP} B limit — splitting into {total} chunks")
+            for idx, chunk in enumerate(chunks):
+                envelope = json.dumps({
+                    "message_type": "global_model_chunk",
+                    "chunk_index": idx,
+                    "total_chunks": total,
+                    "data": base64.b64encode(chunk).decode('utf-8')
+                }).encode()
+                self.channel.basic_publish(
+                    exchange=EXCHANGE_BROADCAST,
+                    routing_key='',
+                    body=envelope,
+                    properties=pika.BasicProperties(delivery_mode=2)
+                )
+                time.sleep(0.05)
+
     def initialize_global_model(self):
         """Initialize the global model structure (LSTM for FL)"""
         import tensorflow as tf
@@ -200,7 +247,8 @@ class FederatedLearningServer:
                     port=AMQP_PORT,
                     credentials=credentials,
                     heartbeat=600,
-                    blocked_connection_timeout=300
+                    blocked_connection_timeout=300,
+                    frame_max=131072  # 128 KB AMQP frame_max (protocol limit)
                 )
                 self.connection = pika.BlockingConnection(parameters)
                 self.channel = self.connection.channel()
@@ -371,7 +419,6 @@ class FederatedLearningServer:
                 if len(self.client_metrics) >= len(self.active_clients) and len(self.active_clients) > 0:
                     self.aggregate_metrics()
                     self.continue_training()
-                    self.continue_training()
         except Exception as e:
             print(f"Server error handling client metrics: {e}")
     
@@ -436,12 +483,7 @@ class FederatedLearningServer:
             }
         }
         
-        self.channel.basic_publish(
-            exchange=EXCHANGE_BROADCAST,
-            routing_key='',
-            body=json.dumps(initial_model_message),
-            properties=pika.BasicProperties(delivery_mode=2)
-        )
+        self.publish_chunked_broadcast(initial_model_message)
         
         print("Initial global model sent to all clients")
         
@@ -453,6 +495,7 @@ class FederatedLearningServer:
         print(f"{'='*70}\n")
         
         # Signal clients to start training with the global model
+        self.round_start_time = time.time()
         self.channel.basic_publish(
             exchange=EXCHANGE_BROADCAST,
             routing_key='',
@@ -462,7 +505,7 @@ class FederatedLearningServer:
             }),
             properties=pika.BasicProperties(delivery_mode=2)
         )
-    
+
     def aggregate_models(self):
         """Aggregate model weights using FedAvg algorithm"""
         print(f"\nAggregating models from {len(self.client_updates)} clients...")
@@ -491,12 +534,7 @@ class FederatedLearningServer:
                 "model_config": self.model_config
             }
 
-            self.channel.basic_publish(
-                exchange=EXCHANGE_BROADCAST,
-                routing_key='',
-                body=json.dumps(global_model_message),
-                properties=pika.BasicProperties(delivery_mode=2)
-            )
+            self.publish_chunked_broadcast(global_model_message)
 
             print(f"Aggregated (kept-quantized) global model from round {self.current_round} sent to all clients")
 
@@ -563,12 +601,7 @@ class FederatedLearningServer:
                 "weights": self.serialize_weights(self.global_weights)
         }
         
-        self.channel.basic_publish(
-            exchange=EXCHANGE_BROADCAST,
-            routing_key='',
-            body=json.dumps(global_model_message),
-            properties=pika.BasicProperties(delivery_mode=2)
-        )
+        self.publish_chunked_broadcast(global_model_message)
         
         print(f"Aggregated global model from round {self.current_round} sent to all clients")
         
@@ -584,10 +617,54 @@ class FederatedLearningServer:
             properties=pika.BasicProperties(delivery_mode=2)
         )
     
+    def update_client_count(self, new_count: int):
+        """Dynamically update the expected client count when late clients join."""
+        self.num_clients = new_count
+        print(f"[update_client_count] Expected clients updated to {self.num_clients}")
+
+    def send_current_model_to_client(self, client_id: int):
+        """Send the current global model to a single late-joining client."""
+        if self.global_weights is None:
+            return
+        if self.quantization_handler is not None and hasattr(self, 'global_compressed') and self.global_compressed is not None:
+            serialized = base64.b64encode(pickle.dumps(self.global_compressed)).decode('utf-8')
+            msg = {
+                "message_type": "global_model",
+                "round": self.current_round,
+                "quantized_data": serialized,
+                "model_config": self.model_config
+            }
+        else:
+            msg = {
+                "message_type": "global_model",
+                "round": self.current_round,
+                "weights": self.serialize_weights(self.global_weights)
+            }
+        queue_name = f"fl_client_{client_id}_updates"
+        try:
+            self.channel.basic_publish(
+                exchange='',
+                routing_key=queue_name,
+                body=json.dumps(msg),
+                properties=pika.BasicProperties(delivery_mode=2)
+            )
+            print(f"[LATE JOIN] Sent current global model (round {self.current_round}) to client {client_id}")
+        except Exception as e:
+            print(f"[LATE JOIN] Failed to send model to client {client_id}: {e}")
+
     def aggregate_metrics(self):
         """Aggregate evaluation metrics from all clients"""
         print(f"\nAggregating metrics from {len(self.client_metrics)} clients...")
-        
+
+        # Track round wall-clock time
+        if getattr(self, 'round_start_time', None) is not None:
+            self.ROUND_TIMES.append(time.time() - self.round_start_time)
+
+        # Battery consumption (drain fraction) from client metrics
+        socs = [m.get('battery_soc', 1.0) for m in self.client_metrics.values()]
+        self.BATTERY_CONSUMPTION.append(1.0 - (sum(socs) / len(socs) if socs else 1.0))
+        self.BATTERY_MODEL_CONSUMPTION.append(avg_battery_model_drain_fraction(self.client_metrics))
+
         # Calculate total samples
         total_samples = sum(metric['num_samples'] 
                           for metric in self.client_metrics.values())
@@ -662,6 +739,7 @@ class FederatedLearningServer:
             time.sleep(2)
             
             # Signal clients to start next training round
+            self.round_start_time = time.time()
             self.channel.basic_publish(
                 exchange=EXCHANGE_BROADCAST,
                 routing_key='',
@@ -719,45 +797,78 @@ class FederatedLearningServer:
             return False
     
     def plot_results(self):
-        """Plot training metrics"""
-        plt.figure(figsize=(15, 5))
-        
-        # MSE Plot
-        plt.subplot(1, 3, 1)
-        plt.plot(self.ROUNDS, self.MSE, marker='o', linewidth=2, markersize=8)
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Mean Squared Error (MSE)', fontsize=12)
-        plt.title('MSE over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        # MAE Plot
-        plt.subplot(1, 3, 2)
-        plt.plot(self.ROUNDS, self.MAE, marker='s', linewidth=2, markersize=8, color='orange')
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Mean Absolute Error (MAE)', fontsize=12)
-        plt.title('MAE over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        # MAPE Plot
-        plt.subplot(1, 3, 3)
-        plt.plot(self.ROUNDS, self.MAPE, marker='^', linewidth=2, markersize=8, color='green')
-        plt.xlabel('Round', fontsize=12)
-        plt.ylabel('Mean Absolute Percentage Error (MAPE)', fontsize=12)
-        plt.title('MAPE over Federated Learning Rounds', fontsize=14)
-        plt.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        
-        # Save to results folder
+        """Plot battery consumption, round/convergence time, loss, and regression metrics."""
         results_dir = get_experiment_results_dir("temperature", "amqp")
-        plt.savefig(results_dir / 'amqp_training_metrics.png', dpi=300, bbox_inches='tight')
-        print(f"Results plot saved to {results_dir / 'amqp_training_metrics.png'}")
-        if os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
-            plt.close()
-        else:
-            plt.show()
+        rounds = self.ROUNDS
+        n = len(rounds)
+        conv_time = self.convergence_time if self.convergence_time is not None else (
+            time.time() - self.start_time if self.start_time else 0)
 
-        # Disconnect and exit after plot is closed
+        # 1) Battery consumption
+        fig1, ax1 = plt.subplots(figsize=(7, 4))
+        bc = (self.BATTERY_CONSUMPTION + [0.0] * max(0, n - len(self.BATTERY_CONSUMPTION)))[:n] \
+            if getattr(self, 'BATTERY_CONSUMPTION', []) else [0.0] * n
+        if bc:
+            ax1.plot(rounds, [c * 100 for c in bc], marker='o', linewidth=2,
+                     markersize=6, color='#2e86ab')
+        ax1.set_xlabel('Round'); ax1.set_ylabel('Battery consumption (%)')
+        ax1.set_title('AMQP (temperature): Battery consumption over FL rounds')
+        ax1.grid(True, alpha=0.3)
+        fig1.tight_layout()
+        fig1.savefig(results_dir / 'amqp_battery_consumption.png', dpi=300, bbox_inches='tight')
+        plt.close(fig1)
+
+        # 2) Time per round and convergence
+        fig2, ax2 = plt.subplots(figsize=(7, 4))
+        rt = (self.ROUND_TIMES + [0.0] * max(0, n - len(self.ROUND_TIMES)))[:n] \
+            if getattr(self, 'ROUND_TIMES', []) else [0.0] * n
+        if rt:
+            ax2.bar(rounds, rt, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        ax2.axhline(y=conv_time, color='#f18f01', linestyle='--', linewidth=2,
+                    label=f'Total convergence: {conv_time:.1f} s')
+        ax2.set_xlabel('Round'); ax2.set_ylabel('Time (s)')
+        ax2.set_title('AMQP (temperature): Time per round and convergence')
+        ax2.legend(); ax2.grid(True, alpha=0.3)
+        fig2.tight_layout()
+        fig2.savefig(results_dir / 'amqp_round_and_convergence_time.png', dpi=300, bbox_inches='tight')
+        plt.close(fig2)
+
+        # 3) Loss
+        fig3, ax3 = plt.subplots(figsize=(7, 4))
+        ax3.plot(rounds, self.LOSS, 'b-', marker='o', linewidth=2, markersize=6)
+        ax3.set_xlabel('Round'); ax3.set_ylabel('Loss (MSE)')
+        ax3.set_title('AMQP (temperature): Loss over FL Rounds')
+        ax3.grid(True, alpha=0.3)
+        fig3.tight_layout()
+        fig3.savefig(results_dir / 'amqp_loss.png', dpi=300, bbox_inches='tight')
+        plt.close(fig3)
+
+        # 4) Regression metrics (MSE / MAE / MAPE)
+        fig4, axes = plt.subplots(1, 3, figsize=(17, 5))
+        axes[0].plot(rounds, self.MSE, marker='o', linewidth=2, markersize=8)
+        axes[0].set_xlabel('Round'); axes[0].set_ylabel('MSE')
+        axes[0].set_title('AMQP (temperature): MSE over Rounds'); axes[0].grid(True, alpha=0.3)
+        axes[1].plot(rounds, self.MAE, marker='s', linewidth=2, markersize=8, color='orange')
+        axes[1].set_xlabel('Round'); axes[1].set_ylabel('MAE')
+        axes[1].set_title('AMQP (temperature): MAE over Rounds'); axes[1].grid(True, alpha=0.3)
+        axes[2].plot(rounds, self.MAPE, marker='^', linewidth=2, markersize=8, color='green')
+        axes[2].set_xlabel('Round'); axes[2].set_ylabel('MAPE (%)')
+        axes[2].set_title('AMQP (temperature): MAPE over Rounds'); axes[2].grid(True, alpha=0.3)
+        fig4.tight_layout()
+        fig4.savefig(results_dir / 'amqp_training_metrics.png', dpi=300, bbox_inches='tight')
+        plt.close(fig4)
+        print(f"Results plots saved to {results_dir}")
+
+        # 5) CPU and RAM (from JSONL logs)
+        plot_cpu_memory_for_server_rounds(
+            results_dir,
+            "amqp_cpu_memory_per_round.png",
+            self.ROUNDS,
+            "temperature",
+            title="AMQP (temperature): avg client CPU and RAM per round",
+        )
+        if not os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
+            plt.show(block=False)
         print("\nTraining complete. Disconnecting...")
         self.stop()
     
@@ -767,16 +878,36 @@ class FederatedLearningServer:
         
         results = {
             "rounds": self.ROUNDS,
+            "loss": self.LOSS,
             "mse": self.MSE,
             "mae": self.MAE,
             "mape": self.MAPE,
-            "loss": self.LOSS,
+            # accuracy proxy: 1 - normalized MSE (maps regression quality into [0,1] range)
+            "accuracy": [max(0.0, 1.0 - v) for v in self.MSE],
+            "battery_consumption": getattr(self, 'BATTERY_CONSUMPTION', []),
+            "battery_model_consumption": getattr(self, 'BATTERY_MODEL_CONSUMPTION', []),
+            "battery_model_consumption_source": "client_battery_model",
+            "round_times_seconds": getattr(self, 'ROUND_TIMES', []),
             "convergence_time_seconds": self.convergence_time,
             "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
             "total_rounds": len(self.ROUNDS),
-            "num_clients": self.num_clients
+            "num_clients": self.num_clients,
+            "summary": {
+                "total_rounds": len(self.ROUNDS),
+                "num_clients": self.num_clients,
+                "final_loss": self.LOSS[-1] if self.LOSS else None,
+                "final_mse": self.MSE[-1] if self.MSE else None,
+                "final_mae": self.MAE[-1] if self.MAE else None,
+                "final_mape": self.MAPE[-1] if self.MAPE else None,
+                "convergence_time_seconds": self.convergence_time,
+                "convergence_time_minutes": self.convergence_time / 60 if self.convergence_time else None,
+                "converged": self.converged,
+                "convergence_threshold": CONVERGENCE_THRESHOLD,
+                "convergence_patience": CONVERGENCE_PATIENCE,
+            }
         }
-        
+        merge_cpu_memory_into_results(results, "temperature")
+
         results_file = results_dir / 'amqp_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=2)

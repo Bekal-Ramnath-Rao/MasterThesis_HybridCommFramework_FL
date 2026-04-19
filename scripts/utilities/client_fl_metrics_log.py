@@ -38,6 +38,7 @@ except ImportError:
 _cumulative_wall_sec: Dict[Tuple[str, int], float] = {}
 _cumulative_training_sec: Dict[Tuple[str, int], float] = {}
 _cumulative_battery_joules: Dict[Tuple[str, int], float] = {}
+_psutil_cpu_warmed = False
 
 
 def use_case_from_env(default: str = "emotion") -> str:
@@ -190,6 +191,13 @@ def append_client_fl_metrics_record(
     protocol: Optional[str] = None,
 ) -> None:
     """Append a single JSON line with FL metrics (loss, accuracy, times, battery, etc.)."""
+    global _psutil_cpu_warmed
+    if _HAS_PSUTIL and not _psutil_cpu_warmed:
+        try:
+            _psutil.cpu_percent(interval=0.05)
+        except Exception:
+            pass
+        _psutil_cpu_warmed = True
     if os.environ.get("CLIENT_METRICS_LOG", "true").strip().lower() in ("0", "false", "no"):
         return
     uc = _sanitize_use_case(use_case_from_env(use_case))

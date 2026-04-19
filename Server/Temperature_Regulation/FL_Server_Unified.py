@@ -15,8 +15,12 @@ import time
 import os
 import sys
 import threading
+import fcntl
 from typing import List, Dict
 from pathlib import Path
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 # Protocol-specific imports
 import paho.mqtt.client as mqtt
@@ -46,6 +50,16 @@ _utilities_path = os.path.join(_project_root, "scripts", "utilities")
 if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from experiment_results_path import get_experiment_results_dir
+try:
+    from fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+except ModuleNotFoundError:
+    from scripts.utilities.fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
 
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
@@ -58,6 +72,18 @@ try:
 except ImportError:
     print("Warning: Quantization module not available")
     QUANTIZATION_AVAILABLE = False
+
+try:
+    from fl_termination_env import stop_on_client_convergence
+except ImportError:
+    def stop_on_client_convergence() -> bool:
+        mode = (os.getenv("TRAINING_TERMINATION_MODE") or "").strip().lower()
+        if mode == "fixed_rounds":
+            return False
+        if mode == "client_convergence":
+            return True
+        v = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").strip().lower()
+        return v in ("1", "true", "yes")
 
 # Server Configuration
 # Dynamic client configuration
@@ -76,6 +102,28 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
 GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(4 * 1024 * 1024)))
 PROTOCOL_NEGOTIATION_TIMEOUT_SEC = float(os.getenv("PROTOCOL_NEGOTIATION_TIMEOUT_SEC", "3.0"))
 PROTOCOL_NEGOTIATION_POLL_SEC = float(os.getenv("PROTOCOL_NEGOTIATION_POLL_SEC", "0.1"))
+
+
+def _amqp_use_case_tag() -> str:
+    """Isolate AMQP model-update traffic per use case (shared broker: emotion native uses ``client.update``)."""
+    raw = (os.getenv("USE_CASE") or os.getenv("CLIENT_USE_CASE") or "temperature").strip().lower()
+    return raw.replace(" ", "_").replace("-", "_") if raw else "temperature"
+
+
+_AMQP_UC = _amqp_use_case_tag()
+# Default namespaced keys so another stack (e.g. emotion on host) does not fill our consumer with foreign rounds.
+AMQP_MODEL_UPDATE_ROUTING_KEY = os.getenv(
+    "AMQP_MODEL_UPDATE_ROUTING_KEY", f"client.update.{_AMQP_UC}"
+)
+AMQP_MODEL_UPDATE_QUEUE = os.getenv(
+    "AMQP_MODEL_UPDATE_QUEUE", f"fl.client.update.{_AMQP_UC}"
+)
+AMQP_MODEL_METRICS_ROUTING_KEY = os.getenv(
+    "AMQP_MODEL_METRICS_ROUTING_KEY", f"client.metrics.{_AMQP_UC}"
+)
+AMQP_MODEL_METRICS_QUEUE = os.getenv(
+    "AMQP_MODEL_METRICS_QUEUE", f"fl.client.metrics.{_AMQP_UC}"
+)
 
 
 class UnifiedFederatedLearningServer:
@@ -112,6 +160,7 @@ class UnifiedFederatedLearningServer:
         self.converged = False
         self.start_time = None
         self.convergence_time = None
+        self.converged_clients = set()  # tracks clients that sent client_converged=1.0
         
         # Lock for thread-safe operations
         self.lock = threading.Lock()
@@ -138,7 +187,7 @@ class UnifiedFederatedLearningServer:
         self.initialize_global_model()
         
         print(f"\n{'='*70}")
-        print(f"UNIFIED FEDERATED LEARNING SERVER - EMOTION RECOGNITION")
+        print(f"UNIFIED FEDERATED LEARNING SERVER - TEMPERATURE REGULATION")
         print(f"{'='*70}")
         print(f"Clients Expected: {self.num_clients}")
         print(f"Max Rounds: {self.num_rounds}")
@@ -146,25 +195,35 @@ class UnifiedFederatedLearningServer:
         print(f"{'='*70}\n")
     
     def initialize_global_model(self):
-        """Initialize global model weights (temperature recognition CNN)"""
-        # Simple initialization - clients will have actual trained weights
-        # This creates a structure that matches the CNN architecture
-        self.global_weights = {
-            'conv1': np.random.randn(3, 3, 1, 32) * 0.01,
-            'conv2': np.random.randn(3, 3, 32, 64) * 0.01,
-            'conv3': np.random.randn(3, 3, 64, 128) * 0.01,
-            'conv4': np.random.randn(3, 3, 128, 128) * 0.01,
-            'dense1': np.random.randn(6272, 1024) * 0.01,  # After flatten
-            'dense2': np.random.randn(1024, 7) * 0.01  # 7 temperatures
-        }
-        print("[Model] Global model initialized")
+        """Initialize global model weights as a list (Keras get_weights() format).
+
+        The temperature model is a small Dense network; initialise to None so the
+        server does NOT broadcast oversized random CNN arrays that (a) overflow gRPC
+        4 MB limit and (b) have the wrong layer structure.  global_weights is
+        populated by list-based FedAvg after the first round of real client updates.
+        """
+        self.global_weights = None
+        print("[Model] Global model initialised (weights=None; will be set after first aggregation)")
     
     def start_mqtt_server(self):
         """Start MQTT protocol handler"""
         try:
-            self.mqtt_client = mqtt.Client(client_id="fl_unified_server_mqtt", 
-                                          protocol=mqtt.MQTTv311, 
-                                          clean_session=True)
+            # paho-mqtt ≥2.0 requires an explicit CallbackAPIVersion; use VERSION1
+            # for backward-compatible on_connect(client, userdata, flags, rc) signature.
+            _mqtt_version = getattr(mqtt, "CallbackAPIVersion", None)
+            if _mqtt_version is not None:
+                self.mqtt_client = mqtt.Client(
+                    _mqtt_version.VERSION1,
+                    client_id="fl_unified_server_mqtt",
+                    protocol=mqtt.MQTTv311,
+                    clean_session=True,
+                )
+            else:
+                self.mqtt_client = mqtt.Client(
+                    client_id="fl_unified_server_mqtt",
+                    protocol=mqtt.MQTTv311,
+                    clean_session=True,
+                )
             self.mqtt_client.on_connect = self.on_mqtt_connect
             self.mqtt_client.on_message = self.on_mqtt_message
             self.mqtt_client.connect(MQTT_BROKER, 1883, 60)
@@ -207,19 +266,44 @@ class UnifiedFederatedLearningServer:
             
             channel.exchange_declare(exchange='fl_client_updates', exchange_type='direct', durable=True)
             channel.queue_declare(queue='fl.client.register')
-            channel.queue_declare(queue='fl.client.update')
-            channel.queue_declare(queue='fl.client.metrics')
+            channel.queue_declare(queue=AMQP_MODEL_UPDATE_QUEUE)
+            channel.queue_declare(queue=AMQP_MODEL_METRICS_QUEUE)
             channel.queue_bind(exchange='fl_client_updates', queue='fl.client.register', routing_key='client.register')
-            channel.queue_bind(exchange='fl_client_updates', queue='fl.client.update', routing_key='client.update')
-            channel.queue_bind(exchange='fl_client_updates', queue='fl.client.metrics', routing_key='client.metrics')
+            channel.queue_bind(
+                exchange='fl_client_updates',
+                queue=AMQP_MODEL_UPDATE_QUEUE,
+                routing_key=AMQP_MODEL_UPDATE_ROUTING_KEY,
+            )
+            channel.queue_bind(
+                exchange='fl_client_updates',
+                queue=AMQP_MODEL_METRICS_QUEUE,
+                routing_key=AMQP_MODEL_METRICS_ROUTING_KEY,
+            )
+            print(
+                f"[AMQP] Unified temperature: update queue={AMQP_MODEL_UPDATE_QUEUE!r} "
+                f"routing_key={AMQP_MODEL_UPDATE_ROUTING_KEY!r}; "
+                f"metrics queue={AMQP_MODEL_METRICS_QUEUE!r} routing_key={AMQP_MODEL_METRICS_ROUTING_KEY!r}"
+            )
+            # Durable queues retain JSON updates from prior runs; purge ours on startup.
+            if os.getenv("AMQP_PURGE_UPDATE_QUEUES_ON_START", "true").strip().lower() in ("1", "true", "yes"):
+                for qname in (AMQP_MODEL_UPDATE_QUEUE, AMQP_MODEL_METRICS_QUEUE):
+                    try:
+                        purged = channel.queue_purge(qname)
+                        mc = getattr(getattr(purged, "method", purged), "message_count", None)
+                        if mc is not None:
+                            print(f"[AMQP] Purged queue {qname!r} on startup ({mc} stale message(s))")
+                        else:
+                            print(f"[AMQP] Purged queue {qname!r} on startup")
+                    except Exception as pe:
+                        print(f"[AMQP] Purge {qname!r} skipped: {pe}")
             
             channel.basic_consume(queue='fl.client.register',
                                 on_message_callback=self.on_amqp_register,
                                 auto_ack=True)
-            channel.basic_consume(queue='fl.client.update',
+            channel.basic_consume(queue=AMQP_MODEL_UPDATE_QUEUE,
                                 on_message_callback=self.on_amqp_update,
                                 auto_ack=True)
-            channel.basic_consume(queue='fl.client.metrics',
+            channel.basic_consume(queue=AMQP_MODEL_METRICS_QUEUE,
                                 on_message_callback=self.on_amqp_metrics,
                                 auto_ack=True)
             
@@ -235,24 +319,33 @@ class UnifiedFederatedLearningServer:
     def on_amqp_register(self, ch, method, properties, body):
         """AMQP registration callback"""
         try:
-            payload = json.loads(body.decode())
+            payload = json.loads(body.decode("utf-8"))
             self.handle_client_registration(payload['client_id'], 'amqp')
         except Exception as e:
             print(f"[AMQP] Error handling registration: {e}")
     
     def on_amqp_update(self, ch, method, properties, body):
-        """AMQP update callback"""
+        """AMQP update callback (JSON body; ignore stale binary pickles from legacy clients)."""
         try:
-            payload = json.loads(body.decode())
+            payload = json.loads(body.decode("utf-8"))
             self.handle_client_update(payload, 'amqp')
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            hint = (
+                f"[AMQP] Ignoring non-JSON update on {AMQP_MODEL_UPDATE_QUEUE!r} "
+                "(often durable stale pickle from an older client build; purge the queue or restart RabbitMQ with a clean volume). "
+                f"Detail: {e}"
+            )
+            print(hint)
         except Exception as e:
             print(f"[AMQP] Error handling update: {e}")
     
     def on_amqp_metrics(self, ch, method, properties, body):
         """AMQP metrics callback"""
         try:
-            payload = json.loads(body.decode())
+            payload = json.loads(body.decode("utf-8"))
             self.handle_client_metrics(payload, 'amqp')
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            print(f"[AMQP] Ignoring non-JSON metrics message: {e}")
         except Exception as e:
             print(f"[AMQP] Error handling metrics: {e}")
     
@@ -267,14 +360,48 @@ class UnifiedFederatedLearningServer:
                 print(f"\n[Server] All {self.num_clients} clients registered!")
                 self.start_training()
     
+    def mark_client_converged(self, client_id: int):
+        """Record that client reported RL convergence and stop training if all clients done."""
+        self.converged_clients.add(client_id)
+        print(f"[Server] Client {client_id} signaled RL convergence ({len(self.converged_clients)}/{len(self.registered_clients)})")
+        if len(self.converged_clients) >= len(self.registered_clients):
+            self.signal_training_complete()
+
+    def signal_training_complete(self):
+        """Mark training as complete and trigger save."""
+        if not self.converged:
+            print(f"\n✅ ALL CLIENTS RL-CONVERGED — stopping FL at round {self.current_round}")
+            self.converged = True
+            self.convergence_time = time.time() - self.start_time
+            self.save_results()
+
     def handle_client_update(self, payload, protocol):
         """Handle client model update (thread-safe)"""
         with self.lock:
             client_id = payload['client_id']
             round_num = payload['round']
-            
+
+            # Check for client-driven RL convergence signal (empty-weights notification)
+            client_converged_flag = float((payload.get('metrics') or {}).get('client_converged', 0.0))
+            if stop_on_client_convergence() and client_converged_flag >= 1.0:
+                print(f"[{protocol.upper()}] Received RL convergence signal from client {client_id}")
+                self.mark_client_converged(client_id)
+                # Convergence-only message has no real weights; skip normal update processing.
+                if not payload.get('weights'):
+                    return
+
             if round_num != self.current_round:
-                print(f"[{protocol.upper()}] Ignoring update from client {client_id} (wrong round)")
+                if self.current_round == 0:
+                    print(
+                        f"[{protocol.upper()}] Ignoring update from client {client_id}: "
+                        f"server not in training (current_round=0, update claims round={round_num}). "
+                        f"Ensure the client calls gRPC RegisterClient (or publishes AMQP register) before FL rounds."
+                    )
+                else:
+                    print(
+                        f"[{protocol.upper()}] Ignoring update from client {client_id}: "
+                        f"wrong round (server expects {self.current_round}, payload has {round_num})"
+                    )
                 return
             
             self.client_uplink_protocols[client_id] = protocol
@@ -350,12 +477,18 @@ class UnifiedFederatedLearningServer:
         print(f"ROUND {self.current_round}/{self.num_rounds}")
         print(f"{'='*70}")
         
-        # Aggregate weights (FedAvg)
-        aggregated_weights = {}
-        for key in self.global_weights.keys():
-            weights_list = [update['weights'][key] for update in self.client_updates.values()]
-            aggregated_weights[key] = np.mean(weights_list, axis=0)
-        
+        # Aggregate weights using list-based FedAvg.
+        # Clients send model.get_weights() which is a list of numpy arrays (one
+        # per Keras layer), so we iterate by integer index, not string key.
+        all_weights = [update['weights'] for update in self.client_updates.values()]
+        if not all_weights:
+            print("[Aggregation] No client weights received; skipping round.")
+            return
+        num_layers = len(all_weights[0])
+        aggregated_weights = [
+            np.mean([w[i] for w in all_weights], axis=0)
+            for i in range(num_layers)
+        ]
         self.global_weights = aggregated_weights
         
         # Aggregate metrics (temperature clients use val_accuracy / val_mae proxies)
@@ -397,22 +530,32 @@ class UnifiedFederatedLearningServer:
         print(f"Avg Loss: {avg_loss:.4f}")
         print(f"Avg training time (clients reporting): {self.AVG_TRAINING_TIME_SEC[-1]:.3f} s")
         print(f"Avg battery SoC: {self.AVG_BATTERY_SOC[-1]:.4f}")
-        
-        # Check convergence
-        if self.current_round >= MIN_ROUNDS:
-            if self.best_loss - avg_loss > CONVERGENCE_THRESHOLD:
-                self.best_loss = avg_loss
-                self.rounds_without_improvement = 0
+
+        # If all clients already signaled RL convergence, stop immediately
+        if self.converged:
+            return
+
+        # Loss-based early stopping — disabled in client_convergence mode so the
+        # RL agent can complete all 3 phases (Phase 1: 20+ rounds, Phase 2:
+        # boundary setting, Phase 3: Q-learning until 5 consecutive same-protocol).
+        if not stop_on_client_convergence():
+            if self.current_round >= MIN_ROUNDS:
+                if self.best_loss - avg_loss > CONVERGENCE_THRESHOLD:
+                    self.best_loss = avg_loss
+                    self.rounds_without_improvement = 0
+                else:
+                    self.rounds_without_improvement += 1
+
+                if self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
+                    self.converged = True
+                    self.convergence_time = time.time() - self.start_time
+                    print(f"\n✅ CONVERGENCE ACHIEVED at round {self.current_round}")
+                    self.save_results()
+                    return
             else:
-                self.rounds_without_improvement += 1
-            
-            if self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
-                self.converged = True
-                self.convergence_time = time.time() - self.start_time
-                print(f"\n✅ CONVERGENCE ACHIEVED at round {self.current_round}")
-                self.save_results()
-                return
+                self.best_loss = min(self.best_loss, avg_loss)
         else:
+            # client_convergence mode: track best loss for reporting but don't stop early
             self.best_loss = min(self.best_loss, avg_loss)
         
         # Clear for next round
@@ -508,6 +651,7 @@ class UnifiedFederatedLearningServer:
             results['convergence_time_seconds'] = None
             results['convergence_time_minutes'] = None
 
+        merge_cpu_memory_into_results(results, "temperature")
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         results_file = results_dir / f"unified_results_{timestamp}.json"
 
@@ -520,6 +664,87 @@ class UnifiedFederatedLearningServer:
 
         print(f"\n✅ Results saved to {results_file}")
         print(f"✅ Experiment runner snapshot: {stable_runner}")
+        self.plot_results()
+
+    def plot_results(self):
+        """Plot battery SoC, round/convergence time, loss, and accuracy."""
+        results_dir = get_experiment_results_dir("temperature", "unified")
+        rounds = self.ROUNDS
+        n = len(rounds)
+        if n == 0:
+            print("[plot_results] No rounds recorded – skipping plots.")
+            return
+        conv_time = self.convergence_time if self.convergence_time is not None else (
+            time.time() - self.start_time if self.start_time else 0
+        )
+
+        # 1) Battery SoC per round
+        fig1, ax1 = plt.subplots(figsize=(7, 4))
+        soc = (self.AVG_BATTERY_SOC + [1.0] * max(0, n - len(self.AVG_BATTERY_SOC)))[:n] if self.AVG_BATTERY_SOC else [1.0] * n
+        ax1.plot(rounds, [s * 100 for s in soc], marker='o', linewidth=2, markersize=6, color='#2e86ab')
+        ax1.set_xlabel('Round', fontsize=12)
+        ax1.set_ylabel('Avg Battery SoC (%)', fontsize=12)
+        ax1.set_title('Unified (temperature): Avg Battery SoC per FL round', fontsize=14)
+        ax1.grid(True, alpha=0.3)
+        fig1.tight_layout()
+        fig1.savefig(results_dir / 'unified_battery_soc.png', dpi=300, bbox_inches='tight')
+        plt.close(fig1)
+        print(f"Battery SoC plot saved to {results_dir / 'unified_battery_soc.png'}")
+
+        # 2) Time per round and convergence time
+        fig2, ax2 = plt.subplots(figsize=(7, 4))
+        rt = (self.ROUND_TIMES + [0.0] * max(0, n - len(self.ROUND_TIMES)))[:n] if self.ROUND_TIMES else [0.0] * n
+        ax2.bar(rounds, rt, color='#a23b72', alpha=0.8, label='Time per round (s)')
+        ax2.axhline(y=conv_time, color='#f18f01', linestyle='--', linewidth=2,
+                    label=f'Total convergence time: {conv_time:.1f} s')
+        ax2.set_xlabel('Round', fontsize=12)
+        ax2.set_ylabel('Time (s)', fontsize=12)
+        ax2.set_title('Unified (temperature): Time per round and total convergence time', fontsize=14)
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        fig2.tight_layout()
+        fig2.savefig(results_dir / 'unified_round_and_convergence_time.png', dpi=300, bbox_inches='tight')
+        plt.close(fig2)
+        print(f"Time plot saved to {results_dir / 'unified_round_and_convergence_time.png'}")
+
+        # 3) Loss and Accuracy
+        fig3, (ax3a, ax3b) = plt.subplots(1, 2, figsize=(12, 5))
+        ax3a.plot(rounds, self.LOSS, marker='o', linewidth=2, markersize=8, color='red')
+        ax3a.set_xlabel('Round', fontsize=12)
+        ax3a.set_ylabel('Loss', fontsize=12)
+        ax3a.set_title('Unified (temperature): Loss over FL Rounds', fontsize=14)
+        ax3a.grid(True, alpha=0.3)
+        ax3b.plot(rounds, [a * 100 for a in self.ACCURACY], marker='s', linewidth=2, markersize=8, color='green')
+        ax3b.set_xlabel('Round', fontsize=12)
+        ax3b.set_ylabel('Accuracy (%)', fontsize=12)
+        ax3b.set_title('Unified (temperature): Accuracy over FL Rounds', fontsize=14)
+        ax3b.grid(True, alpha=0.3)
+        fig3.tight_layout()
+        fig3.savefig(results_dir / 'unified_training_metrics.png', dpi=300, bbox_inches='tight')
+        plt.close(fig3)
+        print(f"Training metrics plot saved to {results_dir / 'unified_training_metrics.png'}")
+
+        # 4) Avg training time per round
+        fig4, ax4 = plt.subplots(figsize=(7, 4))
+        att = (self.AVG_TRAINING_TIME_SEC + [0.0] * max(0, n - len(self.AVG_TRAINING_TIME_SEC)))[:n] if self.AVG_TRAINING_TIME_SEC else [0.0] * n
+        ax4.plot(rounds, att, marker='D', linewidth=2, markersize=6, color='#6a4c93')
+        ax4.set_xlabel('Round', fontsize=12)
+        ax4.set_ylabel('Avg client training time (s)', fontsize=12)
+        ax4.set_title('Unified (temperature): Avg client training time per round', fontsize=14)
+        ax4.grid(True, alpha=0.3)
+        fig4.tight_layout()
+        fig4.savefig(results_dir / 'unified_avg_training_time.png', dpi=300, bbox_inches='tight')
+        plt.close(fig4)
+        print(f"Training time plot saved to {results_dir / 'unified_avg_training_time.png'}")
+
+        # 5) CPU and RAM from client JSONL
+        plot_cpu_memory_for_server_rounds(
+            results_dir,
+            "unified_cpu_memory_per_round.png",
+            self.ROUNDS,
+            "temperature",
+            title="Unified RL (temperature): avg client CPU and RAM per round",
+        )
 
     def run(self):
         """Run unified server (all protocols)"""
@@ -548,6 +773,7 @@ if GRPC_PROTO_AVAILABLE:
     class FLServicer(federated_learning_pb2_grpc.FederatedLearningServicer):
         def __init__(self, server):
             self.server = server
+            self._grpc_update_chunks = {}
 
         def RegisterClient(self, request, context):
             self.server.handle_client_registration(request.client_id, 'grpc')
@@ -603,18 +829,92 @@ if GRPC_PROTO_AVAILABLE:
             return federated_learning_pb2.ProtocolSelectionResponse(success=True, message='recorded')
 
         def SendModelUpdate(self, request, context):
-            return federated_learning_pb2.UpdateResponse(success=False, message='not implemented in this unified mode')
+            """Receive model update (chunked when payload exceeds gRPC frame budget). Same contract as emotion unified."""
+            try:
+                client_id = request.client_id
+                round_num = request.round
+                metrics = dict(request.metrics)
+                total_chunks = getattr(request, "total_chunks", 1) or 1
+                chunk_index = getattr(request, "chunk_index", 0) or 0
+
+                # Check for RL convergence signal BEFORE the round-mismatch guard.
+                # The client sends this with round = current_round + 1 (which never
+                # matches server's current_round), so it would be silently dropped if
+                # we checked rounds first — leaving the server stuck in its run() loop.
+                client_converged_flag = float(metrics.get("client_converged", 0.0))
+                if client_converged_flag >= 1.0:
+                    print(f"[gRPC] Received RL convergence signal from client {client_id} (round={round_num})")
+                    self.server.mark_client_converged(client_id)
+                    return federated_learning_pb2.UpdateResponse(
+                        success=True,
+                        message="RL convergence acknowledged",
+                    )
+
+                if round_num != self.server.current_round:
+                    return federated_learning_pb2.UpdateResponse(
+                        success=False,
+                        message=f"Round mismatch: expected {self.server.current_round}, got {round_num}",
+                    )
+
+                if total_chunks > 1:
+                    key = (client_id, round_num)
+                    if key not in self._grpc_update_chunks:
+                        self._grpc_update_chunks[key] = {"chunks": {}, "num_samples": 0, "metrics": {}}
+                    buf = self._grpc_update_chunks[key]
+                    buf["chunks"][chunk_index] = request.weights if request.weights else b""
+                    if chunk_index == 0:
+                        buf["num_samples"] = request.num_samples
+                        buf["metrics"] = metrics
+                    if len(buf["chunks"]) < total_chunks:
+                        return federated_learning_pb2.UpdateResponse(
+                            success=True,
+                            message=f"Chunk {chunk_index + 1}/{total_chunks} received for round {round_num}",
+                        )
+                    serialized_weights = b"".join(buf["chunks"][i] for i in range(total_chunks))
+                    num_samples = buf["num_samples"]
+                    metrics = buf["metrics"]
+                    del self._grpc_update_chunks[key]
+                else:
+                    serialized_weights = request.weights
+                    num_samples = request.num_samples
+
+                weights_b64 = base64.b64encode(serialized_weights).decode("ascii")
+                data = {
+                    "client_id": client_id,
+                    "round": round_num,
+                    "weights": weights_b64,
+                    "num_samples": num_samples,
+                    "metrics": metrics,
+                }
+                self.server.handle_client_update(data, "grpc")
+                return federated_learning_pb2.UpdateResponse(success=True, message="Update received")
+            except Exception as e:
+                print(f"[gRPC] Error in SendModelUpdate: {e}")
+                import traceback
+                traceback.print_exc()
+                return federated_learning_pb2.UpdateResponse(success=False, message=str(e))
 
         def SendMetrics(self, request, context):
             return federated_learning_pb2.MetricsResponse(success=False, message='not implemented in this unified mode')
 
         def GetTrainingConfig(self, request, context):
-            return federated_learning_pb2.TrainingConfig(batch_size=16, local_epochs=5)
+            return federated_learning_pb2.TrainingConfig(batch_size=16, local_epochs=20)
 
 
 def main():
     """Main function"""
-    server = UnifiedFederatedLearningServer(NUM_CLIENTS, NUM_ROUNDS)
+    # Prevent duplicate unified server instance in the same container/host.
+    lock_path = os.path.join(os.path.expanduser("~"), ".unified_temperature_server.lock")
+    lock_file = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("[Startup] Another unified server instance is already running. Exiting.")
+        return
+
+    # Use MIN_CLIENTS (dynamic clients) and configured NUM_ROUNDS.
+    # MAX_CLIENTS controls the upper bound of concurrently registered clients.
+    server = UnifiedFederatedLearningServer(MIN_CLIENTS, NUM_ROUNDS, max_clients=MAX_CLIENTS)
     server.run()
 
 

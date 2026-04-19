@@ -38,6 +38,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-server-mqtt-temperature
+    command: python -u Server/Temperature_Regulation/FL_Server_MQTT.py
     deploy:
       resources:
         reservations:
@@ -68,6 +69,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-mqtt-temperature-1
+    command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
     deploy:
       resources:
         reservations:
@@ -98,6 +100,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-mqtt-temperature-2
+    command: python -u Client/Temperature_Regulation/FL_Client_MQTT.py
     deploy:
       resources:
         reservations:
@@ -143,6 +146,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-server-amqp-temperature
+    command: python -u Server/Temperature_Regulation/FL_Server_AMQP.py
     deploy:
       resources:
         reservations:
@@ -173,6 +177,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-amqp-temperature-1
+    command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
     deploy:
       resources:
         reservations:
@@ -203,6 +208,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-amqp-temperature-2
+    command: python -u Client/Temperature_Regulation/FL_Client_AMQP.py
     deploy:
       resources:
         reservations:
@@ -236,6 +242,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-server-grpc-temperature
+    command: python -u Server/Temperature_Regulation/FL_Server_gRPC.py
     deploy:
       resources:
         reservations:
@@ -265,6 +272,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-grpc-temperature-1
+    command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
     deploy:
       resources:
         reservations:
@@ -294,6 +302,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-grpc-temperature-2
+    command: python -u Client/Temperature_Regulation/FL_Client_gRPC.py
     deploy:
       resources:
         reservations:
@@ -327,6 +336,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-server-quic-temperature
+    command: python -u Server/Temperature_Regulation/FL_Server_QUIC.py
     deploy:
       resources:
         reservations:
@@ -356,6 +366,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-quic-temperature-1
+    command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
     deploy:
       resources:
         reservations:
@@ -385,6 +396,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-quic-temperature-2
+    command: python -u Client/Temperature_Regulation/FL_Client_QUIC.py
     deploy:
       resources:
         reservations:
@@ -528,6 +540,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-server-dds-temperature
+    command: python -u Server/Temperature_Regulation/FL_Server_DDS.py
     cap_add:
       - NET_ADMIN
     deploy:
@@ -558,6 +571,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-dds-temperature-1
+    command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
     cap_add:
       - NET_ADMIN
     deploy:
@@ -588,6 +602,7 @@ services:
     networks:
       - temperature_network
     container_name: fl-client-dds-temperature-2
+    command: python -u Client/Temperature_Regulation/FL_Client_DDS.py
     cap_add:
       - NET_ADMIN
     deploy:

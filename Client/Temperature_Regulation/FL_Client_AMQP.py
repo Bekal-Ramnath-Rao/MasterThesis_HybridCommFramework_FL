@@ -57,6 +57,12 @@ if _utilities_path not in sys.path:
     sys.path.insert(0, _utilities_path)
 from client_fl_metrics_log import append_client_fl_metrics_record, use_case_from_env
 
+# Battery model (shared with Emotion/gRPC/MQTT/Unified)
+_client_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _client_dir not in sys.path:
+    sys.path.insert(0, _client_dir)
+from battery_model import BatteryModel
+
 # Make TensorFlow logs less verbose
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 logging.getLogger("tensorflow").setLevel(logging.ERROR)
@@ -73,6 +79,9 @@ CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 STOP_ON_CLIENT_CONVERGENCE = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").lower() in ("1", "true", "yes")
+
+# Payload size limit: 128 KB (AMQP frame_max protocol constraint)
+MAX_PAYLOAD_AMQP = 128 * 1024  # 128 KB
 
 # AMQP Exchanges and Queues
 EXCHANGE_BROADCAST = "fl_broadcast"
@@ -114,6 +123,11 @@ class FederatedLearningClient:
         self.has_converged = False
         self._last_training_time_sec = 0.0
         self._last_uplink_model_comm_sec = 0.0
+        self._last_downlink_model_bytes = 0
+
+        # Battery/energy model for consumption tracking
+        self.battery_model = BatteryModel(protocol="amqp")
+        self._chunk_buffer = {}  # {total_chunks: int, chunks: dict[int, bytes]}
         
         # AMQP connection
         self.connection = None
@@ -193,7 +207,8 @@ class FederatedLearningClient:
                     port=AMQP_PORT,
                     credentials=credentials,
                     heartbeat=600,
-                    blocked_connection_timeout=300
+                    blocked_connection_timeout=300,
+                    frame_max=131072  # 128 KB AMQP frame_max (protocol limit)
                 )
                 self.connection = pika.BlockingConnection(parameters)
                 self.channel = self.connection.channel()
@@ -256,6 +271,8 @@ class FederatedLearningClient:
             
             if message_type == 'global_model':
                 self.on_global_model(ch, method, properties, body)
+            elif message_type == 'global_model_chunk':
+                self.handle_global_model_chunk(data)
             elif message_type == 'training_config':
                 self.on_training_config(ch, method, properties, body)
             elif message_type == 'start_training':
@@ -278,9 +295,29 @@ class FederatedLearningClient:
         import sys
         sys.exit(0)
     
+    def handle_global_model_chunk(self, envelope):
+        """Accumulate AMQP global-model chunks and reassemble into a full message."""
+        try:
+            idx = envelope['chunk_index']
+            total = envelope['total_chunks']
+            chunk_bytes = base64.b64decode(envelope['data'])
+            if self._chunk_buffer.get('total_chunks') != total:
+                self._chunk_buffer = {'total_chunks': total, 'chunks': {}}
+            self._chunk_buffer['chunks'][idx] = chunk_bytes
+            print(f"[AMQP] Received chunk {idx+1}/{total} for global model")
+            if len(self._chunk_buffer['chunks']) == total:
+                body = b''.join(self._chunk_buffer['chunks'][i] for i in range(total))
+                self._chunk_buffer = {}
+                print(f"[AMQP] All {total} chunks received — reassembled {len(body)} B")
+                self._last_downlink_model_bytes = len(body)
+                self.on_global_model(None, None, None, body)
+        except Exception as e:
+            print(f"Client {self.client_id} error handling model chunk: {e}")
+
     def on_global_model(self, ch, method, properties, body):
         """Callback for receiving global model"""
         try:
+            self._last_downlink_model_bytes = len(body)
             data = json.loads(body.decode())
             
             # Check message type
@@ -575,7 +612,9 @@ class FederatedLearningClient:
             "loss": float(loss),
             "mse": float(mse),
             "mae": float(mae),
-            "mape": float(mape)
+            "mape": float(mape),
+            "battery_soc": float(self.battery_model.battery_soc),
+            "cumulative_energy_j": float(self.battery_model.cumulative_energy_j),
         }
         if self.has_converged and STOP_ON_CLIENT_CONVERGENCE:
             metrics_dict["client_converged"] = 1.0
@@ -589,6 +628,7 @@ class FederatedLearningClient:
         
         _mb = json.dumps(metrics_message)
         _mt0 = time.time()
+        bytes_sent_metrics = len(_mb.encode())
         self.channel.basic_publish(
             exchange=EXCHANGE_CLIENT_UPDATES,
             routing_key='client.metrics',
@@ -596,6 +636,13 @@ class FederatedLearningClient:
             properties=pika.BasicProperties(delivery_mode=2)
         )
         _uplink_metrics_sec = time.time() - _mt0
+        # Update battery model with this round's communication cost
+        self.battery_model.update(
+            bytes_sent_metrics,
+            self._last_downlink_model_bytes,
+            self._last_training_time_sec,
+            float(self._last_uplink_model_comm_sec) + _uplink_metrics_sec,
+        )
         append_client_fl_metrics_record(
             self.client_id,
             {
@@ -613,8 +660,9 @@ class FederatedLearningClient:
                     + self._last_uplink_model_comm_sec
                     + _uplink_metrics_sec
                 ),
-                "battery_energy_joules": 0.0,
-                "battery_soc_after": 1.0,
+                "battery_energy_joules": float(self.battery_model.last_energy_j),
+                "battery_soc_after": float(self.battery_model.battery_soc),
+                "cumulative_battery_energy_joules": float(self.battery_model.cumulative_energy_j),
             },
             use_case=use_case_from_env("temperature"),
             protocol="amqp",

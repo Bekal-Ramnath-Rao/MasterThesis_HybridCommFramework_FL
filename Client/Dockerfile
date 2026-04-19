@@ -48,6 +48,7 @@ RUN mkdir -p /app/scripts/utilities
 COPY scripts/utilities/packet_logger.py /app/scripts/utilities/
 COPY scripts/utilities/q_learning_logger.py /app/scripts/utilities/
 COPY scripts/utilities/client_fl_metrics_log.py /app/scripts/utilities/
+COPY scripts/utilities/fl_training_results_cpu_memory.py /app/scripts/utilities/
 COPY scripts/utilities/experiment_results_path.py /app/scripts/utilities/
 COPY scripts/utilities/client_experiment_results.py /app/scripts/utilities/
 # DDS: LAN multicast + runtime static unicast generator (DDS_PEER_*)
@@ -76,5 +77,6 @@ ENV DDS_PEER_SERVER=129.69.102.245
 ENV DDS_PEER_CLIENT1=129.69.102.245
 ENV DDS_PEER_CLIENT2=129.69.102.173
 
-# Default command - can be overridden in docker-compose
-CMD ["python", "-u", "Client/Emotion_Recognition/FL_Client_MQTT.py"]
+# Default command - MUST be overridden by docker-compose command: field.
+# Fails loudly if USE_CASE is not set so misconfigured compose files are caught early.
+CMD ["sh", "-c", "echo '[ERROR] No command specified in docker-compose. Set USE_CASE and add a command: entry.' && exit 1"]

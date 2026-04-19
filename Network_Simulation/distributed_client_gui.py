@@ -7,11 +7,15 @@ Allows running clients on separate PCs that connect to a central experiment serv
 import sys
 import os
 import json
+import re
 import subprocess
 import threading
 import glob
 import shutil
 from datetime import datetime
+
+# Outgoing interface in `ip -4 route get` / `ip route show default` output.
+_IP_ROUTE_DEV_RE = re.compile(r"\bdev\s+(\S+)")
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
@@ -896,7 +900,32 @@ class DistributedClientGUI(QMainWindow):
                 )
         except OSError as e:
             self.log_text.append(f"⚠️ Could not remove reset_epsilon_flag.txt: {e}\n")
-    
+
+    def _write_current_rl_network_scenario_file(self, shared_data_path: str, scenario_label: str) -> None:
+        """
+        Hint for unified FL clients: fine-grained scenario label (especially ``dynamic`` draws).
+        Read by ``FL_Client_Unified`` as ``/shared_data/current_rl_network_scenario.txt``.
+        """
+        try:
+            os.makedirs(shared_data_path, exist_ok=True)
+            path = os.path.join(shared_data_path, "current_rl_network_scenario.txt")
+            sl = (scenario_label or "default").strip().lower() or "default"
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(f"scenario={sl}\n")
+        except OSError as e:
+            self.log_text.append(f"⚠️ Could not write current_rl_network_scenario.txt: {e}\n")
+
+    def _gui_resolved_network_scenario_label(self, network_scenario_combo_data) -> str:
+        """Map GUI combo value to the RL / SQLite network-scenario string (dynamic → current draw)."""
+        data = network_scenario_combo_data
+        if data in (None, "none"):
+            return "none"
+        if data == "dynamic":
+            if not getattr(self, "_last_dynamic_base", None):
+                self.apply_random_dynamic_base()
+            return str(self._last_dynamic_base or "moderate").strip().lower()
+        return str(data).strip().lower() or "default"
+
     def update_dds_impl_visibility(self):
         """Enable DDS implementation selector only when DDS protocol is selected"""
         is_dds = (self.protocol_mode.currentData() == "dds")
@@ -1695,7 +1724,9 @@ class DistributedClientGUI(QMainWindow):
             f"shared_data mount: {'Yes' if self.mount_shared_data.isChecked() else 'No'} "
             f"(client metrics JSONL, DBs, RL Q-tables when unified)\n"
             f"experiment_results mount: Yes → host <project>/experiment_results → /app/experiment_results "
-            f"(client training JSON/plots; same layout as server)\n"
+            f"(training JSON/plots; same layout as server). Avg CPU/RAM are merged into *_training_results.json; "
+            f"per-protocol charts are *_cpu_memory_per_round.png. On the experiment PC, use Experiment GUI → "
+            f"Combine Plots to generate combined_cpu_memory.png across protocols.\n"
         )
         if is_unified and self.is_rl_training_mode():
             shared_data_lines += (
@@ -1804,6 +1835,8 @@ class DistributedClientGUI(QMainWindow):
                 return
             if is_unified:
                 self._sync_reset_epsilon_flag_for_distributed(shared_data_path)
+            eff_lbl = self._gui_resolved_network_scenario_label(network_scenario)
+            self._write_current_rl_network_scenario_file(shared_data_path, eff_lbl)
 
         _uc_key = str(use_case).lower().replace(" ", "")
         client_use_case_env = {
@@ -2028,6 +2061,9 @@ class DistributedClientGUI(QMainWindow):
                 # Apply network conditions if specified
                 if network_scenario != "none":
                     self.apply_network_conditions(container_name, network_scenario)
+                if self.mount_shared_data.isChecked():
+                    eff_lbl2 = self._gui_resolved_network_scenario_label(network_scenario)
+                    self._write_current_rl_network_scenario_file(shared_data_path, eff_lbl2)
                 if network_scenario == "dynamic":
                     self._dynamic_network_timer.start(self.dynamic_interval_sec.value() * 1000)
                 
@@ -2064,34 +2100,109 @@ class DistributedClientGUI(QMainWindow):
         )
         self._apply_tc_profile(container_name, cond)
 
-    def _tc_netdev_for_container(self, container_name: str) -> str:
-        """Interface to shape (host-network containers often have enp*, not eth0)."""
-        server_ip = self.server_ip.text().strip()
-        if not server_ip:
-            return "eth0"
+    def _parse_dev_from_ip_route_text(self, text: str):
+        """Return first non-loopback `dev` from `ip route` output, or None."""
+        if not text or not text.strip():
+            return None
+        first = text.strip().splitlines()[0]
+        m = _IP_ROUTE_DEV_RE.search(first)
+        if not m:
+            return None
+        dev = m.group(1)
+        return None if dev == "lo" else dev
+
+    def _route_iface_on_host(self, dest_ip: str):
+        """Outgoing iface toward dest on this machine (same view as --network host)."""
+        try:
+            r = subprocess.run(
+                ["ip", "-4", "route", "get", dest_ip],
+                capture_output=True,
+                text=True,
+                timeout=6,
+            )
+            if r.returncode == 0:
+                return self._parse_dev_from_ip_route_text(r.stdout)
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            pass
+        return None
+
+    def _host_default_route_iface(self):
+        try:
+            r = subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if r.returncode == 0 and r.stdout.strip():
+                return self._parse_dev_from_ip_route_text(r.stdout)
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            pass
+        return None
+
+    def _route_iface_docker_exec(self, container_name: str, dest_ip: str):
+        """Same as host when using network_mode=host; kept as secondary probe."""
         try:
             r = subprocess.run(
                 [
                     "docker",
                     "exec",
                     container_name,
-                    "bash",
+                    "/bin/sh",
                     "-c",
-                    f"ip -4 route get {server_ip} 2>/dev/null",
+                    f"ip -4 route get {dest_ip} 2>/dev/null",
                 ],
                 capture_output=True,
                 text=True,
                 timeout=6,
             )
-            if r.returncode == 0 and "dev" in r.stdout:
-                parts = r.stdout.split()
-                i = parts.index("dev")
-                if i + 1 < len(parts):
-                    dev = parts[i + 1]
-                    if dev != "lo":
-                        return dev
-        except (subprocess.SubprocessError, FileNotFoundError, ValueError, IndexError):
+            if r.returncode == 0:
+                return self._parse_dev_from_ip_route_text(r.stdout)
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
             pass
+        return None
+
+    def _iface_exists_in_container_netns(self, container_name: str, iface: str) -> bool:
+        if not iface:
+            return False
+        try:
+            r = subprocess.run(
+                [
+                    "docker",
+                    "exec",
+                    container_name,
+                    "/bin/sh",
+                    "-c",
+                    f"test -e /sys/class/net/{iface}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return r.returncode == 0
+        except (subprocess.SubprocessError, FileNotFoundError, OSError):
+            return False
+
+    def _tc_netdev_for_container(self, container_name: str) -> str:
+        """Interface to shape for --network host (real NIC is often enp*/wlan*, not eth0)."""
+        server_ip = self.server_ip.text().strip()
+        if not server_ip:
+            return "eth0"
+        # Prefer host `ip route get`: with Docker host networking, container and host share
+        # the same routing table; this avoids relying on docker exec/bash when resolving iface.
+        ordered = []
+        for iface in (
+            self._route_iface_on_host(server_ip),
+            self._route_iface_docker_exec(container_name, server_ip),
+            self._host_default_route_iface(),
+        ):
+            if iface and iface not in ordered:
+                ordered.append(iface)
+        for iface in ordered:
+            if self._iface_exists_in_container_netns(container_name, iface):
+                return iface
+        if ordered:
+            return ordered[0]
         return "eth0"
 
     def _apply_tc_profile(self, container_name, cond):
@@ -2115,18 +2226,29 @@ class DistributedClientGUI(QMainWindow):
                 f"tc qdisc add dev {dev} parent 1:12 handle 10: netem {' '.join(netem_params)}"
             )
 
+            all_ok = True
             for tc_cmd in setup_cmds:
                 result = subprocess.run(
-                    ["docker", "exec", container_name, "bash", "-c", tc_cmd],
+                    ["docker", "exec", container_name, "/bin/sh", "-c", tc_cmd],
                     capture_output=True,
                     text=True,
                     timeout=10,
                 )
 
                 if result.returncode != 0:
-                    self.log_text.append(f"⚠️ Warning applying network condition: {result.stderr}\n")
+                    all_ok = False
+                    err = (result.stderr or result.stdout or "").strip()
+                    self.log_text.append(f"⚠️ Warning applying network condition: {err}\n")
 
-            self.log_text.append("✅ Network conditions applied successfully\n")
+            if all_ok:
+                self.log_text.append("✅ Network conditions applied successfully\n")
+            else:
+                self.log_text.append(
+                    "❌ Network shaping did not apply cleanly. "
+                    "Check that the client container has CAP_NET_ADMIN, `iproute2`/`tc` inside the image, "
+                    "and that the interface name above exists in the container "
+                    "(on host networking, run `ip -4 route get <SERVER_IP>` on the host to see the correct NIC).\n"
+                )
 
         except Exception as e:
             self.log_text.append(f"⚠️ Error applying network conditions: {str(e)}\n")
@@ -2156,6 +2278,13 @@ class DistributedClientGUI(QMainWindow):
             f"jitter={cond['jitter']}ms, loss={cond['packet_loss']:.1f}%\n"
         )
         self._apply_tc_profile(self.client_container, cond)
+        project_root = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        )
+        shared_data_path = os.path.join(project_root, "shared_data")
+        if self.mount_shared_data.isChecked() and os.path.isdir(shared_data_path):
+            eff = self._gui_resolved_network_scenario_label("dynamic")
+            self._write_current_rl_network_scenario_file(shared_data_path, eff)
 
     def on_randomize_dynamic_now(self):
         if not self.client_container:
@@ -2166,6 +2295,13 @@ class DistributedClientGUI(QMainWindow):
         cond = self.get_effective_network_profile()
         self.log_text.append(f"\n🌐 [DYNAMIC] Manual randomize → {self._last_dynamic_base}\n")
         self._apply_tc_profile(self.client_container, cond)
+        project_root = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        )
+        shared_data_path = os.path.join(project_root, "shared_data")
+        if self.mount_shared_data.isChecked() and os.path.isdir(shared_data_path):
+            eff = self._gui_resolved_network_scenario_label("dynamic")
+            self._write_current_rl_network_scenario_file(shared_data_path, eff)
 
     def _refresh_dynamic_randomize_btn(self):
         running = self.client_container is not None

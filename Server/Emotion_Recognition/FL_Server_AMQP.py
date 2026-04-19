@@ -30,6 +30,16 @@ if _utilities_path not in sys.path:
 
 from packet_logger import log_sent_packet, log_received_packet, init_db
 from experiment_results_path import get_experiment_results_dir
+try:
+    from fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
+except ModuleNotFoundError:
+    from scripts.utilities.fl_training_results_cpu_memory import (
+        merge_cpu_memory_into_results,
+        plot_cpu_memory_for_server_rounds,
+    )
 from battery_results_agg import avg_battery_model_drain_fraction
 
 # Add Compression_Technique to path
@@ -1002,6 +1012,13 @@ class FederatedLearningServer:
         fig3.savefig(results_dir / 'amqp_training_metrics.png', dpi=300, bbox_inches='tight')
         plt.close(fig3)
         print(f"Training metrics plot saved to {results_dir / 'amqp_training_metrics.png'}")
+        plot_cpu_memory_for_server_rounds(
+            results_dir,
+            "amqp_cpu_memory_per_round.png",
+            self.ROUNDS,
+            "emotion",
+            title="AMQP (emotion): avg client CPU and RAM per round",
+        )
         if not os.environ.get("FL_DIAGNOSTIC_PIPELINE") == "1":
             plt.show(block=False)
         print("\nPlot closed. Training complete.")
@@ -1030,7 +1047,8 @@ class FederatedLearningServer:
                 'convergence_patience': CONVERGENCE_PATIENCE
             }
         }
-        
+        merge_cpu_memory_into_results(results, "emotion")
+
         results_file = results_dir / 'amqp_training_results.json'
         with open(results_file, 'w') as f:
             json.dump(results, f, indent=4)
