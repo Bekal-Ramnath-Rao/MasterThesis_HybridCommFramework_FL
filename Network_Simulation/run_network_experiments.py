@@ -126,6 +126,7 @@ class ExperimentRunner:
         self._runtime_compose_files: Dict[str, str] = {}
         self._runtime_compose_files_stop: Dict[str, str] = {}
         self._runtime_compose_files_num_clients: Dict[str, str] = {}
+        self._runtime_compose_files_cpu: Dict[str, str] = {}
         self.dataset_client_map: Dict[int, int] = dict(dataset_client_map or {})
         self._runtime_compose_files_dataset: Dict[tuple, str] = {}
         
@@ -627,7 +628,72 @@ class ExperimentRunner:
             patched_path = self._patch_compose_pruning_env(patched_path)
         patched_path = self._patch_compose_stop_env(patched_path)
         patched_path = self._patch_compose_num_clients_substitution(patched_path)
-        return self._patch_compose_dataset_env(patched_path)
+        patched_path = self._patch_compose_dataset_env(patched_path)
+        if not self.enable_gpu:
+            patched_path = self._patch_compose_disable_gpu_reservations(patched_path)
+        return patched_path
+
+    def _patch_compose_disable_gpu_reservations(self, compose_file: str) -> str:
+        """Create a runtime compose file without NVIDIA device reservations for CPU runs."""
+        if compose_file in self._runtime_compose_files_cpu:
+            return self._runtime_compose_files_cpu[compose_file]
+
+        src_path = Path(compose_file)
+        if not src_path.exists():
+            return compose_file
+
+        try:
+            original = src_path.read_text(encoding="utf-8")
+        except Exception:
+            return compose_file
+
+        lines = original.splitlines()
+        patched_lines: List[str] = []
+        changed = False
+        i = 0
+        n = len(lines)
+
+        while i < n:
+            line = lines[i]
+            if line.strip() != "deploy:":
+                patched_lines.append(line)
+                i += 1
+                continue
+
+            indent = len(line) - len(line.lstrip())
+            block_lines = [line]
+            j = i + 1
+            while j < n:
+                next_line = lines[j]
+                if next_line.strip() == "":
+                    block_lines.append(next_line)
+                    j += 1
+                    continue
+                next_indent = len(next_line) - len(next_line.lstrip())
+                if next_indent <= indent:
+                    break
+                block_lines.append(next_line)
+                j += 1
+
+            block_text = "\n".join(block_lines)
+            if "driver: nvidia" in block_text or "capabilities: [gpu]" in block_text:
+                changed = True
+            else:
+                patched_lines.extend(block_lines)
+            i = j
+
+        if not changed:
+            self._runtime_compose_files_cpu[compose_file] = compose_file
+            return compose_file
+
+        patched = "\n".join(patched_lines) + ("\n" if original.endswith("\n") else "")
+        tmp_dir = Path(tempfile.gettempdir()) / "fl_runtime_compose"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        patched_path = tmp_dir / f"{src_path.stem}.runtime-cpu{src_path.suffix}"
+        self._write_runtime_compose_patch(patched_path, patched)
+        self._runtime_compose_files_cpu[compose_file] = str(patched_path)
+        print(f"[INFO] Using CPU-safe compose file: {patched_path}")
+        return str(patched_path)
 
     def _patch_compose_dataset_env(self, compose_file: str) -> str:
         """Inject DATASET_CLIENT_ID next to matching CLIENT_ID lines for per-container data shards."""
