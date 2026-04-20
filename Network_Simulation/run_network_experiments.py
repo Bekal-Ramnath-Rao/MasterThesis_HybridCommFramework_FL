@@ -1586,7 +1586,10 @@ class ExperimentRunner:
         rounds = []
         loss = []
         accuracy = []
-        metrics_by_round = {}
+        mse = []
+        mae = []
+        mape = []
+        metrics_by_round: Dict[int, Dict[str, float]] = {}
 
         # Pattern 1: Round X - Aggregated Metrics:
         # Pattern 2: Round X Aggregated Metrics:
@@ -1609,7 +1612,10 @@ class ExperimentRunner:
         for pattern in aggregated_patterns:
             for round_str, loss_str, acc_str in pattern.findall(content):
                 round_num = int(round_str)
-                metrics_by_round[round_num] = (float(loss_str), float(acc_str))
+                metrics_by_round[round_num] = {
+                    "loss": float(loss_str),
+                    "accuracy": float(acc_str),
+                }
 
         # Pattern 3 (gRPC):
         # ROUND X SUMMARY ... Average Loss: Y ... Average Accuracy: Z
@@ -1621,7 +1627,10 @@ class ExperimentRunner:
         )
         for round_str, loss_str, acc_str in grpc_summary_pattern.findall(content):
             round_num = int(round_str)
-            metrics_by_round[round_num] = (float(loss_str), float(acc_str))
+            metrics_by_round[round_num] = {
+                "loss": float(loss_str),
+                "accuracy": float(acc_str),
+            }
 
         # Pattern 4 (unified / RL-unified emotion server):
         # Round X Results:
@@ -1635,16 +1644,70 @@ class ExperimentRunner:
         )
         for round_str, loss_str, acc_str in unified_round_pattern.findall(content):
             round_num = int(round_str)
-            metrics_by_round[round_num] = (float(loss_str), float(acc_str))
+            metrics_by_round[round_num] = {
+                "loss": float(loss_str),
+                "accuracy": float(acc_str),
+            }
+
+        # Pattern 5 (temperature servers):
+        # Round X - Aggregated Metrics:
+        #   Loss: ...
+        #   MSE:  ...
+        #   MAE:  ...
+        #   MAPE: ...
+        temperature_round_pattern = re.compile(
+            r"Round\s+(\d+)\s*-?\s*Aggregated\s+Metrics:\s*"
+            r"(?:\n|\r\n)+\s*Loss:\s*([\d.]+)\s*"
+            r"(?:\n|\r\n)+\s*MSE:\s*([\d.]+)\s*"
+            r"(?:\n|\r\n)+\s*MAE:\s*([\d.]+)\s*"
+            r"(?:\n|\r\n)+\s*MAPE:\s*([\d.]+)",
+            re.IGNORECASE,
+        )
+        for round_str, loss_str, mse_str, mae_str, mape_str in temperature_round_pattern.findall(content):
+            round_num = int(round_str)
+            mse_val = float(mse_str)
+            metrics_by_round[round_num] = {
+                "loss": float(loss_str),
+                "mse": mse_val,
+                "mae": float(mae_str),
+                "mape": float(mape_str),
+                # Match temperature server JSON behavior: use a bounded proxy accuracy.
+                "accuracy": max(0.0, 1.0 - mse_val),
+            }
+
+        # Pattern 6 (temperature RL-unified server):
+        # ROUND X/200
+        # Avg Accuracy (proxy): ...
+        # Avg Loss: ...
+        unified_temperature_round_pattern = re.compile(
+            r"ROUND\s+(\d+)\s*/\s*\d+"
+            r"(?:.|\n|\r\n)*?Avg\s+Accuracy\s*\(proxy\)\s*:\s*([\d.]+)\s*"
+            r"(?:.|\n|\r\n)*?Avg\s+Loss\s*:\s*([\d.]+)",
+            re.IGNORECASE,
+        )
+        for round_str, acc_str, loss_str in unified_temperature_round_pattern.findall(content):
+            round_num = int(round_str)
+            metrics_by_round[round_num] = {
+                "loss": float(loss_str),
+                "accuracy": float(acc_str),
+            }
 
         if not metrics_by_round:
             return None
 
         for round_num in sorted(metrics_by_round.keys()):
-            loss_val, acc_val = metrics_by_round[round_num]
+            round_metrics = metrics_by_round[round_num]
+            loss_val = float(round_metrics.get("loss", 0.0))
+            acc_val = float(round_metrics.get("accuracy", 0.0))
             rounds.append(round_num)
             loss.append(loss_val)
             accuracy.append(acc_val / 100.0 if acc_val > 1.0 else acc_val)
+            if "mse" in round_metrics:
+                mse.append(float(round_metrics["mse"]))
+            if "mae" in round_metrics:
+                mae.append(float(round_metrics["mae"]))
+            if "mape" in round_metrics:
+                mape.append(float(round_metrics["mape"]))
 
         if not rounds:
             return None
@@ -1675,7 +1738,7 @@ class ExperimentRunner:
             except Exception:
                 pass
 
-        return {
+        results = {
             "rounds": rounds,
             "loss": loss,
             "accuracy": accuracy,
@@ -1685,6 +1748,13 @@ class ExperimentRunner:
             "final_accuracy": accuracy[-1] if accuracy else None,
             "final_loss": loss[-1] if loss else None,
         }
+        if len(mse) == len(rounds):
+            results["mse"] = mse
+        if len(mae) == len(rounds):
+            results["mae"] = mae
+        if len(mape) == len(rounds):
+            results["mape"] = mape
+        return results
 
     @staticmethod
     def _normalize_training_results(data: Dict) -> Dict:

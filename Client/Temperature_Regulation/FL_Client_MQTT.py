@@ -628,13 +628,43 @@ class FederatedLearningClient:
 if __name__ == "__main__":
     # Load data
     print(f"Loading dataset for client {CLIENT_ID}...")
-    # Detect environment and construct dataset path
-    if os.path.exists('/app'):
-        dataset_path = '/app/Client/Temperature_Regulation/Dataset/base_data_baseline_unique.csv'
-    else:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(os.path.dirname(script_dir))
-        dataset_path = os.path.join(project_root, 'Client', 'Temperature_Regulation', 'Dataset', 'base_data_baseline_unique.csv')
+    # Allow the launcher to override the exact CSV path. This is important for
+    # distributed clients started on remote PCs where the dataset may be bind-
+    # mounted from the host rather than baked into the Docker image.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(script_dir))
+    candidate_dataset_paths = []
+
+    env_dataset_path = os.getenv("DATASET_PATH", "").strip()
+    if env_dataset_path:
+        candidate_dataset_paths.append(env_dataset_path)
+
+    candidate_dataset_paths.extend([
+        '/app/Client/Temperature_Regulation/Dataset/base_data_baseline_unique.csv',
+        os.path.join(project_root, 'Client', 'Temperature_Regulation', 'Dataset', 'base_data_baseline_unique.csv'),
+        os.path.join(script_dir, 'Dataset', 'base_data_baseline_unique.csv'),
+    ])
+
+    dataset_path = None
+    seen = set()
+    for cand in candidate_dataset_paths:
+        if cand and cand not in seen:
+            seen.add(cand)
+            if os.path.exists(cand):
+                dataset_path = cand
+                break
+
+    if dataset_path is None:
+        print("Dataset resolution failed. Checked the following paths:")
+        for cand in candidate_dataset_paths:
+            if cand:
+                print(f"  - {cand}")
+        raise FileNotFoundError(
+            "Temperature dataset not found. On a remote distributed client PC, "
+            "ensure the Dataset folder exists locally and is bind-mounted into the container, "
+            "or rebuild the Docker image on that PC so /app/Client/Temperature_Regulation/Dataset "
+            "contains base_data_baseline_unique.csv."
+        )
     print(f"Dataset path: {dataset_path}")
     dataframe = pd.read_csv(dataset_path)
     print(f"Dataset loaded: {dataframe.shape}")
