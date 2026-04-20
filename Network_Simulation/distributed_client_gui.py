@@ -1867,6 +1867,17 @@ class DistributedClientGUI(QMainWindow):
                 f"⚠️  Dataset directory not found on host: {dataset_host_path}\n"
                 f"   The container image must contain the dataset, or training will fail.\n"
             )
+            QMessageBox.critical(
+                self,
+                "Dataset missing on remote PC",
+                "The selected use-case dataset is not available on this machine.\n\n"
+                f"Expected host directory:\n{dataset_host_path}\n\n"
+                "To run the distributed client from a remote PC, do one of the following:\n"
+                "1. Copy/sync the repository Dataset folder to this remote PC, then restart the client.\n"
+                "2. Rebuild the client Docker image on this remote PC from the current repository so the dataset is copied into /app/Client/...\n"
+                "3. Manually mount the dataset CSV into the container path expected by the client."
+            )
+            return
 
         # Base command
         cmd = [
@@ -1885,7 +1896,10 @@ class DistributedClientGUI(QMainWindow):
         ]
         # Always bind-mount the dataset directory so stale images still have the CSV.
         if dataset_mount_available:
-            cmd.extend(["-v", f"{dataset_host_path}:{dataset_container_path}:ro"])
+            cmd.extend([
+                "-v", f"{dataset_host_path}:{dataset_container_path}:ro",
+                "-e", f"DATASET_PATH={dataset_container_path}/base_data_baseline_unique.csv",
+            ])
         if self.mount_shared_data.isChecked():
             cmd.extend(
                 [
