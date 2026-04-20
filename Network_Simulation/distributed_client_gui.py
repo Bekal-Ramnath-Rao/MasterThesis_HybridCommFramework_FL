@@ -1848,13 +1848,33 @@ class DistributedClientGUI(QMainWindow):
             network_scenario_env = "default"
         else:
             network_scenario_env = str(network_scenario).strip().lower() or "default"
-        
+
+        # Resolve per-use-case Dataset directory so it can be bind-mounted into the
+        # container, guaranteeing the CSV is present even when the image is stale.
+        _uc_dir_map = {
+            "emotion": "Emotion_Recognition",
+            "mentalstate": "MentalState_Recognition",
+            "temperature": "Temperature_Regulation",
+        }
+        _uc_dir = _uc_dir_map.get(_uc_key, "Temperature_Regulation")
+        dataset_host_path = os.path.join(project_root, "Client", _uc_dir, "Dataset")
+        dataset_container_path = f"/app/Client/{_uc_dir}/Dataset"
+        dataset_mount_available = os.path.isdir(dataset_host_path)
+        if dataset_mount_available:
+            self.log_text.append(f"📂 Dataset mount: {dataset_host_path} → {dataset_container_path}\n")
+        else:
+            self.log_text.append(
+                f"⚠️  Dataset directory not found on host: {dataset_host_path}\n"
+                f"   The container image must contain the dataset, or training will fail.\n"
+            )
+
         # Base command
         cmd = [
             "docker", "run", "-d",
             "--name", container_name,
             "--network", "host",  # Use host network to access server
-            "--cap-add", "NET_ADMIN",  # For network simulation
+            "--cap-add", "NET_ADMIN",   # For tc/netem network shaping
+            "--cap-add", "SYS_ADMIN",   # Needed by some kernels for netem/HTB
             "-v",
             f"{experiment_results_host}:/app/experiment_results",
             "-e", f"CLIENT_ID={client_id}",
@@ -1863,6 +1883,9 @@ class DistributedClientGUI(QMainWindow):
             "-e", f"CLIENT_USE_CASE={client_use_case_env}",
             "-e", f"NETWORK_SCENARIO={network_scenario_env}",
         ]
+        # Always bind-mount the dataset directory so stale images still have the CSV.
+        if dataset_mount_available:
+            cmd.extend(["-v", f"{dataset_host_path}:{dataset_container_path}:ro"])
         if self.mount_shared_data.isChecked():
             cmd.extend(
                 [
@@ -2208,6 +2231,17 @@ class DistributedClientGUI(QMainWindow):
     def _apply_tc_profile(self, container_name, cond):
         """Apply tc/netem profile inside the client container (detect iface toward server IP)."""
         try:
+            # Ensure sch_netem and sch_htb kernel modules are available on the host
+            # (needed for --network host containers; failures are non-fatal).
+            for mod in ("sch_netem", "sch_htb"):
+                try:
+                    subprocess.run(
+                        ["sudo", "modprobe", mod],
+                        capture_output=True, timeout=5,
+                    )
+                except (subprocess.SubprocessError, FileNotFoundError, OSError):
+                    pass
+
             dev = self._tc_netdev_for_container(container_name)
             self.log_text.append(f"  tc netdev: {dev} (route toward server {self.server_ip.text().strip()})\n")
             setup_cmds = [
