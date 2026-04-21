@@ -590,8 +590,12 @@ class UnifiedFederatedLearningServer:
             self.client_delivery_protocols.setdefault(client_id, 'grpc')
             print(f"[{protocol.upper()}] Client {client_id} registered ({len(self.registered_clients)}/{self.num_clients})")
             
-            if len(self.registered_clients) >= self.min_clients:
-                print(f"\n[Server] All {self.num_clients} clients registered!")
+            # Start training once, when the minimum required clients have joined.
+            if self.current_round == 0 and len(self.registered_clients) >= self.min_clients:
+                print(
+                    f"\n[Server] Minimum clients reached: {len(self.registered_clients)}/{self.min_clients}. "
+                    "Starting training."
+                )
                 self.start_training()
     
     def mark_client_converged(self, client_id: int):

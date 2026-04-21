@@ -890,21 +890,23 @@ class ExperimentRunner:
                 # Emotion unified client: collect→boundaries→RL training (override via env if needed)
                 os.environ.setdefault("RL_BOUNDARY_PIPELINE", "true")
                 os.environ.setdefault("RL_PHASE0_ROUNDS", "20")
+                # IMPORTANT: Respect federation size requested by the user (--min-clients).
+                # Previously this branch forced MIN_CLIENTS=1 whenever any local client was started,
+                # causing experiments to begin/finish after the first client joined.
+                total_fed = self._total_expected_federation_clients()
+                os.environ["MIN_CLIENTS"] = str(total_fed)
+                os.environ["NUM_CLIENTS"] = str(total_fed)
+                os.environ["MAX_CLIENTS"] = "100"
                 if int(self.local_clients) <= 0:
-                    # Server/brokers only: federation size from --min-clients (same as non-QL unified).
-                    total_fed = self._total_expected_federation_clients()
-                    os.environ["MIN_CLIENTS"] = str(total_fed)
-                    os.environ["NUM_CLIENTS"] = str(total_fed)
-                    os.environ["MAX_CLIENTS"] = "100"
                     print(
                         "RL training mode: no local client containers; "
-                        "server uses federation MIN_CLIENTS/NUM_CLIENTS until remote clients attach."
+                        "server waits for federation MIN_CLIENTS/NUM_CLIENTS until remote clients attach."
                     )
                 else:
-                    # RL training: one local client; server waits for 1 client; run until Q converges and exit
-                    os.environ["MIN_CLIENTS"] = "1"
-                    os.environ["NUM_CLIENTS"] = "1"
-                    print("RL training mode: starting only 1 client (converge and exit)")
+                    print(
+                        "RL training mode: starting local clients; "
+                        f"server will wait for MIN_CLIENTS={total_fed} total participants."
+                    )
             else:
                 os.environ["USE_QL_CONVERGENCE"] = "false"
                 # Multi-client FL: explore (train Q) unless explicit inference-only from GUI/CLI.
@@ -932,13 +934,17 @@ class ExperimentRunner:
                     ]
                     compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_ql
                 else:
-                    services_single_client = [
+                    # Unified compose defines up to three client services.
+                    max_unified_clients = 3
+                    num_local = max(0, min(int(self.local_clients), max_unified_clients))
+                    services_multi_client = [
                         "mqtt-broker-unified",
                         "amqp-broker-unified",
                         f"fl-server-unified-{uc}",
-                        f"fl-client-unified-{uc}-1",
                     ]
-                    compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_single_client
+                    for i in range(1, num_local + 1):
+                        services_multi_client.append(f"fl-client-unified-{uc}-{i}")
+                    compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_multi_client
             else:
                 # Unified compose defines up to three client services; a bare `up -d` starts all and ignores
                 # --local-clients. Start only brokers + server + the first N client services (N=0..3).
