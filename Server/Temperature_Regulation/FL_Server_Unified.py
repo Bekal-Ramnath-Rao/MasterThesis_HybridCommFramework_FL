@@ -27,6 +27,27 @@ import paho.mqtt.client as mqtt
 import pika  # AMQP
 import grpc  # gRPC
 from concurrent import futures
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+QUIC_AVAILABLE = False
+HTTP3_AVAILABLE = False
+try:
+    from aioquic.asyncio import serve
+    from aioquic.quic.configuration import QuicConfiguration
+    from aioquic.asyncio.protocol import QuicConnectionProtocol
+    from aioquic.quic.events import StreamDataReceived
+    QUIC_AVAILABLE = True
+except Exception as e:
+    print(f"Warning: aioquic not available, QUIC disabled ({type(e).__name__}: {e})")
+
+try:
+    from aioquic.h3.connection import H3_ALPN, H3Connection
+    from aioquic.h3.events import DataReceived, HeadersReceived, H3Event
+    from aioquic.quic.events import StreamReset
+    HTTP3_AVAILABLE = True
+except Exception as e:
+    print(f"Warning: aioquic H3 not available, HTTP/3 disabled ({type(e).__name__}: {e})")
 try:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'Protocols'))
     import federated_learning_pb2
@@ -102,6 +123,35 @@ GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
 GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(4 * 1024 * 1024)))
 PROTOCOL_NEGOTIATION_TIMEOUT_SEC = float(os.getenv("PROTOCOL_NEGOTIATION_TIMEOUT_SEC", "3.0"))
 PROTOCOL_NEGOTIATION_POLL_SEC = float(os.getenv("PROTOCOL_NEGOTIATION_POLL_SEC", "0.1"))
+QUIC_HOST = os.getenv("QUIC_HOST", "0.0.0.0")
+QUIC_PORT = int(os.getenv("QUIC_PORT", "4433"))
+HTTP3_HOST = os.getenv("HTTP3_HOST", "0.0.0.0")
+HTTP3_PORT = int(os.getenv("HTTP3_PORT", "4434"))
+
+
+def _resolve_cert_dir() -> Path:
+    # Docker unified compose mounts certs at /app/certs; local uses repo ./certs
+    if Path("/app/certs").exists():
+        return Path("/app/certs")
+    return Path(__file__).parent.parent.parent / "certs"
+
+
+def _load_quic_cert_chain(configuration: "QuicConfiguration") -> None:
+    cert_dir = _resolve_cert_dir()
+    cert_path = cert_dir / "quic_cert.pem"
+    key_path = cert_dir / "quic_key.pem"
+    if not cert_path.exists() or not key_path.exists():
+        raise FileNotFoundError(f"Missing QUIC cert/key in {cert_dir}")
+    configuration.load_cert_chain(str(cert_path), str(key_path))
+
+
+def _load_http3_cert_chain(configuration: "QuicConfiguration") -> None:
+    cert_dir = _resolve_cert_dir()
+    cert_path = cert_dir / "http3_cert.pem"
+    key_path = cert_dir / "http3_key.pem"
+    if not cert_path.exists() or not key_path.exists():
+        raise FileNotFoundError(f"Missing HTTP/3 cert/key in {cert_dir}")
+    configuration.load_cert_chain(str(cert_path), str(key_path))
 
 
 def _amqp_use_case_tag() -> str:
@@ -173,6 +223,8 @@ class UnifiedFederatedLearningServer:
         self.grpc_should_train = {}
         self.grpc_should_evaluate = {}
         self.grpc_model_ready = {}
+        self.quic_clients = {}   # client_id -> QuicConnectionProtocol
+        self.http3_clients = {}  # client_id -> QuicConnectionProtocol (with H3Connection on protocol)
         
         # Initialize quantization if needed
         use_quantization = os.getenv("USE_QUANTIZATION", "false").lower() in ("true", "1", "yes")
@@ -193,6 +245,188 @@ class UnifiedFederatedLearningServer:
         print(f"Max Rounds: {self.num_rounds}")
         print(f"Protocols: MQTT, AMQP, gRPC, QUIC, DDS")
         print(f"{'='*70}\n")
+
+    # -------------------------------------------------------------------------
+    # QUIC + HTTP/3 (UDP) protocol handlers
+    # -------------------------------------------------------------------------
+
+    async def handle_quic_message(self, message: dict, protocol: "QuicConnectionProtocol") -> None:
+        msg_type = (message or {}).get("type")
+        if msg_type == "register":
+            client_id = int(message["client_id"])
+            self.quic_clients[client_id] = protocol
+            await asyncio.get_running_loop().run_in_executor(None, self.handle_client_registration, client_id, "quic")
+            return
+        if msg_type == "model_update":
+            await asyncio.get_running_loop().run_in_executor(None, self.handle_client_update, message, "quic")
+            return
+        if msg_type == "metrics":
+            await asyncio.get_running_loop().run_in_executor(None, self.handle_client_metrics, message, "quic")
+            return
+
+    def send_quic_message(self, client_id: int, message: dict) -> None:
+        protocol = self.quic_clients.get(int(client_id))
+        if protocol is None:
+            return
+        try:
+            stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
+            data = (json.dumps(message) + "\n").encode("utf-8")
+            protocol._quic.send_stream_data(stream_id, data, end_stream=True)
+            protocol.transmit()
+        except Exception as e:
+            print(f"[QUIC] Failed to send to client {client_id}: {e}")
+
+    def start_quic_server(self) -> None:
+        if not QUIC_AVAILABLE:
+            print("[QUIC] aioquic not available; skipping QUIC server start")
+            return
+
+        def run_quic():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._run_quic_server())
+            except Exception as e:
+                print(f"[QUIC] Server thread error: {e}")
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=run_quic, daemon=True).start()
+        print(f"[QUIC] Server initialized on {QUIC_HOST}:{QUIC_PORT}")
+
+    async def _run_quic_server(self) -> None:
+        configuration = QuicConfiguration(is_client=False)
+        _load_quic_cert_chain(configuration)
+
+        server_ref = self
+
+        class _UnifiedQuicProtocol(QuicConnectionProtocol):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._buffer = b""
+
+            def quic_event_received(self, event):
+                if isinstance(event, StreamDataReceived):
+                    self._buffer += event.data
+                    while b"\n" in self._buffer:
+                        message_data, self._buffer = self._buffer.split(b"\n", 1)
+                        if not message_data:
+                            continue
+                        try:
+                            msg = json.loads(message_data.decode("utf-8"))
+                        except Exception:
+                            continue
+                        asyncio.create_task(server_ref.handle_quic_message(msg, self))
+
+        await serve(
+            QUIC_HOST,
+            QUIC_PORT,
+            configuration=configuration,
+            create_protocol=_UnifiedQuicProtocol,
+        )
+        await asyncio.Future()
+
+    async def handle_http3_message(self, message: dict, protocol: "QuicConnectionProtocol") -> None:
+        msg_type = (message or {}).get("type")
+        if msg_type == "register":
+            client_id = int(message["client_id"])
+            self.http3_clients[client_id] = protocol
+            await asyncio.get_running_loop().run_in_executor(None, self.handle_client_registration, client_id, "http3")
+            return
+        if msg_type == "model_update":
+            await asyncio.get_running_loop().run_in_executor(None, self.handle_client_update, message, "http3")
+            return
+        if msg_type == "metrics":
+            await asyncio.get_running_loop().run_in_executor(None, self.handle_client_metrics, message, "http3")
+            return
+
+    def send_http3_message(self, client_id: int, message: dict) -> None:
+        protocol = self.http3_clients.get(int(client_id))
+        if protocol is None:
+            return
+        try:
+            if getattr(protocol, "_http", None) is None:
+                protocol._http = H3Connection(protocol._quic)
+            payload = json.dumps(message).encode("utf-8")
+            headers = [
+                (b":status", b"200"),
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(payload)).encode()),
+            ]
+            stream_id = protocol._quic.get_next_available_stream_id(is_unidirectional=False)
+            protocol._http.send_headers(stream_id=stream_id, headers=headers)
+            protocol._http.send_data(stream_id=stream_id, data=payload, end_stream=True)
+            protocol.transmit()
+        except Exception as e:
+            print(f"[HTTP/3] Failed to send to client {client_id}: {e}")
+
+    def start_http3_server(self) -> None:
+        if not (QUIC_AVAILABLE and HTTP3_AVAILABLE):
+            print("[HTTP/3] aioquic H3 not available; skipping HTTP/3 server start")
+            return
+
+        def run_h3():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(self._run_http3_server())
+            except Exception as e:
+                print(f"[HTTP/3] Server thread error: {e}")
+            finally:
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=run_h3, daemon=True).start()
+        print(f"[HTTP/3] Server initialized on {HTTP3_HOST}:{HTTP3_PORT}")
+
+    async def _run_http3_server(self) -> None:
+        configuration = QuicConfiguration(is_client=False, alpn_protocols=H3_ALPN)
+        _load_http3_cert_chain(configuration)
+
+        server_ref = self
+
+        class _UnifiedHttp3Protocol(QuicConnectionProtocol):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._http = None
+                self._buffers = {}
+
+            def quic_event_received(self, event):
+                if self._http is None:
+                    self._http = H3Connection(self._quic)
+                for h3_event in self._http.handle_event(event):
+                    self._handle_h3_event(h3_event)
+
+            def _handle_h3_event(self, event: "H3Event"):
+                if isinstance(event, HeadersReceived):
+                    self._buffers.setdefault(event.stream_id, b"")
+                elif isinstance(event, DataReceived):
+                    sid = event.stream_id
+                    self._buffers.setdefault(sid, b"")
+                    self._buffers[sid] += event.data
+                    if event.stream_ended:
+                        raw = self._buffers.get(sid, b"")
+                        self._buffers[sid] = b""
+                        try:
+                            msg = json.loads(raw.decode("utf-8"))
+                        except Exception:
+                            return
+                        asyncio.create_task(server_ref.handle_http3_message(msg, self))
+                elif isinstance(event, StreamReset):
+                    self._buffers.pop(event.stream_id, None)
+
+        await serve(
+            HTTP3_HOST,
+            HTTP3_PORT,
+            configuration=configuration,
+            create_protocol=_UnifiedHttp3Protocol,
+        )
+        await asyncio.Future()
     
     def initialize_global_model(self):
         """Initialize global model weights as a list (Keras get_weights() format).
@@ -599,7 +833,10 @@ class UnifiedFederatedLearningServer:
                 elif protocol == 'grpc':
                     # Client pulls via GetGlobalModel over gRPC control/data plane.
                     pass
-                # Other protocols can be added here as needed.
+                elif protocol == 'quic':
+                    self.send_quic_message(int(client_id), {'type': 'global_model', **message})
+                elif protocol == 'http3':
+                    self.send_http3_message(int(client_id), {'type': 'global_model', **message})
                 
                 print(f"[{protocol.upper()}] Sent global model to client {client_id}")
             except Exception as e:
@@ -753,6 +990,8 @@ class UnifiedFederatedLearningServer:
         self.start_mqtt_server()
         self.start_amqp_server()
         self.start_grpc_server()
+        self.start_quic_server()
+        self.start_http3_server()
         
         print("[Server] All protocol handlers started")
         print("[Server] Waiting for client registrations...")
