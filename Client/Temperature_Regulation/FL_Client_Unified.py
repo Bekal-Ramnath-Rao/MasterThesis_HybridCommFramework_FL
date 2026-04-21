@@ -1883,11 +1883,15 @@ class UnifiedFLClient_Temperature:
                     "training_time_sec": float(train_metrics.get("training_time", 0.0)),
                     "total_fl_wall_time_sec": float(round_time),
                     "uplink_model_comm_sec": float(self.round_metrics.get("communication_time", 0.0)),
+                    # Tag unified runs explicitly so post-processing can select them even
+                    # though the chosen transport varies per-round.
+                    "run_key": "unified",
+                    "selected_protocol": str(protocol),
                     "battery_energy_joules": 0.0,
                     "battery_soc_after": _batt_soc,
                 },
                 use_case=use_case_from_env("temperature"),
-                protocol=str(protocol),
+                protocol="unified",
             )
             
             return {
