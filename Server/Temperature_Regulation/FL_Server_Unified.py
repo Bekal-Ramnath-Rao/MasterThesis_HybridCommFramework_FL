@@ -106,6 +106,21 @@ except ImportError:
         v = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").strip().lower()
         return v in ("1", "true", "yes")
 
+
+def _training_termination_mode() -> str:
+    """Normalize training termination mode for unified server logic."""
+    return (os.getenv("TRAINING_TERMINATION_MODE") or "").strip().lower()
+
+
+def _loss_early_stopping_enabled() -> bool:
+    """
+    Loss-based early stopping is disabled when:
+    - fixed_rounds: user/GUI wants exactly NUM_ROUNDS
+    - client_convergence: RL phases may require many rounds
+    """
+    mode = _training_termination_mode()
+    return mode not in ("fixed_rounds", "client_convergence")
+
 # Server Configuration
 # Dynamic client configuration
 MIN_CLIENTS = int(os.getenv("MIN_CLIENTS", "2"))  # Minimum clients to start training
@@ -773,10 +788,11 @@ class UnifiedFederatedLearningServer:
         if self.converged:
             return
 
-        # Loss-based early stopping — disabled in client_convergence mode so the
-        # RL agent can complete all 3 phases (Phase 1: 20+ rounds, Phase 2:
-        # boundary setting, Phase 3: Q-learning until 5 consecutive same-protocol).
-        if not stop_on_client_convergence():
+        # Loss-based early stopping — DISABLED when GUI/user selects fixed_rounds,
+        # and also disabled in client_convergence mode so the RL agent can complete
+        # all 3 phases (Phase 1: 20+ rounds, Phase 2: boundary setting, Phase 3:
+        # Q-learning until 5 consecutive same-protocol).
+        if _loss_early_stopping_enabled():
             if self.current_round >= MIN_ROUNDS:
                 if self.best_loss - avg_loss > CONVERGENCE_THRESHOLD:
                     self.best_loss = avg_loss

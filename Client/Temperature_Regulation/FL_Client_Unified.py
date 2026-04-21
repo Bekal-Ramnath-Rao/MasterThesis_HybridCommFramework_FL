@@ -1258,6 +1258,9 @@ class UnifiedFLClient_Temperature:
                     current_round=int(getattr(self, "current_round", 0)),
                 )
             )
+            # If the server is complete, stop polling for rounds.
+            if bool(getattr(status, "is_complete", False)):
+                return None
             r = int(status.current_round)
             return r if r > 0 else None
         except Exception as e:
