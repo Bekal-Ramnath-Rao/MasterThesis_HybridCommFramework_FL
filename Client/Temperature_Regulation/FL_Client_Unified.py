@@ -266,7 +266,7 @@ class UnifiedFLClient_Temperature:
         
         # Process data
         self.dataframe = dataframe
-        self.X_train, self.y_train = self._prepare_data()
+        self.X_train, self.y_train, self.X_test, self.y_test = self._prepare_data()
         
         # Model
         self.model = None
@@ -800,7 +800,7 @@ class UnifiedFLClient_Temperature:
         except Exception as e:
             print(f"[Network] Failed to measure network condition: {e}")
 
-    def _prepare_data(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _prepare_data(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Prepare temperature data for training (same partitioning as FL_Client_MQTT: 1-based CLIENT_ID)."""
         total_samples = len(self.dataframe)
         # CLIENT_ID is 1-based in Docker; map to 0-based partition index (matches other temperature clients).
@@ -829,12 +829,20 @@ class UnifiedFLClient_Temperature:
             X = client_data.iloc[:, :-1].values
             y = client_data.iloc[:, -1].values
 
+        # Split into train (80%) and test (20%) - matches single-protocol clients
+        split_idx = int(len(X) * 0.8)
+        X_train = X[:split_idx]
+        y_train = y[:split_idx]
+        X_test = X[split_idx:]
+        y_test = y[split_idx:]
+
         print(f"[Data Preparation] Client {self.client_id}")
         print(f"  Total dataset: {total_samples} samples")
         print(f"  Client subset: {len(y)} samples (indices {start_idx} to {end_idx}, partition {client_index}/{self.num_clients})")
+        print(f"  Training samples: {len(y_train)}, Test samples: {len(y_test)}")
         print(f"  Features shape: {X.shape}")
 
-        return X.astype(np.float32), y.astype(np.float32)
+        return X_train.astype(np.float32), y_train.astype(np.float32), X_test.astype(np.float32), y_test.astype(np.float32)
     
     def build_model(self, input_dim) -> keras.Model:
         """Build temperature regulation model (Dense network for regression)"""
@@ -1417,37 +1425,55 @@ class UnifiedFLClient_Temperature:
         
         start_time = time.time()
         
-        # Train with GPU acceleration (validation_split needs enough samples; same idea as emotion FL clients)
-        n_samples = len(self.y_train)
-        fit_kwargs = {
-            "epochs": self.local_epochs,
-            "batch_size": self.batch_size,
-            "verbose": 0,
-        }
-        if n_samples >= 5:
-            fit_kwargs["validation_split"] = 0.2
-
+        # Train with GPU acceleration (without validation_split since we have separate test set)
         with tf.device('/GPU:0' if gpus else '/CPU:0'):
-            history = self.model.fit(self.X_train, self.y_train, **fit_kwargs)
+            history = self.model.fit(
+                self.X_train, 
+                self.y_train,
+                epochs=self.local_epochs,
+                batch_size=self.batch_size,
+                verbose=0
+            )
 
         training_time = time.time() - start_time
-
-        hist = history.history
-        if "val_mae" in hist:
-            val_mae = hist["val_mae"][-1]
-            val_loss = hist["val_loss"][-1]
-        else:
-            val_mae = hist["mae"][-1]
-            val_loss = hist["loss"][-1]
         
         metrics = {
             'training_time': training_time,
-            'val_accuracy': 1.0 / (1.0 + val_mae),  # Convert MAE to accuracy-like metric
-            'val_loss': val_loss,
-            'val_mae': val_mae
         }
         
-        print(f"[Training] Time: {training_time:.2f}s, MAE: {val_mae:.4f}")
+        print(f"[Training] Time: {training_time:.2f}s")
+        
+        return metrics
+    
+    def evaluate_model(self) -> Dict:
+        """Evaluate model on test set - matches single-protocol clients"""
+        if self.model is None:
+            return {}
+        
+        # Evaluate on test set
+        with tf.device('/GPU:0' if gpus else '/CPU:0'):
+            test_loss, test_mae = self.model.evaluate(
+                self.X_test,
+                self.y_test,
+                batch_size=16,
+                verbose=0
+            )
+        
+        # Also compute MSE and MAPE for consistency with single-protocol clients
+        predictions = self.model.predict(self.X_test, verbose=0)
+        mse = float(np.mean((predictions.flatten() - self.y_test) ** 2))
+        # MAPE calculation (avoid division by zero)
+        epsilon = 1e-10
+        mape = float(np.mean(np.abs((self.y_test - predictions.flatten()) / (self.y_test + epsilon))) * 100)
+        
+        metrics = {
+            'loss': float(test_loss),
+            'mae': float(test_mae),
+            'mse': float(mse),
+            'mape': float(mape),
+        }
+        
+        print(f"[Evaluation] Loss: {test_loss:.4f}, MAE: {test_mae:.4f}, MSE: {mse:.4f}, MAPE: {mape:.2f}%")
         
         return metrics
     
@@ -1491,9 +1517,10 @@ class UnifiedFLClient_Temperature:
         num_samples = int(self.X_train.shape[0])
         tm = train_metrics or {}
         metrics = {
-            "val_accuracy": float(tm.get("val_accuracy", 0.0)),
-            "val_loss": float(tm.get("val_loss", 0.0)),
-            "val_mae": float(tm.get("val_mae", 0.0)),
+            "loss": float(tm.get("loss", 0.0)),
+            "mse": float(tm.get("mse", 0.0)),
+            "mae": float(tm.get("mae", 0.0)),
+            "mape": float(tm.get("mape", 0.0)),
             "training_time": float(tm.get("training_time", 0.0)),
             "training_time_sec": float(tm.get("training_time", 0.0)),
         }
@@ -1703,14 +1730,20 @@ class UnifiedFLClient_Temperature:
             # Train locally
             print(f"[Training] Starting local training...")
             train_metrics = self.train_local_model()
+            
+            # Evaluate on test set (matches single-protocol clients)
+            print(f"[Evaluation] Starting model evaluation...")
+            eval_metrics = self.evaluate_model()
 
-            upload_ok, uplink_sec = self._uplink_send_model_update(protocol, train_metrics)
+            # Merge metrics for uplink message
+            combined_metrics = {**train_metrics, **eval_metrics}
+            upload_ok, uplink_sec = self._uplink_send_model_update(protocol, combined_metrics)
             self.round_metrics["communication_time"] = float(uplink_sec)
             
             # Update metrics
             round_time = time.time() - round_start
             self.round_metrics['convergence_time'] = train_metrics['training_time']
-            self.round_metrics['accuracy'] = train_metrics['val_accuracy']
+            self.round_metrics['accuracy'] = 1.0 / (1.0 + eval_metrics.get('mae', 1.0))  # Convert MAE to accuracy-like metric
             self.round_metrics['success'] = upload_ok
             
             # Q-learning updates only while exploring (USE_RL_EXPLORATION); inference is greedy-only, frozen Q.
@@ -1872,14 +1905,22 @@ class UnifiedFLClient_Temperature:
                 if (USE_RL_SELECTION and self.env_manager)
                 else 1.0
             )
+            # Update local convergence tracking with test loss
+            test_loss = float(eval_metrics.get("loss", 0.0))
+            if ENABLE_LOCAL_CONVERGENCE_STOP:
+                should_stop = self._update_client_convergence_and_maybe_stop(test_loss)
+                if should_stop:
+                    print(f"[Client {self.client_id}] Stopping due to local convergence")
+            
             append_client_fl_metrics_record(
                 self.client_id,
                 {
                     "client_id": self.client_id,
                     "round": int(getattr(self, "current_round", 0)),
-                    "loss": float(train_metrics.get("val_loss", 0.0)),
-                    "accuracy": float(train_metrics.get("val_accuracy", 0.0)),
-                    "val_mae": float(train_metrics.get("val_mae", 0.0)),
+                    "loss": float(eval_metrics.get("loss", 0.0)),
+                    "mse": float(eval_metrics.get("mse", 0.0)),
+                    "mae": float(eval_metrics.get("mae", 0.0)),
+                    "mape": float(eval_metrics.get("mape", 0.0)),
                     "training_time_sec": float(train_metrics.get("training_time", 0.0)),
                     "total_fl_wall_time_sec": float(round_time),
                     "uplink_model_comm_sec": float(self.round_metrics.get("communication_time", 0.0)),
@@ -1898,10 +1939,13 @@ class UnifiedFLClient_Temperature:
                 'protocol': protocol,
                 'round_time': round_time,
                 **self.round_metrics,
-                **train_metrics
+                **train_metrics,
+                **eval_metrics
             }
         except Exception as e:
             print(f"[Error] FL Round failed: {e}")
+            import traceback
+            traceback.print_exc()
             return {'protocol': protocol, 'success': False}
     
     def run(self, num_rounds: int = 10):
