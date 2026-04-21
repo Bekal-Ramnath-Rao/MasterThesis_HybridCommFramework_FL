@@ -1907,22 +1907,44 @@ class UnifiedFLClient_Temperature:
                 f"[Client {self.client_id}] WARNING: gRPC registration failed — "
                 f"server will stay at current_round=0 and will reject all model updates (wrong round)."
             )
-        
-        for round_num in range(num_rounds):
-            self.current_round = round_num
+
+        # IMPORTANT: block until the server actually starts training (current_round > 0).
+        # Otherwise a single client can race ahead and publish updates that the server
+        # must reject while it is still waiting for MIN_CLIENTS registrations.
+        rounds_completed = 0
+        last_round_sent: Optional[int] = None
+        while rounds_completed < num_rounds:
+            server_round = self._fetch_server_fl_round_for_uplink()
+            if server_round is None:
+                if rounds_completed == 0:
+                    print(
+                        f"[Client {self.client_id}] Waiting for server to start training "
+                        f"(server current_round=0; likely waiting for MIN_CLIENTS)..."
+                    )
+                time.sleep(1.0)
+                continue
+
+            if last_round_sent == int(server_round):
+                time.sleep(0.25)
+                continue
+
+            self.current_round = int(server_round)
             print(f"\n{'#'*70}")
-            print(f"# ROUND {round_num + 1}/{num_rounds}")
+            print(f"# ROUND {rounds_completed + 1}/{num_rounds} (server_round={self.current_round})")
             print(f"{'#'*70}\n")
-            
+
             metrics = self.federated_learning_round()
-            
-            print(f"\n[Round {round_num + 1}] Metrics:")
+
+            last_round_sent = int(server_round)
+            rounds_completed += 1
+
+            print(f"\n[Round {rounds_completed}] Metrics:")
             for key, value in metrics.items():
                 print(f"  {key}: {value}")
 
             if getattr(self, "_temperature_rl_converged", False):
                 print(
-                    f"\n[Client {self.client_id}] Stopping after round {round_num + 1}: "
+                    f"\n[Client {self.client_id}] Stopping after round {rounds_completed}: "
                     f"USE_QL_CONVERGENCE and uplink+downlink protocol-selection convergence (goals met)."
                 )
                 self._notify_rl_converged_grpc()
@@ -1934,7 +1956,7 @@ class UnifiedFLClient_Temperature:
                 loss_val = float(metrics.get("val_loss", float("inf")))
                 if self._update_client_convergence_and_maybe_stop(loss_val):
                     print(
-                        f"\n[Client {self.client_id}] Stopping FL loop after round {round_num + 1}: "
+                        f"\n[Client {self.client_id}] Stopping FL loop after round {rounds_completed}: "
                         f"local loss-convergence reached (ENABLE_LOCAL_CONVERGENCE_STOP=true)."
                     )
                     break

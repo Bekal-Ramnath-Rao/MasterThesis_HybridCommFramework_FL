@@ -55,7 +55,7 @@ services:
       - ../Server/Temperature_Regulation:/app/Server/Temperature_Regulation
       - ../experiment_results:/app/results
       - ../shared_data:/shared_data
-      - ../certs:/app/certs:ro
+      - ../.certs:/app/certs:ro
     depends_on:
       - mqtt-broker-unified
       - amqp-broker-unified
@@ -108,7 +108,7 @@ services:
       - ../Client/Temperature_Regulation:/app/Client/Temperature_Regulation
       - ../shared_data:/shared_data
       - ../experiment_results:/app/results
-      - ../certs:/app/certs:ro
+      - ../.certs:/app/certs:ro
     depends_on:
       - fl-server-unified-temperature
       - mqtt-broker-unified
@@ -176,7 +176,7 @@ services:
       - ../Client/Temperature_Regulation:/app/Client/Temperature_Regulation
       - ../shared_data:/shared_data
       - ../experiment_results:/app/results
-      - ../certs:/app/certs:ro
+      - ../.certs:/app/certs:ro
     depends_on:
       - fl-server-unified-temperature
       - mqtt-broker-unified

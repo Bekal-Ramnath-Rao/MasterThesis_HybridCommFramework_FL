@@ -77,7 +77,7 @@ services:
       - ../Server/Temperature_Regulation:/app/Server/Temperature_Regulation
       - ../experiment_results:/app/results
       - ../shared_data:/shared_data
-      - ../certs:/app/certs:ro
+      - ../.certs:/app/certs:ro
     depends_on:
       mqtt-broker-unified:
         condition: service_started
@@ -144,7 +144,7 @@ services:
       - ../Network_Simulation:/app/Network_Simulation:ro
       - ../experiment_results:/app/results
       - ../shared_data:/shared_data
-      - ../certs:/app/certs:ro
+      - ../.certs:/app/certs:ro
     depends_on:
       fl-server-unified-temperature:
         condition: service_started
@@ -222,7 +222,7 @@ services:
       - ../Network_Simulation:/app/Network_Simulation:ro
       - ../experiment_results:/app/results
       - ../shared_data:/shared_data
-      - ../certs:/app/certs:ro
+      - ../.certs:/app/certs:ro
     depends_on:
       fl-server-unified-temperature:
         condition: service_started
