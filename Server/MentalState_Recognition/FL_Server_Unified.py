@@ -14,6 +14,7 @@ import base64
 import time
 import os
 import sys
+import signal
 import threading
 from typing import List, Dict
 from pathlib import Path
@@ -57,6 +58,24 @@ except ModuleNotFoundError:
         plot_cpu_memory_for_server_rounds,
     )
 
+try:
+    from fl_termination_env import stop_on_client_convergence
+except ImportError:
+    def stop_on_client_convergence() -> bool:
+        """Fallback if fl_termination_env is not found."""
+        mode = (os.getenv("TRAINING_TERMINATION_MODE") or "").strip().lower()
+        if mode == "fixed_rounds":
+            return False
+        if mode == "client_convergence":
+            return True
+        # Auto-detect RL mode
+        use_ql = os.getenv("USE_QL_CONVERGENCE", "").strip().lower() in ("1", "true", "yes")
+        if use_ql:
+            print("[Server] Auto-detected USE_QL_CONVERGENCE=True → using fixed_rounds mode (no early stopping)")
+            return False
+        v = os.getenv("STOP_ON_CLIENT_CONVERGENCE", "true").strip().lower()
+        return v in ("1", "true", "yes")
+
 # Add Compression_Technique to path
 compression_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Compression_Technique')
 if compression_path not in sys.path:
@@ -78,14 +97,17 @@ CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
 CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
 MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
 
+# RL Configuration
+USE_QL_CONVERGENCE = os.getenv("USE_QL_CONVERGENCE", "").strip().lower() in ("1", "true", "yes")
+
 # Protocol endpoints (auto-detect Docker vs local)
 IN_DOCKER = os.path.exists('/app')
 MQTT_BROKER = os.getenv("MQTT_BROKER", 'mqtt-broker' if IN_DOCKER else 'localhost')
 AMQP_BROKER = os.getenv("AMQP_BROKER", 'amqp-broker' if IN_DOCKER else 'localhost')
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50051"))
 GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(4 * 1024 * 1024)))
-PROTOCOL_NEGOTIATION_TIMEOUT_SEC = float(os.getenv("PROTOCOL_NEGOTIATION_TIMEOUT_SEC", "3.0"))
-PROTOCOL_NEGOTIATION_POLL_SEC = float(os.getenv("PROTOCOL_NEGOTIATION_POLL_SEC", "0.1"))
+PROTOCOL_NEGOTIATION_TIMEOUT_SEC = float(os.getenv("PROTOCOL_NEGOTIATION_TIMEOUT_SEC", "10.0"))  # Increased from 3.0 to 10.0 to wait for client training to finish
+PROTOCOL_NEGOTIATION_POLL_SEC = float(os.getenv("PROTOCOL_NEGOTIATION_POLL_SEC", "0.2"))
 
 
 class UnifiedFederatedLearningServer:
@@ -126,9 +148,13 @@ class UnifiedFederatedLearningServer:
         # Lock for thread-safe operations
         self.lock = threading.Lock()
         
+        # Shutdown flag for graceful termination
+        self.shutdown_requested = False
+        
         # Protocol handlers
         self.mqtt_client = None
         self.amqp_connection = None
+        self.amqp_channel = None
         self.grpc_server = None
         self.dds_participant = None
         self.grpc_should_train = {}
@@ -157,17 +183,23 @@ class UnifiedFederatedLearningServer:
     
     def initialize_global_model(self):
         """Initialize global model weights using the actual mentalstate CNN+BiLSTM+MHA architecture."""
+        t0 = time.time()
+        print(f"[Model] initialize_global_model(): begin (pid={os.getpid()})", flush=True)
+        print("[Model] Importing TensorFlow...", flush=True)
         import tensorflow as tf
+        print(f"[Model] TensorFlow imported (v={getattr(tf, '__version__', 'unknown')}) in {time.time()-t0:.3f}s", flush=True)
         try:
             _server_dir = os.path.dirname(os.path.abspath(__file__))
             if _server_dir not in sys.path:
                 sys.path.insert(0, _server_dir)
+            print("[Model] Importing FL_Server_MQTT.build_model...", flush=True)
             from FL_Server_MQTT import build_model as _build_ms_model
+            print("[Model] Building mentalstate model...", flush=True)
             _model = _build_ms_model()
             self.global_weights = _model.get_weights()
-            print(f"[Model] Global model initialized (CNN+BiLSTM+MHA, {len(self.global_weights)} weight tensors)")
+            print(f"[Model] Global model initialized (CNN+BiLSTM+MHA, {len(self.global_weights)} weight tensors) in {time.time()-t0:.3f}s", flush=True)
         except Exception as e:
-            print(f"[Model] Could not load mentalstate build_model ({e}); falling back to random weights")
+            print(f"[Model] Could not load mentalstate build_model ({e}); falling back to random weights", flush=True)
             # Fallback: build the architecture inline so weight shapes are always correct
             inp = tf.keras.Input(shape=(256, 20))
             x = tf.keras.layers.Conv1D(64, 7, padding="same", use_bias=False)(inp)
@@ -191,7 +223,7 @@ class UnifiedFederatedLearningServer:
             out = tf.keras.layers.Dense(5, activation="softmax", dtype="float32")(x)
             _model = tf.keras.Model(inp, out)
             self.global_weights = _model.get_weights()
-            print(f"[Model] Global model initialized via fallback ({len(self.global_weights)} weight tensors)")
+            print(f"[Model] Global model initialized via fallback ({len(self.global_weights)} weight tensors) in {time.time()-t0:.3f}s", flush=True)
     
     def start_mqtt_server(self):
         """Start MQTT protocol handler"""
@@ -275,6 +307,7 @@ class UnifiedFederatedLearningServer:
             amqp_thread.start()
             
             self.amqp_connection = connection
+            self.amqp_channel = channel
             print("[AMQP] Server started")
         except Exception as e:
             print(f"[AMQP] Failed to start: {e}")
@@ -367,12 +400,15 @@ class UnifiedFederatedLearningServer:
         return normalized if normalized in allowed else None
 
     def _get_delivery_protocol(self, client_id):
-        return self.client_delivery_protocols.get(client_id, 'grpc')
+        selected = self.client_delivery_protocols.get(client_id, 'grpc')
+        print(f"[Server] _get_delivery_protocol({client_id}): returning '{selected}' (available protocols: {dict(self.client_delivery_protocols)})")
+        return selected
 
     def prepare_downlink_protocol_negotiation(self, target_client_ids, round_id, global_model_id):
         target_clients = [cid for cid in target_client_ids if cid in self.registered_clients]
         if not target_clients:
             return
+        print(f"[Server] Preparing downlink protocol negotiation for round {round_id}, global_model {global_model_id}, clients: {target_clients}")
         for client_id in target_clients:
             self.client_protocol_queries[client_id] = {
                 'round_id': int(round_id),
@@ -383,10 +419,13 @@ class UnifiedFederatedLearningServer:
         while time.time() < deadline:
             pending = [cid for cid in target_clients if cid in self.client_protocol_queries]
             if not pending:
+                print(f"[Server] All clients responded to downlink protocol negotiation")
                 break
             time.sleep(max(PROTOCOL_NEGOTIATION_POLL_SEC, 0.01))
 
         pending_after_wait = [cid for cid in target_clients if cid in self.client_protocol_queries]
+        if pending_after_wait:
+            print(f"[Server] Timeout waiting for clients {pending_after_wait} to select downlink protocol, defaulting to gRPC")
         for client_id in pending_after_wait:
             self.client_delivery_protocols[client_id] = 'grpc'
             self.client_protocol_queries.pop(client_id, None)
@@ -446,22 +485,40 @@ class UnifiedFederatedLearningServer:
         print(f"Avg training time (clients reporting): {self.AVG_TRAINING_TIME_SEC[-1]:.3f} s")
         print(f"Avg battery SoC: {self.AVG_BATTERY_SOC[-1]:.4f}")
         
-        # Check convergence
-        if self.current_round >= MIN_ROUNDS:
-            if self.best_loss - avg_loss > CONVERGENCE_THRESHOLD:
-                self.best_loss = avg_loss
-                self.rounds_without_improvement = 0
-            else:
-                self.rounds_without_improvement += 1
-            
-            if self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
-                self.converged = True
-                self.convergence_time = time.time() - self.start_time
-                print(f"\n✅ CONVERGENCE ACHIEVED at round {self.current_round}")
-                self.save_results()
-                return
+        # Check for client-reported convergence signals (RL Q-convergence mode)
+        if stop_on_client_convergence():
+            # In client convergence mode (RL training), check if clients reported convergence
+            for client_id, metrics in self.client_metrics.items():
+                client_converged_flag = float(metrics.get('client_converged', 0.0))
+                if client_converged_flag >= 1.0:
+                    print(f"[Server] Client {client_id} reported convergence (Q-learning complete)")
+                    # In single-client mode, stop immediately when client reports convergence
+                    if len(self.registered_clients) == 1:
+                        self.converged = True
+                        self.convergence_time = time.time() - self.start_time
+                        print(f"\n✅ CLIENT CONVERGENCE (Q-LEARNING) at round {self.current_round}")
+                        self.save_results()
+                        return
+            # Don't check server-side accuracy convergence in client-convergence mode
         else:
-            self.best_loss = min(self.best_loss, avg_loss)
+            # Fixed-rounds mode: check server-side accuracy convergence ONLY if not using RL
+            if not USE_QL_CONVERGENCE:
+                if self.current_round >= MIN_ROUNDS:
+                    if self.best_loss - avg_loss > CONVERGENCE_THRESHOLD:
+                        self.best_loss = avg_loss
+                        self.rounds_without_improvement = 0
+                    else:
+                        self.rounds_without_improvement += 1
+                    
+                    if self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
+                        self.converged = True
+                        self.convergence_time = time.time() - self.start_time
+                        print(f"\n✅ ACCURACY CONVERGENCE at round {self.current_round}")
+                        self.save_results()
+                        return
+                else:
+                    self.best_loss = min(self.best_loss, avg_loss)
+            # If USE_QL_CONVERGENCE=True, skip accuracy convergence entirely (run all NUM_ROUNDS)
         
         # Clear for next round
         self.client_updates.clear()
@@ -478,15 +535,20 @@ class UnifiedFederatedLearningServer:
         """Broadcast global model to all clients via their registered protocols"""
         weights_b64 = base64.b64encode(pickle.dumps(self.global_weights)).decode()
 
+        # Protocol negotiation only happens from round 2 onwards (round 1 always uses gRPC)
         if self.current_round > 1:
+            print(f"[Server] Round {self.current_round}: Initiating downlink protocol negotiation...")
             self.prepare_downlink_protocol_negotiation(
                 target_client_ids=list(self.registered_clients.keys()),
                 round_id=self.current_round,
                 global_model_id=self.current_round,
             )
+        else:
+            print(f"[Server] Round {self.current_round}: Initial model broadcast, using gRPC (no negotiation)")
         
         for client_id in self.registered_clients.keys():
             protocol = 'grpc' if self.current_round == 1 else self._get_delivery_protocol(client_id)
+            print(f"[Server] Broadcasting round {self.current_round} to client {client_id} via {protocol.upper()}")
             message = {
                 'round': self.current_round,
                 'weights': weights_b64,
@@ -578,8 +640,69 @@ class UnifiedFederatedLearningServer:
         print(f"\n✅ Results saved to {results_file}")
         print(f"✅ Experiment runner snapshot: {stable_runner}")
 
+    def cleanup(self):
+        """Cleanup all protocol handlers gracefully"""
+        print("\n[Server] Shutting down all protocol handlers...")
+        
+        # Stop gRPC server
+        if self.grpc_server is not None:
+            try:
+                print("[gRPC] Stopping server...")
+                self.grpc_server.stop(grace=2)
+                print("[gRPC] Server stopped")
+            except Exception as e:
+                print(f"[gRPC] Error stopping server: {e}")
+        
+        # Disconnect MQTT client
+        if self.mqtt_client is not None:
+            try:
+                print("[MQTT] Disconnecting client...")
+                self.mqtt_client.loop_stop()
+                self.mqtt_client.disconnect()
+                print("[MQTT] Client disconnected")
+            except Exception as e:
+                print(f"[MQTT] Error disconnecting: {e}")
+        
+        # Close AMQP connection
+        if self.amqp_channel is not None:
+            try:
+                print("[AMQP] Stopping channel...")
+                self.amqp_channel.stop_consuming()
+            except Exception as e:
+                print(f"[AMQP] Error stopping channel: {e}")
+        
+        if self.amqp_connection is not None:
+            try:
+                print("[AMQP] Closing connection...")
+                self.amqp_connection.close()
+                print("[AMQP] Connection closed")
+            except Exception as e:
+                print(f"[AMQP] Error closing connection: {e}")
+        
+        # Cleanup DDS participant
+        if self.dds_participant is not None:
+            try:
+                print("[DDS] Cleaning up participant...")
+                # DDS participant cleanup is automatic when object is destroyed
+                self.dds_participant = None
+                print("[DDS] Participant cleaned up")
+            except Exception as e:
+                print(f"[DDS] Error cleaning up: {e}")
+        
+        print("[Server] All protocol handlers stopped")
+    
+    def signal_handler(self, signum, frame):
+        """Handle shutdown signals (SIGTERM, SIGINT)"""
+        sig_name = signal.Signals(signum).name
+        print(f"\n[Server] Received {sig_name} signal, initiating graceful shutdown...")
+        self.shutdown_requested = True
+
     def run(self):
         """Run unified server (all protocols)"""
+        # Register signal handlers for graceful shutdown
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        signal.signal(signal.SIGINT, self.signal_handler)
+        
         print("[Server] Starting all protocol handlers...")
         
         self.start_mqtt_server()
@@ -589,16 +712,16 @@ class UnifiedFederatedLearningServer:
         print("[Server] All protocol handlers started")
         print("[Server] Waiting for client registrations...")
         
-        # Keep main thread alive
+        # Keep main thread alive until convergence or shutdown signal
         try:
-            while not self.converged and self.current_round <= self.num_rounds:
+            while not self.shutdown_requested and not self.converged and self.current_round <= self.num_rounds:
                 time.sleep(1)
         except KeyboardInterrupt:
             print("\n[Server] Interrupted by user")
+            self.shutdown_requested = True
         
-        print("[Server] Shutting down...")
-        if self.grpc_server is not None:
-            self.grpc_server.stop(0)
+        # Perform cleanup
+        self.cleanup()
 
 
 if GRPC_PROTO_AVAILABLE:
@@ -652,11 +775,15 @@ if GRPC_PROTO_AVAILABLE:
             return federated_learning_pb2.TrainingStatus(**kwargs)
 
         def SendProtocolSelection(self, request, context):
+            print(f"[Server] Received SendProtocolSelection from client {request.client_id}: round={request.round_id}, model={request.global_model_id}, protocol={request.downlink_protocol_requested}")
             selected = self.server._normalize_protocol_name(request.downlink_protocol_requested)
             if selected is None:
+                print(f"[Server] Invalid protocol requested: {request.downlink_protocol_requested}")
                 return federated_learning_pb2.ProtocolSelectionResponse(success=False, message='invalid protocol')
+            print(f"[Server] Setting client {request.client_id} delivery protocol to: {selected}")
             self.server.client_delivery_protocols[request.client_id] = selected
             self.server.client_protocol_queries.pop(request.client_id, None)
+            print(f"[Server] Successfully recorded protocol selection for client {request.client_id}")
             return federated_learning_pb2.ProtocolSelectionResponse(success=True, message='recorded')
 
         def SendModelUpdate(self, request, context):
@@ -679,7 +806,10 @@ if GRPC_PROTO_AVAILABLE:
             return federated_learning_pb2.MetricsResponse(success=False, message='not implemented in this unified mode')
 
         def GetTrainingConfig(self, request, context):
-            return federated_learning_pb2.TrainingConfig(batch_size=16, local_epochs=5)
+            # Use configurable batch size and epochs (environment variables or defaults)
+            batch_size = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "32"))
+            local_epochs = int(os.getenv("DEFAULT_LOCAL_EPOCHS", "20"))
+            return federated_learning_pb2.TrainingConfig(batch_size=batch_size, local_epochs=local_epochs)
 
 
 def main():

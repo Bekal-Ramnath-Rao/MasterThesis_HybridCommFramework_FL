@@ -9,6 +9,7 @@ Uses Q-Learning to dynamically select the best protocol
 import os
 import sys
 import time
+import threading
 import numpy as np
 _xla_flags = os.environ.get("XLA_FLAGS", "").strip()
 if _xla_flags:
@@ -19,7 +20,7 @@ if _xla_flags:
         os.environ.pop("XLA_FLAGS", None)
 import tensorflow as tf
 from tensorflow import keras
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List, Any
 import json
 import pickle
 import logging
@@ -44,9 +45,14 @@ from cyclonedds.sub import DataReader
 
 # Import custom modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from rl_q_learning_selector import QLearningProtocolSelector, EnvironmentStateManager
+from rl_q_learning_selector import (
+    QLearningProtocolSelector,
+    EnvironmentStateManager,
+    finalize_rl_boundary_collection_and_start_training,
+)
 from dynamic_network_controller import DynamicNetworkController
 from MentalState_Recognition.data_partitioner import get_client_data, NUM_CLASSES
+from fl_termination_env import stop_on_client_convergence
 
 # q_learning_logger lives in scripts/utilities (Docker: /app/scripts/utilities, local: project_root/scripts/utilities)
 if os.path.exists('/app'):
@@ -92,7 +98,18 @@ if gpus:
 CLIENT_ID = int(os.getenv("CLIENT_ID", "0"))
 NUM_CLIENTS = int(os.getenv("NUM_CLIENTS", "3"))
 USE_RL_SELECTION = os.getenv("USE_RL_SELECTION", "true").lower() == "true"
+CONVERGENCE_THRESHOLD = float(os.getenv("CONVERGENCE_THRESHOLD", "0.001"))
+CONVERGENCE_PATIENCE = int(os.getenv("CONVERGENCE_PATIENCE", "2"))
+MIN_ROUNDS = int(os.getenv("MIN_ROUNDS", "3"))
+DEFAULT_DATA_BATCH_SIZE = int(os.getenv("DEFAULT_DATA_BATCH_SIZE", "32"))
+DEFAULT_LOCAL_EPOCHS = int(os.getenv("DEFAULT_LOCAL_EPOCHS", "20"))
+ENABLE_LOCAL_CONVERGENCE_STOP = os.getenv("ENABLE_LOCAL_CONVERGENCE_STOP", "false").lower() == "true"
+# Controls whether this client should signal/exit on local convergence (see fl_termination_env).
+from fl_termination_env import stop_on_client_convergence
+# When True, training ends when Q-learning value converges; when False, ends on accuracy convergence
 USE_QL_CONVERGENCE = os.getenv("USE_QL_CONVERGENCE", "false").lower() == "true"
+# Epsilon-greedy exploration for protocol selection (actual RL training). Independent of USE_QL_CONVERGENCE
+# when USE_RL_EXPLORATION is set explicitly; if unset, matches USE_QL_CONVERGENCE for backward compatibility.
 _ue = os.getenv("USE_RL_EXPLORATION", "").strip().lower()
 if _ue in ("true", "1", "yes"):
     USE_RL_EXPLORATION = True
@@ -100,6 +117,14 @@ elif _ue in ("false", "0", "no"):
     USE_RL_EXPLORATION = False
 else:
     USE_RL_EXPLORATION = USE_QL_CONVERGENCE
+Q_CONVERGENCE_THRESHOLD = float(os.getenv("Q_CONVERGENCE_THRESHOLD", "0.01"))
+Q_CONVERGENCE_PATIENCE = int(os.getenv("Q_CONVERGENCE_PATIENCE", "5"))
+# Phase 1 — data collection: one sample per FL evaluation round with epsilon=1, no Q-updates (0 = skip → train immediately).
+# The federated job length is NUM_ROUNDS (server). Phase 1 needs at least RL_PHASE0_ROUNDS FL rounds to finish
+# collecting samples and run boundary computation; add more rounds for Phase 3 Q-learning after that.
+RL_PHASE0_ROUNDS = int(os.getenv("RL_PHASE0_ROUNDS", "20"))
+# When true (default), unified RL training runs: collect → compute boundaries → Q-learning training
+RL_BOUNDARY_PIPELINE = os.getenv("RL_BOUNDARY_PIPELINE", "true").lower() in ("1", "true", "yes")
 USE_COMMUNICATION_MODEL_REWARD = os.getenv("USE_COMMUNICATION_MODEL_REWARD", "true").lower() == "true"
 
 
@@ -110,9 +135,48 @@ def _env_truthy(name: str) -> bool:
 RL_INFERENCE_ONLY = _env_truthy("RL_INFERENCE_ONLY")
 _RL_PROTOCOL_SELECTION_RECORD_LEARNING = not RL_INFERENCE_ONLY
 
+# Skip loading any on-disk Q-table (zeros + default epsilon). Overrides shared_data / PRETRAINED discovery.
+RL_FRESH_Q_TABLE = _env_truthy("RL_FRESH_Q_TABLE")
+# Optional explicit pickle paths for inference or a chosen checkpoint (highest priority if set and file exists).
+_RL_Q_TABLE_UPLINK_FILE = (os.getenv("RL_Q_TABLE_UPLINK_PATH") or os.getenv("RL_Q_TABLE_UPLINK") or "").strip()
+_RL_Q_TABLE_DOWNLINK_FILE = (os.getenv("RL_Q_TABLE_DOWNLINK_PATH") or os.getenv("RL_Q_TABLE_DOWNLINK") or "").strip()
+
+_num_rounds_env = os.getenv("NUM_ROUNDS", "").strip()
+if (
+    _num_rounds_env
+    and RL_BOUNDARY_PIPELINE
+    and RL_PHASE0_ROUNDS > 0
+    and not RL_FRESH_Q_TABLE
+):
+    try:
+        _nr = int(_num_rounds_env)
+        if _nr < RL_PHASE0_ROUNDS:
+            print(
+                f"[RL] Warning: NUM_ROUNDS={_nr} < RL_PHASE0_ROUNDS={RL_PHASE0_ROUNDS}. "
+                f"Phase 1 (boundary data collection) will not complete before FL stops; "
+                f"raise NUM_ROUNDS to at least {RL_PHASE0_ROUNDS} (plus rounds for Phase 3), "
+                f"or lower RL_PHASE0_ROUNDS."
+            )
+    except ValueError:
+        pass
+
 TOPIC_CLIENT_UPDATE = f"fl/client/{CLIENT_ID}/update"
 TOPIC_CLIENT_METRICS = f"fl/client/{CLIENT_ID}/metrics"
 GRPC_MAX_MESSAGE_BYTES = int(os.getenv("GRPC_MAX_MESSAGE_BYTES", str(64 * 1024 * 1024)))
+
+
+def _resolve_unified_grpc_host(default_host: str = "fl-server-unified-mentalstate") -> str:
+    """Prefer GRPC_SERVER (compose) over GRPC_HOST (Client/Dockerfile may set fl-server)."""
+    gs = (os.getenv("GRPC_SERVER") or "").strip()
+    if gs:
+        return gs.split(":", 1)[0].strip()
+    gh = (os.getenv("GRPC_HOST") or "").strip()
+    if gh:
+        return gh.split(":", 1)[0].strip()
+    uf = (os.getenv("UNIFIED_FL_SERVER_HOST") or "").strip()
+    if uf:
+        return uf.split(":", 1)[0].strip()
+    return default_host
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +238,8 @@ class UnifiedFLClient_MentalState:
         
         # Model
         self.model = None
-        self.local_epochs = 5
-        self.batch_size = 16
+        self.local_epochs = DEFAULT_LOCAL_EPOCHS
+        self.batch_size = DEFAULT_DATA_BATCH_SIZE
         
         # RL Components: two SEPARATE agents for UPLINK and DOWNLINK, each with own Q-table
         if USE_RL_SELECTION:
@@ -239,11 +303,39 @@ class UnifiedFLClient_MentalState:
             self.env_manager.update_model_size('large')  # Mental state (LSTM model)
             if init_qlearning_db is not None:
                 init_qlearning_db()
+            
+            # Boundary collection phase (similar to emotion recognition)
+            # Phase 1 (data collection): collect uplink/downlink comm times, resource %, battery SoC
+            # for RL_PHASE0_ROUNDS FL rounds with epsilon=1. Then Phase 2: compute boundary percentiles.
+            # Finally Phase 3: Q-learning training with calculated boundaries.
+            self._rl_boundary_collection_phase = bool(
+                RL_BOUNDARY_PIPELINE
+                and RL_PHASE0_ROUNDS > 0
+                and not RL_FRESH_Q_TABLE
+                and not RL_INFERENCE_ONLY
+            )
+            self._rl_boundary_uplink_comm_samples: List[float] = []
+            self._rl_boundary_downlink_comm_samples: List[float] = []
+            self._rl_boundary_res_samples: List[float] = []
+            self._rl_boundary_batt_samples: List[float] = []
+            self._rl_boundary_res_samples_dl: List[float] = []
+            self._rl_boundary_batt_samples_dl: List[float] = []
+            self._last_downlink_comm_wall_s: float = 0.0
+            self._last_uplink_rl_state: Optional[Dict] = None
+            if self._rl_boundary_collection_phase:
+                self.rl_selector_uplink.epsilon = 1.0
+                self.rl_selector_downlink.epsilon = 1.0
+                print(
+                    f"[Client {client_id}] RL pipeline: Phase 1 = first {RL_PHASE0_ROUNDS} FL rounds "
+                    f"(uplink+downlink wall comm time, resource load, battery SoC; epsilon=1; no Q-updates). "
+                    f"Then Phase 2 = boundaries, Phase 3 = Q-learning training."
+                )
         else:
             self.rl_selector_uplink = None
             self.rl_selector_downlink = None
             self.rl_selector = None
             self.env_manager = None
+            self._rl_boundary_collection_phase = False
         
         # Protocol handlers (same structure as emotion recognition)
         self.protocol_handlers = {
@@ -270,13 +362,28 @@ class UnifiedFLClient_MentalState:
         # Downlink RL tracking
         self._last_downlink_rl_state = None
         self._downlink_select_time = None
-        self.grpc_host = os.getenv("GRPC_HOST", "fl-server-unified-mentalstate")
+        self.grpc_host = _resolve_unified_grpc_host()
         self.grpc_port = int(os.getenv("GRPC_PORT", "50051"))
+        
+        # Convergence tracking (for both accuracy and RL convergence)
+        self.has_converged = False
+        self.is_active = True
+        self.shutdown_requested = False
+        self.best_loss = float('inf')
+        self.rounds_without_improvement = 0
+        
+        # gRPC listener thread for background protocol query polling
+        self.grpc_listener_thread = None
+        self.grpc_stub = None
+        self.grpc_lock = threading.Lock()  # Synchronize gRPC calls to prevent conflicts
+        self.last_grpc_train_signal_round = -1
+        self.last_grpc_eval_signal_round = -1
         
         print(f"\n{'='*70}")
         print(f"UNIFIED FL CLIENT - MENTAL STATE RECOGNITION")
         print(f"{'='*70}")
         print(f"Client ID: {self.client_id}/{self.num_clients}")
+        print(f"gRPC (control / protocol negotiation): {self.grpc_host}:{self.grpc_port}")
         print(f"Training Samples: {len(self.y_train)}")
         print(f"RL Protocol Selection: {'ENABLED' if USE_RL_SELECTION else 'DISABLED'}")
         if USE_RL_SELECTION:
@@ -339,6 +446,10 @@ class UnifiedFLClient_MentalState:
         """Select UPLINK protocol using the dedicated UPLINK RL agent (CPU-only Q-learning)"""
         if USE_RL_SELECTION and self.rl_selector_uplink and self.env_manager:
             try:
+                # During Phase 1 (boundary collection), maintain epsilon=1.0 for pure random exploration
+                if self._rl_boundary_collection_phase:
+                    self.rl_selector_uplink.epsilon = 1.0
+                
                 # RL logic runs on CPU only (no GPU); keeps Q-table updates off GPU
                 with tf.device('/CPU:0'):
                     import psutil
@@ -383,43 +494,101 @@ class UnifiedFLClient_MentalState:
             return None
 
     def _update_downlink_rl_after_reception(self, round_num: int = 0):
-        """Compute and log downlink Q-learning reward after global model is received.
-        Q-value is updated only when USE_RL_EXPLORATION is True; logging always runs."""
+        """
+        Compute and log the downlink Q-learning reward after the global model is received.
+        Uses the dedicated DOWNLINK RL agent (separate Q-table from uplink).
+        Q-value is updated only during Phase 3 (after boundary collection).
+        """
         if (not USE_RL_SELECTION
                 or self.rl_selector_downlink is None
                 or self._downlink_select_time is None
                 or self._last_downlink_rl_state is None):
             return
+        
+        if not USE_RL_EXPLORATION:
+            self._last_downlink_rl_state = None
+            return
+        
         try:
             comm_time = time.time() - self._downlink_select_time
             self._downlink_select_time = None
+            self._last_downlink_comm_wall_s = float(comm_time)
+            
+            # Phase 1: Collect boundary samples for downlink (no Q-updates yet)
+            if self._rl_boundary_collection_phase:
+                import psutil
+                cpu_m = psutil.cpu_percent(interval=0.0)
+                mem_m = psutil.virtual_memory().percent
+                resource_load_dl = (cpu_m + mem_m) / 2.0
+                batt_dl = float(self.env_manager.battery_soc) if self.env_manager else 1.0
+                self._rl_boundary_downlink_comm_samples.append(comm_time)
+                self._rl_boundary_res_samples_dl.append(resource_load_dl)
+                self._rl_boundary_batt_samples_dl.append(batt_dl)
+                nd = len(self._rl_boundary_downlink_comm_samples)
+                print(
+                    f"[Client {self.client_id}] RL Phase 1 (downlink data collection): sample {nd} "
+                    f"(wall comm={comm_time:.3f}s, load={resource_load_dl:.1f}%, SoC={batt_dl:.3f})"
+                )
+                self._last_downlink_rl_state = None
+                return
+            
             downlink_state = self._last_downlink_rl_state
             self._last_downlink_rl_state = None
             protocol = self.selected_downlink_protocol or 'grpc'
             resources = self.env_manager.get_resource_consumption() if self.env_manager else {}
-            payload_bytes = 12 * 1024 * 1024
+            # Use actual downlink payload bytes from model reception
+            payload_bytes = getattr(self, '_downlink_payload_bytes', None) or (12 * 1024 * 1024)
             t_calc = self._get_t_calc_for_reward(protocol, payload_bytes) if USE_COMMUNICATION_MODEL_REWARD else None
+            
             reward = self.rl_selector_downlink.calculate_reward(
                 communication_time=comm_time,
                 success=True,
                 resource_consumption=resources,
                 t_calc=t_calc,
             )
-            if USE_RL_EXPLORATION:
-                self.rl_selector_downlink.update_q_value(reward, next_state=None, done=True)
+            
+            # Compute next state for Q-learning
+            if self.env_manager:
+                self.env_manager.update_comm_level_from_time(
+                    comm_time,
+                    self.rl_selector_downlink.comm_t_low,
+                    self.rl_selector_downlink.comm_t_high,
+                )
+                self.env_manager.sync_battery_level_from_soc(None)
+                next_state = self.env_manager.get_current_state()
+            else:
+                next_state = None
+            
+            # Only update Q-values during Phase 3 (after boundary calculation)
+            if self._should_update_q_value():
+                self.rl_selector_downlink.update_q_value(
+                    reward,
+                    next_state=next_state,
+                    done=False if next_state is not None else True,
+                )
+            
             q_delta = self.rl_selector_downlink.get_last_q_delta()
             q_value = self.rl_selector_downlink.get_last_q_value()
             avg_reward = (
                 float(np.mean(self.rl_selector_downlink.total_rewards[-100:]))
                 if self.rl_selector_downlink.total_rewards else 0.0
             )
-            if USE_RL_EXPLORATION:
+            
+            if self._should_update_q_value():
                 self.rl_selector_downlink.end_episode()
-            q_converged = self.rl_selector_downlink.check_q_converged()
-            print(f"[Downlink RL] round={round_num} | protocol={protocol.upper()} | "
-                  f"comm_time={comm_time:.3f}s | reward={reward:.2f} | "
-                  f"epsilon={self.rl_selector_downlink.epsilon:.4f}")
-            if log_q_step is not None:
+            
+            q_converged = self.rl_selector_downlink.check_q_converged(
+                threshold=Q_CONVERGENCE_THRESHOLD,
+                patience=Q_CONVERGENCE_PATIENCE,
+                state=downlink_state,
+            )
+            
+            print(f"[Downlink RL] Client {self.client_id} | round={round_num} | protocol={protocol.upper()} | "
+                  f"comm_time={comm_time:.3f}s | reward={reward:.2f} | q_delta={q_delta:.4f} | "
+                  f"epsilon={self.rl_selector_downlink.epsilon:.4f} | q_conv_dl={q_converged}")
+            
+            # Only log Q-values during Phase 3 (Q-learning training), not during boundary collection
+            if log_q_step is not None and self._should_update_q_value():
                 reward_details = self.rl_selector_downlink.get_last_reward_breakdown()
                 log_q_step(
                     client_id=self.client_id,
@@ -447,11 +616,13 @@ class UnifiedFLClient_MentalState:
                     reward_communication_time=reward_details.get('reward_communication_time'),
                     reward_resource_penalty=reward_details.get('reward_resource_penalty'),
                     reward_battery_penalty=reward_details.get('reward_battery_penalty'),
-                    reward_total=reward_details.get('reward_total'),
+                    reward_total=reward_details.get('reward_total', reward),
                     link_direction='downlink',
                 )
         except Exception as e:
-            print(f"[Downlink RL] reward update error: {e}")
+            print(f"[Downlink RL] Client {self.client_id} reward update error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _open_grpc_stub(self):
         if not GRPC_PROTO_AVAILABLE:
@@ -497,6 +668,11 @@ class UnifiedFLClient_MentalState:
             return 0.0
         try:
             weights_bytes = self.get_model_weights()
+            # Track model size for monitoring and RL reward calculation
+            payload_bytes = len(weights_bytes)
+            self.round_metrics['payload_bytes'] = payload_bytes
+            print(f"[Model Size] Uplink: {payload_bytes / (1024*1024):.2f} MB")
+            
             t0 = time.time()
             resp = stub.SendModelUpdate(
                 federated_learning_pb2.ModelUpdate(
@@ -524,13 +700,20 @@ class UnifiedFLClient_MentalState:
 
     def _wait_and_apply_global_model_via_grpc(self, target_round: int, timeout: int = 180) -> bool:
         """Poll server until it has a global model for target_round, then apply it.
+        The background gRPC listener handles protocol query responses automatically.
         Returns True if the model was successfully downloaded and applied."""
         channel, stub = self._open_grpc_stub()
         if stub is None:
             return False
         deadline = time.time() + timeout
+        poll_count = 0
         try:
             while time.time() < deadline:
+                poll_count += 1
+                if poll_count <= 10 or poll_count % 5 == 0:  # Log first 10 polls, then every 5th
+                    print(f"[Client {self.client_id}] Poll #{poll_count} for round {target_round}: checking for model...")
+                
+                # Check for global model
                 try:
                     response = stub.GetGlobalModel(
                         federated_learning_pb2.ModelRequest(
@@ -538,12 +721,19 @@ class UnifiedFLClient_MentalState:
                         )
                     )
                     if response.available and response.weights and response.round >= target_round:
+                        # Track downlink model size
+                        downlink_payload_bytes = len(response.weights)
+                        self._downlink_payload_bytes = downlink_payload_bytes
+                        print(f"[Model Size] Downlink: {downlink_payload_bytes / (1024*1024):.2f} MB")
+                        
                         self.set_model_weights(response.weights)
                         self.initial_global_model_downloaded = True
                         print(f"[gRPC] Applied global model (server round={response.round})")
                         return True
                 except Exception as e:
-                    print(f"[gRPC] GetGlobalModel error (target={target_round}): {e}")
+                    if poll_count <= 3:  # Only log first few errors
+                        print(f"[gRPC] GetGlobalModel error (target={target_round}): {e}")
+                
                 time.sleep(2.0)
             print(f"[gRPC] Timed out waiting for global model (target_round={target_round})")
             return False
@@ -551,21 +741,33 @@ class UnifiedFLClient_MentalState:
             channel.close()
 
     def _select_downlink_protocol(self, round_id: int, global_model_id: int) -> str:
-        # First global model bootstrap is always forced to gRPC.
+        """Select downlink protocol using RL agent.
+        
+        Round 1 (initial model) always uses gRPC - no protocol selection.
+        Protocol selection via RL starts from Round 2 onwards (matches Emotion Recognition).
+        """
+        # Round 1: Always use gRPC for initial model bootstrap
         if round_id <= 1 or global_model_id <= 1 or not self.initial_global_model_downloaded:
+            print(f"[Downlink] Round {round_id}: Using gRPC (initial model, no RL selection)")
             return 'grpc'
-        # Use the dedicated DOWNLINK RL agent
+        
+        # Round 2+: Use dedicated DOWNLINK RL agent for protocol selection
         if USE_RL_SELECTION and self.rl_selector_downlink and self.env_manager:
             try:
+                # During Phase 1 (boundary collection), maintain epsilon=1.0 for pure random exploration
+                if self._rl_boundary_collection_phase:
+                    self.rl_selector_downlink.epsilon = 1.0
+                
                 with tf.device('/CPU:0'):
                     state = self.env_manager.get_current_state()
+                    print(f"[Downlink RL Selection] State: {state}")
                     selected = self.rl_selector_downlink.select_protocol(
                         state, training=USE_RL_EXPLORATION, record_learning=_RL_PROTOCOL_SELECTION_RECORD_LEARNING
                     )
+                    print(f"[Downlink RL Selection] Selected Protocol: {selected.upper()}")
+                    print(f"[Downlink RL Selection] Epsilon: {self.rl_selector_downlink.epsilon:.4f}")
                 self._last_downlink_rl_state = state
                 self._downlink_select_time = time.time()
-                print(f"[Downlink RL] selected {selected.upper()} "
-                      f"(epsilon={self.rl_selector_downlink.epsilon:.4f})")
             except Exception as e:
                 print(f"[Downlink RL] Error: {e}, using default")
                 selected = self.select_protocol()
@@ -577,54 +779,142 @@ class UnifiedFLClient_MentalState:
             self._downlink_select_time = None
         return selected if selected in {'mqtt', 'amqp', 'grpc', 'quic', 'http3', 'dds'} else 'grpc'
 
-    def _poll_and_respond_protocol_query_via_grpc(self):
-        channel, stub = self._open_grpc_stub()
-        if stub is None:
+    def _handle_grpc_protocol_query(self, protocol_query):
+        """Respond to server ProtocolQuery via gRPC using RL-based downlink selection.
+        Called automatically by the background gRPC listener thread."""
+        if protocol_query is None:
             return
+
+        query_key = (
+            int(getattr(protocol_query, 'round_id', -1)),
+            int(getattr(protocol_query, 'global_model_id', -1)),
+        )
+        if self.last_protocol_query_key == query_key:
+            return
+
+        round_id, global_model_id = query_key
+        selected_downlink_protocol = self._select_downlink_protocol(round_id, global_model_id)
+
+        with self.grpc_lock:
+            if self.grpc_stub is None:
+                return
+            response = self.grpc_stub.SendProtocolSelection(
+                federated_learning_pb2.ProtocolSelection(
+                    client_id=self.client_id,
+                    round_id=round_id,
+                    global_model_id=global_model_id,
+                    downlink_protocol_requested=selected_downlink_protocol,
+                )
+            )
+
+        if response.success:
+            self.selected_downlink_protocol = selected_downlink_protocol
+            self.last_protocol_query_key = query_key
+            # Real downlink reward is computed in _update_downlink_rl_after_reception()
+            # after global model arrives. We do NOT log reward=0.0 here.
+            _dl_eps = (
+                f"{self.rl_selector_downlink.epsilon:.4f}"
+                if self.rl_selector_downlink is not None
+                else "N/A"
+            )
+            print(
+                f"[gRPC] Client {self.client_id} replied ProtocolSelection: "
+                f"round={round_id}, global_model_id={global_model_id}, "
+                f"downlink={selected_downlink_protocol} "
+                f"(downlink RL agent epsilon={_dl_eps})"
+            )
+        else:
+            print(f"[gRPC] Client {self.client_id} ProtocolSelection rejected: {response.message}")
+
+    def _poll_and_respond_protocol_query_via_grpc(self):
+        """Manual polling version (kept for backwards compatibility during transition)."""
+        with self.grpc_lock:
+            if self.grpc_stub is None:
+                return
+            stub = self.grpc_stub
+        
         try:
             status = stub.CheckTrainingStatus(
                 federated_learning_pb2.StatusRequest(client_id=self.client_id, current_round=self.current_round)
             )
-            if not getattr(status, 'has_protocol_query', False):
-                return
-            query = status.protocol_query
-            query_key = (int(query.round_id), int(query.global_model_id))
-            if self.last_protocol_query_key == query_key:
-                return
-            selected = self._select_downlink_protocol(query.round_id, query.global_model_id)
-            response = stub.SendProtocolSelection(
-                federated_learning_pb2.ProtocolSelection(
-                    client_id=self.client_id,
-                    round_id=int(query.round_id),
-                    global_model_id=int(query.global_model_id),
-                    downlink_protocol_requested=selected,
-                )
-            )
-            if response.success:
-                self.selected_downlink_protocol = selected
-                self.last_protocol_query_key = query_key
-                # Real downlink reward is computed in _update_downlink_rl_after_reception()
-                # after global model arrives. We do NOT log reward=0.0 here.
-                _dl_eps = (
-                    f"{self.rl_selector_downlink.epsilon:.4f}"
-                    if self.rl_selector_downlink is not None
-                    else "N/A"
-                )
-                print(
-                    f"[gRPC] Client {self.client_id} protocol selection sent: "
-                    f"round={query.round_id}, global_model_id={query.global_model_id}, downlink={selected} "
-                    f"(downlink RL epsilon={_dl_eps})"
-                )
+            
+            has_query = getattr(status, 'has_protocol_query', False)
+            if has_query:
+                self._handle_grpc_protocol_query(status.protocol_query)
         except Exception as e:
-            print(f"[gRPC] Client {self.client_id} protocol query handling failed: {e}")
-        finally:
-            channel.close()
+            print(f"[gRPC] Client {self.client_id} protocol query poll error: {e}")
+
+    def start_grpc_listener(self):
+        """Start gRPC polling thread for automatic protocol query handling."""
+        if self.grpc_listener_thread is not None and self.grpc_listener_thread.is_alive():
+            return
+        
+        def grpc_listener_loop():
+            try:
+                # Create gRPC channel and stub
+                options = [
+                    ('grpc.max_send_message_length', 4 * 1024 * 1024),
+                    ('grpc.max_receive_message_length', 4 * 1024 * 1024),
+                    ('grpc.keepalive_time_ms', 600000),
+                    ('grpc.keepalive_timeout_ms', 60000),
+                ]
+                channel = grpc.insecure_channel(f"{self.grpc_host}:{self.grpc_port}", options=options)
+                with self.grpc_lock:
+                    self.grpc_stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
+                
+                print(f"[gRPC] Listener started for client {self.client_id}")
+
+                # Polling loop
+                while not self.shutdown_requested:
+                    try:
+                        status_request = federated_learning_pb2.StatusRequest(client_id=self.client_id)
+                        with self.grpc_lock:
+                            if self.grpc_stub is None:
+                                break
+                            stub = self.grpc_stub
+                        status = stub.CheckTrainingStatus(status_request)
+
+                        if getattr(status, 'has_protocol_query', False):
+                            self._handle_grpc_protocol_query(status.protocol_query)
+
+                    except grpc.RpcError as e:
+                        # Don't spam logs for connection errors during shutdown
+                        if not self.shutdown_requested:
+                            print(
+                                f"[gRPC] Client {self.client_id} CheckTrainingStatus RpcError (will retry): "
+                                f"{e.code()} - {e.details()}"
+                            )
+                    except Exception as e:
+                        if not self.shutdown_requested:
+                            print(f"[gRPC] Client {self.client_id} CheckTrainingStatus error: {e}")
+
+                    time.sleep(1)  # Poll every second
+                    
+            except Exception as e:
+                print(f"[gRPC] Listener error: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                with self.grpc_lock:
+                    self.grpc_stub = None
+                try:
+                    channel.close()
+                except:
+                    pass
+        
+        self.grpc_listener_thread = threading.Thread(target=grpc_listener_loop, daemon=True, name=f"gRPC-Listener-{self.client_id}")
+        self.grpc_listener_thread.start()
 
     def _ensure_initial_global_model_via_grpc(self):
-        """Download and apply the initial global model (round 0) from the server."""
+        """Download and apply the initial global model from the server via gRPC.
+        
+        The server always broadcasts Round 1 (initial model) via gRPC - no protocol negotiation.
+        Protocol negotiation starts from Round 2 onwards.
+        """
         if self.initial_global_model_downloaded:
             return
-        self._wait_and_apply_global_model_via_grpc(target_round=0, timeout=180)
+        print(f"[Client {self.client_id}] Downloading initial global model via gRPC (Round 1)...")
+        self._wait_and_apply_global_model_via_grpc(target_round=0, timeout=180)  # Round 0 means "any round >= 0"
 
     def train_local_model(self) -> Dict:
         """Train model locally using real EEG data"""
@@ -634,14 +924,14 @@ class UnifiedFLClient_MentalState:
         
         start_time = time.time()
         
-        # Train with GPU acceleration
+        # Train with GPU acceleration (verbose=2 to show epoch progress)
         with tf.device('/GPU:0' if gpus else '/CPU:0'):
             history = self.model.fit(
                 self.X_train, self.y_train,
                 epochs=self.local_epochs,
                 batch_size=self.batch_size,
                 validation_split=0.2,
-                verbose=0
+                verbose=2  # Show epoch progress like emotion recognition
             )
         
         training_time = time.time() - start_time
@@ -737,9 +1027,8 @@ class UnifiedFLClient_MentalState:
         """Execute one round of federated learning"""
         round_start = time.time()
 
-        # Ensure first-round model bootstrap and handle pending protocol negotiation over gRPC.
+        # Ensure first-round model bootstrap (protocol negotiation happens after upload)
         self._ensure_initial_global_model_via_grpc()
-        self._poll_and_respond_protocol_query_via_grpc()
         
         if protocol is None:
             protocol = self.select_protocol()
@@ -757,6 +1046,7 @@ class UnifiedFLClient_MentalState:
             comm_time = self._upload_model_via_grpc(self.current_round, train_metrics)
 
             # ---- Downlink: wait for server to aggregate and broadcast new global model ----
+            # (Protocol negotiation polling happens automatically while waiting)
             next_round = self.current_round + 1
             if next_round <= self._total_rounds:
                 self._wait_and_apply_global_model_via_grpc(target_round=next_round, timeout=180)
@@ -768,9 +1058,22 @@ class UnifiedFLClient_MentalState:
             self.round_metrics['communication_time'] = comm_time
             self.round_metrics['success'] = True
             
-            # Uplink RL: compute reward always for logging; update Q only when exploring.
+            # Uplink RL: compute reward always for logging; update Q only when not in boundary collection phase.
             if USE_RL_SELECTION and self.rl_selector_uplink and self.env_manager:
+                import psutil
                 resources = self.env_manager.get_resource_consumption()
+                cpu_usage = psutil.cpu_percent(interval=0.1)
+                memory_usage = psutil.virtual_memory().percent
+                resource_avg = (cpu_usage + memory_usage) / 2.0
+                battery_soc = self.env_manager.battery_soc
+                
+                # Phase 1: Collect boundary samples (no Q-updates yet)
+                if self._rl_boundary_collection_phase:
+                    self._rl_boundary_uplink_comm_samples.append(comm_time)
+                    self._rl_boundary_res_samples.append(resource_avg)
+                    self._rl_boundary_batt_samples.append(battery_soc)
+                    print(f"[RL Phase 1] Collecting boundary data: comm={comm_time:.3f}s, resource={resource_avg:.1f}%, battery={battery_soc:.2f}")
+                
                 payload_bytes = self.round_metrics.get('payload_bytes', 12 * 1024 * 1024)
                 t_calc = self._get_t_calc_for_reward(protocol, payload_bytes) if USE_COMMUNICATION_MODEL_REWARD else None
                 reward = self.rl_selector_uplink.calculate_reward(
@@ -779,9 +1082,13 @@ class UnifiedFLClient_MentalState:
                     resource_consumption=resources,
                     t_calc=t_calc,
                 )
-                if USE_RL_EXPLORATION:
+                
+                # Only update Q-values during Phase 3 (after boundary calculation)
+                if USE_RL_EXPLORATION and self._should_update_q_value():
                     self.rl_selector_uplink.update_q_value(reward, done=False)
-                if log_q_step is not None:
+                
+                # Only log Q-values during Phase 3 (Q-learning training), not during boundary collection
+                if log_q_step is not None and self._should_update_q_value():
                     st = self.env_manager.get_current_state()
                     q_delta = self.rl_selector_uplink.get_last_q_delta()
                     q_value = self.rl_selector_uplink.get_last_q_value()
@@ -852,6 +1159,124 @@ class UnifiedFLClient_MentalState:
             print(f"[Error] FL Round failed: {e}")
             return {'protocol': protocol, 'success': False}
     
+    def _should_update_q_value(self) -> bool:
+        """Return True if we should perform Q-value updates (not during boundary collection phase)"""
+        return not getattr(self, "_rl_boundary_collection_phase", False)
+    
+    def _compute_boundaries_and_start_q_learning(self):
+        """
+        Compute boundary percentiles from collected samples and transition from Phase 1 to Phase 3.
+        Called after RL_PHASE0_ROUNDS rounds of data collection.
+        Uses finalize_rl_boundary_collection_and_start_training to properly set boundaries 
+        for both uplink and downlink RL agents.
+        """
+        if not self._rl_boundary_collection_phase:
+            return
+        
+        print(f"\n{'='*70}")
+        print("RL PIPELINE: COMPUTING BOUNDARIES (Phase 2)")
+        print(f"{'='*70}")
+        print(f"Collected {len(self._rl_boundary_uplink_comm_samples)} uplink comm samples")
+        print(f"Collected {len(self._rl_boundary_downlink_comm_samples)} downlink comm samples")
+        print(f"Collected {len(self._rl_boundary_res_samples)} uplink resource samples")
+        print(f"Collected {len(self._rl_boundary_batt_samples)} uplink battery samples")
+        print(f"Collected {len(self._rl_boundary_res_samples_dl)} downlink resource samples")
+        print(f"Collected {len(self._rl_boundary_batt_samples_dl)} downlink battery samples")
+        
+        # Use the same function as emotion recognition to compute and apply boundaries
+        if finalize_rl_boundary_collection_and_start_training is not None:
+            finalize_rl_boundary_collection_and_start_training(
+                self.rl_selector_uplink,
+                self.rl_selector_downlink,
+                self.env_manager,
+                self._rl_boundary_uplink_comm_samples,
+                self._rl_boundary_res_samples,
+                self._rl_boundary_batt_samples,
+                client_id=self.client_id,
+                downlink_comm_times=self._rl_boundary_downlink_comm_samples,
+                resource_loads_downlink=self._rl_boundary_res_samples_dl,
+                battery_socs_downlink=self._rl_boundary_batt_samples_dl,
+            )
+        
+        print(f"\n{'='*70}")
+        print("RL PIPELINE: STARTING Q-LEARNING TRAINING (Phase 3)")
+        print(f"{'='*70}\n")
+        
+        # Transition to Phase 3: enable Q-learning (finalize function resets epsilon to 1.0 for both agents)
+        self._rl_boundary_collection_phase = False
+        
+        # Clear the collected samples to free memory
+        self._rl_boundary_uplink_comm_samples = []
+        self._rl_boundary_downlink_comm_samples = []
+        self._rl_boundary_res_samples = []
+        self._rl_boundary_batt_samples = []
+        self._rl_boundary_res_samples_dl = []
+        self._rl_boundary_batt_samples_dl = []
+    
+    def _would_converge_after_eval(self, loss: float) -> bool:
+        """True if this eval loss would trigger local convergence in the same round (mirrors FL_Client_gRPC)."""
+        if self.current_round < MIN_ROUNDS or self.has_converged:
+            return False
+        if self.best_loss - loss > CONVERGENCE_THRESHOLD:
+            return False
+        return (self.rounds_without_improvement + 1) >= CONVERGENCE_PATIENCE
+
+    def _update_client_convergence_and_maybe_disconnect(self, loss: float):
+        """Track local convergence and disconnect this client when converged."""
+        if self.current_round < MIN_ROUNDS:
+            self.best_loss = min(self.best_loss, float(loss))
+            return
+
+        if self.best_loss - float(loss) > CONVERGENCE_THRESHOLD:
+            self.best_loss = float(loss)
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+
+        if self.rounds_without_improvement >= CONVERGENCE_PATIENCE:
+            self.has_converged = True
+            print(f"[Client {self.client_id}] Local convergence reached at round {self.current_round}")
+            if stop_on_client_convergence():
+                self._notify_convergence_to_server()
+                self._disconnect_after_convergence()
+
+    def _notify_convergence_to_server(self):
+        """Notify server this client is converged using gRPC control signal."""
+        if grpc is None or federated_learning_pb2 is None or federated_learning_pb2_grpc is None:
+            print(f"[gRPC] Client {self.client_id} convergence signal skipped: gRPC unavailable")
+            return
+        try:
+            options = [
+                ('grpc.max_send_message_length', GRPC_MAX_MESSAGE_BYTES),
+                ('grpc.max_receive_message_length', GRPC_MAX_MESSAGE_BYTES),
+                ('grpc.keepalive_time_ms', 600000),
+                ('grpc.keepalive_timeout_ms', 60000),
+            ]
+            channel = grpc.insecure_channel(f'{self.grpc_host}:{self.grpc_port}', options=options)
+            stub = federated_learning_pb2_grpc.FederatedLearningStub(channel)
+            response = stub.SendModelUpdate(
+                federated_learning_pb2.ModelUpdate(
+                    client_id=self.client_id,
+                    round=self.current_round,
+                    weights=b"",
+                    num_samples=0,
+                    metrics={"client_converged": 1.0}
+                )
+            )
+            if response.success:
+                print(f"[gRPC] Client {self.client_id} convergence notification sent")
+            else:
+                print(f"[gRPC] Convergence notification failed: {response.message}")
+            channel.close()
+        except Exception as e:
+            print(f"[gRPC] Client {self.client_id} failed to notify convergence: {e}")
+
+    def _disconnect_after_convergence(self):
+        """Stop participating once local convergence is reached."""
+        self.is_active = False
+        self.shutdown_requested = True
+        print(f"[Client {self.client_id}] Disconnecting after local convergence")
+    
     def run(self, num_rounds: int = 10):
         """Run federated learning for multiple rounds"""
         print(f"\n{'='*70}")
@@ -870,6 +1295,10 @@ class UnifiedFLClient_MentalState:
         else:
             print("[gRPC] Could not register with server – proceeding in stand-alone mode")
 
+        # Start gRPC listener thread for automatic protocol query handling
+        print("[gRPC] Starting background listener for protocol queries...")
+        self.start_grpc_listener()
+        
         # Wait for server to start training and deliver the initial global model
         print("[gRPC] Waiting for initial global model from server...")
         self._ensure_initial_global_model_via_grpc()
@@ -880,15 +1309,75 @@ class UnifiedFLClient_MentalState:
             print(f"# ROUND {round_num}/{num_rounds}")
             print(f"{'#'*70}\n")
             
+            # Check if we need to transition from Phase 1 (boundary collection) to Phase 3 (Q-learning)
+            if (
+                self._rl_boundary_collection_phase
+                and round_num == RL_PHASE0_ROUNDS
+            ):
+                self._compute_boundaries_and_start_q_learning()
+            
             metrics = self.federated_learning_round()
             
             print(f"\n[Round {round_num}] Metrics:")
             for key, value in metrics.items():
                 print(f"  {key}: {value}")
             
+            # Handle RL convergence check (when USE_QL_CONVERGENCE is enabled and not in boundary collection phase)
+            if USE_RL_SELECTION and self.rl_selector_uplink and USE_QL_CONVERGENCE and not self._rl_boundary_collection_phase:
+                # Check Q-learning convergence for both uplink and downlink
+                q_uplink_converged = self.rl_selector_uplink.check_q_converged(
+                    threshold=Q_CONVERGENCE_THRESHOLD,
+                    patience=Q_CONVERGENCE_PATIENCE,
+                    state=self._last_uplink_rl_state if hasattr(self, '_last_uplink_rl_state') else None,
+                )
+                q_downlink_converged = (
+                    self.rl_selector_downlink.check_q_converged(
+                        threshold=Q_CONVERGENCE_THRESHOLD,
+                        patience=Q_CONVERGENCE_PATIENCE,
+                        state=self._last_downlink_rl_state,
+                    )
+                    if self.rl_selector_downlink is not None
+                    else True
+                )
+                q_both_converged = q_uplink_converged and q_downlink_converged
+                
+                if q_uplink_converged and not q_downlink_converged:
+                    print(
+                        f"[Client {self.client_id}] Uplink Q converged at round {round_num} but downlink "
+                        f"has not; continuing (uplink Q-updates unchanged)."
+                    )
+                
+                # End training only when both uplink and downlink Q-learning converged
+                if q_both_converged and stop_on_client_convergence():
+                    self.has_converged = True
+                    print(
+                        f"[Client {self.client_id}] RL convergence reached at round {round_num} "
+                        f"(last {Q_CONVERGENCE_PATIENCE} consecutive protocol selections identical "
+                        f"on uplink AND downlink)"
+                    )
+                    try:
+                        self.rl_selector_uplink.save_q_table()
+                    except Exception as e:
+                        print(f"[Client {self.client_id}] Warning: could not save uplink Q-table on convergence: {e}")
+                    try:
+                        self.rl_selector_downlink.save_q_table()
+                    except Exception as e:
+                        print(f"[Client {self.client_id}] Warning: could not save downlink Q-table on convergence: {e}")
+                    self._notify_convergence_to_server()
+                    self._disconnect_after_convergence()
+                    break  # Exit training loop after convergence
+            
+            # Handle accuracy convergence check (when not using RL convergence mode)
+            if not USE_QL_CONVERGENCE and ENABLE_LOCAL_CONVERGENCE_STOP and stop_on_client_convergence():
+                loss_f = float(metrics.get('val_loss', 0.0))
+                self._update_client_convergence_and_maybe_disconnect(loss_f)
+                if self.has_converged:
+                    break  # Exit training loop after convergence
+            
             if USE_RL_SELECTION and self.rl_selector and USE_QL_CONVERGENCE:
                 self.rl_selector_uplink.end_episode()
                 self.rl_selector_downlink.end_episode()
+        
         if USE_RL_SELECTION and self.rl_selector:
             self.rl_selector.print_statistics()
 

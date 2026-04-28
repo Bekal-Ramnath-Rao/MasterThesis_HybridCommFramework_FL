@@ -129,6 +129,8 @@ class ExperimentRunner:
         self._runtime_compose_files_cpu: Dict[str, str] = {}
         self.dataset_client_map: Dict[int, int] = dict(dataset_client_map or {})
         self._runtime_compose_files_dataset: Dict[tuple, str] = {}
+        # A per-experiment identifier (used e.g. for RL epsilon resets and optional compose scoping)
+        self.current_experiment_id: Optional[str] = None
         
         # Map use_case values to actual Server directory names
         self.use_case_dir_map = {
@@ -932,7 +934,10 @@ class ExperimentRunner:
                         "amqp-broker-unified",
                         f"fl-server-unified-{uc}",
                     ]
-                    compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_ql
+                    # --no-recreate avoids compose trying to stop/recreate an already-running container.
+                    # This is critical on some systems where Docker can get stuck waiting for an "exit event"
+                    # and will otherwise fail the entire experiment start.
+                    compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d", "--no-recreate"] + services_ql
                 else:
                     # Unified compose defines up to three client services.
                     max_unified_clients = 3
@@ -944,7 +949,7 @@ class ExperimentRunner:
                     ]
                     for i in range(1, num_local + 1):
                         services_multi_client.append(f"fl-client-unified-{uc}-{i}")
-                    compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_multi_client
+                    compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d", "--no-recreate"] + services_multi_client
             else:
                 # Unified compose defines up to three client services; a bare `up -d` starts all and ignores
                 # --local-clients. Start only brokers + server + the first N client services (N=0..3).
@@ -962,7 +967,7 @@ class ExperimentRunner:
                 ]
                 for i in range(1, num_local + 1):
                     services_multi.append(f"fl-client-unified-{uc}-{i}")
-                compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d"] + services_multi
+                compose_cmd = self._docker_compose_base(compose_file) + ["up", "-d", "--no-recreate"] + services_multi
             
             if self.use_ql_convergence:
                 _n_loc = 0 if int(self.local_clients) <= 0 else 1
@@ -2692,6 +2697,8 @@ class ExperimentRunner:
                     import uuid
                     timestamp = time.time()
                     experiment_id = str(uuid.uuid4())[:8]  # Short unique ID for this experiment
+                    # Store on runner so other parts (e.g. compose scoping/logging) can reference it.
+                    self.current_experiment_id = experiment_id
                     with open(reset_flag_file, 'w') as f:
                         f.write(f"experiment_id={experiment_id}\n")
                         f.write(f"scenario={scenario}\n")
